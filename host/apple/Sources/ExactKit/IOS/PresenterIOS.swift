@@ -28,13 +28,9 @@ package final class Presenter {
     var gridMoved: [NodeView] = []
     /// The views Core Animation's next commit may show (`unshown`).
     var awaitingFrame: [WeakNodeView] = []
-    /// What the native projections show changed outside a batch (a subtree's appearance or
-    /// size traits, geometry applied after the batch, as a flight's landing is).
-    /// Run the projection steps an empty batch used to run, once, on the next
-    /// turn, without waiting for a batch an idle app may never commit (LLP
-    /// 1079's amendment of 2026-10-04): grouped lists remount (frames, cell
-    /// heights, switches), lists redraw separators where geometry applied,
-    /// then tab bars and controls.
+    /// Coalesce native appearance and geometry changes outside a batch into the
+    /// next main-thread turn. Synchronize grouped lists, row separators, segments
+    /// and controls without waiting for another kernel batch (LLP 1079).
     package func requestProjectionSync() {
         guard !projectionSyncOwed else { return }
         projectionSyncOwed = true
@@ -1170,8 +1166,17 @@ package final class Presenter {
             return false
         }
         let contained = NodeView.keepingGhosts(want.filter { !heldByArrangement($0) && !navigation.ownsContainment(of: $0, under: parent) && !menus.lifted($0) && !isFlying($0) }, in: container)
+        // Keep paragraph coverage below authored children when UIKit owns its view
+        let text = parent.specs?.rasterView
+        let offset = text?.superview === container ? 1 : 0
+        if offset != 0, let text, container.subviews.first !== text {
+            container.sendSubviewToBack(text)
+            parent.insertBoxSublayer(text.layer)
+        }
         current = container.subviews
-        for (i, child) in contained.enumerated() where !(i < current.count && current[i] === child) {
+        for (rank, child) in contained.enumerated() {
+            let i = rank + offset
+            if i < current.count && current[i] === child { continue }
             // One already here is past `i` (those before it are in place):
             // moved as UIKit moves it, without asking for every subview again
             // (a pooled row comes back from past the rows, each a move).

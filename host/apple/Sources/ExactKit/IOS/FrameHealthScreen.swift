@@ -31,6 +31,8 @@ final class FrameHealthScreen {
     var willDraw: (() -> Void)?
     /// The app session's workload flags (`FrameHealth.workload`), which each frame records as its update is scheduled
     var workload: (() -> UInt64)?
+    /// A diagnostic recorder consumes numeric boundaries without a card or a frame-rate request
+    var completedUpdate: ((_ scheduled: Double, _ start: Double, _ deadline: Double, _ beforeCommit: Double, _ finished: Double, _ waited: Double) -> Void)?
     /// Seconds: one refresh at the display's highest rate
     private(set) var refresh = 1.0 / 60
     private(set) var running = false
@@ -48,7 +50,7 @@ final class FrameHealthScreen {
         /// As it began, the nodes' layouts and the seconds of Exact's host phases (`HostPhases.total`)
         let layouts: Int, phases: Double
         /// Seconds: how long the main thread waited and the card worked within it
-        var waited = 0.0, card = 0.0
+        var beforeCommit = 0.0, waited = 0.0, card = 0.0
         /// At its last Core Animation commit, as seen just after it, where its work ends: the time, and the host phases'
         /// seconds, the nodes' layouts and the card's seconds then
         var committed: (at: Double, phases: Double, layouts: Int, card: Double)?
@@ -85,6 +87,9 @@ final class FrameHealthScreen {
             self?.scheduled(presented: info.estimatedPresentationTime, deadline: info.completionDeadlineTime)
         }
         link.addAction(to: .afterCADisplayLinkDispatch) { [weak self] _, _ in self?.willDraw?() }
+        for phase in [UIUpdateActionPhase.beforeCATransactionCommit, .beforeLowLatencyCATransactionCommit] {
+            link.addAction(to: phase) { [weak self] _, _ in self?.update?.beforeCommit = CACurrentMediaTime() }
+        }
         for phase in [UIUpdateActionPhase.afterCATransactionCommit, .afterLowLatencyCATransactionCommit] {
             link.addAction(to: phase) { [weak self] _, _ in self?.committed(at: CACurrentMediaTime()) }
         }
@@ -173,6 +178,7 @@ final class FrameHealthScreen {
         }
         health.record(arrival: start, target: update.deadline, period: 0, finished: finished,
             flags: health.captureID == 0 ? 0 : health.environmentFlags | update.flags)
+        completedUpdate?(update.start, start, update.deadline, update.beforeCommit, finished, update.waited)
         chart?.screenFrame(at: presented, work: finished - start, budget: update.deadline - start)
         newest = max(newest, presented)
     }

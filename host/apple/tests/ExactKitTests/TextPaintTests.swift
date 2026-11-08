@@ -497,25 +497,22 @@ final class TextPaintTests: XCTestCase {
             let paragraph = engine.paragraph(spec, width: 100)
             let geometry = try XCTUnwrap(engine.measuredBreaks(spec, width: 100))
             let box = CGRect(x: 0, y: 0, width: 100, height: 40)
-            var job = TextRasterJob(source: engine.attributed(spec), ranges: geometry.ranges, baselines: paragraph.baselines,
+            let job = TextRasterJob(source: engine.attributed(spec), ranges: geometry.ranges, baselines: paragraph.baselines,
                                     flush: 0, box: box, size: box.size, scale: 1, clamped: geometry.clamped)
-            #if os(iOS) || os(tvOS)
-            job.tints = true
-            #endif
             return try XCTUnwrap(job.render())
         }
         let ordinary = try raster(black)
-        XCTAssertNil(ordinary.tint, "red text and a black token cannot share one tint")
-        if ordinary.tint == nil {
-            let pixels = rasterPixels(ordinary)
-            XCTAssertGreaterThan(pixels.filter { $0.w > 0.5 && max($0.x, $0.y, $0.z) < 0.05 }.count, 5,
-                                 "the ellipsis paints black while all source glyphs paint red")
-        }
+        #if os(iOS) || os(tvOS)
+        XCTAssertFalse(ordinary.isDrawn, "red text and a black token are not one colour, so not drawn by the layer")
+        #endif
+        let pixels = rasterPixels(ordinary)
+        XCTAssertGreaterThan(pixels.filter { $0.w > 0.5 && max($0.x, $0.y, $0.z) < 0.05 }.count, 5,
+                             "the ellipsis paints black while all source glyphs paint red")
         let p3 = try raster(wide)
         #if os(macOS)
         let space = IOSurfaceCopyValue(p3.surface, kIOSurfaceColorSpace).flatMap { CGColorSpace(propertyListPlist: $0) }
         #else
-        let space = p3.image.colorSpace
+        let space = p3.pixels?.colorSpace
         #endif
         XCTAssertEqual(space?.name, CGColorSpace.displayP3, "the token alone requires wide storage")
         let light = try raster(bright)
@@ -533,17 +530,14 @@ final class TextPaintTests: XCTestCase {
         let width = image.surface.width, height = image.surface.height
         let deep = image.surface.bytesPerElement == 8
         #else
-        let width = image.image.width, height = image.image.height
-        let deep = image.image.bitsPerComponent == 16
+        let pixels = image.pixels!
+        let width = pixels.width, height = pixels.height
+        let deep = pixels.bitsPerComponent == 16
         #endif
-        let row = width * (image.tint != nil ? 1 : deep ? 8 : 4)
+        let row = width * (deep ? 8 : 4)
         let data = CapturePixels.bytes(image)
         return data.withUnsafeBytes { raw in
             (0..<height).flatMap { y in (0..<width).map { x in
-                if let tint = image.tint?.converted(to: CGColorSpace(name: CGColorSpace.sRGB)!, intent: .relativeColorimetric, options: nil)?.components {
-                    let alpha = Float(raw.load(fromByteOffset: y * row + x, as: UInt8.self)) / 255
-                    return SIMD4(Float(tint[0]) * alpha, Float(tint[1]) * alpha, Float(tint[2]) * alpha, alpha)
-                }
                 let channels: [Float] = (0..<4).map { channel in
                     if deep {
                         return Float(Float16(bitPattern: raw.loadUnaligned(fromByteOffset: y * row + x * 8 + channel * 2, as: UInt16.self)))
@@ -619,21 +613,29 @@ final class TextPaintTests: XCTestCase {
     /// LLP 1100 D2: a paragraph whose colour is wide rasterizes into Display
     /// P3, so its ink is not clipped to sRGB; any other stays sRGB.
     func testAWideColouredParagraphRastersInDisplayP3() throws {
-        func space(_ color: [Double]) throws -> String? {
+        func raster(_ color: [Double]) throws -> TextRasterImage {
             let spec = Spec(runs: [run("Wide")], align: 0, lineClamp: 0, color: color)
             let p = engine.paragraph(spec, width: 200)
             let box = CGRect(x: 0, y: 0, width: 200, height: 40)
             let job = TextRasterJob(source: engine.attributed(spec), ranges: p.lines.map { CTLineGetStringRange($0) },
                                     baselines: p.baselines, flush: 0, box: box, size: box.size, scale: 2)
-            let image = try XCTUnwrap(job.render())
+            return try XCTUnwrap(job.render())
+        }
+        func space(_ image: TextRasterImage) -> String? {
             #if os(macOS)
-            let profile = IOSurfaceCopyValue(image.surface, kIOSurfaceColorSpace)
-            return profile.flatMap { CGColorSpace(propertyListPlist: $0) }?.name as String?
+            IOSurfaceCopyValue(image.surface, kIOSurfaceColorSpace).flatMap { CGColorSpace(propertyListPlist: $0) }?.name as String?
             #else
-            return image.image.colorSpace?.name as String?
+            image.isDrawn ? nil : image.pixels?.colorSpace?.name as String?
             #endif
         }
-        XCTAssertEqual(try space([255, 0, 0, 255, 1, 1, 0, 0, 1]), CGColorSpace.displayP3 as String)
-        XCTAssertEqual(try space([255, 0, 0, 255]), CGColorSpace.sRGB as String)
+        #if os(macOS)
+        XCTAssertEqual(space(try raster([255, 0, 0, 255, 1, 1, 0, 0, 1])), CGColorSpace.displayP3 as String)
+        XCTAssertEqual(space(try raster([255, 0, 0, 255])), CGColorSpace.sRGB as String)
+        #else
+        let wide = try XCTUnwrap(try raster([255, 0, 0, 255, 1, 1, 0, 0, 1]).singleColorCoverage)
+        XCTAssertEqual(wide.mask.bitsPerPixel, 8, "wide and sRGB text use coverage")
+        XCTAssertTrue(ColorRange.needsExtendedComponents(wide.color.converted(to: CGColorSpace(name: CGColorSpace.extendedSRGB)!, intent: .relativeColorimetric, options: nil)))
+        XCTAssertTrue(try raster([255, 0, 0, 255]).isDrawn, "plain glyph values remain reusable")
+        #endif
     }
 }

@@ -32,7 +32,7 @@ enum CapturePixels {
         defer { surface.unlock(options: .readOnly, seed: nil) }
         return rows(surface.baseAddress, width: surface.width * surface.bytesPerElement, height: surface.height, stride: surface.bytesPerRow)
         #else
-        return bytes(raster.image)
+        return bytes(raster.pixels)
         #endif
     }
 
