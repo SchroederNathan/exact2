@@ -72,6 +72,16 @@
   `workers_start_with_the_first_request` also misses its five-second completion bound with main's web files
   (2026-11-04), alone and through the asynchronous-core wrapper. The ordered request completes; the independent
   request without a grant does not. The same failure occurs with the web timeout fix restored.
+  In the press-spelling checks (2026-11-07), Linux's
+  `an_abort_whose_answer_was_replaced_is_still_cancelled_on_an_empty_pump` could not obtain seven
+  worker slots within 30 seconds before its server-write timeout. A control with main's sources
+  passed, as did the isolated case and full run after restoring the candidate.
+- **The Mac table's first-click probe fails with main's sources** (2026-11-07).
+  `TableFeedKeyMacTests.testTheClickThatBringsTheWindowForwardSelectsARowAndPressesAControlInIt`
+  leaves the selected row at -1. The same ten assertions fail with all changed Rust, Swift and
+  Contract sources from main at `70365218ab`, then with the candidate restored, in the same QA checkout.
+  The other key-window cases and authored press-paint regression pass. Check the injected
+  first-click event against a native reference before changing the host.
 - **Retained Metal boot can submit without a displayed timestamp** (2026-10-30, LLP 1149.001 Stage 0b). On the unlocked, quiet silver Mac, boot-only launches 4, 5, 7 and 8 of ten submit frames but reach the probe's 30-second deadline with no positive presented time; all ten interleaved wgpu controls and all ten Metal archive misses complete. This repeats the earlier incomplete warm cohort and blocks the summed first-screen gate. Join the layer exposure, submission and displayed callbacks using the retained traces in `host/ink/MEASUREMENTS.md` before changing startup.
 - **Trace G5m's native moving-bar cost** (2026-10-30, LLP 1149.001). Native's moving bar costs 84.49 ms/s on the main thread against the prediction below 10. Attribute that CPU cost before changing the path; M2b resolved Ink's continuous caret submissions. The quiet three-round series and captures are in `bench/heavy-list/gpui/RESULTS.md`, G5m.
 - **The SVG expansion-limit test exceeds its five-second deadline after a passing full run** (2026-10-30, LLP 1149.001 Stage 0 review fixes). `exact-svg-file::tests::a_file_that_expands_past_a_limit_draws_nothing_and_names_it` fails at 8.218781 s in the root suite and 8.294572 s in isolation, both with `RUST_TEST_THREADS=2`. The preceding full run passes all fourteen SVG tests in 3.52 s. This lane changes neither SVG nor its kernel, motion or numeric dependencies. The third full root run passes SVG; the timing failure remains unexplained. Investigate the measured expansion work before changing the deadline. Logs: `target/s0/review-fixes/checks-final/test.log`, `svg-limit-isolated.log`, `root-final-round3/test.log`, and `checks-rebased/test.log`.

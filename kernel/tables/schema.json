@@ -4452,7 +4452,7 @@
       "field": "press_background_color",
       "codec": "color",
       "default": 0,
-      "_comment": "@ref LLP 1061 D7: not CSS. The background colour a node shows in place of its own while a pointer holds it pressed; unset is none. Host-owned as `-exact-press-scale` is. Custom nodes replace the platform's unsaid press; native controls replace only the background. Paint only.",
+      "_comment": "@ref LLP 1061 D7, LLP 1121 D8: compiler representation of `:active background-color`. The background colour a node shows in place of its own while a pointer holds it pressed; unset is none. Host-owned as `-exact-press-scale` is. Custom nodes replace the platform's unsaid press; native controls replace only the background. Paint only.",
       "cold": true
     },
     {
@@ -4460,7 +4460,7 @@
       "field": "press_color",
       "codec": "color",
       "default": 0,
-      "_comment": "@ref LLP 1061 D7: not CSS. The text colour a node shows while a pointer holds it pressed, given to its subtree as `color` is (a descendant that writes its own `color` keeps it); unset is none. Host-owned as `-exact-press-scale` is. Custom nodes replace the platform's unsaid press; native controls replace only inherited ink. Paint only.",
+      "_comment": "@ref LLP 1061 D7, LLP 1121 D8: compiler representation of `:active color`. The text colour a node shows while a pointer holds it pressed, given to its subtree as `color` is (a descendant that writes its own `color` keeps it); unset is none. Host-owned as `-exact-press-scale` is. Custom nodes replace the platform's unsaid press; native controls replace only inherited ink. Paint only.",
       "cold": true
     },
     {

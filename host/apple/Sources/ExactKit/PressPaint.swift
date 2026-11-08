@@ -1,8 +1,8 @@
 // The author's pressed paint (LLP 1061 D7), on both platforms: while the
 // press `pressed` tracks holds a node (the bit `-exact-press-scale` and the
 // platform's dim use), it shows its `-exact-press-opacity` as a fraction of
-// its own opacity, its `-exact-press-background-color` in place of its
-// background, and its `-exact-press-color` as its text colour, which its
+// its own opacity, its active `background-color` in place of its
+// background, and its active `color` as its text colour, which its
 // subtree takes as CSS's `color` is taken (a descendant with a colour of its
 // own keeps it). Eased in and back on the scale's curve and duration, at once
 // under the agent's clock; a release before the press was ever on screen

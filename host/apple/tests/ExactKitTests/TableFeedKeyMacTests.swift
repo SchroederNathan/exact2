@@ -648,7 +648,11 @@ final class TableFeedKeyMacTests: XCTestCase {
     }
 
     func testAuthoredPressedPaintFollowsTheTablesClickWithoutReplacingSelection() throws {
-        let source = TableFixture.source(count: 20).replacingOccurrences(of: "row press=open(r)", with: "row press=open(r) -exact-press-opacity=0.4 -exact-press-background-color=\"#ff0000\" -exact-press-color=\"#00ff00\"")
+        let source = TableFixture.source(count: 20).split(separator: "\n", omittingEmptySubsequences: false).map { line in
+            guard line.contains("row press=open(r)") else { return String(line) }
+            let indent = line.prefix { $0 == " " }
+            return "\(line) -exact-press-opacity=0.4\n\(indent)  :active\n\(indent)    background-color=\"#ff0000\"\n\(indent)    color=\"#00ff00\""
+        }.joined(separator: "\n")
         let f = try keyed(count: 20, source: source)
         let row = try f.node("row-1"), title = try f.node("title-1")
         XCTAssertTrue(row.authorsPress)

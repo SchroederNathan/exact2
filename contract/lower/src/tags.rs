@@ -978,8 +978,10 @@ pub fn renamed(old: &str) -> Option<&'static str> {
         // LLP 1061 D7: the pressed paint, and React Native's
         // `TouchableOpacity`/`TouchableHighlight` props that set it.
         "press-opacity" | "activeOpacity" => "-exact-press-opacity",
-        "press-background-color" | "underlayColor" => "-exact-press-background-color",
-        "press-color" => "-exact-press-color",
+        "-exact-press-background-color" | "press-background-color" | "underlayColor" => {
+            ":active background-color"
+        }
+        "-exact-press-color" | "press-color" => ":active color",
         "content-transition" => "-exact-content-transition",
         "scroll-edge-effect" => "-exact-scroll-edge-effect",
         "hover-effect" => "-exact-hover-effect",

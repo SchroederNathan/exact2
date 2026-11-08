@@ -3148,25 +3148,18 @@ its schemes in `app.json`: `"host": { "ios": { "queriesSchemes":
 List at most 50 schemes, without `:` or `://`; changing the list requires a
 native rebuild.
 
-A pressed look is the host's, as UIKit's highlight is (LLP 1061 D7):
-`-exact-press-opacity` (0 to 1, a share of the node's own opacity),
-`-exact-press-background-color` and `-exact-press-color` (any colour row's
-values: a token, a role, `light-dark()`), beside `-exact-press-scale`, with
-which they compose. The host shows them while a finger or the mouse holds the
-node (the innermost pressable, inside its box; sliding off, a cancel or a pan
-lets go). Custom nodes ease in over 120 ms; native controls keep the platform's
-timing. The agent applies the target at once, so `"tap row
-down" "screenshot x.png" "tap up"` shows it. Nothing waits on the runner and no
-state changes. `-exact-press-color` reaches the node's text as `color` does
-(a text with its own colour keeps it). On custom nodes, any of them, 1 included,
+Write pressed `background-color`, `color` and absolute `opacity` in a
+`:active` block. `-exact-press-opacity` multiplies the node's presented opacity;
+`-exact-press-scale` multiplies its presented scale. The host applies these
+values while a finger or mouse holds the innermost pressable inside its box.
+Sliding off, cancellation or a pan releases it. Custom nodes ease over 120 ms;
+native controls keep the platform's timing. The agent applies the target at
+once, so `"tap row down" "screenshot x.png" "tap up"` shows it. Pressing requires
+no runner round trip. Active `color` reaches text that inherits the node's
+colour; descendants with their own keep it. On custom nodes, authored feedback
 replaces the platform's unsaid press. Native buttons and native list rows keep
-unwritten fields of the platform's highlighted state. An `:active` state part
-(below) says the same paint, with an opacity that is what the node shows pressed
-rather than a share; write each
-paint one way or the other, not both. These are paint only; a press that
-changes layout is app state. Do not draw a press from
-`pointerdown`/`pointerup` state: each touch then waits on the runner. Say
-nothing to get the platform's own.
+unwritten fields of the platform's highlighted state. Leave feedback unwritten
+for the platform default. A press that changes layout uses app state.
 
 Haptics are already there (LLP 1077 D14). `-exact-press-haptic` (`selection`,
 `impact-light|medium|heavy|soft|rigid`) plays at touch-down without a round
@@ -4422,9 +4415,10 @@ their native state beneath each authored override. Its `opacity` is the opacity
 it shows pressed, not a share.
 Its targets may compute during ordinary commits, including a conditional class
 and `none` to clear a target. Pressing needs no runner round trip.
-Say each once: `:active background-color` beside `-exact-press-background-color`
-is refused (`lower-state-press-paint`), as is a border or shadow there, which the
-press cannot paint yet. `:hover` and `:focus-visible` take `background-color`,
+Absolute active opacity and `-exact-press-opacity` are mutually exclusive
+(`lower-state-press-paint`), as are two declarations of the press scale. Border
+and shadow targets remain unsupported until their host paint is implemented.
+`:hover` and `:focus-visible` take `background-color`,
 `border-color`, `opacity` and `box-shadow`, shown at once while they hold (a
 `:hover` replaces the platform's hover wash, as `:active` its press; on
 the web a `transition` of the node's own on one of those rows still times it), the

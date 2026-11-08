@@ -722,7 +722,7 @@ style PostButton
   can write today. **`:hover` and `:focus-visible`** lower to a **state look**: a `looks` row
   `{ node, state, rows }`, keyed by node and state, applied by the host on its own tracking,
   with no round trip (LLP 1061 D1's reason). **`:active` lowers to the press paint** (LLP 1061
-  D7: `-exact-press-background-color`, `-exact-press-color`, the press's opacity and
+  D7: private `press_background_color` and `press_color` rows, the press's opacity and
   `-exact-press-scale`), so each host has one press and one runtime for it, and no `:active`
   look.
 - **`:active` is the host's existing press**, not CSS's: the innermost node with a `press`
@@ -750,10 +750,11 @@ style PostButton
   target, eased from the opacity shown at the press (a hover or focus look's included), not
   D7's share of the node's own; the press paint carries the target, replacing D7's clamped
   share for it. A `:hover` or `:focus-visible` look's colours snap under Reduce Motion.
-- **One spelling a node.** A node or its class writing a D7 row and the same paint in `:active`
-  (`-exact-press-background-color` and `:active`'s `background-color`, say) is refused,
-  naming both. The design tool's `hold active` drives the host's real press, and inspect gives
-  an `:active` row's source span, though it lowered to the press paint.
+- **One spelling a node.** Absolute `:active opacity` and the multiplicative
+  `-exact-press-opacity` are mutually exclusive, as are two declarations of press scale.
+  Pressed colours use only `:active`; `contract migrate` moves retired paint attributes
+  into that block. The design tool's `hold active` drives the host's real press, and
+  inspect gives an active row's source span.
 - **A declared state replaces the host's default for that state only.** `:disabled` sets the
   same `disabledStyled` mark the heuristic sets, and the heuristic's existing forms (an
   authored `opacity`; a colour that reads what `disabled` reads) still count. `:active`
@@ -3614,8 +3615,8 @@ on a fresh page.
 Built to D8 as amended 2026-10-18 (Charlie's option B; theme2's 06:14 ruling on the replan).
 
 - **`:active` lowers to the press paint** (`contract/lower/src/states.rs`). Its rows are written on the node, the class's then the node's (the node's wins), each keeping its `:active` span for inspect and the map:
-  - `background-color` → `-exact-press-background-color`;
-  - `color` → `-exact-press-color`;
+  - `background-color` → private `press_background_color`;
+  - `color` → private `press_color`;
   - `-exact-press-scale` → the node's own;
   - `opacity` → `-exact-press-opacity-to`, a new row, bit 215, lowering's alone. An author's is `lower-unknown-attr`, naming `:active opacity`, and `contract vocab` doesn't list it.
 
@@ -3624,7 +3625,7 @@ Built to D8 as amended 2026-10-18 (Charlie's option B; theme2's 06:14 ruling on 
   Refused:
   - `border-color` and `box-shadow` in `:active` (`lower-state-row`: the press can't paint them yet);
   - `-exact-press-scale` in `:hover` or `:focus-visible` (`lower-state-row`, pointing at `:active`);
-  - a node, or its class, saying a press paint both ways (`lower-state-press-paint`): `-exact-press-background-color`, `-exact-press-color`, `-exact-press-opacity` or `-exact-press-scale` beside the same `:active` row.
+  - a node, or its class, saying opacity or press scale both ways (`lower-state-press-paint`): `-exact-press-opacity` or `-exact-press-scale` beside the same `:active` row.
 - **Where an `:active` row is written** (theme2's 06:14 condition). The map's binding for a lowered row carries `"state": "active"` and `at`, the `:active` row's file and span (`sites::Origin::State`; its `origin` is still the node's or class's). `uses`, and so explain, name that line, not the node's. (Since LLP 1122's queue item (1), on theme2's 2026-10-20 ruling: the part is the press row binding's `states` entry, `{state: "active", origin, at}`, and the binding has no base fields; `:hover` and `:focus-visible` rows are entries of their rows' `states` too.)
 - **The absolute press opacity.** The press eases from the opacity shown at the press, a hover or focus look's included, to the target. For that node it replaces D7's clamped share. A hand-written `-exact-press-opacity` keeps the share.
   - Web: `--exact-press-opacity-to`. The glue's `PAINT` list takes it, and index.html computes `base + (to − base) × paint`.

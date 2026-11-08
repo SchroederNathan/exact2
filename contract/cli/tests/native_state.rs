@@ -9,6 +9,27 @@ impl DataSource for NoData {
 }
 
 #[test]
+fn retired_press_paints_name_the_active_property() {
+    for (retired, property) in [
+        ("-exact-press-background-color", "background-color"),
+        ("-exact-press-color", "color"),
+    ] {
+        for source in [
+            format!("component App\n  view\n    button {retired}=\"#ff0000\"\n      text \"Go\"\n"),
+            format!("style Feedback\n  {retired}=\"#ff0000\"\ncomponent App\n  view\n    button class=Feedback\n      text \"Go\"\n"),
+        ] {
+            let error = contract::compile(&source).unwrap_err();
+            assert_eq!(error.id, "lower-unknown-attr", "{source}: {error}");
+            assert!(error.message.contains(":active"), "{error}");
+            assert!(error.message.contains(property), "{error}");
+            assert!(error.message.contains("contract migrate"), "{error}");
+            let migrated = contract_syntax::migrate::migrate(&source).unwrap();
+            contract::compile(&migrated).unwrap_or_else(|error| panic!("{migrated}: {error}"));
+        }
+    }
+}
+
+#[test]
 fn active_properties_keep_native_buttons_and_leave_their_base_face_native() {
     let mut failures = Vec::new();
     for appearance in ["", "appearance=\"auto\""] {

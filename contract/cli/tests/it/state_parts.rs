@@ -232,7 +232,7 @@ fn active_and_the_press_paint_are_one_spelling() {
         format!("style Card\n  {rows}\n\ncomponent App\n  state on = false\n  action go\n    on = !on\n  view\n    column class=Card press=go\n      :active\n        {part}\n      text \"b\"\n")
     };
     for (rows, part) in [
-        ("-exact-press-color = \"#000000\"", "color = \"#ff0000\""),
+        ("-exact-press-opacity = 0.5", "opacity = 0.9"),
         ("-exact-press-scale = 0.9", "-exact-press-scale = 0.95"),
     ] {
         assert_eq!(

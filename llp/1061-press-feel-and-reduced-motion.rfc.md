@@ -14,9 +14,9 @@
 
 
 **Ruled (Charlie, 2026-10-17, on a review panel of Astra, Grok and Fable, all for it):**
-an author's own pressed look is admitted as host-owned paint rows in the press family,
-not as an `:active` selector: `-exact-press-opacity`, `-exact-press-background-color` and
-`-exact-press-color`. D7 records it.
+an author's own pressed look is admitted as host-owned paint. Pressed colours are now
+authored in `:active` (LLP 1121 D8); `-exact-press-opacity` retains its multiplicative
+meaning. D7 records the host representation.
 
 > **Spelling (2026-10-06):** `press-scale` is spelled `-exact-press-scale` since [LLP 1081](1081-names-exact-invents.rfc.md). This document keeps the spelling it was written with, as the record.
 
@@ -205,8 +205,9 @@ reduced-motion switch (`DEFERRED`).
 
 **D7 — The author's pressed paint is three more rows in the press family**
 (ruled 2026-10-17). `-exact-press-opacity` (bit 212, `f32`, default 1: a share
-of the node's own opacity, 0 to 1), `-exact-press-background-color` (bit 213)
-and `-exact-press-color` (bit 214), colours as any colour row takes them
+of the node's own opacity, 0 to 1), plus private `press_background_color` (bit 213)
+and `press_color` (bit 214), authored as `background-color` and `color` in `:active`.
+The colours take the same values as other colour rows
 (tokens, roles, `light-dark()`); none inherited, none a keyframe or
 `transition` target. A hand-built UIKit control writes its highlighted look
 (`setTitleColor(_:for: .highlighted)`, a cell's `selectedBackgroundView`), and a
@@ -215,9 +216,8 @@ say either was a `pressed` state set from `pointerdown` and `pointerup`, a
 runner round trip per touch that also replaced the platform's press with
 nothing until it answered.
 
-- **No selector.** CSS says this as an `:active` rule. Contract has no
-  selectors, and `:active` matches every pressed ancestor too, where the press
-  is the innermost pressable's (D3, UIKit's rule).
+- **Active part.** Contract's `:active` belongs to the innermost pressable
+  (D3, UIKit's rule); the browser pseudo-class also matches its ancestors.
 - **The press state the host already tracks.** The same bit that drives
   `-exact-press-scale` and the platform's dim: inside the unpressed box, let
   go on sliding off, a cancel or a pan, again on sliding back; the scale's

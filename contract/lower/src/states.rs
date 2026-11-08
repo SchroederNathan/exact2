@@ -39,11 +39,14 @@ const HOST_ROWS: [&str; 4] = ["background-color", "border-color", "opacity", "bo
 
 /// The rows `:active` takes, and the press paint's row each lowers to: the
 /// press's colour reaches the subtree, so `color` is one (LLP 1061 D7).
-const ACTIVE_ROWS: [(&str, &str); 4] = [
-    ("background-color", "-exact-press-background-color"),
-    ("color", "-exact-press-color"),
-    ("opacity", PRESS_OPACITY_TO),
-    ("-exact-press-scale", "-exact-press-scale"),
+const ACTIVE_ROWS: [(&str, &[exact_kernel::StyleId]); 4] = [
+    (
+        "background-color",
+        &[exact_kernel::StyleId::PressBackgroundColor],
+    ),
+    ("color", &[exact_kernel::StyleId::PressColor]),
+    ("opacity", &[exact_kernel::StyleId::PressOpacityTo]),
+    ("-exact-press-scale", &[exact_kernel::StyleId::PressScale]),
 ];
 
 /// Nodes whose platform state handling restricts authored parts.
@@ -56,8 +59,8 @@ pub(crate) enum StateTarget {
 
 /// The rows a written active part supplies, including before button admission.
 pub(crate) fn active_target(row: &str) -> Option<tags::AttrTarget> {
-    let (_, paint) = ACTIVE_ROWS.iter().find(|(name, _)| *name == row)?;
-    crate::style_names::lookup(paint)
+    let (_, rows) = ACTIVE_ROWS.iter().find(|(name, _)| *name == row)?;
+    Some(tags::AttrTarget::Styles(rows))
 }
 
 /// The press's absolute opacity, lowering's row for `:active`'s `opacity`
@@ -170,14 +173,11 @@ pub(crate) fn refusal(state: &str, row: &Attr, values: bool) -> Option<LowerErro
 /// for its colours and scale (not inherited, as the fold lowers them), its
 /// `opacity` as `opacity` (the press's absolute target, checked alike), any
 /// other state's row itself.
-pub(crate) fn checked_as<'a>(state: &str, row: &'a str) -> &'a str {
-    match (state, row) {
-        ("active", "opacity") => row,
-        ("active", _) => ACTIVE_ROWS
-            .iter()
-            .find(|(r, _)| *r == row)
-            .map_or(row, |(_, p)| p),
-        _ => row,
+pub(crate) fn checked_as(state: &str, row: &str) -> String {
+    if state == "active" && row != "opacity" {
+        contract_syntax::state::state_attr(":active", row)
+    } else {
+        row.to_string()
     }
 }
 
@@ -460,10 +460,8 @@ impl Lowerer<'_> {
         for (state, row, _) in parts.iter().filter(|(s, ..)| *s == "active") {
             let paint = match row.name.as_str() {
                 "opacity" => "-exact-press-opacity",
-                name => ACTIVE_ROWS
-                    .iter()
-                    .find(|(r, _)| *r == name)
-                    .map_or("", |(_, p)| *p),
+                "-exact-press-scale" => "-exact-press-scale",
+                _ => continue,
             };
             if base.iter().any(|a| a.name == paint) {
                 return err(
@@ -607,16 +605,13 @@ impl Lowerer<'_> {
         // node's (the node's wins), each at its `:active` row's span.
         let pressed = attrs.len();
         for (_, row, class) in parts.iter().filter(|(s, ..)| *s == "active") {
-            let (_, paint) = ACTIVE_ROWS
-                .iter()
-                .find(|(r, _)| *r == row.name)
-                .expect("admitted");
-            if let Some(at) = (pressed..attrs.len()).find(|i| attrs[*i].name == *paint) {
+            let name = contract_syntax::state::state_attr(":active", &row.name);
+            if let Some(at) = (pressed..attrs.len()).find(|i| attrs[*i].name == name) {
                 attrs.remove(at);
                 by_class.remove(at - base_len);
             }
             attrs.push(Attr {
-                name: paint.to_string(),
+                name,
                 ..row.clone()
             });
             by_class.push(*class);

@@ -192,6 +192,15 @@ cargo run -q -p contract -- fmt --stdout apps/messages/app.contract
 cargo run -q -p contract -- fmt --check apps/messages/app.contract
 ```
 
+`contract migrate <file.contract>` rewrites retired spellings in place. It moves
+`-exact-press-background-color` and `-exact-press-color` into the owner's
+`:active` block, merging with an existing block and retaining expressions and
+comments. It refuses conflicting active rows, directly nested inline text and
+explicit `appearance="auto"` controls other than buttons before writing.
+Classes and component uses are checked at compile time. Compile the result with
+`contract build`; use `contract fmt` to format it. Arbitrary strings and
+transition targets are unchanged.
+
 `symbols` prints JSON with `definitions` and `references`. Each reference's
 `to` is an index into `definitions`; locations include the original file,
 1-based line and byte column, and an exclusive `end_col`. Component interfaces,

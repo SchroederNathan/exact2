@@ -292,8 +292,6 @@ pub const STYLE_NAMES: &[(&str, &str, AttrTarget)] = &[
     ("-exact-press-scale", "exact LLP 1061", AttrTarget::Styles(&[StyleId::PressScale])),
     // @ref LLP 1061 D7 — the author's pressed paint, host-owned as the scale is.
     ("-exact-press-opacity", "exact LLP 1061 D7", AttrTarget::Styles(&[StyleId::PressOpacity])),
-    ("-exact-press-background-color", "exact LLP 1061 D7", AttrTarget::Styles(&[StyleId::PressBackgroundColor])),
-    ("-exact-press-color", "exact LLP 1061 D7", AttrTarget::Styles(&[StyleId::PressColor])),
     // @ref LLP 1121 D8 — lowering's row for `:active`'s `opacity`, never an
     // author's (`nodes.rs` refuses it written).
     ("-exact-press-opacity-to", "exact LLP 1121 D8", AttrTarget::Styles(&[StyleId::PressOpacityTo])),
