@@ -11,7 +11,6 @@ final class ArrangementHost {
     private var syncingInsets = false
     private var layoutPending = false
     private var children: [UInt32: [UInt32]] = [:]
-    private var restoreBarPolicy: [ObjectIdentifier: () -> Void] = [:]
     private(set) var entries: [UInt32: Entry] = [:]
 
     final class Entry {
@@ -65,8 +64,11 @@ final class ArrangementHost {
     func set(_ node: UInt32, controller: UIArrangementViewController?) -> Bool {
         guard let root = presenter.views[node] else { return false }
         if controller != nil, paneIDs(of: root) == nil { return false }
-        if let controller, entries[node]?.controller !== controller,
-           controller.parent != nil || controller.viewIfLoaded?.superview != nil { return false }
+        if let controller, entries[node]?.controller !== controller {
+            guard controller.parent == nil, controller.viewIfLoaded?.superview == nil,
+                  controller.viewController(for: .primary) == nil,
+                  controller.viewController(for: .secondary) == nil else { return false }
+        }
         if let controller, requests.contains(where: { $0.key != node && $0.value === controller }) { return false }
         requests[node] = controller
         sync()
@@ -82,7 +84,7 @@ final class ArrangementHost {
     }
 
     func sync() {
-        guard !requests.isEmpty || !entries.isEmpty || !insetScrollers.isEmpty || !restoreBarPolicy.isEmpty else { return }
+        guard !requests.isEmpty || !entries.isEmpty || !insetScrollers.isEmpty else { return }
         for (id, entry) in entries where requests[id] !== entry.controller || presenter.views[id] !== entry.node || entry.panes.contains(where: { presenter.views[$0.id] !== $0 }) || (children[id] != nil && children[id] != entry.panes.map(\.id)) {
             retire(entry); entries[id] = nil
             if presenter.views[id] === entry.node { presenter.placeChildren(entry.node, children[id] ?? entry.panes.map(\.id)) }
@@ -152,7 +154,7 @@ final class ArrangementHost {
         }
     }
 
-    /// Peer scrollers share a route edge only when every visible pane can own its inset.
+    /// Panes touching a route edge own its inset; interior panes must already clear that edge.
     func scrollers(in route: NodeView, top: Bool) -> [NodeView] {
         entries.values.flatMap { entry -> [NodeView] in
             let node = entry.node, room = node.contentBox()
@@ -160,14 +162,18 @@ final class ArrangementHost {
                   top ? room.minY <= 0.5 : node.bounds.maxY - room.maxY <= 0.5,
                   reachesEdge(node, in: route, top: top) else { return [] }
             let holders = entry.holders.filter { !entry.isHidden($0) && !$0.node.isHidden && !$0.view.bounds.isEmpty }
-            guard !holders.isEmpty, holders.allSatisfy({ holder in
-                let pane = holder.node, frame = pane.convert(pane.bounds, to: holder.view)
+            let touching = holders.filter { holder in
                 let allocation = holder.view.convert(holder.view.bounds, to: node)
-                let reaches = abs(top ? allocation.minY : node.bounds.maxY - allocation.maxY) < 1
-                return reaches && pane.scrollView != nil && pane.scrollsVertically && pane.transform.isIdentity && pane.clipPath == nil && NavigationHost.inFlow(pane)
+                return abs(top ? allocation.minY : node.bounds.maxY - allocation.maxY) < 1
+            }
+            guard !touching.isEmpty, holders.allSatisfy({ holder in
+                touching.contains { $0 === holder } || (top ? holder.view.safeAreaInsets.top : holder.view.safeAreaInsets.bottom) < 1
+            }), touching.allSatisfy({ holder in
+                let pane = holder.node, frame = pane.convert(pane.bounds, to: holder.view)
+                return pane.scrollView != nil && pane.scrollsVertically && pane.transform.isIdentity && pane.clipPath == nil && NavigationHost.inFlow(pane)
                     && abs(top ? frame.minY : holder.view.bounds.maxY - frame.maxY) < 1
             }) else { return [] }
-            return holders.map(\.node)
+            return touching.map(\.node)
         }
     }
 
@@ -202,7 +208,6 @@ final class ArrangementHost {
         syncingInsets = true
         defer { syncingInsets = false }
         adoptOwners()
-        syncBarPolicy()
         syncSafeAreas()
         var now: [UInt32: UIScrollView] = [:]
         for route in presenter.navigation.controllers.values where !NavigationHost.transparentBar(route.node) {
@@ -245,22 +250,6 @@ final class ArrangementHost {
             }
         }
         finishScrollHandoffs()
-    }
-
-    private func syncBarPolicy() {
-        let routes = entries.values.compactMap { route(of: $0.node) }
-        let current = Set(routes.map(ObjectIdentifier.init))
-        for id in Array(restoreBarPolicy.keys) where !current.contains(id) {
-            restoreBarPolicy.removeValue(forKey: id)?()
-        }
-        for route in routes where restoreBarPolicy[ObjectIdentifier(route)] == nil {
-            let policy = route.navigationItem.navigationBarMinimization.safeAreaAdjustment
-            restoreBarPolicy[ObjectIdentifier(route)] = { [weak route] in
-                guard let route, route.navigationItem.navigationBarMinimization.safeAreaAdjustment == .disabled else { return }
-                route.navigationItem.navigationBarMinimization.safeAreaAdjustment = policy
-            }
-            route.navigationItem.navigationBarMinimization.safeAreaAdjustment = .disabled
-        }
     }
 
     /// Move each arrangement under the controller that holds its node now. A route adopts its

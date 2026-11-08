@@ -1841,6 +1841,12 @@ price: answers arrive `Later`, outside the action's transaction (LLP 1027.002 D1
   `EXACT_BAKED` or a linked bake. Then relink and run the focused class.
   (QUEUE 638 review, 2026-10-23.)
 
+- **A manual hosted XCTest rerun uses an older build.** The hosted
+  `.xctestrun` loads the test bundle copied into `ExactTestHost.app/PlugIns`,
+  not the bundle an incremental Xcode build updates. Refresh it with
+  `hostedIn` from `host/apple/xctest.mjs` and re-sign the host before rerunning,
+  or use `build.mjs --test --ios`, which refreshes the copy.
+
 - **`build.mjs <app> --test` can break tests that assume Caltrain data.** The
   Swift suite links the named app's plan and sources; its owner and batch tests
   call `defaultLocation`. Use `build.mjs --test` for the full AppKit suite, then

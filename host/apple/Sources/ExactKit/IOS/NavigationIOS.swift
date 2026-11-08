@@ -317,11 +317,39 @@ final class RouteController: UIViewController, UIScrollViewDelegate {
     /// The stack it is in: its navigation controller, or a tab's held stack.
     var stack: UIViewController? { navigationController ?? (parent as? HeldStack) }
 
+    private var projectingContentScrollView = false
+    private(set) var nativeContentScrollEdges: NSDirectionalRectEdge = []
+    var nativeContentScroller: NodeView? {
+        // UIKit's getter reports explicit selection only; nil keeps automatic scroll targeting.
+        guard let selected = contentScrollView(for: .top) else { return Presenter.firstVerticalScroller(under: node) }
+        var owner = (selected as? Viewport)?.documentNode
+        var ancestor = selected.superview
+        while owner == nil, let view = ancestor {
+            if let node = view as? NodeView, node.scrollView === selected { owner = node }
+            ancestor = view.superview
+        }
+        return owner.flatMap { $0 === node || $0.isDescendant(of: node) ? $0 : nil }
+    }
+
+    /// Authored layout supplies defaults; an app's native selection owns that edge, including nil.
+    func projectContentScrollView(_ scrollView: UIScrollView?, for edge: NSDirectionalRectEdge) {
+        guard nativeContentScrollEdges.intersection(edge).isEmpty else { return }
+        projectingContentScrollView = true
+        defer { projectingContentScrollView = false }
+        setContentScrollView(scrollView, for: edge)
+    }
+
     // A held stack's tab bar follows the route's scroll views as a navigation controller's follows its top's.
     override func setContentScrollView(_ scrollView: UIScrollView?, for edge: NSDirectionalRectEdge) {
+        if !projectingContentScrollView { nativeContentScrollEdges.formUnion(edge) }
         super.setContentScrollView(scrollView, for: edge)
         (parent as? HeldStack)?.setContentScrollView(scrollView, for: edge)
-        if edge == .top { followTopEdge(scrollView) }
+        if edge.contains(.top) {
+            followTopEdge(scrollView)
+            #if os(iOS)
+            if !projectingContentScrollView { host?.presenter.syncScrollsToTop() }
+            #endif
+        }
     }
 
     private var topEdgeWatch: NSKeyValueObservation?
@@ -352,6 +380,7 @@ final class RouteController: UIViewController, UIScrollViewDelegate {
 }
 
 final class NavigationHost: NSObject, UINavigationControllerDelegate, UIGestureRecognizerDelegate {
+    weak var scrollsToTopSelection: UIScrollView?
     unowned let presenter: Presenter
     /// The selected tab's stack. An app's tab container can show a stack
     /// without appearance callbacks, so restart its reveal here.
@@ -1411,6 +1440,10 @@ final class NavigationHost: NSObject, UINavigationControllerDelegate, UIGestureR
         pendingPress?.pending = false; pendingPress?.settle(); pendingPress = nil
         lastTransition = "idle"
         if clearFocus { presenter.cancelPendingFocus() }
+        #if os(iOS)
+        scrollsToTopSelection?.scrollsToTop = false
+        scrollsToTopSelection = nil
+        #endif
         // The routes no stack holds now give their blocks back (LLP 1123 D2)
         presenter.owners.publish()
     }

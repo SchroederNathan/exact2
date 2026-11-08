@@ -2389,16 +2389,68 @@ allocated children do not give an auto-height parent its height. Pass `nil` to
 restore CSS layout.
 
 A `true` result accepts the request; UIKit lays it out when the owning container
-is available. `false` means the element is unavailable, it lacks two valid children,
-or the controller already belongs to another container. Once accepted, the request
-falls back to CSS if the element no longer has two valid children and resumes when
-two valid children return. Child order and replacements follow the authored tree.
+is available. `false` means the element is unavailable, it does not have exactly
+two valid children, or a new controller is already attached or has populated
+content slots. Once accepted, the request uses CSS while the element
+does not have exactly two valid children, then resumes native layout when both
+return. Child order and replacements follow the authored tree.
+
+The first child is UIKit's primary pane and the second is its secondary pane.
+Exact supplies their child controllers and manages the arrangement's content
+slots and containment. Supply a detached controller with empty slots; reuse that
+controller for configuration changes. Call UIKit's `updateArrangement(_:animated:)`
+to change axes, split or overlay behavior, dimensions and placement properties.
+Exact does not translate those settings. Navigation stays in the enclosing controller.
+UIKit may hide a pane when the allowed axes do not suit the current display.
+
+```swift
+let arrangement = UIArrangementViewController()
+arrangement.updateArrangement(.split.axes(.horizontal))
+element.arrange(using: arrangement)
+
+// A later menu action changes the same controller, keeping the authored panes.
+arrangement.updateArrangement(.overlay, animated: true)
+```
+
+The pane wrappers do not measure authored content for UIKit's `.intrinsic`
+dimension. Use native automatic, absolute or fractional dimensions for now.
 
 Use a bounded scroller in each child for independent scrolling. The first visible
 vertical scroller is the default title and scroll-to-top target; `navigationScroll`
-can name another. Exact keeps the route's safe area while its navigation bar
-minimizes, so scrolling one pane leaves the other's content in place. Removing the
-arrangement restores the prior policy. Each scroller keeps UIKit's edge effect.
+can name another. UIKit owns bar minimization, safe-area changes, each pane's
+scroll-edge effect and navigation transitions. Arrangement adoption leaves the
+route's native navigation policy unchanged. The route hatch receives the enclosing
+controller, so title and bar settings use UIKit directly:
+
+```swift
+let item = route.controller.navigationItem
+item.largeTitleDisplayMode = .automatic
+item.navigationBarMinimization.minimizationBehavior = .onScrollDown
+item.navigationBarMinimization.safeAreaAdjustment = .automatic
+```
+
+Set only the native properties the app needs to change. For a fixed header, set
+`minimizationBehavior` to `.never`. Select the bar's scroll view with
+`route.controller.setContentScrollView(_:for:)`. An explicit native selection
+survives authored layout updates; passing `nil` leaves discovery to UIKit and keeps
+the first visible vertical scroller as Exact's scroll-to-top target. UIKit's
+`contentScrollView(for:)` getter reports only explicit selections, so `nil` does not
+mean scrolling is disabled. Each edge is independent, and `.all` selects all edges.
+For example, a menu action can select the secondary pane after the arrangement
+has mounted:
+
+```swift
+if let scroll = arrangement.viewController(for: .secondary)?.contentScrollView(for: .top) {
+    route.controller.setContentScrollView(scroll, for: .top)
+}
+```
+
+The route hatch's `contentScrollView` is the actual selected view, including a
+native collection view or an app-owned `UIScrollView`.
+
+The containing navigation controller still owns one shared navigation bar. UIKit
+decides where its large title and each pane's edge effect appear; the panes keep
+their own scroll offsets and safe areas.
 
 Declare the hatch for its platforms in `app.json`. Keep navigation outside the
 arrangement and avoid nesting it in authored scrollers or other native layout

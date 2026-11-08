@@ -774,7 +774,7 @@ extension NavigationHost {
             let bar = stackShows ? self.bar(of: c.node, pushed: index > 0) : .hidden
             let shows = bar != .hidden
             let canGoBack = index > 0 && canInvokeBack && shape?.authoredBack != true
-            let scroller = contentScroller(of: c), scroll = scroller?.scrollView
+            let scroller = contentScroller(of: c), scroll = contentScrollView(of: c)
             let dataset = c.node.props["dataset"]
             func barSource(_ key: (HeaderShape.Item) -> String) -> BarSource {
                 BarSource(bar: bar, authored: shape?.authored.map(\.id) ?? [], placed: shape?.placed.map(\.id) ?? [], header: shape?.header.id, title: shape?.title ?? "", level: shape?.level ?? 0, leading: shape?.leading.map(key) ?? [],
@@ -813,7 +813,7 @@ extension NavigationHost {
             hatching(nav) { presenter.session?.natives.routeHatch(c.hatched ? .changed : .built, controller: c, navigation: nav, scroll: scroll,
                                                                   key: c.key, dataset: dataset) }
             c.hatched = true
-            if scroll != nil { c.ownedScroll = scroller }
+            c.ownedScroll = scroller
         }
         coverLifted(routes)
         // A route's header shown or hidden in place; a push or pop sets the
@@ -1137,7 +1137,7 @@ extension NavigationHost {
         // …and is there before UIKit is handed it: a bar handed a
         // scroller that far from its top closes an open large title.
         if atStart, let sv = shown, sv.contentOffset.y != -sv.adjustedContentInset.top { sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: -sv.adjustedContentInset.top), in: sv) }
-        c.setContentScrollView(shown ?? c.bandedTop, for: .top) // or the scroller its control bars are over (LLP 1131)
+        c.projectContentScrollView(shown ?? c.bandedTop, for: .top) // or the scroller its control bars are over (LLP 1131)
         // The scroller left behind gets the page's offsets back only once the
         // bar follows the new one: UIKit reads its inset taken away while the
         // bar still follows it as a scroll, and closes an open large title.
@@ -1208,9 +1208,10 @@ extension NavigationHost {
         let peer = contentScroller(of: c).flatMap { node in peers.contains(where: { $0 === node }) ? node : nil } ?? peers.first
         let found = presented || presenter.viewportFit != "cover" ? (Self.bottomScroller(in: c.node, cover: c.bottomClearance) ?? peer) : nil
         let target = found === c.collapseScroll && Self.transparentBar(c.node) ? nil : found
-        guard c.edgeScroll !== target || c.contentScrollView(for: .bottom) !== (target?.scrollView ?? c.bandedBottom) else { return }
+        let projects = !c.nativeContentScrollEdges.contains(.bottom)
+        guard c.edgeScroll !== target || (projects && c.contentScrollView(for: .bottom) !== (target?.scrollView ?? c.bandedBottom)) else { return }
         if let old = c.edgeScroll, let sv = old.scrollView, old !== c.collapseScroll, !arrangementInsets(sv, in: c) { sv.contentInsetAdjustmentBehavior = .never }
-        if let previous = c.contentScrollView(for: .bottom), previous !== target?.scrollView,
+        if projects, let previous = c.contentScrollView(for: .bottom), previous !== target?.scrollView,
            previous !== c.collapseScrollView, !arrangementInsets(previous, in: c) { previous.contentInsetAdjustmentBehavior = .never }
         c.edgeScroll = target
         let shown = shownScroll(target)
@@ -1224,7 +1225,7 @@ extension NavigationHost {
         if atStart, let sv = shown, sv.contentOffset.y != -sv.adjustedContentInset.top { sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: -sv.adjustedContentInset.top), in: sv) }
         // tvOS has no bottom bar whose edge follows a scroller.
         #if !os(tvOS)
-        c.setContentScrollView(shown ?? c.bandedBottom, for: .bottom)
+        c.projectContentScrollView(shown ?? c.bandedBottom, for: .bottom)
         #endif
         presenter.session?.log("navigation: route \(c.key) \(target == nil ? "keeps its content above the bottom edge" : "scrolls its content to the bottom edge")")
     }
@@ -1419,29 +1420,7 @@ extension NavigationHost {
         return item
     }
 
-    /// A route's content scroller (LLP 1115.000 D11.1). With nothing written
-    /// it is the first scroller under the route that scrolls vertically, as
-    /// a hand-built screen's scroll view is its bar's unasked; a route names
-    /// a different one with `navigationScroll`, resolved inside it by HTML
-    /// id as its Back control is (E7: nothing searches), and a name that
-    /// finds no scroller is none. One rule for everything that asks: the
-    /// bar's scroller (`collapse`), the status bar's tap and a reselected
-    /// tab's (`ScrollsToTopIOS`), and the scroll view a route hatch is given.
-    func contentScroller(of c: RouteController) -> NodeView? {
-        if let name = c.node.props["navigationScroll"], !name.isEmpty {
-            return element(named: name, in: c.node).flatMap { $0.scrollView == nil ? nil : $0 }
-        }
-        return Presenter.firstVerticalScroller(under: c.node)
-    }
-
-    /// The authored content scroller, or the route's document viewport when none was named.
-    func contentScrollView(of route: RouteController) -> UIScrollView? {
-        if let node = contentScroller(of: route) { return shownScroll(node) }
-        if let name = route.node.props["navigationScroll"], !name.isEmpty { return nil }
-        return route.contentViewport
-    }
-
-    private func element(named name: String, in route: NodeView) -> NodeView? {
+    func element(named name: String, in route: NodeView) -> NodeView? {
         presenter.carrying("id").first { $0.props["id"] == name && ($0 === route || $0.isDescendant(of: route)) }
     }
 
