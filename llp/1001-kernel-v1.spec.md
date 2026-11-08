@@ -426,7 +426,7 @@ that last held focus, or its first focusable descendant. The guide is disabled
 while focus is inside the container. Other hosts ignore both literal and bound
 values. This is a declared platform deviation: CSS and HTML have no spatial
 focus guide, and the browser retains its sequential Tab order. See
-[LLP 1008 §9](1008-apple-host-v1.spec.md#tvos-doug-lowder-landed-2026-10-03).
+[LLP 1008 §9](1008-apple-host-v1.spec.md#tvos).
 `swipeIndicator` (prop 56, boolean, absent/false by default) marks a direct
 child of a `swiperight` target as authored gesture feedback. Web and iOS hold
 its opacity and scale between their authored values and 1 as the rightward
