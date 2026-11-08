@@ -530,7 +530,7 @@ export function afterPaintPieces(load, o) {
   motion.followTimelines = call('motion', 'followTimelines', false);
   // Every first batch commits the (empty) collection set: a use only with items.
   const commit = call('collections', 'commit'), reconcile = call('collections', 'commit', false);
-  const collections = { commit: items => (items.length ? commit : reconcile)(items) };
+  const collections = { commit: items => (items.length ? commit : reconcile)(items), scrollPending: () => live?.collections.scrollPending() ?? false };
   for (const name of ['reset', 'dataReady', 'releaseInteraction', 'settle']) collections[name] = call('collections', name, false);
   collections.jump = call('collections', 'jump');
   collections.restyled = () => live?.collections.restyled(); collections.fireOwedScrolls = async () => await live?.collections.fireOwedScrolls() ?? { fired: false, owed: 0 }; collections.owedScrolls = () => live?.collections.owedScrolls() ?? 0; // nothing to restyle, and no list moved, before the piece

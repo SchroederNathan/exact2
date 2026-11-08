@@ -9,6 +9,7 @@
 // preview (reorder.rs) by reorder.js, which the motion piece loads for a
 // reorder drag; not carried (refused at build): a dynamic `virtualized`.
 import { inactive } from "./document.js";
+import { rt as runtime } from './rt-link.js';
 import { sig, effect, scope, end, untracked, write, writeItem, owner, onEnd, viewId, Views, inflight, Before, After, rev, ticket, journal, Resources, Mutations, unadopted, adopting, adoptRow, settled, Refusal, Hosts, exitView, clock, eq } from "./rt.js";
 
 const BOOTSTRAP_ROWS = 16, ESTIMATED = 32, LEAD_SECONDS = 0.25, FAR_VIEWPORTS = 2, KEPT = 4096;
@@ -266,7 +267,7 @@ class Collection {
     return { view: this.view, axis: this.axis, ...(this.parent != null ? { parent: this.parent } : {}), ...(this.restored ? { restored: true } : {}), ...(this.target ? { [this.requestWaits() ? "waiting" : "seeking"]: true, request: this.request } : {}),
       revision: this.revision, scrollSequence: g ? g.scroll_sequence : 0, count: this.index.len, totalExtent: this.index.total,
       rows: this.mounted.map(m => ({ view: m.view, root: m.root, index: m.position, start: this.index.prefix(m.position), size: this.index.h[m.position], epoch: m.epoch, measured: this.index.measured(this.index.order[m.position]) })),
-      pending: this.pending || this.portUnknown || (!!this.target && !this.requestWaits()), correction: this.correction }; // a request admitted, or a port whose position is unknown, asks for its next report (into_view.rs `asks_report`)
+      pending: this.pending || (this.atEnd && this.index.len > 0) || this.portUnknown || (!!this.target && !this.requestWaits()), correction: this.correction }; // opening, an admitted request, or an unknown port owes another report (into_view.rs `asks_report`)
   }
   scrollAnchor() {
     const horizontal = this.axis === "x", i = this.index;
@@ -1046,6 +1047,7 @@ After.push(() => {
 });
 function load() {
   if (Loading || typeof requestAnimationFrame !== "function" || globalThis.__exactRender) return;
+  runtime.collectionScrollPending = () => Controller?.scrollPending() ?? false;
   inflight.n++;
   Loading = new Promise(r => requestAnimationFrame(() => r())).then(() => import("./collection-glue.js")).then(({ collectionController }) => {
     Controller = collectionController({ root: document.getElementById("exact-root"), views: Views, report, agent: clock.agent, settled() {} });
@@ -1067,7 +1069,7 @@ function report(bytes, f, fill) {
     scrolling: !!fill?.scrolling, gesture: !!fill?.gesture, animating: !!fill?.animating };
   const c = Lists.get(f.view);
   const byView = c?.prepare(f);
-  if (!byView) return true;
+  if (!byView) { publish(); return false; }
   const cats = [f.focus_view != null, f.interaction_view != null];
   if (cats[0] || cats[1]) for (const o of Lists.values()) if (o !== c && !o.contains(c)) o.releasePins(cats);
   const [, edge] = c.feedback(f, byView, fill);

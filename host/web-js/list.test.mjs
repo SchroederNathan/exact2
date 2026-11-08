@@ -1156,15 +1156,24 @@ test('a list opened at its end anchors at its end with no overshoot', async () =
     rt.settled(); await exact.lists.pending(); await exact.lists.settle();
     const c = port.$list, gap = port.scrollHeight - port.scrollTop - port.clientHeight;
     // Its anchor while it opens (start.rs): the opening phase, as the collection is in it before its rows settle.
-    const was = c.atEnd; c.atEnd = true;
+    c.atEnd = true;
     const g = c.geometry, a = c.anchor();
     // An input past the end too (the extent), where an identity would not give the end.
     const opening = { atEnd: c.atEnd, beyond: a.beyond, offset: c.anchorOffset(g.offset, g.port_main), offEnd: c.anchorOffset(c.index.extent, g.port_main), max: c.index.maxOffset(g.port_main), restored: c.index.restoreAnchor(a, g.port_main) };
-    c.atEnd = was;
-    const out = { opening, gap };
+    const pending = c.snapshot().pending;
+    c.feedback({...g, revision:c.revision, measurements:[]}, new Map(c.mounted.map((m, i) => [m.view, i])), {});
+    const acknowledged = !c.atEnd && !c.snapshot().pending;
+    const empty = port.cloneNode(false); port.after(empty);
+    const emptyOwner = rt.scope(() => list.vl(empty, () => [], i => i(), () => {}, {est:50, pw:[], ph:[300], atEnd:true}));
+    rt.settled(); const emptyPending = empty.$list.snapshot().pending;
+    rt.end(emptyOwner); empty.remove();
+    const out = { opening, gap, pending, acknowledged, emptyPending };
     rt.end(own); port.remove(); rt.settled();
     return out;
   })()`);
+  expect(result.pending).toBe(true);
+  expect(result.acknowledged).toBe(true);
+  expect(result.emptyPending).toBe(false);
   expect(result.opening).not.toBeNull();
   expect(result.opening.atEnd).toBe(true);
   expect(result.opening.beyond).toBe(0);

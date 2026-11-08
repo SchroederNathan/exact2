@@ -2955,6 +2955,8 @@ task autosave when dirty
 
 `frame` and `update` have a 100 ms waiting bound. `scrollend` is unbounded unless `max=` names a bound. `idle` defaults to the larger of its interval and 1,000 ms. Bounds start at the nominal deadline; reaching one makes the firing ordinary due work. They limit intentional waiting, not OS scheduling latency. A hidden session admits frame and scroll waits without waiting for display callbacks. Observations can arrive late; a web scroll that ends without an event uses a quiet-period fallback.
 
+The web host treats a virtualized list as still scrolling until its final motion report is accepted and any scroll event owed by an accepted position change is delivered.
+
 Use `wait=scrollend` for list refreshes and `wait=idle` for saves or housekeeping. For a clock display, prefer live `time` rather than an action that copies the clock into state. A waiting repeat keeps its original phase and merges missed beats. A false gate or changed key cancels its held firing.
 
 The agent's clock is deterministic: `frame` runs at the next virtual 60 Hz frame; `update`, `scrollend` and `idle` run at their nominal deadlines, with idle tasks last at the same time. `state.taskTiming` reports each task's nominal deadline, requested wait kind, held state, active cap and wake tolerance. `perf` counts firings by admission kind, including caps.
