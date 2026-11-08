@@ -329,6 +329,7 @@ extension NodeView {
     /// the same ease with the new depth; a press opacity no longer written goes
     /// at once.
     func refreshPressOpacity(_ s: NodeStyle? = nil) {
+        if isNativeButton { refreshNativeActivePresentation(); return }
         applyLookOpacity()
         // Held, easing in or easing out: the fade is always `-depth ×
         // progress` on the press's own ease, so what shows moves with it, as
@@ -474,6 +475,8 @@ extension NodeView {
         endInked(pressPaint.inked.compactMap(\.view).filter { $0 !== self })
         paintLayer?.removeAnimation(forKey: "pressOpacity")
         paintLayer?.removeAnimation(forKey: "lookOpacity")
+        paintLayer?.removeAnimation(forKey: "nativeActiveOpacity")
+        paintLayer?.removeAnimation(forKey: "nativeActiveScale")
         pressPaint = PressPaint()
     }
 }

@@ -16,8 +16,8 @@
 //! - `:hover` and `:focus-visible` are recorded for the hosts to apply on
 //!   their own tracking: their rows by longhand ([`Folded::looks`]).
 //! - Hover and focus looks are literal; active targets may compute.
-//! - Paint rows only. List rows admit authored press paint; native controls
-//!   currently refuse state parts.
+//! - Paint rows only. List rows and native buttons admit active properties;
+//!   other native controls keep their platform states.
 
 use super::*;
 use contract_syntax::state::state_of;
@@ -50,6 +50,7 @@ const ACTIVE_ROWS: [(&str, &str); 4] = [
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StateTarget {
     NativeControl,
+    NativeButton,
     ListRow,
 }
 
@@ -390,8 +391,8 @@ pub(crate) fn row_name(id: exact_kernel::StyleId) -> Option<&'static str> {
 
 impl Lowerer<'_> {
     /// Fold `expanded`'s state parts; `None` when it has none. `target` is
-    /// which states the platform alone handles (all on a native control,
-    /// non-press states on a list row); `implied`
+    /// which states the platform alone handles (all on other native controls,
+    /// non-press states on a native button or list row); `implied`
     /// the rows the node takes when its author writes none (a link's text
     /// colour), a base a state's row falls back to; `class_len` how many of
     /// `expanded` are its sheet's and class's.
@@ -428,6 +429,9 @@ impl Lowerer<'_> {
             {
                 let why = match target {
                     StateTarget::NativeControl => "a native control",
+                    StateTarget::NativeButton => {
+                        "a native button, whose non-press states are the platform's"
+                    }
                     StateTarget::ListRow => "a list's row, whose non-press states are the cell's",
                 };
                 return err(

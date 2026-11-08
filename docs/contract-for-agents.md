@@ -3154,13 +3154,15 @@ A pressed look is the host's, as UIKit's highlight is (LLP 1061 D7):
 values: a token, a role, `light-dark()`), beside `-exact-press-scale`, with
 which they compose. The host shows them while a finger or the mouse holds the
 node (the innermost pressable, inside its box; sliding off, a cancel or a pan
-lets go), eased in over 120 ms, at once under the agent's clock, so `"tap row
+lets go). Custom nodes ease in over 120 ms; native controls keep the platform's
+timing. The agent applies the target at once, so `"tap row
 down" "screenshot x.png" "tap up"` shows it. Nothing waits on the runner and no
 state changes. `-exact-press-color` reaches the node's text as `color` does
-(a text with its own colour keeps it). Any of them, 1 included, replaces the
-platform's unsaid press: iOS's dim, the Mac's darkening, a list row's cell
-highlight. An `:active` state part (below) says the same paint, with an
-opacity that is what the node shows pressed rather than a share; write each
+(a text with its own colour keeps it). On custom nodes, any of them, 1 included,
+replaces the platform's unsaid press. Native buttons and native list rows keep
+unwritten fields of the platform's highlighted state. An `:active` state part
+(below) says the same paint, with an opacity that is what the node shows pressed
+rather than a share; write each
 paint one way or the other, not both. These are paint only; a press that
 changes layout is app state. Do not draw a press from
 `pointerdown`/`pointerup` state: each touch then waits on the runner. Say
@@ -4414,9 +4416,10 @@ component App
 under `:disabled`, and `:disabled` is your own disabled look (no default dim).
 `:active` is the host's own press of the innermost node with a `press`: it takes
 `background-color`, `color`, `opacity` and `-exact-press-scale`, which become the
-node's pressed paint (LLP 1061 D7), eased on the press curve (under Reduce
-Motion too, as the press is feedback) and replacing the host's unsaid press (no
-65% dim on top); its `opacity` is the opacity it shows pressed, not a share.
+node's pressed paint (LLP 1061 D7). Custom nodes ease on the press curve (under
+Reduce Motion too) and replace the host's unsaid press. Native controls keep
+their native state beneath each authored override. Its `opacity` is the opacity
+it shows pressed, not a share.
 Its targets may compute during ordinary commits, including a conditional class
 and `none` to clear a target. Pressing needs no runner round trip.
 Say each once: `:active background-color` beside `-exact-press-background-color`
@@ -4429,11 +4432,19 @@ focus's over the hover's, under the press. Each host applies them on its own
 tracking, over the node's rows (rows a part doesn't name show the base, also a
 base that changes while pressed); hover and focus rows are literals, tokens included. A
 disabled node takes none. The web (both targets) does this today; Apple, Linux
-and Android follow (LLP 1121 stage 8 B). A part
-on a native control is currently refused. A list's row accepts `:active`; its
-other states remain the platform's. A button with authored press paint becomes
-a custom button unless you explicitly require native appearance, which refuses
-that paint. A node's own part whose state it never writes (`:disabled` with no
+and Android follow (LLP 1121 stage 8 B). Native buttons and list rows accept
+`:active`; their other states remain the platform's. Active properties keep a
+button native, including with `appearance="auto"`. Each written property overrides
+that field; unwritten fields keep the native highlighted state. Clearing a target
+restores the current native configuration. UIKit and AppKit own native button
+tracking, cancellation and accessibility. Native Apple controls add no fixed
+press curve to authored properties. A projected bar item, tab segment, menu row or
+confirmation action accepts only properties its native API can express. The
+host rejects an unsupported combination in the journal and keeps the native
+component. A UIKit title-only bar item supports active `color`; image bar items
+and per-item segments do not. Remove the unsupported properties.
+Other native controls refuse state parts.
+A node's own part whose state it never writes (`:disabled` with no
 `disabled`) is warned of (`lower-state-dead`).
 
 A native control takes `accent-color` and, a field, the design's `Field`,

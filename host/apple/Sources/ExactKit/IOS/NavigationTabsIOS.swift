@@ -284,6 +284,7 @@ extension NavigationHost {
 
     private func syncItems(_ tabs: NavigationTabs, navs: [UIViewController]) {
         tabItemsSource = (tabs, navs)
+        for tab in tabs.tabs { tab.rejectNativeActiveProperties(on: "UITabBarItem") }
         let faces = tabs.tabs.map(TabFace.init)
         // A tab's test id is its item's identifier, which XCUITest and
         // Maestro address it by (LLP 1116 D2); without one, its symbol or title.

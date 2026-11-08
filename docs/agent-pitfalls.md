@@ -1694,6 +1694,11 @@ price: answers arrive `Later`, outside the action's transaction (LLP 1027.002 D1
   `try { … } finally { await db.close(); }`. (LLP 1097 D7, Charlie,
   2026-10-07.)
 
+- **Native button contents can be viewless.** Read color ownership from
+  the face's `rows.title`, `rows.subtitle` and `rows.symbol` `written` fields.
+  Walking child views misses these contents and can replace a child's authored
+  color with an inherited active color.
+
 - **A native button refuses an image's frame or a third text.** Its face is
   semantic: two texts (title and subtitle) and one symbol image. Raster faces
   need `appearance="none"` until every graphical host paints them. The symbol's size

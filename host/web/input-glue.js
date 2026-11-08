@@ -267,6 +267,7 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
   const paints = new Map();
   const hasPaint = el => PAINT.some(p => el.style.getPropertyValue(p));
   const EASE = { duration: 120, easing: "cubic-bezier(0.16,1,0.3,1)", fill: "both" };
+  const pressDuration = (el, duration) => agentMode || el.matches('button[data-button-style]') ? 0 : duration;
   // Start the ease toward `state.to` from where it shows, over `duration`,
   // on the node's look beneath, read now (`paintRule`): at the press, as it
   // shows; later (the release, a change of the node's style or class, the
@@ -276,7 +277,8 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
     // The paint stays on while it is read again (`paintRule`): taking it off would itself be a style change.
     const rule = paintRule(el, state);
     state.animation?.cancel();
-    const animation = state.animation = el.animate([{ "--exact-press-paint": from }, { "--exact-press-paint": state.to }], { ...EASE, duration: agentMode ? 0 : duration });
+    const ms = pressDuration(el, duration);
+    const animation = state.animation = el.animate([{ "--exact-press-paint": from }, { "--exact-press-paint": state.to }], { ...EASE, duration: ms });
     const written = new Set(el.getAnimations());
     el.setAttribute("data-exact-painting", hold(el, state, rule));
     // Writing a kept declaration back is the glue's own change, which Firefox (its transition styles see the
@@ -284,7 +286,7 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
     if (Object.keys(state.kept ?? {}).length) { getComputedStyle(el).opacity; for (const a of el.getAnimations()) if (!written.has(a) && a.transitionProperty in state.kept) a.cancel(); }
     // A finish already queued when a re-press replaced the ease ends nothing.
     if (state.to === 0) animation.onfinish = () => { if (state.animation === animation) endPaint(el, state); };
-    if (agentMode) animation.finish();
+    if (ms === 0) animation.finish();
   };
   const endPaint = (el, state) => {
     if (paints.get(el) !== state) return;
@@ -499,13 +501,14 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
     const progress = old?.animation.effect.getComputedTiming().progress ?? 0;
     const from = old ? old.from + (old.to - old.from) * progress : 1;
     old?.animation.cancel();
-    const animation = el.animate([{ "--exact-press-factor": from }, { "--exact-press-factor": to }], { ...EASE, duration: agentMode ? 0 : EASE.duration });
+    const ms = pressDuration(el, EASE.duration);
+    const animation = el.animate([{ "--exact-press-factor": from }, { "--exact-press-factor": to }], { ...EASE, duration: ms });
     const state = { animation, from, to };
     feedback.set(el, state);
     animation.onfinish = () => {
       if (to === 1 && feedback.get(el) === state) { animation.cancel(); feedback.delete(el); }
     };
-    if (agentMode || now) animation.finish();
+    if (ms === 0 || now) animation.finish();
   };
   // Keep the release style only until its transitions end. Immediate cancellation and the agent's clock skip it.
   const releases = new WeakMap(), RELEASED = new Set(["opacity", "background-color", "--exact-wash"]);

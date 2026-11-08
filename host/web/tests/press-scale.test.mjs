@@ -21,6 +21,35 @@ beforeAll(() => {
 });
 afterAll(() => server?.stop(true));
 
+for (const engine of ['chromium', 'webkit']) test(`${engine}: native active properties add no implicit animation`, async () => {
+  const browser = await suiteBrowser(engine);
+  try {
+    const page = await browser.newPage();
+    await page.goto(server.url.href);
+    await page.waitForFunction(() => window.ready);
+    const seen = await page.evaluate(async () => {
+      const root = document.getElementById('exact-root'), results = [], pixel = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+      for (const held of [false, true]) {
+        root.innerHTML = '<button data-native data-button-style="filled" data-exact-on="press" style="width:120px;height:44px;--exact-press:0.9;--exact-press-opacity-to:0.4;--exact-press-color:blue;--exact-press-background-color:red;scale:calc(1.25 * var(--exact-press-factor,1))"><span>Native</span></button>';
+        const el = root.firstElementChild, box = el.getBoundingClientRect();
+        const pointer = type => el.dispatchEvent(new PointerEvent(type, { bubbles: true, pointerType: 'mouse', pointerId: 1, isPrimary: true, button: 0, buttons: type === 'pointerdown' ? 1 : 0, clientX: box.x + box.width / 2, clientY: box.y + box.height / 2 }));
+        if (held) exact.hold(el, 'active'); else pointer('pointerdown');
+        await new Promise(requestAnimationFrame);
+        const durations = el.getAnimations().filter(a => a.effect.getKeyframes().some(f => '--exact-press-factor' in f || '--exact-press-paint' in f)).map(a => a.effect.getTiming().duration);
+        const style = getComputedStyle(el);
+        pixel.fillStyle = style.color; pixel.fillRect(0, 0, 1, 1);
+        const color = Array.from(pixel.getImageData(0, 0, 1, 1).data).slice(0, 3);
+        results.push([durations, Number(style.scale), Number(style.opacity), color, Number(getComputedStyle(el.firstElementChild).opacity)]);
+        if (held) exact.hold(el, null); else pointer('pointerup');
+        await new Promise(requestAnimationFrame);
+        results.push([Number(getComputedStyle(el).scale), Number(getComputedStyle(el).opacity)]);
+      }
+      return results;
+    });
+    expect(seen).toEqual([[[0, 0], 1.125, 0.4, [0, 0, 255], 0.75], [1.25, 1], [[0, 0], 1.125, 0.4, [0, 0, 255], 0.75], [1.25, 1]]);
+  } finally { await browser.close(); }
+}, 60_000);
+
 for (const engine of ['chromium', 'webkit']) test(`${engine}: stationary physical and held presses follow computed scale targets`, async () => {
   const browser = await suiteBrowser(engine);
   try {

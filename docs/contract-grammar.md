@@ -152,9 +152,13 @@ and `-exact-tint-color`, and fold into the node's own rows, `:checked` under
 `:disabled`; `:active` takes `background-color`, `color`, `opacity` and
 `-exact-press-scale` and lowers to the press paint (LLP 1061 D7: its `opacity` an
 absolute target), `:hover` and `:focus-visible` take `background-color`,
-`border-color`, `opacity` and `box-shadow`; a host state's row is a literal
-(`lower-state-literal`; a token's name is one). Another row is `lower-state-row`;
-a part on a native control, a list's row, or (for `:active`, `:hover` and
+`border-color`, `opacity` and `box-shadow`. Active targets may compute or clear
+with `none`; hover and focus targets are literals (`lower-state-literal`; a
+token's name is one). Another row is `lower-state-row`;
+native buttons and list rows accept `:active` and keep their other native states.
+A host rejects properties its projected native component cannot express, names
+them in the journal and keeps the native component.
+A part on another native control, or (for `:active`, `:hover` and
 `:focus-visible`) a run inside a paragraph is `lower-state-target`. An `:active`
 row beside the same paint's `-exact-press-` row is `lower-state-press-paint`.
 The node's block wins over its class's, row by row.

@@ -42,7 +42,7 @@ component Feel
   derive still = media.prefersReducedMotion
   view
     column animation=(still ? "none" : "rise 320ms cubic-bezier(0.32, 0.72, 0, 1) both")
-      button press=record press-scale=0.97 transition=(still ? "none" : "opacity 120ms cubic-bezier(0.32, 0.72, 0, 1)")
+      button appearance="none" press=record press-scale=0.97 transition=(still ? "none" : "opacity 120ms cubic-bezier(0.32, 0.72, 0, 1)")
         text "Record"
 ```
 
@@ -228,13 +228,36 @@ nothing until it answered.
   background stands in for the node's own; the colour reaches the subtree as
   CSS's `color` does (a descendant with a colour of its own keeps it). Any
   other `-exact-press-` name is refused, naming these (`lower-unknown-attr`),
-  as is an opacity outside 0 to 1 (`lower-attr-value`) and any of them on a
-  native button, which draws its own (`lower-button-style-attr`). A press that
+  as is an opacity outside 0 to 1 (`lower-attr-value`). A press that
   changes layout is app state.
-- **Author over platform.** Any of the three, 1 included, replaces the
+- **Author over platform on custom nodes.** Any of the three, 1 included, replaces the
   platform's unsaid press as `-exact-press-scale` does (LLP 1115.000 D6): no
   dim on iOS or the web, no AppKit darkening, no cell highlight on a list's
   row (D16). Unsaid, the press stays the platform's.
+
+**Native controls (James, 2026-11-06).** Native behavior is the default;
+authored properties are independent building blocks. A native button accepts
+active properties and stays a native button. UIKit resolves its configuration
+for the actual highlighted state; conditional native transformers override only
+authored fields. Grouped cells keep that state too. AppKit writes only the
+corresponding bezel, ink or symbol field while pressed. An authored color keeps
+colors owned by descendants. An opacity or scale leaves the native colors and
+tracking geometry alone. Clearing a property restores the current native
+configuration, including changes made while pressed. Native Apple controls add
+no fixed Exact animation curve to these overrides.
+
+`NativeButtonState` projects state values into ordinary face-property rows;
+the platform adapters own their native mappings. Further properties belong on
+that path, with admission, value transport and native-reference tests. Border
+color and shadow remain unimplemented; neither needs another press renderer
+or gesture tracker. A host-specific field belongs to that host's adapter;
+another host need not imitate it. A projected native component that cannot
+express a property rejects that combination in the journal and stays native
+(James, 2026-11-06). A UIKit title-only bar item maps active color to highlighted
+title attributes; image items and per-item segments have no such field.
+
+UIKit's [`updated(for:)`](https://developer.apple.com/documentation/uikit/uibutton/configuration-swift.struct/updated(for:))
+preserves custom values while resolving native defaults for the button's state.
 
 Hosts: **Apple** (`PressPaint.swift`) adds an additive Core Animation on
 `opacity`, as the dim is, and stands the colours in the views' styles for

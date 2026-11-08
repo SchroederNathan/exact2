@@ -76,6 +76,7 @@ final class NodePaintExtras {
 }
 
 final class NodeExtras {
+    var nativeActiveRefusals: [String: String] = [:]
     /// The tint its authored `accent-color` gives its subtree (`applyAccentTint`)
     var authoredAccentTint: UIColor?
     var pressContact: PressContact?
@@ -262,6 +263,10 @@ extension NodeView {
         if let extras { return extras }
         let made = NodeExtras(); extras = made
         return made
+    }
+    var nativeActiveRefusals: [String: String] {
+        get { extras?.nativeActiveRefusals ?? [:] }
+        set { if !newValue.isEmpty || extras != nil { more.nativeActiveRefusals = newValue } }
     }
     var inlinePressed: UInt32? { get { extras?.inlinePressed } set { if newValue != nil || extras != nil { more.inlinePressed = newValue } } }
     var pressContact: PressContact? { get { extras?.pressContact } set { if newValue != nil || extras != nil { more.pressContact = newValue } } }

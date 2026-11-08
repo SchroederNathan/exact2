@@ -130,6 +130,7 @@ final class ContextMenuHost: NSObject, UIContextMenuInteractionDelegate, UIEditM
             if owner.keyboardConfiguration != nil { keyboardInteraction.dismissMenu() }
             restore(owner)
         }
+        if let owner = open, let pop = current(owner) { menus?.rejectActiveMenuProperties(in: pop) }
         var wanted: [UInt32: NodeView] = [:]
         if !ExactEnv.agentPaints {
             for v in presenter.textViews.values where v.hasInlineContextPopover { wanted[v.id] = v }

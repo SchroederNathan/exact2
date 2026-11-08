@@ -103,6 +103,9 @@ extension MenuHost {
             route = host.presenter?.navigation.routeKey(containing: (anchored ? source : nil) ?? popover)
             alert = UIAlertController(title: title, message: message, preferredStyle: style == .alert ? .alert : .actionSheet)
         }
+        func rejectActiveProperties() {
+            for entry in actions + [cancel].compactMap({ $0 }) { entry.node?.rejectNativeActiveProperties(on: "UIAlertAction") }
+        }
         func observeDisappearance() {
             let lifetime = ConfirmationLifetime(frame: .zero)
             lifetime.owner = self

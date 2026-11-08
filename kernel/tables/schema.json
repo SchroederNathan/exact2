@@ -3918,7 +3918,7 @@
       "field": "press_scale",
       "codec": "f32",
       "default": 1,
-      "_comment": "@ref LLP 1061 D1: the uniform scale a node shows while a pointer holds it pressed, about `transform-origin`; 1 is none. Not CSS: the host owns the feedback (no runner round trip), eased in 120 ms, and keeps it under reduced motion. It composes with, never replaces, the `scale` row.",
+      "_comment": "@ref LLP 1061 D1: the uniform scale a node shows while a pointer holds it pressed, about `transform-origin`; 1 is none. Not CSS: the host owns the feedback without a runner round trip and keeps it under reduced motion. Custom nodes ease in 120 ms; native controls retain unwritten native feedback and add no Exact curve. It composes with, never replaces, the `scale` row.",
       "cold": true
     },
     {
@@ -4444,7 +4444,7 @@
       "field": "press_opacity",
       "codec": "f32",
       "default": 1,
-      "_comment": "@ref LLP 1061 D7: not CSS. The opacity a node shows, as a fraction of its own, while a pointer holds it pressed; 1 is none. Host-owned as `-exact-press-scale` is (no runner round trip; eased in 120 ms, at once under the agent's clock), and any written value replaces the platform's unsaid press. Not a motion target; paint only.",
+      "_comment": "@ref LLP 1061 D7: not CSS. The opacity a node shows, as a fraction of its own, while a pointer holds it pressed; 1 is none. Host-owned without a runner round trip. Custom nodes ease in 120 ms and replace the platform's unsaid press; native controls replace only opacity and add no Exact curve. The agent applies the target at once. Not a motion target; paint only.",
       "cold": true
     },
     {
@@ -4452,7 +4452,7 @@
       "field": "press_background_color",
       "codec": "color",
       "default": 0,
-      "_comment": "@ref LLP 1061 D7: not CSS. The background colour a node shows in place of its own while a pointer holds it pressed; unset is none. Host-owned as `-exact-press-scale` is, and it replaces the platform's unsaid press. Paint only.",
+      "_comment": "@ref LLP 1061 D7: not CSS. The background colour a node shows in place of its own while a pointer holds it pressed; unset is none. Host-owned as `-exact-press-scale` is. Custom nodes replace the platform's unsaid press; native controls replace only the background. Paint only.",
       "cold": true
     },
     {
@@ -4460,7 +4460,7 @@
       "field": "press_color",
       "codec": "color",
       "default": 0,
-      "_comment": "@ref LLP 1061 D7: not CSS. The text colour a node shows while a pointer holds it pressed, given to its subtree as `color` is (a descendant that writes its own `color` keeps it); unset is none. Host-owned as `-exact-press-scale` is, and it replaces the platform's unsaid press. Paint only.",
+      "_comment": "@ref LLP 1061 D7: not CSS. The text colour a node shows while a pointer holds it pressed, given to its subtree as `color` is (a descendant that writes its own `color` keeps it); unset is none. Host-owned as `-exact-press-scale` is. Custom nodes replace the platform's unsaid press; native controls replace only inherited ink. Paint only.",
       "cold": true
     },
     {
@@ -4468,7 +4468,7 @@
       "field": "press_opacity_to",
       "codec": "f32",
       "default": 1,
-      "_comment": "@ref LLP 1121 D8 (stage 8 B): not CSS, and lowering's alone (an author's is refused): an `:active` part's `opacity`, the absolute opacity a node shows while a pointer holds it pressed, eased from the opacity shown at the press (a hover or focus look's included). Replaces `-exact-press-opacity`'s share for the node; it replaces the platform's unsaid press as the pressed paint does. Not a motion target; paint only.",
+      "_comment": "@ref LLP 1121 D8 (stage 8 B): not CSS, and lowering's alone (an author's is refused): an `:active` part's `opacity`, the absolute opacity a node shows while a pointer holds it pressed. Custom nodes ease from the shown opacity (a hover or focus look's included) and replace the platform's unsaid press. Native controls replace only opacity and add no Exact curve. Replaces `-exact-press-opacity`'s share for the node. Not a motion target; paint only.",
       "cold": true
     },
     {

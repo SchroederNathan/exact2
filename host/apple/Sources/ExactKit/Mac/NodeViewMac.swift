@@ -89,6 +89,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     var cachedTextLayout: (width: CGFloat, paragraph: Paragraph)?
     var liveText: String?
     package var props: [String: String] = [:] { didSet { presenter?.propsChanged(self); presenter?.mouseChain.bubbledPress?.validate() } }
+    var nativeActiveRefusals: [String: String] = [:]
     package var style: NodeStyle = [:]
     /// What the host's own writers hid (a covered route, a tab a native control
     /// stands in for, a placement); a `display: none` box is hidden besides, as

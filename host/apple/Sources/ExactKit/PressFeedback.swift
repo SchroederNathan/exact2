@@ -122,6 +122,7 @@ extension NodeView {
             return
         }
         #endif
+        if isNativeButton { heldHighlight(); return }
         let down = down && defaultLink == nil
         // What a press shows goes at its release whatever the style says now:
         // an authored look the style dropped while held included.
@@ -279,6 +280,10 @@ extension NodeView {
     /// `transform-origin` in the box's own coordinates (LLP 1061 D6): each
     /// axis points or `{"pct": n}` of the border box; the centre when unset.
     var transformOriginPoint: CGPoint {
+        Self.resolveTransformOrigin(style, in: bounds)
+    }
+
+    package static func resolveTransformOrigin(_ style: NodeStyle, in bounds: CGRect) -> CGPoint {
         let axes = style["transform_origin"]?.array ?? []
         func axis(_ i: Int, _ size: CGFloat) -> CGFloat {
             guard axes.count == 2 else { return size / 2 }

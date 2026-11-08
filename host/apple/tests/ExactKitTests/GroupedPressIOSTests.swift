@@ -5,6 +5,85 @@ import XCTest
 @testable import ExactGroupedLists
 
 final class GroupedPressIOSTests: GroupedListFixture {
+    func testViewlessNativeRowKeepsTheTitlesColorOwnership() throws {
+        var face = ButtonFace()
+        face.title = "Profile"
+        face.rows.title["written"] = .array([.string("text_color")])
+        var model = model()
+        model.sections[0].rows[0].titleLook.color = .array([.number(0), .number(255), .number(0), .number(255)])
+        let seed = Presenter()
+        seed.buttonFace = { _ in face }
+        let p = presenter(nativeButtonRow: true, on: seed) { model }
+        let row = try XCTUnwrap(p.views[10])
+        XCTAssertTrue(row.container.subviews.compactMap { $0 as? NodeView }.isEmpty)
+        let native = try cell(p, 10)
+        let style: [String: Any] = ["press_color": [0, 0, 255, 255]]
+        p.apply(wireBatch([["op": "style", "id": 10, "style": style]]))
+        native.isHighlighted = true
+        native.setNeedsUpdateConfiguration()
+        waitForMainQueue()
+        func ink() -> UIColor? {
+            (native.contentConfiguration as? UIListContentConfiguration)?.textProperties.color.resolvedColor(with: native.traitCollection)
+        }
+        XCTAssertEqual(ink(), .green)
+        face.rows.title["written"] = nil
+        p.controls.facesChanged()
+        p.apply(wireBatch([["op": "style", "id": 10, "style": style]]))
+        native.setNeedsUpdateConfiguration()
+        waitForMainQueue()
+        XCTAssertEqual(ink(), .blue)
+    }
+
+    func testActiveScaleKeepsTheAuthoredOriginFixed() throws {
+        let p = presenter { self.model() }
+        let cell = try XCTUnwrap(try cell(p, 10) as? GroupedCell)
+        let content = try XCTUnwrap(cell.contentConfiguration as? UIListContentConfiguration)
+        cell.activePaint(["press_scale": .number(0.5), "transform_origin": .array([.number(0), .number(0)])],
+                         content: content, enabled: true, protected: (false, false, false))
+        cell.isHighlighted = true
+        cell.setNeedsUpdateConfiguration()
+        waitFor("the active scale", late: 1, cap: 2) { abs((cell.layer.presentation()?.sublayerTransform.m11 ?? 1) - 0.5) < 0.001 }
+        let transform = try XCTUnwrap(cell.layer.presentation()).sublayerTransform
+        let anchor = CGPoint(x: cell.bounds.width * cell.layer.anchorPoint.x, y: cell.bounds.height * cell.layer.anchorPoint.y)
+        XCTAssertEqual(anchor.x * (1 - transform.m11) + transform.m41, 0, accuracy: 0.01, "the top-left origin stays fixed")
+        XCTAssertEqual(anchor.y * (1 - transform.m22) + transform.m42, 0, accuracy: 0.01)
+        XCTAssertEqual(cell.layer.sublayerTransform.m11, 1, "tracking keeps its native geometry")
+        cell.isHighlighted = false
+    }
+
+    func testPartialActivePropertiesKeepTheNativeHighlightedConfiguration() throws {
+        let cases: [NodeStyle] = [
+            ["press_scale": .number(0.94)], ["press_opacity_to": .number(0.4)],
+            ["press_color": .array([.number(255), .number(0), .number(0), .number(255)])],
+        ]
+        for style in cases {
+            let p = presenter { self.model() }
+            let native = try XCTUnwrap(try cell(p, 10) as? GroupedCell)
+            let content = try XCTUnwrap(native.contentConfiguration as? UIListContentConfiguration)
+            let ground = try XCTUnwrap(native.backgroundConfiguration)
+            var highlighted: Bool?
+            native.configurationUpdateHandler = { cell, state in
+                highlighted = state.isHighlighted
+                cell.backgroundConfiguration = ground.updated(for: state)
+            }
+            native.activePaint(style, content: content, enabled: true, protected: (false, false, false))
+            native.isHighlighted = true
+            native.setNeedsUpdateConfiguration()
+            waitForMainQueue()
+            XCTAssertEqual(highlighted, true, "a property override keeps UIKit's native state")
+            let expected = ground.updated(for: native.configurationState)
+            XCTAssertEqual(native.backgroundConfiguration?.backgroundColor?.resolvedColor(with: native.traitCollection),
+                           expected.backgroundColor?.resolvedColor(with: native.traitCollection), "an unwritten background stays native")
+            if style["press_color"] == nil {
+                let expected = content.updated(for: native.configurationState)
+                XCTAssertEqual((native.contentConfiguration as? UIListContentConfiguration)?.textProperties.color.resolvedColor(with: native.traitCollection),
+                               expected.textProperties.color.resolvedColor(with: native.traitCollection))
+            }
+            native.isHighlighted = false
+            window.isHidden = true
+        }
+    }
+
     func testActiveInkUsesTheLeadingSymbolsColorOwnership() throws {
         for ownsLeading in [false, true] {
             let p = presenter { self.model() }

@@ -528,6 +528,7 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
             if tabs.count > 1, faces.count == tabs.count {
                 owner.accessibilityTraits.remove(.tabBar)
                 decide(owner, "projected to UITabBar (\(tabs.count) items)")
+                for tab in tabs { tab.rejectNativeActiveProperties(on: "UITabBarItem") }
                 project(owner, tabs, faces)
                 continue
             }
@@ -544,6 +545,7 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
             }
             owner.accessibilityTraits.remove(.tabBar)
             decide(owner, "projected to UISegmentedControl (\(tabs.count) segments)")
+            for tab in tabs { tab.rejectNativeActiveProperties(on: "UISegmentedControl") }
             adopt(owner, tabs)
             // Finish native layout in the same unanimated update as selection: UIKit can defer
             // positioning its selection indicator until the control receives its final frame

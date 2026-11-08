@@ -617,6 +617,11 @@ const NATIVE_ROWS: &[StyleId] = &[
     StyleId::Transition,
     StyleId::Animation,
     StyleId::ExitAnimation,
+    StyleId::PressScale,
+    StyleId::PressOpacity,
+    StyleId::PressOpacityTo,
+    StyleId::PressBackgroundColor,
+    StyleId::PressColor,
 ];
 
 /// Whether a native button's box may carry row `id` ([`NATIVE_ROWS`]): what

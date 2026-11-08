@@ -715,7 +715,7 @@ fn active_targets_can_belong_to_list_rows() {
 }
 
 #[test]
-fn active_targets_select_a_custom_button_when_needed() {
+fn active_targets_keep_default_buttons_native() {
     let r = booted(
         r##"component App
   state n = 0
@@ -730,6 +730,6 @@ fn active_targets_select_a_custom_button_when_needed() {
     );
     let k = r.kernel();
     let node = k.node_by_key(k.find_by_test_id("paint")[0]).unwrap();
-    assert_eq!(node.node_type, exact_kernel::NodeType::Pressable);
+    assert_eq!(node.node_type, exact_kernel::NodeType::Control);
     assert!(node.style.mask.has(StyleId::PressBackgroundColor));
 }

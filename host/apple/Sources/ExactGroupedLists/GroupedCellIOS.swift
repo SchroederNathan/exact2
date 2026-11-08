@@ -4,6 +4,13 @@ import UIKit
 
 // Keep the detail button while UIKit refreshes the cell for accessibility.
 final class GroupedCell: UICollectionViewListCell {
+    private var activeBounds = CGRect.null
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds != activeBounds else { return }
+        activeBounds = bounds
+        if layer.animation(forKey: "nativeActiveScale") != nil { setNeedsUpdateConfiguration() }
+    }
     var forcedPressed = false { didSet { if forcedPressed != oldValue { setNeedsUpdateConfiguration() } } }
     override var configurationState: UICellConfigurationState {
         var state = super.configurationState

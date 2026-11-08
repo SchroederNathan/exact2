@@ -6,14 +6,12 @@ extension GroupedCell {
     static let activeRows = ["press_background_color", "press_color", "press_opacity", "press_opacity_to", "press_scale"]
 
     func restorePressPresentation() {
-        layer.removeAnimation(forKey: "activeOpacity")
-        layer.removeAnimation(forKey: "activeScale")
+        ActivePresentation.restore(layer)
     }
 
-    /// Keep UIKit's content metrics and native selection; authored paint replaces its press only.
+    /// Resolve the native state first, then replace only the authored properties.
     func activePaint(_ style: NodeStyle, content: UIListContentConfiguration, enabled: Bool, protected: (title: Bool, secondary: Bool, image: Bool)) {
         guard Self.activeRows.contains(where: { style[$0] != nil }) else { restorePressPresentation(); return }
-        let base = (alpha: alpha, transform: layer.sublayerTransform)
         let background = backgroundConfiguration ?? .clear()
         let nativeUpdate = configurationUpdateHandler
         let color = { (value: BatchValue) in UIColor { traits in
@@ -21,11 +19,9 @@ extension GroupedCell {
         } }
         configurationUpdateHandler = { cell, state in
             let down = enabled && state.isHighlighted
-            var native = state
-            if down { native.isHighlighted = false }
-            nativeUpdate?(cell, native)
-            var ground = nativeUpdate == nil ? background.updated(for: native) : cell.backgroundConfiguration ?? .clear()
-            var shown = content.updated(for: native)
+            nativeUpdate?(cell, state)
+            var ground = nativeUpdate == nil ? background.updated(for: state) : cell.backgroundConfiguration ?? .clear()
+            var shown = content.updated(for: state)
             if down, let fill = style["press_background_color"] {
                 ground.backgroundColor = color(fill)
                 ground.backgroundColorTransformer = nil
@@ -42,47 +38,11 @@ extension GroupedCell {
             }
             cell.backgroundConfiguration = ground
             cell.contentConfiguration = shown
-            let opacity = down ? style["press_opacity_to"]?.number.map { CGFloat(min(1, max(0, $0))) }
-                ?? base.alpha * CGFloat(min(1, max(0, style["press_opacity"]?.number ?? 1))) : base.alpha
-            let scale = CGFloat(style["press_scale"]?.number ?? 1)
-            let factor = down && scale.isFinite && scale > 0 ? scale : 1
-            let transform = CATransform3DScale(base.transform, factor, factor, 1)
-            (cell as? GroupedCell)?.pressPresentation(alpha: opacity, transform: transform, down: down)
+            ActivePresentation.apply(style, to: cell.layer, down: down, origin: NodeView.resolveTransformOrigin(style, in: cell.bounds))
         }
         setNeedsUpdateConfiguration()
     }
 
-    private func pressPresentation(alpha target: CGFloat, transform: CATransform3D, down: Bool) {
-        if !down && ExactEnv.agentFreezes { restorePressPresentation(); return }
-        let delta = Float(target) - layer.opacity
-        let oldOpacity = layer.animation(forKey: "activeOpacity") as? CABasicAnimation
-        if oldOpacity?.toValue as? Float != delta || oldOpacity?.isRemovedOnCompletion == down {
-            if delta != 0 || oldOpacity != nil {
-                let from = (layer.presentation()?.opacity ?? layer.opacity) - layer.opacity
-                animatePress("activeOpacity", path: "opacity", from: from, to: delta, additive: true, down: down)
-            }
-        }
-        let oldScale = layer.animation(forKey: "activeScale") as? CABasicAnimation
-        let previous = (oldScale?.toValue as? NSValue)?.caTransform3DValue
-        if previous.map({ !CATransform3DEqualToTransform($0, transform) }) ?? true || oldScale?.isRemovedOnCompletion == down {
-            if !CATransform3DEqualToTransform(layer.sublayerTransform, transform) || oldScale != nil {
-                let from = layer.presentation()?.sublayerTransform ?? layer.sublayerTransform
-                animatePress("activeScale", path: "sublayerTransform", from: NSValue(caTransform3D: from), to: NSValue(caTransform3D: transform), additive: false, down: down)
-            }
-        }
-    }
-
-    private func animatePress(_ key: String, path: String, from: Any, to: Any, additive: Bool, down: Bool) {
-        let animation = CABasicAnimation(keyPath: path)
-        animation.fromValue = ExactEnv.agentFreezes ? to : from
-        animation.toValue = to
-        animation.isAdditive = additive
-        animation.duration = PressFeedback.duration
-        animation.timingFunction = PressFeedback.timing
-        animation.isRemovedOnCompletion = !down
-        animation.fillMode = .both
-        layer.add(animation, forKey: key)
-    }
 }
 
 extension GroupedListHost {
@@ -101,7 +61,7 @@ extension GroupedListView {
     func activeSignature(_ id: UInt32) -> BatchValue {
         let style = host.presenter.views[id]?.style ?? [:]
         let owns = pressInkBoundaries(id)
-        return .array(GroupedCell.activeRows.map { style[$0] ?? .null } + [owns.title, owns.secondary, owns.image].map(BatchValue.bool))
+        return .array((GroupedCell.activeRows + ["transform_origin"]).map { style[$0] ?? .null } + [owns.title, owns.secondary, owns.image].map(BatchValue.bool))
     }
 
     func activePaint(_ cell: GroupedCell, _ id: UInt32, content: UIListContentConfiguration) {
@@ -113,6 +73,7 @@ extension GroupedListView {
     /// The row's colour may be replaced; colours written below it keep their owner.
     private func pressInkBoundaries(_ id: UInt32) -> (title: Bool, secondary: Bool, image: Bool) {
         guard let row = host.presenter.views[id] else { return (false, false, false) }
+        if let owns = row.nativeButtonColorOwnership { return owns }
         let symbol = symbolView(of: id)
         var texts: [Bool] = [], image = false
         func walk(_ node: NodeView, protected: Bool) {
