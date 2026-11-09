@@ -239,7 +239,7 @@ final class InlineContextIOSTests: XCTestCase {
             ["op": "frame", "id": 5, "x": 20, "y": 100, "w": 300, "h": 30],
         ]))
         let node = try XCTUnwrap(p.views[2]), under = try XCTUnwrap(p.views[5])
-        until("both paragraphs are drawn") { under.textRasterLayer?.contents != nil && node.snapshotView(afterScreenUpdates: false) != nil }
+        waitFor("both paragraphs are drawn") { under.textRasterLayer?.contents != nil && node.snapshotView(afterScreenUpdates: false) != nil }
         let coverage = try XCTUnwrap((under.textRasterLayer?.delegate as? CoverageImageView)?.coverage)
         let rects = node.inlineRects(try XCTUnwrap(p.inlineText(10)))
         let preview = try lift(p, node, at: try XCTUnwrap(rects.first))
@@ -267,7 +267,7 @@ final class InlineContextIOSTests: XCTestCase {
             ["op": "frame", "id": 5, "x": 20, "y": 100, "w": 300, "h": 30],
         ]))
         let node = try XCTUnwrap(p.views[2]), under = try XCTUnwrap(p.views[5])
-        until("both paragraphs are drawn") { under.textRasterLayer?.contents != nil && node.snapshotView(afterScreenUpdates: false) != nil }
+        waitFor("both paragraphs are drawn") { under.textRasterLayer?.contents != nil && node.snapshotView(afterScreenUpdates: false) != nil }
         p.apply(wireBatch([["op": "props", "id": 5, "set": ["text": "42"]]]))
         _ = p.refreshVisibleText()
         p.paintVisibleText()
@@ -290,7 +290,7 @@ final class InlineContextIOSTests: XCTestCase {
             ["op": "frame", "id": 5, "x": 20, "y": 400, "w": 300, "h": 30],
         ]))
         let node = try XCTUnwrap(p.views[2]), far = try XCTUnwrap(p.views[5])
-        until("both paragraphs are drawn") { far.textRasterLayer?.contents != nil && node.snapshotView(afterScreenUpdates: false) != nil }
+        waitFor("both paragraphs are drawn") { far.textRasterLayer?.contents != nil && node.snapshotView(afterScreenUpdates: false) != nil }
         let rect = try XCTUnwrap(node.inlineRects(try XCTUnwrap(p.inlineText(10))).first)
         XCTAssertFalse(textLines([rect], in: node).area.intersects(far.frame), "the paragraph lies away from the run")
         XCTAssertFalse(try XCTUnwrap(try lift(p, node, at: rect).view.subviews.first).isScreens, "at rest, copies")
