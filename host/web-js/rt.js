@@ -190,7 +190,7 @@ export function commit(f, what = "commit", finished) {
     ok = false;
     for (const [n, v] of undo.reverse()) write(n, v);
     if (Now.v !== was) { Now.v = was; for (const o of Now.obs) stale(o, DIRTY); } // nor its time: the clock's readers read as they did
-    Resources.forEach((r, k) => k < saved.length && r.restore(saved[k])); // a resource the commit made (an element's, each.js) has nothing to put back Mutations.forEach((m, k) => { m.ticket = held[k]; }); Sched?.restore(queued); Ov.restore(writes);
+    Resources.forEach((r, k) => k < saved.length && r.restore(saved[k])); Mutations.forEach((m, k) => { m.ticket = held[k]; }); Sched?.restore(queued); Ov.restore(writes); // a resource the commit made (an element's, each.js) has nothing to put back
     Store.restore(store);
     for (const go of Out) go.refused?.(e?.message ?? e); Out = []; Commands = []; Landed = []; Refused = e; // what would have gone says so (ts-stream.js, ts-data.js)
     say(`refused ${what}: ${e.message}`); Why = why(step, e instanceof Refusal ? e.message : String(e)); // `String`: a TypeError's name too
