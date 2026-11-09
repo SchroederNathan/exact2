@@ -54,6 +54,11 @@ pub(crate) struct Presence {
     layout: LayoutMotion,
     /// A resize lays out next: positions are taken, not animated.
     pub(super) snap: bool,
+    /// This operation lays out for a host's fact, not an app's commit (an
+    /// inset, the text size, a native size): a box it moves takes its place
+    /// unless it is moving already, as on the web, where a layout transition
+    /// plays only what a commit moved. `finish` clears it.
+    pub(super) unauthored: bool,
     /// The presented frame a motion tick is for (LLP 1003.001 D5): every
     /// present while it is set starts what waits for it.
     pub(super) frame: Option<f64>,
@@ -305,13 +310,14 @@ impl<D: DataSource> Host<D> {
         let settled = |id: Option<ViewId>| id.is_some_and(|id| self.presence.settled.contains(&id));
         let wraps =
             |n: exact_kernel::NodeRef| n.props.str(exact_kernel::PropId::ListItemKey).is_some();
-        let unauthored = !self.presence.settled.is_empty()
-            && kernel.node_by_key(key).is_some_and(|n| {
-                (wraps(n) && settled(n.parent))
-                    || n.parent
-                        .and_then(|p| kernel.node(p))
-                        .is_some_and(|p| wraps(p) && settled(p.parent))
-            });
+        let unauthored = self.presence.unauthored
+            || (!self.presence.settled.is_empty()
+                && kernel.node_by_key(key).is_some_and(|n| {
+                    (wraps(n) && settled(n.parent))
+                        || n.parent
+                            .and_then(|p| kernel.node(p))
+                            .is_some_and(|p| wraps(p) && settled(p.parent))
+                }));
         let retired = if unauthored {
             self.presence
                 .layout

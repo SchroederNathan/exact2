@@ -73,6 +73,7 @@ impl<D: DataSource> Host<D> {
         list_margins: &[(ViewId, Option<[f32; 2]>)],
         restyles: &[(ViewId, Restyle)],
     ) -> String {
+        self.presence.unauthored = true;
         let needs_layout = !(covers.is_empty()
             && blocks.is_empty()
             && margins.is_empty()
