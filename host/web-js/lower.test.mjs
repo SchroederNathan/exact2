@@ -11,6 +11,8 @@ mock.module('./rt.js', () => ({
   normal: (prop, t) => t === 'bogus' ? '' : t,
   css: (e, prop, unit, v) => { if (v == null) e.style.removeProperty(prop); else e.style.setProperty(prop, typeof v === 'number' ? v + unit : v); },
 }));
+// The build generates navigation.js from the web host's; flow.js only walks the views with it.
+mock.module('./navigation.js', () => ({ viewChildren: e => [...(e.children ?? [])], viewParent: e => e.parentElement ?? null }));
 mock.module('./textflow-glue.js', () => ({ createTextFlow: () => ({}), createFlowRequest: async () => ({}) }));
 
 /** A declaration block, as CSSStyleDeclaration keeps one. */
