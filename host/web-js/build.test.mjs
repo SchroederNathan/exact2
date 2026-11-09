@@ -223,7 +223,8 @@ test('web-build --out writes a site that serve.mjs serves by the hosting rule, r
     }
     expect(readFileSync(resolve(out, '.exact/install.json'), 'utf8')).toContain('"mode": "Release build"');
     expect(readFileSync(resolve(out, 'index.html'), 'utf8')).toContain('<link rel="manifest" href="./manifest.json">');
-    expect(readdirSync(app).filter((name) => name.startsWith('dist'))).toEqual(['dist']);
+    // Expect only the site and the persistent lock its swap takes beside it (build-lock.mjs)
+    expect(readdirSync(app).filter((name) => name.startsWith('dist'))).toEqual(['dist', 'dist.lock']);
     // As a static host serves it: a request or cached route gets the shell, which has none of the data.
     const { serveBuildTree } = await import('../web/serve.mjs');
     server = createServer((req, res) => serveBuildTree(out, req, res));
@@ -247,7 +248,7 @@ test('web-build --out writes a site that serve.mjs serves by the hosting rule, r
     const after = await generation(), kept = await fetch(url(`/.exact/gen/${before}/app.js`));
     expect([before === after, kept.status, Buffer.from(await kept.arrayBuffer()).equals(script)]).toEqual([false, 200, true]);
     expect(readFileSync(resolve(out, 'app.js')).equals(script)).toBe(false);
-    expect(readdirSync(app).filter((name) => name.startsWith('dist')).sort()).toEqual(['dist', 'dist.gen']);
+    expect(readdirSync(app).filter((name) => name.startsWith('dist')).sort()).toEqual(['dist', 'dist.gen', 'dist.lock']);
     // As `serve` serves it: each route's page rendered with its data, the live one per request, the cached one once.
     serve = await serving(root, out);
     const { get, renders, heard } = serve;
