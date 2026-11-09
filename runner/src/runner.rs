@@ -934,9 +934,13 @@ impl<D: DataSource> Runner<D> {
         runner.carry_uploads_in(carried.map_or(&[][..], |c| &c.uploads));
         // @ref LLP 1048.000 D6 — a document's answers seed their resources.
         // The device's own store is an input its render never had.
-        let (seeded, note) = match seed {
+        let (seeded, open, note) = match seed {
             Seed::Checkpoint(checkpoint) => runner.seed_checkpoint(checkpoint),
-            _ => (vec![false; runner.plan.resources.len()], String::new()),
+            _ => (
+                vec![false; runner.plan.resources.len()],
+                Vec::new(),
+                String::new(),
+            ),
         };
         let device_state = matches!(seed, Seed::Checkpoint(_)) && runner.has_app_store();
         // Store-reading resources when the data source is not ready (a TypeScript module before
@@ -956,6 +960,15 @@ impl<D: DataSource> Runner<D> {
             runner.refresh_next.extend(
                 (0..seeded.len()).filter(|&i| seeded[i] && runner.plan.resources[i].reader),
             );
+        }
+        // An open stream's rendered answer shows until the stream, asked
+        // again, answers: now when its source can, else at `data_ready`.
+        for i in open {
+            if !ready {
+                runner.stale[i] = true;
+            } else if !runner.refresh_next.contains(&i) {
+                runner.refresh_next.push(i);
+            }
         }
         runner.resource_values = vec![None; runner.plan.resources.len()];
         runner.pending_res = vec![false; runner.plan.resources.len()];

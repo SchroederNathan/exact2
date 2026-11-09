@@ -11,9 +11,9 @@ use std::sync::Mutex;
 /// ordinary boot. An undeclared route waits when its render left the
 /// runtime nothing to do before the reader acts (LLP 1048.007 D1, as
 /// `render.mjs` `infer` decides it): nothing in the plan only the runtime
-/// keeps (`exact_runner::activation`), no answer pending, nothing due on
-/// the clock, no handler the capture script can neither replay nor wake
-/// for.
+/// keeps (`exact_runner::activation`), no answer pending, no stream to
+/// subscribe again, nothing due on the clock, no handler the capture script
+/// can neither replay nor wake for.
 pub(crate) fn activation(
     plan: &Plan,
     location: &str,
@@ -29,6 +29,7 @@ pub(crate) fn activation(
         let inference = inference(plan);
         let waits = !inference.never_waits()
             && state.pending.is_empty()
+            && state.open.is_empty()
             && !clocked
             && handlers
                 .values()

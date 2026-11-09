@@ -15,13 +15,15 @@ test('navigation waits for unknown status capability', async () => {
   expect(response.status).toBe(404);
 });
 
-test('an answered open stream settles its page and subscribes again in the browser', async () => {
+test('an answered open stream settles its page, and the browser subscribes again and asks nothing else', async () => {
   const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/stream-document-test-'));
   const streams = new Map(), encoder = new TextEncoder(), connected = Promise.withResolvers();
   const event = value => encoder.encode(`data: ${value}\n\n`);
+  let labels = 0;
   const peer = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
     const name = new URL(request.url).pathname.slice(1);
     if (name === 'heartbeat') { return new Response(null, { status: 204 }); }
+    if (name === 'label') { labels++; return Response.json('Label', { headers: { 'access-control-allow-origin': '*' } }); }
     const body = new ReadableStream({ start(controller) {
       const connections = streams.get(name) ?? [];
       connections.push(controller); streams.set(name, connections);
@@ -41,14 +43,16 @@ test('an answered open stream settles its page and subscribes again in the brows
 
 component App
   resource live = feed(top(nav).name) as shape string else empty()
+  resource label = label() as shape string
   view
     main
       if top(nav).name == "status" && live != ""
         head status=410
       text live testId="live"
+      text label
 `);
     writeFileSync(resolve(dir, 'app.ts'), `export const grants = 'net.fetch ${peer.url.origin}';
-export const answer = (_name: string, args: string[]): any => fetch('${peer.url.origin}/' + args[0], {
+export const answer = (name: string, args: string[]): any => name === 'label' ? fetch('${peer.url.origin}/label').then(response => response.json()) : fetch('${peer.url.origin}/' + args[0], {
   exactStream: (event: any) => event.data,
   ...(args[0] === 'heartbeat' ? { exactLongPoll: { cursor: 'since', from: 'seq' } } : {}),
 } as RequestInit);
@@ -67,8 +71,9 @@ export const answer = (_name: string, args: string[]): any => fetch('${peer.url.
       const reply = await render(path, expected === 503 ? 500 : 10000);
       expect([reply.status, reply.settled], path).toEqual([expected, expected !== 503]);
       expect(reply.html).toContain('data-activate="eager"');
-      expect(reply.html).toContain('"revalidate":true');
-      expect(reply.html).toContain(expected === 503 ? '"pending":["live"]' : '"pending":[]');
+      // A page at its deadline has every answer asked again; a settled one, only its open stream
+      expect(reply.html.includes('"revalidate":true'), path).toBe(expected === 503);
+      expect(reply.html).toContain(expected === 503 ? '"pending":["live"]' : '"pending":[],"open":["live"]');
       pages.set(path, reply);
     }
     site = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
@@ -79,6 +84,7 @@ export const answer = (_name: string, args: string[]): any => fetch('${peer.url.
     } });
     browser = await suiteBrowser();
     const page = await browser.newPage();
+    const rendered = labels;
     await page.goto(site.url.href);
     await page.waitForFunction(() => document.querySelector('[data-testid="live"]')?.textContent === 'first');
     let bound;
@@ -87,11 +93,14 @@ export const answer = (_name: string, args: string[]): any => fetch('${peer.url.
     } finally { clearTimeout(bound); }
     streams.get('home')[1].enqueue(event('second'));
     await page.waitForFunction(() => document.querySelector('[data-testid="live"]')?.textContent === 'second');
+    // The label the page was rendered with stands: the browser asked it nothing while it subscribed again
+    expect(await page.evaluate(() => document.querySelector('main')?.textContent)).toContain('Label');
+    expect(labels).toBe(rendered);
   } finally {
     await browser?.close(); site?.stop(true); peer.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
-}, 30000);
+}, 60000);
 
 test('a refused settlement restores renderer pending state', async () => {
   const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/rollback-document-test-'));

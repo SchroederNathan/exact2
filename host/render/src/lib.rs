@@ -146,7 +146,8 @@ pub enum Ids {
     Runtime,
     /// None the reader keeps (the JavaScript runtime adopts by tag and drops
     /// them, `page::for_runtime`): the settled runner's tree is projected
-    /// when it is provably the checkpoint boot's ([`projects_as_booted`]),
+    /// when it is the checkpoint boot's, but for an open stream's `pending(x)`
+    /// ([`projects_as_booted`]),
     /// saving the second tree (~1.4 ms of RealWorld's ~4.5 ms CPU a page).
     Any,
 }
@@ -164,13 +165,17 @@ fn project_for<D: DataSource>(
 
 /// Whether the tree a runner settles to projects as the tree one booted from
 /// its checkpoint builds, view ids apart. Regions, rows and bindings follow
-/// state; what could differ is only state fixed where a slot is first made:
+/// state; what could differ is state fixed where a slot is first made:
 /// an initializer that read a resource (or a derive, or a pending or failed
 /// flag) would see the placeholder in the runner that settled and the answer
 /// in a boot from the checkpoint. An initializer reads props, injects and
 /// earlier slots, and a prop may carry a parent's resource (a row's state
 /// seeded from it, `host/web-js/conformance/budget.contract`); such a plan
-/// renders with a kernel.
+/// renders with a kernel. One difference is not looked for, since a plan
+/// does not say which source streams: a view that reads `pending(x)` of an
+/// open stream reads false here and true in a boot whose source can answer at
+/// once, which asks the stream again (LLP 1048.000 D6). A runtime whose first
+/// tree differs this way renders the page afresh.
 pub fn projects_as_booted(plan: &Plan) -> bool {
     use exact_plan::Opcode::*;
     plan.slots.iter().all(|slot| {
@@ -502,7 +507,8 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
     };
     drop(watchdog);
     // Whatever is still in flight is abandoned with the render; an executor
-    // with nothing in flight goes back to this worker's pool.
+    // with nothing in flight goes back to this worker's pool, its open
+    // streams let go.
     if matches!(settled, Settled::Deadline) {
         drop(executor);
     } else {
@@ -780,6 +786,29 @@ pub fn settle<D: DataSource>(
         if requests::settle_aborts(runner, executor)? {
             continue;
         }
+        // Check before taking the next reply: an open stream may always have
+        // one waiting.
+        if runner
+            .pending()
+            .iter()
+            // A re-ask's wait is the runner's, never the executor's: no timer
+            // fires here, and the checkpoint lists it for the client to ask.
+            // A stream that has answered is open, not in flight: the page
+            // shows its message, and the checkpoint lists it for the client
+            // to subscribe again. A mutation's stream ends with the render.
+            .all(|(_, t)| {
+                held.refused.contains(t)
+                    || held.busy.contains(t)
+                    || runner.is_reask_wait(*t)
+                    || runner.is_open_stream(*t)
+            })
+        {
+            return Ok(if held.busy.is_empty() {
+                Settled::Complete
+            } else {
+                Settled::Busy
+            });
+        }
         let outcomes = executor.drain();
         if !outcomes.is_empty() {
             for (ticket, outcome, elapsed_ms) in outcomes {
@@ -803,21 +832,6 @@ pub fn settle<D: DataSource>(
                 return Ok(Settled::Deadline);
             }
             continue;
-        }
-        if runner
-            .pending()
-            .iter()
-            // A re-ask's wait is the runner's, never the executor's: no timer
-            // fires here, and the checkpoint lists it for the client to ask.
-            .all(|(_, t)| {
-                held.refused.contains(t) || held.busy.contains(t) || runner.is_reask_wait(*t)
-            })
-        {
-            return Ok(if held.busy.is_empty() {
-                Settled::Complete
-            } else {
-                Settled::Busy
-            });
         }
         if Instant::now() >= deadline {
             return Ok(Settled::Deadline);

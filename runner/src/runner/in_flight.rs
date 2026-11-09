@@ -135,6 +135,13 @@ impl<D: DataSource> Runner<D> {
         out
     }
 
+    /// Whether request `ticket` is a stream that has answered: open, no
+    /// longer in flight (LLP 1016.000 D5). An upload is in flight until its
+    /// reply (D10).
+    pub fn is_open_stream(&self, ticket: u64) -> bool {
+        (self.pending.iter()).any(|p| p.ticket == ticket && !p.in_flight())
+    }
+
     /// Every open stream: its resource, ticket, and counts (the agent's
     /// `state.streams`, LLP 1016.000 D5).
     pub fn streams(&self) -> Vec<(String, u64, StreamCount)> {

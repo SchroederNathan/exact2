@@ -175,6 +175,12 @@ fn one_stream(r: &mut Runner<Scripted>) -> u64 {
     out[0].ticket
 }
 
+/// What a render's checkpoint would list now: pending, and open (LLP 1048.000 D6).
+fn listed(r: &Runner<Scripted>) -> (Vec<String>, Vec<String>) {
+    let checkpoint = r.document_checkpoint("/");
+    (checkpoint.pending, checkpoint.open)
+}
+
 #[test]
 fn three_messages_then_a_close_commit_four_times() {
     let mut r = boot();
@@ -184,7 +190,8 @@ fn three_messages_then_a_close_commit_four_times() {
         Value::Bool(true),
         "pending until a message"
     );
-    assert!(r.has_pending());
+    assert!(r.has_pending() && !r.is_open_stream(ticket));
+    assert_eq!(listed(&r), (vec!["progress".into()], vec![]));
     for (i, n) in ["10", "20", "30"].iter().enumerate() {
         let receipt = r.fulfill(ticket, message(n, 0)).unwrap();
         assert!(receipt.is_some(), "message {i} commits");
@@ -196,7 +203,8 @@ fn three_messages_then_a_close_commit_four_times() {
         );
         assert!(!r.has_pending(), "settle does not wait on an open stream");
         assert!(r.holds(ticket), "the ticket stays open");
-        assert!(r.in_flight().is_empty());
+        assert!(r.in_flight().is_empty() && r.is_open_stream(ticket));
+        assert_eq!(listed(&r), (vec![], vec!["progress".into()]));
     }
     assert_eq!(
         r.streams(),
@@ -221,7 +229,8 @@ fn three_messages_then_a_close_commit_four_times() {
         Value::Number(-2.),
         "the end is shaped"
     );
-    assert!(!r.holds(ticket) && r.streams().is_empty());
+    assert!(!r.holds(ticket) && r.streams().is_empty() && !r.is_open_stream(ticket));
+    assert_eq!(listed(&r), (vec![], vec![]));
     assert!(
         r.take_requests().is_empty(),
         "the host never reconnects by itself"
@@ -347,8 +356,12 @@ fn a_long_poll_s_replies_hold_it_and_each_counts() {
     assert!(!r.has_pending(), "but waited on by no clock");
     assert_eq!(r.held_requests(), [("progress".to_string(), ticket)]);
     assert_eq!(r.held_replies(), [("progress".to_string(), 1)]);
+    assert!(!r.is_open_stream(ticket), "not open before its first event");
+    assert_eq!(listed(&r), (vec!["progress".into()], vec![]));
     r.fulfill(ticket, message("5", 0)).unwrap();
     assert_eq!(value(&r, "progress"), Value::Number(5.));
+    assert!(r.is_open_stream(ticket));
+    assert_eq!(listed(&r), (vec![], vec!["progress".into()]));
     assert_eq!(r.held_replies(), [("progress".to_string(), 2)]);
     let state = crate::agent::state(&r);
     assert!(
@@ -469,7 +482,10 @@ fn an_upload_is_pending_until_its_reply_while_its_progress_commits() {
         );
         assert!(r.has_pending(), "every clock waits for it");
         assert_eq!(r.in_flight(), [("progress".to_string(), ticket)]);
-        assert!(r.holds(ticket));
+        assert!(
+            r.holds(ticket) && !r.is_open_stream(ticket),
+            "in flight, not open"
+        );
     }
     let reply = Outcome::Response(Response {
         status: 201,

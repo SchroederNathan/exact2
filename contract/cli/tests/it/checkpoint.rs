@@ -1,7 +1,8 @@
 //! LLP 1048.000 D6: a rendered document's checkpoint answers are an input of
 //! their own. The runtime takes them as answers it already has — not asked
 //! again at boot or at `data_ready`, only when their arguments or inputs
-//! change — and the device's store and clock apply as ordinary updates.
+//! change, or when their stream was open — and the device's store and clock
+//! apply as ordinary updates.
 
 use exact_kernel::{Kernel, PropId};
 use exact_runner::{
@@ -203,6 +204,50 @@ fn a_checkpoint_answer_is_not_asked_again_at_boot_or_at_data_ready() {
     r.dispatch(view_of(&r, "next"), Event::Press).unwrap();
     assert_eq!(*source.asks.borrow(), ["post"]);
     assert_eq!(text_of(&r, "title"), "Asked 8");
+}
+
+#[test]
+fn an_open_streams_answer_shows_until_it_is_asked_again() {
+    let plan = contract::compile(SRC).unwrap();
+    let checkpoint = Checkpoint {
+        open: vec!["post".into()],
+        ..rendered(&plan, "Rendered")
+    };
+    // Before the source is ready: asked at `data_ready`, and nothing else is.
+    let source = Source {
+        wording: "Asked",
+        ..Source::default()
+    };
+    source.not_ready.set(true);
+    let mut r = boot(&plan, source.clone(), &checkpoint, &[]).unwrap();
+    assert!(
+        source.asks.borrow().is_empty(),
+        "{:?}",
+        source.asks.borrow()
+    );
+    assert_eq!(text_of(&r, "title"), "Rendered 7");
+    source.not_ready.set(false);
+    r.data_ready().unwrap();
+    assert_eq!(*source.asks.borrow(), ["post"]);
+    assert_eq!(text_of(&r, "title"), "Asked 7");
+
+    // A ready source is asked at boot, showing the rendered answer until it answers.
+    let source = Source {
+        later: true,
+        ..Source::default()
+    };
+    let mut r = boot(&plan, source.clone(), &checkpoint, &[]).unwrap();
+    assert_eq!(*source.asks.borrow(), ["post"]);
+    assert_eq!(text_of(&r, "title"), "Rendered 7");
+    let requests = r.take_requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let reply = Outcome::Response(exact_runner::Response {
+        status: 200,
+        headers: vec![],
+        body: b"{}".to_vec(),
+    });
+    r.fulfill(requests[0].ticket, reply).unwrap();
+    assert_eq!(text_of(&r, "title"), "Fresh 7");
 }
 
 #[test]

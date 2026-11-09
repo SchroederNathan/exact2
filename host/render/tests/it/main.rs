@@ -15,6 +15,7 @@ mod direct;
 mod longpoll;
 mod overload;
 mod serve;
+mod stream;
 mod viewport;
 
 /// How the fixture's `post` source answers later.

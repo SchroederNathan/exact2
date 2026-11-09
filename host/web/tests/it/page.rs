@@ -125,6 +125,8 @@ fn a_checkpoint_reads_back_as_the_runner_wrote_it() {
         !json.contains('<') && !json.contains('>') && !json.contains('&'),
         "{json}"
     );
+    // No stream is open, so no `open` is written
+    assert!(!json.contains("\"open\""), "{json}");
     let read = read_checkpoint(&json).unwrap();
     assert_eq!(read, host.runner().document_checkpoint("/said?q=1"));
     assert_eq!(read.answers[0].3, Value::str("</script><!-- & \u{1F4AC}"));
@@ -143,7 +145,7 @@ fn a_checkpoint_reads_back_as_the_runner_wrote_it() {
 fn checkpoint_values_are_json_that_reads_back_exactly() {
     // Every kind of plan value, as `push_value` spells it: text a page's
     // compression matches against the document's own strings.
-    let text = r#"{"location":"/","time":1.5,"logic":null,"answers":[["a","src",["x",{"n":"NaN"}],{"r":[1,-0,2.25,true,null,{},{"s":"y"},["p","q"],{"n":"-Infinity"}]}]],"pending":["b"]}"#;
+    let text = r#"{"location":"/","time":1.5,"logic":null,"answers":[["a","src",["x",{"n":"NaN"}],{"r":[1,-0,2.25,true,null,{},{"s":"y"},["p","q"],{"n":"-Infinity"}]}]],"pending":["b"],"open":["a"]}"#;
     let read = read_checkpoint(text).unwrap();
     let (name, source, args, value) = &read.answers[0];
     assert_eq!((name.as_str(), source.as_str()), ("a", "src"));
@@ -165,6 +167,7 @@ fn checkpoint_values_are_json_that_reads_back_exactly() {
     );
     assert_eq!(fields[8], Value::Number(f64::NEG_INFINITY));
     assert_eq!(read.pending, ["b"]);
+    assert_eq!(read.open, ["a"]);
     assert!(read_checkpoint(&text.replace("{\"s\"", "{\"z\"")).is_err());
 }
 
