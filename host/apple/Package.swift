@@ -71,7 +71,7 @@ let core: [Target] = [
     // session's node model, for WidgetKit's archive. Linked by an app with
     // entries and its extension, never by a presenter.
     .target(name: "ExactSnapshot", dependencies: ["ExactCore", "CExact"], path: "Sources/ExactSnapshot", swiftSettings: [.unsafeFlags(["-application-extension"])]),
-    .target(name: "ExactKit", dependencies: [.target(name: "ExactCore"), .target(name: "CExact")] + (gallery ? [.target(name: "ExactSnapshot")] : []), path: "Sources/ExactKit", swiftSettings: devTools + gallerySettings),
+    .target(name: "ExactKit", dependencies: [.target(name: "ExactCore"), .target(name: "CExact"), .target(name: "CExactLaunch")] + (gallery ? [.target(name: "ExactSnapshot")] : []), path: "Sources/ExactKit", swiftSettings: devTools + gallerySettings),
     .target(name: "ExactUpdates", dependencies: ["ExactKit", "CExact"], path: "Sources/ExactUpdates"),
     .target(name: "ExactGroupedLists", dependencies: ["ExactKit", "CExact"], path: "Sources/ExactGroupedLists"),
     .target(name: "ExactMarkdown", dependencies: ["ExactKit", "CExact"], path: "Sources/ExactMarkdown"),
