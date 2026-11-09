@@ -1395,8 +1395,7 @@ package final class Presenter {
             let top = max(minimum, min(wanted, maximum))
             if panel.frame.origin.y != top { moveOrPlace(panel) { panel.frame.origin.y = top } }
             // A tall preview can fill the available region. Keep the trailing
-            // control group inside it, even when that overlaps the preview
-            // (the native 24-line Messages reference does this).
+            // control group inside it, even when that overlaps the preview (the native 24-line Messages reference does this).
             var branch: UIView = preview
             while let owner = branch.superview, owner !== panel { branch = owner }
             let trailing = panel.subviews.compactMap { $0 as? NodeView }.filter {
@@ -1433,8 +1432,7 @@ package final class Presenter {
     /// view controller's view carries its own under the status bar and the
     /// home indicator; `systemBackground` when it sets none (LLP 1115 D2).
     var onCanvasColor: ((UIColor) -> Void)?
-    /// The head's title (LLP 1048.003 D1), for the app adapter that owns the
-    /// scene; an embedded view never claims it.
+    /// The head's title (LLP 1048.003 D1), for the app adapter that owns the scene; an embedded view never claims it.
     private(set) var title: String?
     var onTitle: ((String?) -> Void)?
     #if os(iOS)
@@ -1465,11 +1463,9 @@ package final class Presenter {
         if viewport.backgroundColor != color { viewport.backgroundColor = color; onCanvasColor?(color) }
     }
     /// An op touched a node (LLP 1014 D4 a): every canvas it is painted
-    /// through captures again at the end of the batch — the canvas above
-    /// it, and itself for its own `children` op.
+    /// through captures again at the end of the batch — the canvas above it, and itself for its own `children` op.
     func touched(_ id: UInt32, children: Bool = false, textChanged: Bool = false, boxChanged: Bool = true) {
-        // A filtered box draws again when it or anything in it changes, a
-        // flat leaf (a layer in its parent's view) included.
+        // A filtered box draws again when it or anything in it changes, a flat leaf (a layer in its parent's view) included.
         if !boxFilters.isEmpty, let v = views[id] ?? flats.parent(of: id).flatMap({ views[$0] }) { boxFilters.touched(v) }
         guard let start = views[id] else { return }
         var paragraph: NodeView? = start
