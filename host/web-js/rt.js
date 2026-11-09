@@ -931,7 +931,7 @@ export const onAtompress = (e, kind, f, l) => l(kind, ev => { if (Array.isArray(
 export const onSelectionChange = (e, kind, f, l) => { return sourceField(e) ? l(kind, () => f(inputRecord(e, e.value, false))) : onEnd(onSelection(e, (text, a, b, rects) => f([text, a, b, rects]))); };
 // ---------------------------------------------------------------- presence (LLP 1063)
 // `-exact-exit-animation` and `-exact-layout-transition`: the web host's own presence-glue.js, fetched after the first
-// painted frame by a plan with either row (its node calls `pr`; a bound layout transition's, `lt`), plays both. Each commit it
+// painted frame by a plan with either row (its node calls `pr`; a bound layout transition's, `lt`; a bound exit's, `px`), plays both. Each commit it
 // measures the views that declare a layout transition, or may gain one (a bound one's, as the wasm host's style op), before the
 // tree changes and plays back each that moved after; a region's removed root that declares an exit stays, out of flow at its
 // last box, until its animations end, where it was: `clear` passes over it. Until the piece is here, rows jump and leave at once.
@@ -939,9 +939,17 @@ let Pres = null, Presence = null, Present = null, Leave = null, Sh = null; // Sh
 /** The after-paint pieces on their way (the agent waits for them before an
  * operation, as glue.js's `agentSettled` waits for `pieces.pending()`). */
 export const pieces = () => Promise.all([Motion, Inputs, Presence, Flow, Native, Media?.mediaPiece(), OnHooks.loading].filter(Boolean)).then(() => {}, () => {});
-/** A view leaves with the exit animation `css` names (a virtualized list's
- * row wrapper, list.js): whether it stays, leaving, for presence-glue.js to remove. */
-export function exitView(el, css) { if (!Pres || !css) return false; Pres.exit(el, css); return exiting(el); }
+/** A virtualized list's row wrapper `el` leaves with the exit its row's `root` declares (list.js): whether it stays,
+ * leaving, for presence-glue.js to remove. */
+export function exitView(el, root) { const css = root && exitOf(root); if (!Pres || !css) return false; Pres.exit(el, css); return exiting(el); }
+// Keep each bound exit's value from the start of the commit, which a removal in that commit plays whichever write came
+// first: the runner ends an arm without updating its bindings (region.rs)
+let Exits = null;
+export function px(e) {
+  if (!Exits) { Exits = new Set(); Before.push(() => { for (const x of Exits) x.$exit = x.style.getPropertyValue(EXIT); }); }
+  Exits.add(e); onEnd(() => Exits.delete(e)); pr(e);
+}
+const EXIT = "--exact-exit-animation", exitOf = n => (n.$exit ?? n.style.getPropertyValue(EXIT)).trim();
 const Created = [], Bound = new Map(), LT = "--exact-layout-transition";
 export function lt(e, declaring, f) { Bound.set(e, () => { const d = node(null), [l, o] = [Listener, Owner]; Listener = Owner = d; try { return declaring.includes(f()); } catch { return false; } finally { Listener = l; Owner = o; drop(d); } }); onEnd(() => Bound.delete(e)); pr(e); } // a bound layout transition (GitHub #809): whether its binding names a value that declares it, read as its effect reads (the committed clock)
 // As wasm's ops: before the tree update a view gaining the row; after, each whose declaration changed (a create: not a restyle, as paint.js keeps a ghost parent's isolation).
@@ -962,7 +970,7 @@ export function pr(e) {
       // A removed region node that declares an exit leaves with it (the
       // kernel's `exit`: a destroyed root whose parent stays).
       Leave = n => {
-        const css = n.nodeType === 1 && n.style.getPropertyValue("--exact-exit-animation").trim();
+        const css = n.nodeType === 1 && exitOf(n);
         if (css) Pres.exit(n, css);
         if (!exiting(n) && !sheetLeaves(n)) n.remove();
       };

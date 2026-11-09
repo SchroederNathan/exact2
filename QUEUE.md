@@ -43,7 +43,9 @@
 - **LLP 1154 steps 2 and 3: Snapback publishes `snapback4-exact`, then exact2 deletes `snapback4/`** (2026-10-31). Step 1 is on main: the native slot's admitted and reserved storage, a package's prebuilt library fetched by hash and embedded on Apple and Linux, its web assets, and `packages/fixtures/vault` proving M5 on the Linux host, the web, macOS and the iOS simulator. What remains is Snapback's (§4: publish the package with D2's `exact.json`, dynamic libraries for Harmony's five targets, the module's call over the C ABI, `init --exact`, the guide) and then exact2's step 3 in one change (§3 Deletes; Harmony depends on the package; M1 to M6). Nothing in exact2 changes until Snapback publishes.
 
 - **A fragment's scroll is driven on the JS target, and on Linux by its presenter's tests, only** (2026-10-30, the LLP 1153 D5 lane). The wasm web host (`fragment.js` from glue.js's `scrollToFragment`) and Apple's `Fragment.swift` were compiled, not driven: open `/item/7#moves` on each and read the scroller. Two gaps remain on Apple: no host holds the target while pictures load there (the web and Linux re-align it until they land), and the Mac moves VoiceOver to the target but its key-view loop has no starting point to move.
-- **Reduced motion on the web** (2026-10-31, found with LLP 1083.000 D4's exit ghosts). An app follows Reduce Motion by computing its motion from `exactViewport().prefersReducedMotion` (LLP 1061 D5, `docs/recipes/motion.md`), and the web host updates that fact from `prefers-reduced-motion`. Two parts remain on the web. (1) Every motion row an app may gate on it should take a computed value on the JS target, as on Apple and the wasm web host. `-exact-exit-animation` does not: "a dynamic `exit_animation` (Animations) is not one declaration; not in the JS target" (`host/web-js/src/style.rs` `style_row`), so a web exit animation is one literal, the same with or without Reduce Motion. A computed `animation`, `transition` and `-exact-layout-transition` already build (`host/web-js/conformance/rowsmore.contract`; `host/web-js/src/rows.rs`, GitHub #809). Presence reads `--exact-exit-animation` from the element's inline style when its region removes it (`host/web-js/rt.js`), so writing it as `-exact-layout-transition` is written, from the values its expression can take (`style.rs` `layout_transitions`), would serve; compiling conditions on `prefersReducedMotion` to `@media (prefers-reduced-motion: reduce)` rules instead would need a non-inherited custom property and presence reading the computed value. Check the other motion rows for the same refusal. (2) The motion the web host starts itself should follow Reduce Motion as the platform's does, as a shared-element flight lands at once on Apple (LLP 1013 D8). Some of it already follows `prefers-reduced-motion`: a view transition (`host/web-js/shared.js`), a switch and a modal's presentation (`host/web/neutral.css`), and a reorder group (`host/web/group-glue.js`'s `reduced`). Check the rest, such as navigation's pushes and pops, sheets, popovers, a reorder's glide and smooth scrolls.
+- **Reduce Motion for web-host motion** (2026-10-31; LLP 1061 D5, LLP 1013 D8). Verify the motion the web host starts against platform behavior under Reduce Motion. Shared-element flights (`host/web-js/shared.js`), switches and modal presentation (`host/web/neutral.css`), and reorder groups (`host/web/group-glue.js`) already read the preference. Check navigation, sheet and popover presentation, reorder glides and scrolling. Author-controlled motion reads `exactViewport().prefersReducedMotion` (`docs/recipes/motion.md`).
+- **A bound exit removed behind a view transition plays an older value** (2026-11-08, found by reading; not yet reproduced). While a shared-element view transition is pending, `host/web-js/shared.js` queues each later commit's tree update, and the first queued update's `flush()` runs every queued commit's effects. `rt.js` `px` snapshots bound exits in that first update's `Before` hook, so a node removed by a later queued commit plays its exit from before the first one; the runner plays the value the earlier commit left. A fix reads each bound exit from its binding, not from its element, at the start of each queued commit: until the first queued update runs, the element still shows the value from before the first queued commit. One flush per commit is not enough, because an effect that several queued commits change is queued once and runs with the last commit's values.
+- **Computed presence strings on the JS target** (2026-11-05). Bound exit and layout declarations accept complete string literals in their binding bytecode (`host/web-js/src/presence.rs`). A valid string assembled at runtime clears with a diagnostic, as `presence_tests::exit_values_write_native_css_and_clear_unlisted_values` checks with `leave  200ms both`. Support other computed values through the kernel's parser rather than a second CSS grammar; first decide how the page loads that parser.
 - **The web's iOS idioms round 34 left** (2026-10-31, LLP 1115.000 D4.8, D4.14, D4.16). Graders still named: the
   segmented control's grey track and raised chip (four web pairs; a web button group or tabs may read better); the
   split's 320 px list column beside a mostly empty detail at 1440 px (shop-inventory, support-inbox); the phone's
@@ -1309,48 +1311,34 @@ sits on that list carries the trade it would take.
   The render host's date is already the Unix render timestamp passed to `boot_at`
   (LLP 1048.000 D5). It has no viewer place to supply; the page reports its own.
 - **Gaps the Bluesky clone's workers hit** (bsky5, b28–b31, 2026-10-12), as reported:
-  - **A dynamic exit animation fails the web build only** (Linux; Charlie,
-    2026-10-22, C and D). Support dynamic `-exact-exit-animation` on the JS
-    target as ce583715bd (#809) supports state-dependent
-    `-exact-layout-transition` (`host/web-js/src/style.rs`, rows and runtime).
-    Make `bun exact.mjs contract build` run the JS emitter check for every
-    app, including apps without `app.ts` + `app.json` and entries not named
-    `app.contract` (`scripts/exact.mjs`, `checkTypes` / `typeDiagnostics`).
-    Report emitter refusals as target refusals, not TypeScript errors on
-    `app.ts`. Done when the dynamic exit runs on the JS target and a refused
-    row fails each of those build forms with a target diagnostic. Not taken:
-    moving the `contract` binary to its own package (compiler dependence on
-    the web host), or a refusal registry in `contract` (a second authority).
-    2026-10-24 (lane q24/dynamic-exit-js on 450b, parked after three fix
-    rounds; the branch is kept there at 5664246094): the JS target maps each
-    exit string the code names through the kernel's CSS (style.rs, as
-    `layout_transitions`), loads presence at an initial `none`, and
-    snapshots the committed exit in rt.js `S` so a removal in the same
-    action plays it in either assignment order, as the wasm host does.
-    `contract build` checks every plan with the emitter (`target-web-js`
-    diagnostics at the row's source site via the map). Lessons for the next
-    attempt: skip `--entry` widget plans (the emitter refuses them as
-    WrongEntry; Shelf's widget build passes on main); keep the TypeScript
-    check main's way (only `app.contract`, no `--entry`, compiled from
-    source so `contract::check`'s bake refusals still fail it); pipe stdout
-    only for `build` (`tamber serve --stdio` streams); run the emitter with
-    `compilerCargo`'s pinned toolchain and keep kept.mjs's cache line off
-    stdout under `--json`; refuse a dynamic `-exact-press-scale` only beside
-    an exit whose keyframes animate `scale`; and child-state initializers
-    must run in declaration order (regions.rs; semantics/corpus/rows/
+  - **A JS-target refusal fails the web build only** (Linux; Charlie,
+    2026-10-22, C and D). Make `bun exact.mjs contract build` run the JS
+    emitter check for every app, including apps without `app.ts` + `app.json`
+    and entries not named `app.contract` (`scripts/exact.mjs`, `checkTypes` /
+    `typeDiagnostics`). Report emitter refusals as target refusals, not
+    TypeScript errors on `app.ts`. Done when a refused row fails each of those
+    build forms with a target diagnostic. Not taken: moving the `contract`
+    binary to its own package (compiler dependence on the web host), or a
+    refusal registry in `contract` (a second authority). 2026-10-24 (lane
+    q24/dynamic-exit-js on 450b, parked after three fix rounds; the branch is
+    kept there at 5664246094): `contract build` checks every plan with the
+    emitter (`target-web-js` diagnostics at the row's source site via the
+    map). Lessons for the next attempt: skip `--entry` widget plans (the
+    emitter refuses them as WrongEntry; Shelf's widget build passes on main);
+    keep the TypeScript check main's way (only `app.contract`, no `--entry`,
+    compiled from source so `contract::check`'s bake refusals still fail it);
+    pipe stdout only for `build` (`tamber serve --stdio` streams); run the
+    emitter with `compilerCargo`'s pinned toolchain and keep kept.mjs's cache
+    line off stdout under `--json`; and child-state initializers must run in
+    declaration order (regions.rs; semantics/corpus/rows/
     row-init-chain.contract is refused otherwise). 2026-10-27, a second
     attempt (branch q24/dynamic-exit-js2 on 450a, at 01897774af, parked after
-    three more fix rounds) carries the six commits onto main and fixes the
-    rest: the snapshot is taken before every writer, including `Sm`'s motion
-    hook; a press scale beside an exit is refused unless every exit the
-    binding can hold is a literal naming no scale keyframes. Its third round
-    found main's holds restore a node's whole saved style on release, so a
-    style committed while a node is held (any property, and modes.js's
-    boundary colours) reverts; it now presents a hold with paused animations
-    on the held properties only. Open where it stopped (Astra): a scale hold's
-    mapping to `--exact-scale` is refreshed only by a gesture sample, so a
-    press-scale change committed mid-pinch snaps the target to scale 1 until
-    the fingers move (host/web/motion-glue.js `cssProperty`).
+    three more fix rounds) carries the first attempt's commits onto main.
+  - **A press-scale change mid-pinch snaps the target to scale 1** (2026-10-27,
+    Astra's review of the second dynamic-exit attempt; not rechecked since).
+    A scale hold's mapping to `--exact-scale` is refreshed only by a gesture
+    sample (`host/web/motion-glue.js` `cssProperty`), so a press-scale change
+    committed mid-pinch snaps the target to scale 1 until the fingers move.
   - **Contract tests:** `back` reports "back refused" on a sheet over a sheet while the route does
     pop; a test can't fake a data source, or open a URL.
   - **Vocabulary:** no vertical scroll snap (the clone hand-built a pager); no direction hand-off
