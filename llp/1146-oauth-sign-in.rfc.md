@@ -263,7 +263,12 @@ API, staged for the type checker), `index.contract` (`OAuthSession`,
   reply and secret writes. The wasm browser module path instead invalidates
   an abandoned update's credential before another holder can read it; the
   person signs in again. A durable marker likewise invalidates an uncertain
-  update after a page or process exits before completion.
+  update after a page or process exits before completion. A host treats a
+  lease's work that throws as an update that stopped: on the web,
+  `exclusiveSecret` forgets the secret at once; a native host forgets it at
+  the next lease if the work sent its POST. So a refresh's work returns the
+  failure it decided on, and the package throws it after the lease: a session
+  that "Refresh" keeps stays.
 - **Sign-in.** `session()`, while signed out, prepares the next sign-in
   (discovery; `state`; a PKCE S256 verifier; `nonce` with `openid`), so
   `signIn()` calls `openAuthSession` before its first `await`. A preparation

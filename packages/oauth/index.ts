@@ -434,8 +434,22 @@ export function oauth(config: OAuthConfig): OAuthProvider {
 
   // Renews `seen`'s access token: one refresh of this session at a time, its
   // rotated refresh token kept before anyone uses the new access token
-  // (RFC 9700 §4.14.2).
-  const refresh = (store: OAuthStore, seen: Kept): Promise<Kept> => exclusive(store, async () => {
+  // (RFC 9700 §4.14.2). The exclusive work returns the failure it decided on,
+  // and `refresh` throws it after the work: a host treats a work that throws
+  // as an update that stopped before its reply and forgets the session (LLP
+  // 1146 §5, "One at a time"), though the failure keeps it. An error the
+  // package did not decide on, such as a failed store write, still throws
+  // inside the work.
+  const refresh = async (store: OAuthStore, seen: Kept): Promise<Kept> => {
+    const outcome = await exclusive(store, () => renew(store, seen).catch((e: unknown) => {
+      if (e instanceof OAuthError) return e;
+      throw e;
+    }));
+    if (outcome instanceof OAuthError) throw outcome;
+    return outcome;
+  };
+
+  const renew = async (store: OAuthStore, seen: Kept): Promise<Kept> => {
     const now = read(store);
     // Another caller refreshed, or the person signed out or in, meanwhile.
     if (!now?.accessToken) throw signedOutError(now);
@@ -448,7 +462,10 @@ export function oauth(config: OAuthConfig): OAuthProvider {
     // What the session keeps is enough: a refresh awaits no discovery,
     // which an answer may have started and may be let go mid-way.
     const endpoint = now.tokenEndpoint;
-    if (!endpoint) throw new OAuthError('config', 'The session keeps no token endpoint. Sign in again.', 0, false, true);
+    if (!endpoint) {
+      end(store, sent, 'The session keeps no token endpoint. Sign in again.', 0, 'config');
+      throw new OAuthError('config', 'The session keeps no token endpoint. Sign in again.', 0, false, true);
+    }
     const body: Record<string, string> = { grant_type: 'refresh_token', refresh_token: sent };
     if (config.refreshScopes) body.scope = (now.scopes?.length ? now.scopes : config.scopes).join(' ');
     // No usable reply (none, or a 2xx whose body stops short): the server may
@@ -518,7 +535,7 @@ export function oauth(config: OAuthConfig): OAuthProvider {
     store.set(config.key, JSON.stringify(next));
     note(async () => ({ type: 'refreshed', sent: await print(sent), got: await print(next.refreshToken), expiresIn: lifetime(reply) ?? 0 }));
     return next;
-  });
+  };
 
   // Ends the session for good, only if the refresh token refused is still
   // the one kept: a newer sign-in or a sign-out already replaced it otherwise.
