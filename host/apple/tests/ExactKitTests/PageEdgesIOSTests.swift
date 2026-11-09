@@ -244,7 +244,10 @@ final class PageEdgesIOSTests: XCTestCase {
         guard #available(iOS 26.0, *) else { throw XCTSkip("control bars are iOS 26's, where UIKit draws the edge effect over them") }
         let (session, _) = try fixture("CONTROL_BARS")
         session.presenter.press(try node(session, "pick-filled").id)
-        until("the transcript runs under the bar") { (try? self.node(session, "wrapped"))?.pageBand.top ?? 0 > 0 }
+        until("the transcript runs under the bar") {
+            guard let sv = (try? self.node(session, "wrapped"))?.scrollView else { return false }
+            return abs(sv.convert(sv.bounds, to: nil).minY) < 0.5
+        }
         let list = try node(session, "wrapped"), sv = try XCTUnwrap(list.scrollView), composer = try node(session, "filled-composer")
         XCTAssertEqual(list.pageBand.bottom, 0, "the filled composer keeps the rows above it")
         XCTAssertEqual(sv.convert(sv.bounds, to: nil).minY, 0, accuracy: 0.5, "its scroll view runs up under the bar")
