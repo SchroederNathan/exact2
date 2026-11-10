@@ -25,6 +25,68 @@ async function browserTest(run) {
   }
 }
 
+test('GPU surface messages reach only their owning canvas or painted wrapper', () => browserTest(async (page, server) => {
+  await page.route('**/gpu-glue.js', route => route.fulfill({ contentType: 'text/javascript', body: 'export {};' }));
+  await page.goto(server.url.href);
+  const result = await page.evaluate(async () => {
+    const rt = await import('/rt.js');
+    globalThis.exact = {};
+    const root = document.querySelector('main'), events = [];
+    const direct = document.createElement('canvas'), painted = document.createElement('div'), sibling = document.createElement('canvas');
+    painted.setAttribute('data-carry-type', 'Canvas');
+    painted.append(document.createElement('canvas'));
+    root.append(direct, painted, sibling);
+    const owner = rt.scope(() => {
+      for (const [name, element] of [['direct', direct], ['painted', painted], ['sibling', sibling]]) {
+        rt.on(element, 'message', text => events.push([name, text]), rt.onMessage);
+        rt.gs(element, 'fixture', () => []);
+      }
+      rt.on(root, 'message', text => events.push(['parent', text]), rt.onMessage);
+    });
+    const emitter = typeof exact.message;
+    if (emitter === 'function') {
+      exact.message(direct, 'ready');
+      exact.message(painted, 'painted-ready');
+      exact.message(sibling, 'sibling-ready');
+    }
+    rt.end(owner);
+    return { emitter, events };
+  });
+  expect(result.emitter).toBe('function');
+  expect(result.events).toEqual([['direct', 'ready'], ['painted', 'painted-ready'], ['sibling', 'sibling-ready']]);
+}), 90000);
+
+test('JS iframe messages reject unauthorized origins and unrelated sources', () => browserTest(async (page, server) => {
+  await page.goto(server.url.href);
+  const result = await page.evaluate(async () => {
+    const rt = await import('/rt.js');
+    const { commitGuestOrigin } = await import('/navigation.js');
+    const frames = [document.createElement('iframe'), document.createElement('iframe')];
+    await Promise.all(frames.map(frame => new Promise(resolve => {
+      frame.addEventListener('load', resolve, { once: true });
+      document.querySelector('main').append(frame);
+    })));
+    const [frame, other] = frames, events = [];
+    frame.src = location.href;
+    commitGuestOrigin(frame);
+    rt.on(frame, 'message', text => events.push(text), rt.onMessage);
+    const send = (source, origin, data) => dispatchEvent(new MessageEvent('message', { source, origin, data }));
+    send(other.contentWindow, location.origin, 'wrong-source');
+    send(frame.contentWindow, 'https://unauthorized.example', 'wrong-origin');
+    frame.dispatchEvent(new CustomEvent('exact-surface-message', { detail: 'wrong-channel' }));
+    const rejected = [...events];
+    send(frame.contentWindow, location.origin, 'accepted');
+    send(frame.contentWindow, location.origin, { accepted: true });
+    frame.setAttribute('sandbox', 'allow-scripts');
+    commitGuestOrigin(frame);
+    send(frame.contentWindow, location.origin, 'wrong-sandbox-origin');
+    send(frame.contentWindow, 'null', 'opaque-accepted');
+    return { rejected, events };
+  });
+  expect(result.rejected).toEqual([]);
+  expect(result.events).toEqual(['accepted', '{"accepted":true}', 'opaque-accepted']);
+}), 90000);
+
 test('app file frames load typed documents, report missing files, and release their URLs', () => browserTest(async (page, server) => {
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
