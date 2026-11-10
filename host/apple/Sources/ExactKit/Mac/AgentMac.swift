@@ -1031,6 +1031,14 @@ extension Agent {
             guard let down = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: t, windowNumber: win.windowNumber, context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: repeats, keyCode: code),
                   let up = NSEvent.keyEvent(with: .keyUp, location: .zero, modifierFlags: upModifiers, timestamp: t, windowNumber: win.windowNumber, context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: code)
             else { return ["error": "no key event"] }
+            var rawDown = down, rawUp = up
+            if lone, let side = KeyCodes.sides[device?.code ?? ""]?.0 {
+                // Device-side bits keep a repeated modifier down from becoming a release.
+                guard let flagsDown = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: NSEvent.ModifierFlags(rawValue: modifiers.rawValue | side), timestamp: t, windowNumber: win.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code),
+                      let flagsUp = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: NSEvent.ModifierFlags(rawValue: upModifiers.rawValue & ~side), timestamp: t, windowNumber: win.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)
+                else { return ["error": "no modifier event"] }
+                rawDown = flagsDown; rawUp = flagsUp
+            }
             // The release's `keyup` handlers at the focus then (#140), as the
             // monitor's route hears a keyboard's (`Presenter.keyUp`).
             // A chord's modifiers are their own keys around it (Charlie, 2026-10-07;
@@ -1102,13 +1110,15 @@ extension Agent {
                 releaseHeard()
                 return ["typed": Int(v.id), "key": chord]
             }
-            if phase != "up", !lone { win.sendEvent(down) }
+            let keyOwner = win.firstResponder as? NodeView
+            if phase != "up" { win.sendEvent(rawDown) }
             if phase != "down" { heardUp() }
-            if phase != "down", !lone { win.sendEvent(up) }
+            if phase != "down" { win.sendEvent(rawUp) }
             if phase == "down", let token = req["releaseKey"] as? String {
-                keyReleases[token] = { [weak v] in
+                keyReleases[token] = { [weak v, weak keyOwner] in
                     heardUp()
-                    v?.keyUp(with: up)
+                    if lone { keyOwner?.flagsChanged(with: rawUp) }
+                    else { v?.keyUp(with: up) }
                     return ["typed": Int(v?.id ?? 0), "phase": "up", "delivery": "platform"]
                 }
             }
