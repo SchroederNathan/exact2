@@ -103,6 +103,17 @@ check('a root tab bar left unsaid is a sidebar on a wide window and a bar on a p
   expect(await evaluate(`[document.getElementById('nav').hasAttribute('data-exact-sidebar'), box('bar')]`)).toEqual([true, [0, 0, 240, 800]]);
 }), 60000);
 
+check('segmented viewports keep root tabs below the full-width route and restore the continuous sidebar', () => inChrome(page(tabs(BAR)), async (evaluate) => {
+  expect(await evaluate(`[document.getElementById('nav').hasAttribute('data-exact-sidebar'), box('panels')[0]]`)).toEqual([true, 240]);
+  for (const [cols, rows] of [[2, 1], [1, 2]]) {
+    await evaluate(`import('./navigation.js').then(({ preferFold }) => { preferFold({ cols: ${cols}, rows: ${rows}, gap: 40 }); select(2); })`);
+    expect(await evaluate(`[document.getElementById('nav').hasAttribute('data-exact-sidebar'), box('panels')[0], box('panels')[2], box('bar')[0], box('bar')[2], box('bar')[1] + box('bar')[3], shown('r2')]`))
+      .toEqual([false, 0, 1280, 0, 1280, 800, true]);
+  }
+  await evaluate(`import('./navigation.js').then(({ preferFold }) => { preferFold(null); select(2); })`);
+  expect(await evaluate(`[document.getElementById('nav').hasAttribute('data-exact-sidebar'), box('panels')[0], shown('r2')]`)).toEqual([true, 240, true]);
+}), 60000);
+
 check('an arrangement the app wrote stays its own on a wide window', async () => {
   // A vertical tablist (a rail), a bar it positions itself, and a root that is no flex column: none is turned.
   const vertical = BAR.replace('role="tablist"', 'role="tablist" aria-orientation="vertical"');

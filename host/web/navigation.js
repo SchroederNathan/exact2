@@ -406,7 +406,7 @@ export const navigation = { personScrolls: 0, // the person's scrolls (`byPerson
     for (const nav of root.querySelectorAll("[navigationBack]")) {
       let key = nav.getAttribute("navigationKey"), [list, panels] = tabsOf(nav);
       // The authored placement is read with the sidebar's own rules lifted, which restyles the page (an embedded frame re-centres), so only when what places the bar may have changed: the wide breakpoint, the bar's parent or orientation, or the root's or the bar's class or inline display, flex direction, position or appearance (their class rules and inline style are what place them).
-      const isWide = wide(), said = [isWide, list?.parentElement === nav && list.getAttribute("aria-orientation"), ...[nav, list].map(el => el && [el.className, el.style.display, el.style.flexDirection, el.style.position, el.style.appearance].join("|"))].join("/"); if (placed.get(nav) !== said) { nav.removeAttribute("data-exact-sidebar"); nav.toggleAttribute("data-exact-sidebar", isWide && unsaidBar(nav, list)); placed.set(nav, said); }
+      const isWide = wide() && fold().rects.length < 2, said = [isWide, list?.parentElement === nav && list.getAttribute("aria-orientation"), ...[nav, list].map(el => el && [el.className, el.style.display, el.style.flexDirection, el.style.position, el.style.appearance].join("|"))].join("/"); if (placed.get(nav) !== said) { nav.removeAttribute("data-exact-sidebar"); nav.toggleAttribute("data-exact-sidebar", isWide && unsaidBar(nav, list)); placed.set(nav, said); }
       for (const panel of managed.get(nav) ?? []) {
         if (!panels.includes(panel)) { panel.style.visibility = ""; setInert(panel, !!panel.authoredInert); }
       }
