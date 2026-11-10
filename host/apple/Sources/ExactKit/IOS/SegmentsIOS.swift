@@ -31,9 +31,13 @@ class LabelledSegmentedControl: UISegmentedControl {
             let id = segmentIDs.indices.contains(index) ? segmentIDs[index] : nil
             if view.accessibilityLabel != label { view.accessibilityLabel = label }
             if view.accessibilityIdentifier != id { view.accessibilityIdentifier = id }
-            let unavailable = segmentUnavailable.indices.contains(index) && segmentUnavailable[index]
-            if unavailable { view.accessibilityTraits.insert(.notEnabled) }
-            else { view.accessibilityTraits.remove(.notEnabled) }
+            let unavailable = !isEnabled || !isEnabledForSegment(at: index) ||
+                (segmentUnavailable.indices.contains(index) && segmentUnavailable[index])
+            var traits = view.accessibilityTraits
+            if unavailable { traits.insert(.notEnabled) } else { traits.remove(.notEnabled) }
+            if index == selectedSegmentIndex { traits.insert(.selected) } else { traits.remove(.selected) }
+            // Avoid freezing UIKit's computed selection with an unchanged override.
+            if view.accessibilityTraits != traits { view.accessibilityTraits = traits }
         }
     }
 }
@@ -598,6 +602,7 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
         // each segment its content's share, so "Temperature" keeps its
         // letters beside "Length" (LLP 1116.004 D2).
         assign(control, \.apportionsSegmentWidthsByContent, frame.width + 0.5 < natural(owner.id, control).width)
+        if !pending { control.layoutIfNeeded() }
     }
 
     /// A title segment's accessibility label: its tab's name where that is

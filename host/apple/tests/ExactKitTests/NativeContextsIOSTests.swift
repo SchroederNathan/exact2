@@ -243,6 +243,36 @@ final class NativeContextsIOSTests: XCTestCase {
         XCTAssertFalse(segments.isEnabled, "inert disables it too")
     }
 
+    func testSegmentLabelsKeepSelectionAndAvailabilityCurrent() throws {
+        let control = LabelledSegmentedControl(items: ["One", "Two"])
+        control.frame = CGRect(x: 0, y: 0, width: 300, height: 32)
+        control.segmentIDs = ["one", "two"]
+        control.selectedSegmentIndex = 0
+        control.layoutIfNeeded()
+        let segments = control.segmentViews
+        XCTAssertEqual(segments.count, 2)
+        guard segments.count == 2 else { return }
+        XCTAssertTrue(segments[0].accessibilityTraits.contains(.selected))
+        control.selectedSegmentIndex = 1
+        control.labelSegments()
+        XCTAssertFalse(segments[0].accessibilityTraits.contains(.selected))
+        XCTAssertTrue(segments[1].accessibilityTraits.contains(.selected))
+        control.segmentUnavailable = [false, true]
+        control.labelSegments()
+        XCTAssertTrue(segments[1].accessibilityTraits.contains(.notEnabled))
+        control.isEnabled = false
+        control.labelSegments()
+        XCTAssertTrue(segments.allSatisfy { $0.accessibilityTraits.contains(.notEnabled) })
+        control.isEnabled = true
+        control.segmentUnavailable = [false, false]
+        control.selectedSegmentIndex = 0
+        control.labelSegments()
+        XCTAssertTrue(segments[0].accessibilityTraits.contains(.selected))
+        XCTAssertFalse(segments[1].accessibilityTraits.contains(.selected))
+        XCTAssertFalse(segments.contains { $0.accessibilityTraits.contains(.notEnabled) })
+    }
+
+
     func testASegmentedTablistsBackgroundBelongsToTheNativeControlAndReturnsWithItsAuthoredTabs() throws {
         let p = tablist([2: face("Day"), 3: face("Week"), 4: face("Month")])
         defer { window.isHidden = true }
