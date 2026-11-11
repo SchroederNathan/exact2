@@ -245,7 +245,12 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         self.queue.write_buffer(&self.uniform, 0, bytes(&uniform));
         let mut viewmodel_uniform = uniform;
         if let Some(proj) = frame.viewmodel_proj {
-            viewmodel_uniform[..16].copy_from_slice(&proj.to_cols_array());
+            // `FrameInput::viewmodel_proj` is a view-to-clip matrix, just like
+            // `proj`. Preserve the same world-to-view transform for the
+            // alternate projection; replacing the full matrix with `proj`
+            // alone only works for geometry near the origin.
+            let viewmodel = proj * frame.view;
+            viewmodel_uniform[..16].copy_from_slice(&viewmodel.to_cols_array());
         }
         self.queue
             .write_buffer(&self.viewmodel_uniform, 0, bytes(&viewmodel_uniform));

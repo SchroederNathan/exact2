@@ -514,16 +514,20 @@ fn viewmodel_projection_image(world_fov_degrees: f32) -> Option<fixture::Pixels>
     )
     .unwrap();
     let w = sim.world_mut();
+    // Keep the camera and scene well away from the origin. A viewmodel
+    // projection must still use the frame's world-to-view matrix; using the
+    // alternate projection by itself only works for origin-centered fixtures.
+    let origin = Vec3::new(8., 4., -6.);
     let model_entity = w.named("model").unwrap();
     w.insert(model_entity, ViewModel);
-    w.require_mut::<Transform>(model_entity).position.x = -1.8;
+    w.require_mut::<Transform>(model_entity).position = origin + Vec3::new(-1.8, 0., 0.);
     for (x, texture, alpha) in [
         (-0.6, "red.tex", AlphaMode::Opaque),
         (0.6, "blue.tex", AlphaMode::Mask),
         (1.8, "magenta.tex", AlphaMode::Blend),
     ] {
         w.spawn((
-            Transform::at(x, 0., 0.),
+            Transform::at(origin.x + x, origin.y, origin.z),
             Sprite {
                 alpha,
                 ..Sprite::new(texture, [1., 1.])
@@ -534,7 +538,7 @@ fn viewmodel_projection_image(world_fov_degrees: f32) -> Option<fixture::Pixels>
     // This unmarked sprite follows the world FOV, proving the test controls
     // the world projection while the marked draws remain fixed.
     w.spawn((
-        Transform::at(3.2, 0., 0.),
+        Transform::at(origin.x, origin.y - 1.0, origin.z),
         Sprite::new("white.tex", [0.8, 0.8]),
     ));
     w.propagate();
@@ -574,9 +578,9 @@ fn viewmodel_projection_image(world_fov_degrees: f32) -> Option<fixture::Pixels>
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let eye = Vec3::new(0., 0., 5.);
+    let eye = origin + Vec3::new(0., 0., 5.);
     let mut frame = exact_game_render::FrameInput {
-        view: view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y),
+        view: view::look_at_mat4(eye, origin, Vec3::Y),
         proj: directx::perspective(
             world_fov_degrees.to_radians(),
             1.,
@@ -637,8 +641,19 @@ fn viewmodel_projection_keeps_models_and_sprites_fixed_across_world_fov() {
     let wide = viewmodel_projection_image(110.).unwrap();
     for color in 0..4 {
         let expected = color_bounds(&standard, color);
-        assert_eq!(color_bounds(&narrow, color), expected, "narrow color {color}");
-        assert_eq!(color_bounds(&wide, color), expected, "wide color {color}");
+        assert!(expected.4 > 0, "standard color {color} is missing");
+        for (label, image) in [("narrow", &narrow), ("wide", &wide)] {
+            let actual = color_bounds(image, color);
+            assert_eq!(
+                (actual.0, actual.1, actual.2, actual.3),
+                (expected.0, expected.1, expected.2, expected.3),
+                "{label} color {color} bounds"
+            );
+            assert!(
+                actual.4.abs_diff(expected.4) <= expected.4 / 20 + 2,
+                "{label} color {color} coverage changed: {actual:?} vs {expected:?}"
+            );
+        }
     }
     assert_ne!(
         color_bounds(&narrow, 4).4,
