@@ -776,7 +776,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             return;
         }
         let camera = crate::cull::planes(frame.proj * frame.view);
-        for (_, slot, depth) in &mut self.models.transparent {
+        for (batch, slot, depth) in &mut self.models.transparent {
             let index = (self.slot_list[*slot as usize] - crate::RENDER_SLOT_BASE) as usize;
             if self.levels.hidden.get(index).copied().unwrap_or(false) {
                 *depth = f32::NAN;
@@ -799,7 +799,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 m.y_axis.truncate().abs(),
                 m.z_axis.truncate().abs(),
             );
-            if !self.batches[index].viewmodel
+            if !self.batches[*batch].viewmodel
                 && record.skin.is_none()
                 && !self.cull.keep_all
                 && !crate::cull::sphere_visible(&camera, position, (abs * mesh.half).length())
