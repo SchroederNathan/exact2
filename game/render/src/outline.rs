@@ -290,7 +290,7 @@ impl<const ASSETS: bool> crate::renderer::RendererWithAssets<ASSETS> {
                     .slice(mesh.base_vertex as u64 * size_of::<crate::Vertex>() as u64..),
             );
             pass.set_vertex_buffer(1, hull.vertices.slice(..));
-            self.draw_outline_group(pass, &mut bound, i);
+            self.draw_outline_group(pass, &mut bound, i, batch.viewmodel);
             stats.draws += 1;
             let instances = u64::from(group.range.end - group.range.start);
             stats.instances += instances;

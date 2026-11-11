@@ -99,7 +99,13 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                         .camera_depth(&self.device, group.mirrored, fading, direct),
                 );
             }
-            self.draw_group(pass, &mut bound, 0, index);
+            self.draw_group(
+                pass,
+                &mut bound,
+                0,
+                index,
+                self.batches[group.batch].viewmodel,
+            );
             draws += 1;
         }
         draws

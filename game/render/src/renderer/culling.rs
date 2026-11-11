@@ -159,6 +159,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 } else {
                     0
                 }
+                | if batch.viewmodel { KEEP_ALL } else { 0 }
                 | if batch.viewmodel { EXEMPT } else { 0 };
             for (range, mirrored) in self.winding_ranges(index, frame) {
                 groups.push(Group {
