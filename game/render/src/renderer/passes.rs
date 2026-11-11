@@ -437,12 +437,20 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         for (index, _) in
             (self.quads.draws.iter().enumerate()).filter(|(_, d)| self.quads.opaque(d))
         {
+            let viewmodel = self.quads.draw_viewmodel(&self.quads.draws[index]);
+            if viewmodel != layer {
+                self.scene_viewport(&mut pass, state.size, viewmodel);
+                layer = viewmodel;
+            }
             let pipeline =
                 (self.quads).bind::<ASSETS>(&mut pass, index, &self.models.textures, state.direct);
             let began = self.probe_begin(&mut pass, || self.quads.record(index, pipeline));
             self.quads.submit(&mut pass, index);
             Probe::end(&mut pass, began);
             state.draws += 1;
+        }
+        if layer {
+            self.scene_viewport(&mut pass, state.size, false);
         }
         if H::ENABLED {
             let start = (!time.seekable).then(crate::perf::Stamp::now);
@@ -768,7 +776,8 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                     draw.kind,
                     crate::quads::Kind::Particle(_, _, _, true)
                         | crate::quads::Kind::Primitive(true)
-                );
+                )
+                || self.quads.draw_viewmodel(draw);
             if viewmodel != layer {
                 self.scene_viewport(pass, size, viewmodel);
                 layer = viewmodel;

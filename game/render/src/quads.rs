@@ -5,7 +5,9 @@ use crate::{
     buffers::{bytes, Buffer},
     FrameInput, RenderError,
 };
-use exact_game::{asset::AlphaMode, Emitter, Entity, ParticleLook, Sprite, Transform, World};
+use exact_game::{
+    asset::AlphaMode, Emitter, Entity, ParticleLook, Sprite, Transform, ViewModel, World,
+};
 use exact_gpu::wgpu;
 use glam::{Vec2, Vec3};
 use std::{collections::BTreeMap, ops::Range};
@@ -64,6 +66,7 @@ pub(crate) struct Item<T> {
     pub entity: Entity,
     pub poses: [Transform; 2],
     pub value: T,
+    pub viewmodel: bool,
     revision: u64,
 }
 struct Quad {
@@ -898,7 +901,7 @@ impl Quads {
                     self.order.push(Order {
                         kind: Kind::Sprite(index),
                         depth: -f.view.transform_point3(center).z,
-                        viewmodel: false,
+                        viewmodel: item.viewmodel,
                         layer: s.layer,
                         slot: item.entity.index(),
                         index: at,
@@ -1077,6 +1080,9 @@ impl Quads {
     pub fn opaque(&self, draw: &Draw) -> bool {
         matches!(draw.kind,Kind::Sprite(i) if self.sprites[i].value.alpha!=AlphaMode::Blend)
     }
+    pub fn draw_viewmodel(&self, draw: &Draw) -> bool {
+        matches!(draw.kind, Kind::Sprite(i) if self.sprites[i].viewmodel)
+    }
     pub fn instances(&self) -> u64 {
         ((self.particle_arena.as_ref().map_or(0, |a| a.words.len())
             + self.sprite_arena.as_ref().map_or(0, |a| a.words.len()))
@@ -1103,8 +1109,10 @@ fn push_draw(
             }
             (Kind::Primitive(a), Kind::Primitive(b)) => a == b,
             (Kind::Sprite(a), Kind::Sprite(b)) => {
-                let (a, b) = (&sprites[a].value, &sprites[b].value);
-                a.texture == b.texture && a.alpha == b.alpha
+                let (a, b) = (&sprites[a], &sprites[b]);
+                a.value.texture == b.value.texture
+                    && a.value.alpha == b.value.alpha
+                    && a.viewmodel == b.viewmodel
             }
             _ => false,
         };
@@ -1175,6 +1183,7 @@ fn feed_with_pose<T: exact_game::Component + Clone>(
         if initial || crate::world::scene::snap(w, i.entity, parent_changed) {
             i.poses[0] = pose;
         }
+        i.viewmodel = w.has::<ViewModel>(i.entity);
         if initial || i.revision != revision {
             i.value.clone_from(&*value);
             i.revision = revision;
@@ -1197,6 +1206,7 @@ fn feed_with_pose<T: exact_game::Component + Clone>(
                 entity,
                 poses: [pose; 2],
                 value: value.clone(),
+                viewmodel: w.has::<ViewModel>(entity),
                 revision,
             });
         }
