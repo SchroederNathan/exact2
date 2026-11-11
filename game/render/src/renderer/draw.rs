@@ -245,7 +245,12 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         self.queue.write_buffer(&self.uniform, 0, bytes(&uniform));
         let mut viewmodel_uniform = uniform;
         if let Some(proj) = frame.viewmodel_proj {
-            viewmodel_uniform[..16].copy_from_slice(&proj.to_cols_array());
+            // `FrameInput::viewmodel_proj` is a view-to-clip projection. Keep
+            // the camera translation and orientation from the frame view when
+            // replacing the world projection; ViewModel entities are still
+            // authored in world space and may sit far from the origin.
+            let viewmodel = proj * frame.view;
+            viewmodel_uniform[..16].copy_from_slice(&viewmodel.to_cols_array());
         }
         self.queue
             .write_buffer(&self.viewmodel_uniform, 0, bytes(&viewmodel_uniform));

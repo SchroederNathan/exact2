@@ -34,7 +34,7 @@ impl Game for Test {
     type Args = ();
     fn setup(w: &mut World, _: &()) {
         w.spawn_named("model", (Transform::default(), Mesh::asset("panels.model")));
-        w.spawn((Transform::at(0., 0., 5.), Camera::default()));
+        w.spawn_named("camera", (Transform::at(0., 0., 5.), Camera::default()));
     }
     fn tick(_: &mut World, _: &Input, _: &()) {}
 }
@@ -495,7 +495,7 @@ fn sprites_marked_viewmodel_draw_in_front_of_walls_for_all_alpha_modes() {
     }
 }
 
-fn viewmodel_projection_image(world_fov_degrees: f32) -> Option<fixture::Pixels> {
+fn viewmodel_projection_image(world_fov_degrees: f32, origin: Vec3) -> Option<fixture::Pixels> {
     let gpu = crate::test_device::device_or_skip(exact_gpu::fixture::device())?;
     let model = Model {
         meshes: vec![panel(0)],
@@ -515,15 +515,16 @@ fn viewmodel_projection_image(world_fov_degrees: f32) -> Option<fixture::Pixels>
     .unwrap();
     let w = sim.world_mut();
     let model_entity = w.named("model").unwrap();
+    *w.require_mut::<Transform>("camera") = Transform::at(origin.x, origin.y, origin.z + 10.);
     w.insert(model_entity, ViewModel);
-    w.require_mut::<Transform>(model_entity).position.x = -1.8;
+    w.require_mut::<Transform>(model_entity).position = origin + Vec3::new(-1.8, 0., 0.);
     for (x, texture, alpha) in [
         (-0.6, "red.tex", AlphaMode::Opaque),
         (0.6, "blue.tex", AlphaMode::Mask),
         (1.8, "magenta.tex", AlphaMode::Blend),
     ] {
         w.spawn((
-            Transform::at(x, 0., 0.),
+            Transform::at(origin.x + x, origin.y, origin.z),
             Sprite {
                 alpha,
                 ..Sprite::new(texture, [1., 1.])
@@ -534,7 +535,7 @@ fn viewmodel_projection_image(world_fov_degrees: f32) -> Option<fixture::Pixels>
     // This unmarked sprite follows the world FOV, proving the test controls
     // the world projection while the marked draws remain fixed.
     w.spawn((
-        Transform::at(3.2, 0., 0.),
+        Transform::at(origin.x, origin.y + 1.5, origin.z),
         Sprite::new("white.tex", [0.8, 0.8]),
     ));
     w.propagate();
@@ -574,9 +575,9 @@ fn viewmodel_projection_image(world_fov_degrees: f32) -> Option<fixture::Pixels>
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let eye = Vec3::new(0., 0., 5.);
+    let eye = origin + Vec3::new(0., 0., 10.);
     let mut frame = exact_game_render::FrameInput {
-        view: view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y),
+        view: view::look_at_mat4(eye, origin, Vec3::Y),
         proj: directx::perspective(
             world_fov_degrees.to_radians(),
             1.,
@@ -630,13 +631,15 @@ fn color_bounds(image: &fixture::Pixels, color: usize) -> (u32, u32, u32, u32, u
 
 #[test]
 fn viewmodel_projection_keeps_models_and_sprites_fixed_across_world_fov() {
-    let Some(narrow) = viewmodel_projection_image(30.) else {
+    let origin = Vec3::ZERO;
+    let Some(narrow) = viewmodel_projection_image(30., origin) else {
         return;
     };
-    let standard = viewmodel_projection_image(70.).unwrap();
-    let wide = viewmodel_projection_image(110.).unwrap();
+    let standard = viewmodel_projection_image(70., origin).unwrap();
+    let wide = viewmodel_projection_image(110., origin).unwrap();
     for color in 0..4 {
         let expected = color_bounds(&standard, color);
+        assert!(expected.4 > 0, "translated viewmodel color {color} is absent");
         assert_eq!(color_bounds(&narrow, color), expected, "narrow color {color}");
         assert_eq!(color_bounds(&wide, color), expected, "wide color {color}");
     }
