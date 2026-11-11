@@ -243,6 +243,12 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         uniform[31] *= self.environment.ambient_scale();
         crate::water::write(&mut uniform, frame, self.water_effects);
         self.queue.write_buffer(&self.uniform, 0, bytes(&uniform));
+        let mut viewmodel_uniform = uniform;
+        if let Some(proj) = frame.viewmodel_proj {
+            viewmodel_uniform[..16].copy_from_slice(&proj.to_cols_array());
+        }
+        self.queue
+            .write_buffer(&self.viewmodel_uniform, 0, bytes(&viewmodel_uniform));
         self.prepare_cull(
             frame,
             cascades.as_ref(),
@@ -337,6 +343,13 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         if self.environment.mapped() {
             // The GPU-projected SH replaces the uniform's CPU irradiance.
             encoder.copy_buffer_to_buffer(&self.environment.sh, 0, &self.uniform, 144 * 4, 144);
+            encoder.copy_buffer_to_buffer(
+                &self.environment.sh,
+                0,
+                &self.viewmodel_uniform,
+                144 * 4,
+                144,
+            );
         }
         if ASSETS {
             if let Some(skin) = &self.models.skinning {
@@ -781,7 +794,8 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 m.y_axis.truncate().abs(),
                 m.z_axis.truncate().abs(),
             );
-            if record.skin.is_none()
+            if !self.batches[index].viewmodel
+                && record.skin.is_none()
                 && !self.cull.keep_all
                 && !crate::cull::sphere_visible(&camera, position, (abs * mesh.half).length())
             {

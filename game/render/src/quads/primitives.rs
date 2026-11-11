@@ -142,7 +142,10 @@ impl Primitives {
                 * (matrix.x_axis.truncate().length_squared()
                     + matrix.y_axis.truncate().length_squared()
                     + matrix.z_axis.truncate().length_squared()).sqrt();
-            if cull && !crate::cull::sphere_visible(camera, matrix.w_axis.truncate(), reach) {
+            if cull
+                && !p.viewmodel
+                && !crate::cull::sphere_visible(camera, matrix.w_axis.truncate(), reach)
+            {
                 continue;
             }
             let glow = p

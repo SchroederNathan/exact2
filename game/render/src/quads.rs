@@ -137,6 +137,7 @@ pub(crate) struct Quads {
     pub draws: Vec<Draw>,
     layout: wgpu::BindGroupLayout,
     bind: wgpu::BindGroup,
+    viewmodel_bind: wgpu::BindGroup,
     particle_pipelines: Option<[wgpu::RenderPipeline; 2]>,
     // Soft dots (alpha, additive), then soft textured particles.
     soft_pipelines: Option<[wgpu::RenderPipeline; 4]>,
@@ -204,6 +205,7 @@ impl Quads {
         d: &wgpu::Device,
         q: &wgpu::Queue,
         uniform: &wgpu::Buffer,
+        viewmodel_uniform: &wgpu::Buffer,
         (samples, format): (u32, wgpu::TextureFormat),
         cache: Option<&wgpu::PipelineCache>,
     ) -> Self {
@@ -228,6 +230,14 @@ impl Quads {
                 resource: uniform.as_entire_binding(),
             }],
         });
+        let viewmodel_bind = d.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("game viewmodel quad frame"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: viewmodel_uniform.as_entire_binding(),
+            }],
+        });
         let mut result = Self {
             cache: cache.cloned(),
             samples,
@@ -249,6 +259,7 @@ impl Quads {
             draws: Vec::with_capacity(4096),
             layout,
             bind,
+            viewmodel_bind,
             particle_pipelines: None,
             soft_pipelines: None,
             soft_layout: None,
@@ -863,7 +874,7 @@ impl Quads {
                 let y = up * (s.size.y * t.y_axis.truncate().length());
                 let center = t.w_axis.truncate() + x * (0.5 - s.anchor.x) + y * (0.5 - s.anchor.y);
                 let radius = 0.5 * (x.length_squared() + y.length_squared()).sqrt();
-                if cull && !crate::cull::sphere_visible(&camera, center, radius) {
+                if cull && !item.viewmodel && !crate::cull::sphere_visible(&camera, center, radius) {
                     if let Some(seen) = &mut self.observed {
                         seen.push((item.entity, QuadFact::Culled, t, true));
                     }
@@ -995,7 +1006,15 @@ impl Quads {
                 .as_ref()
                 .expect("quad pipelines prepare before drawing")
         }
-        pass.set_bind_group(0, &self.bind, &[]);
+        pass.set_bind_group(
+            0,
+            if self.draw_viewmodel(draw) {
+                &self.viewmodel_bind
+            } else {
+                &self.bind
+            },
+            &[],
+        );
         // Primitives share the shader and arena, but never a particle counter or batch.
         let pipeline_kind = match draw.kind {
             Kind::Primitive(_) => Kind::Particle(false, NO_LOOK, false, false),
@@ -1082,6 +1101,8 @@ impl Quads {
     }
     pub fn draw_viewmodel(&self, draw: &Draw) -> bool {
         matches!(draw.kind, Kind::Sprite(i) if self.sprites[i].viewmodel)
+            || matches!(draw.kind, Kind::Particle(_, _, _, true))
+            || matches!(draw.kind, Kind::Primitive(true))
     }
     pub fn instances(&self) -> u64 {
         ((self.particle_arena.as_ref().map_or(0, |a| a.words.len())
