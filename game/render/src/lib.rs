@@ -300,6 +300,9 @@ pub struct FrameInput<'a> {
     pub view: Mat4,
     /// View-to-clip matrix, conventional 0–1 depth, not reverse-Z.
     pub proj: Mat4,
+    /// Optional view-to-clip matrix for entities marked [`ViewModel`]. When
+    /// absent, viewmodel geometry uses `proj` like the rest of the scene.
+    pub viewmodel_proj: Option<Mat4>,
     /// World-space eye position.
     pub camera_position: Vec3,
     /// Tick interpolation fraction, clamped to 0–1.
@@ -345,6 +348,7 @@ impl Default for FrameInput<'_> {
                 0.1,
                 100.0,
             ),
+            viewmodel_proj: None,
             camera_position: Vec3::ZERO,
             alpha: 1.0,
             sun: Some(Sun::default()),

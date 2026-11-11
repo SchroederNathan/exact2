@@ -115,6 +115,9 @@ pub struct Camera {
     pub projection: Projection,
     /// Vertical field of view in degrees.
     pub fov_y_degrees: f32,
+    /// Optional perspective field of view for entities marked [`ViewModel`].
+    /// `None` keeps viewmodel geometry on the camera projection.
+    pub viewmodel_fov_y_degrees: Option<f32>,
     /// Near clipping distance.
     pub near: f32,
     /// Far clipping distance.
@@ -127,6 +130,7 @@ impl Default for Camera {
         Self {
             projection: Projection::Perspective,
             fov_y_degrees: 60.0,
+            viewmodel_fov_y_degrees: None,
             near: 0.1,
             far: 1000.0,
             active: true,
@@ -190,6 +194,9 @@ impl Camera {
             && self.far.is_finite()
             && self.near > 0.
             && self.far > self.near
+            && self
+                .viewmodel_fov_y_degrees
+                .is_none_or(|fov| fov.is_finite() && fov > 0. && fov < 180.)
             && match self.projection {
                 Projection::Perspective => self.fov_y_degrees > 0. && self.fov_y_degrees < 180.,
                 Projection::Orthographic { height, .. } => height.is_finite() && height > 0.,
@@ -235,6 +242,21 @@ impl Camera {
                 ])
             }
         }
+    }
+
+    /// Projection used by entities marked [`ViewModel`], when opted in.
+    /// Orthographic cameras keep their authored projection because an FOV
+    /// override only has meaning for perspective views.
+    pub fn viewmodel_matrix(self, size: crate::Vec2) -> Option<glam::Mat4> {
+        let fov = self.viewmodel_fov_y_degrees?;
+        (self.projection == Projection::Perspective).then(|| {
+            glam::camera::rh::proj::directx::perspective(
+                fov.to_radians(),
+                size.x / size.y,
+                self.near,
+                self.far,
+            )
+        })
     }
 }
 
@@ -1345,6 +1367,25 @@ fn follow_inner(world: &World, placement_only: bool) {
 #[cfg(test)]
 mod camera_patch_regression {
     use super::*;
+    #[test]
+    fn viewmodel_projection_is_opt_in_and_perspective_only() {
+        let size = crate::Vec2::new(320., 200.);
+        let mut camera = Camera {
+            fov_y_degrees: 30.,
+            viewmodel_fov_y_degrees: Some(70.),
+            ..Default::default()
+        };
+        assert!(camera.valid());
+        assert_ne!(camera.viewmodel_matrix(size).unwrap(), camera.matrix(size));
+        camera.projection = Projection::Orthographic {
+            height: 4.,
+            integer_scale: false,
+        };
+        assert!(camera.viewmodel_matrix(size).is_none());
+        camera.viewmodel_fov_y_degrees = Some(180.);
+        assert!(!camera.valid());
+    }
+
     #[test]
     fn perspective_patch_replaces_orthographic_projection() {
         let mut camera = Camera::orthographic(180.).integer_scale();

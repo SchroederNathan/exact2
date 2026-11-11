@@ -413,6 +413,255 @@ fn blended_viewmodel_parts_draw_in_front_of_walls() {
     );
 }
 
+fn sprite_behind_wall(alpha: AlphaMode, marked: bool) -> Option<[u8; 4]> {
+    let gpu = crate::test_device::device_or_skip(exact_gpu::fixture::device())?;
+    let mut w = World::new(60, 0);
+    w.insert_resource(Environment {
+        background: Some([0., 0., 0.].into()),
+        fog: None,
+        bloom: None,
+        tone_mapping: ToneMapping::None,
+        ..Default::default()
+    });
+    w.spawn((
+        Transform {
+            position: Vec3::new(0., 0., 1.),
+            scale: Vec3::new(2., 2., 0.1),
+            ..Default::default()
+        },
+        Mesh::cube(1.),
+        Material::rgb(0., 0., 1.),
+    ));
+    let sprite = w.spawn((
+        Transform::default(),
+        Sprite {
+            alpha,
+            ..Sprite::new("red.tex", [1.5, 1.5])
+        },
+    ));
+    if marked {
+        w.insert(sprite, ViewModel);
+    }
+    w.spawn((Transform::at(0., 0., 5.), Camera::orthographic(4.)));
+    w.propagate();
+    let mut renderer = Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
+    renderer
+        .add_texture(
+            "red.tex",
+            &TextureData {
+                width: 1,
+                height: 1,
+                mips: vec![vec![255, 0, 0, 255]],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut feed = Feed::default();
+    feed.feed(&w, &mut renderer).unwrap();
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 64,
+            height: 64,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let frame = feed.frame(&w, 1., 1.);
+    renderer.draw(&target.create_view(&Default::default()), (64, 64), &frame);
+    Some(fixture::read(&gpu, &target).unwrap().at(32, 32))
+}
+
+#[test]
+fn sprites_marked_viewmodel_draw_in_front_of_walls_for_all_alpha_modes() {
+    for alpha in [AlphaMode::Opaque, AlphaMode::Mask, AlphaMode::Blend] {
+        let Some(plain) = sprite_behind_wall(alpha, false) else {
+            return;
+        };
+        let marked = sprite_behind_wall(alpha, true).unwrap();
+        assert!(
+            plain[2] > plain[0],
+            "wall hides unmarked {alpha:?}: {plain:?}"
+        );
+        assert!(
+            marked[0] > marked[2],
+            "viewmodel sprite shows {alpha:?}: {marked:?}"
+        );
+    }
+}
+
+fn viewmodel_projection_image(world_fov_degrees: f32) -> Option<fixture::Pixels> {
+    let gpu = crate::test_device::device_or_skip(exact_gpu::fixture::device())?;
+    let model = Model {
+        meshes: vec![panel(0)],
+        materials: vec![material([0., 1., 0., 1.], AlphaMode::Opaque)],
+        nodes: vec![Node {
+            mesh: Some(0),
+            ..Default::default()
+        }],
+        bounds: [-0.8, -0.8, 0., 0.8, 0.8, 0.],
+        ..Default::default()
+    };
+    let mut sim = Sim::<Test>::new(()).unwrap();
+    sim.asset(
+        "panels.model",
+        Some(&exact_game::asset::encode_model(&model)),
+    )
+    .unwrap();
+    let w = sim.world_mut();
+    // Keep the camera and scene well away from the origin. A viewmodel
+    // projection must still use the frame's world-to-view matrix; using the
+    // alternate projection by itself only works for origin-centered fixtures.
+    let origin = Vec3::new(8., 4., -6.);
+    let model_entity = w.named("model").unwrap();
+    w.insert(model_entity, ViewModel);
+    w.require_mut::<Transform>(model_entity).position = origin + Vec3::new(-1.8, 0., 0.);
+    for (x, texture, alpha) in [
+        (-0.6, "red.tex", AlphaMode::Opaque),
+        (0.6, "blue.tex", AlphaMode::Mask),
+        (1.8, "magenta.tex", AlphaMode::Blend),
+    ] {
+        w.spawn((
+            Transform::at(origin.x + x, origin.y, origin.z),
+            Sprite {
+                alpha,
+                ..Sprite::new(texture, [1., 1.])
+            },
+            ViewModel,
+        ));
+    }
+    // This unmarked sprite follows the world FOV, proving the test controls
+    // the world projection while the marked draws remain fixed.
+    w.spawn((
+        Transform::at(origin.x, origin.y - 1.0, origin.z),
+        Sprite::new("white.tex", [0.8, 0.8]),
+    ));
+    w.propagate();
+    let mut renderer = Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
+    renderer.prepare_model("panels.model", &model).unwrap();
+    for (name, color) in [
+        ("red.tex", [255, 0, 0, 255]),
+        ("blue.tex", [0, 0, 255, 255]),
+        ("magenta.tex", [255, 0, 255, 220]),
+        ("white.tex", [255, 255, 255, 255]),
+    ] {
+        renderer
+            .add_texture(
+                name,
+                &TextureData {
+                    width: 1,
+                    height: 1,
+                    mips: vec![color.to_vec()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let mut feed = Feed::default();
+    feed.feed(sim.world(), &mut renderer).unwrap();
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 256,
+            height: 256,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let eye = origin + Vec3::new(0., 0., 5.);
+    let mut frame = exact_game_render::FrameInput {
+        view: view::look_at_mat4(eye, origin, Vec3::Y),
+        proj: directx::perspective(
+            world_fov_degrees.to_radians(),
+            1.,
+            0.1,
+            20.,
+        ),
+        viewmodel_proj: Some(directx::perspective(70f32.to_radians(), 1., 0.1, 20.)),
+        camera_position: eye,
+        sun: None,
+        ..Default::default()
+    };
+    frame.environment = exact_game_render::Environment {
+        background: Some([0., 0., 0.].into()),
+        ambient: 1.,
+        tone_mapping: ToneMapping::None,
+        fog: None,
+        bloom: None,
+        ..Default::default()
+    };
+    renderer.draw(&texture.create_view(&Default::default()), (256, 256), &frame);
+    Some(fixture::read(&gpu, &texture).unwrap())
+}
+
+fn color_bounds(image: &fixture::Pixels, color: usize) -> (u32, u32, u32, u32, usize) {
+    let mut bounds = (image.width, image.height, 0, 0, 0);
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let p = image.at(x, y);
+            let hit = match color {
+                0 => u16::from(p[1]) > u16::from(p[0]) + 20
+                    && u16::from(p[1]) > u16::from(p[2]) + 20,
+                1 => u16::from(p[0]) > u16::from(p[1]) + 20
+                    && u16::from(p[0]) > u16::from(p[2]) + 20,
+                2 => u16::from(p[2]) > u16::from(p[0]) + 20
+                    && u16::from(p[2]) > u16::from(p[1]) + 20,
+                3 => u16::from(p[0]) > u16::from(p[1]) + 20
+                    && u16::from(p[2]) > u16::from(p[1]) + 20,
+                _ => p[0] > 200 && p[1] > 200 && p[2] > 200,
+            };
+            if hit {
+                bounds.0 = bounds.0.min(x);
+                bounds.1 = bounds.1.min(y);
+                bounds.2 = bounds.2.max(x);
+                bounds.3 = bounds.3.max(y);
+                bounds.4 += 1;
+            }
+        }
+    }
+    bounds
+}
+
+#[test]
+fn viewmodel_projection_keeps_models_and_sprites_fixed_across_world_fov() {
+    let Some(narrow) = viewmodel_projection_image(30.) else {
+        return;
+    };
+    let standard = viewmodel_projection_image(70.).unwrap();
+    let wide = viewmodel_projection_image(110.).unwrap();
+    for color in 0..4 {
+        let expected = color_bounds(&standard, color);
+        assert!(expected.4 > 0, "standard color {color} is missing");
+        for (label, image) in [("narrow", &narrow), ("wide", &wide)] {
+            let actual = color_bounds(image, color);
+            assert_eq!(
+                (actual.0, actual.1, actual.2, actual.3),
+                (expected.0, expected.1, expected.2, expected.3),
+                "{label} color {color} bounds"
+            );
+            assert!(
+                actual.4.abs_diff(expected.4) <= expected.4 / 20 + 2,
+                "{label} color {color} coverage changed: {actual:?} vs {expected:?}"
+            );
+        }
+    }
+    assert_ne!(
+        color_bounds(&narrow, 4).4,
+        color_bounds(&wide, 4).4,
+        "unmarked world sprite responds to world FOV"
+    );
+}
+
 #[test]
 fn node_materials_tint_and_light_named_nodes_of_one_instance() {
     let Some(gpu) = crate::test_device::device_or_skip(exact_gpu::fixture::device()) else {

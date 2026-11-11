@@ -56,6 +56,7 @@ pub struct RendererWithAssets<const ASSETS: bool> {
     pub(crate) model_poses_current: bool,
     pub(crate) slot_list: Vec<u32>,
     pub(crate) uniform: wgpu::Buffer,
+    pub(crate) viewmodel_uniform: wgpu::Buffer,
     prepass_active: bool,
     transforms: [Buffer; 2],
     attachment_matrices: Buffer,
@@ -68,8 +69,10 @@ pub struct RendererWithAssets<const ASSETS: bool> {
     pub(crate) grids: u32,
     slots: Buffer,
     scene_binds: [wgpu::BindGroup; 2],
+    viewmodel_scene_binds: [wgpu::BindGroup; 2],
     /// The same scene group over the culled lists: binding 4 is a dynamic window.
     culled_binds: [wgpu::BindGroup; 2],
+    viewmodel_culled_binds: [wgpu::BindGroup; 2],
     culled_key: ListsKey,
     /// The camera's occlusion culling (occlusion.rs), made on first use.
     occlusion: Option<crate::occlusion::Occlusion>,
@@ -263,6 +266,12 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let viewmodel_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("game viewmodel frame"),
+            size: (frame::FLOATS * 4) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let transforms = [
             Buffer::new(
                 device,
@@ -304,12 +313,34 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             &environment,
             &lights,
         );
+        let viewmodel_retained_binds = scene_binds(
+            device,
+            &pipelines.scene_layout,
+            &viewmodel_uniform,
+            &transforms,
+            &materials,
+            (&slots.raw, None),
+            &attachment_matrices,
+            &environment,
+            &lights,
+        );
         let cull = crate::cull::Cull::new(device, pipelines.cache.handle.as_ref());
         let culled_key = (cull.compacted.raw.clone(), cull.binding());
         let culled_binds = scene_binds(
             device,
             &pipelines.scene_layout,
             &uniform,
+            &transforms,
+            &materials,
+            (&cull.compacted.raw, cull.binding()),
+            &attachment_matrices,
+            &environment,
+            &lights,
+        );
+        let viewmodel_culled_binds = scene_binds(
+            device,
+            &pipelines.scene_layout,
+            &viewmodel_uniform,
             &transforms,
             &materials,
             (&cull.compacted.raw, cull.binding()),
@@ -371,6 +402,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 device,
                 queue,
                 &uniform,
+                &viewmodel_uniform,
                 (samples, format),
                 pipelines.cache.handle.as_ref(),
             ),
@@ -383,6 +415,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             pipelines,
             outlines: None,
             uniform,
+            viewmodel_uniform,
             prepass_active: false,
             transforms,
             attachment_matrices,
@@ -393,7 +426,9 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             grids: 0,
             slots,
             scene_binds: retained_binds,
+            viewmodel_scene_binds: viewmodel_retained_binds,
             culled_binds,
+            viewmodel_culled_binds,
             culled_key,
             occlusion: None,
             occluding: false,
@@ -901,6 +936,17 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             &self.environment,
             &self.lights,
         );
+        self.viewmodel_scene_binds = scene_binds(
+            &self.device,
+            &self.pipelines.scene_layout,
+            &self.viewmodel_uniform,
+            &self.transforms,
+            &self.materials,
+            (&self.slots.raw, None),
+            &self.attachment_matrices,
+            &self.environment,
+            &self.lights,
+        );
         self.rebind_culled();
         self.rebind_locals();
     }
@@ -910,6 +956,17 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             &self.device,
             &self.pipelines.scene_layout,
             &self.uniform,
+            &self.transforms,
+            &self.materials,
+            (&self.cull.compacted.raw, self.cull.binding()),
+            &self.attachment_matrices,
+            &self.environment,
+            &self.lights,
+        );
+        self.viewmodel_culled_binds = scene_binds(
+            &self.device,
+            &self.pipelines.scene_layout,
+            &self.viewmodel_uniform,
             &self.transforms,
             &self.materials,
             (&self.cull.compacted.raw, self.cull.binding()),
