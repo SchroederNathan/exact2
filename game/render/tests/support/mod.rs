@@ -56,6 +56,7 @@ pub(super) fn frame() -> FrameInput<'static> {
         seconds: 0.,
         view: view::look_at_mat4(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y),
         proj: directx::orthographic(-4.0, 4.0, -2.5, 2.5, 0.1, 100.0),
+        viewmodel_proj: None,
         camera_position: Vec3::new(0.0, 0.0, 10.0),
         alpha: 1.0,
         sun: None,
