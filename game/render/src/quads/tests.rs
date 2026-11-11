@@ -165,6 +165,13 @@ fn revisions_reuse_owned_values_and_membership_compacts_in_order() {
     assert_eq!(emitters[1].value.state.births.as_ptr(), births);
     assert_eq!(emitters[1].value.rate, 91.);
     assert_eq!(sprites[0].value.frame, [32, 0, 16, 16]);
+    assert!(!sprites[0].viewmodel);
+    w.insert(entity, ViewModel);
+    feed::<Sprite>(&w, &mut sprites, false, false, false);
+    assert!(sprites[0].viewmodel);
+    w.remove::<ViewModel>(entity);
+    feed::<Sprite>(&w, &mut sprites, false, false, false);
+    assert!(!sprites[0].viewmodel);
     w.despawn(first);
     feed::<Emitter>(&w, &mut emitters, false, false, false);
     assert_eq!(emitters.len(), 1);

@@ -124,7 +124,12 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         let casters = ((1u32 << cascades) - 1) << 1;
         let mut groups = std::mem::take(&mut self.cull.groups);
         groups.clear();
-        self.viewmodels = self.quads.order.iter().any(|o| o.viewmodel);
+        self.viewmodels = self.quads.order.iter().any(|o| o.viewmodel)
+            || self
+                .quads
+                .draws
+                .iter()
+                .any(|draw| self.quads.draw_viewmodel(draw));
         for (index, batch) in self.batches.iter().enumerate() {
             if batch.slots.is_empty() {
                 continue;

@@ -413,6 +413,88 @@ fn blended_viewmodel_parts_draw_in_front_of_walls() {
     );
 }
 
+fn sprite_behind_wall(alpha: AlphaMode, marked: bool) -> Option<[u8; 4]> {
+    let gpu = crate::test_device::device_or_skip(exact_gpu::fixture::device())?;
+    let mut w = World::new(60, 0);
+    w.insert_resource(Environment {
+        background: Some([0., 0., 0.].into()),
+        fog: None,
+        bloom: None,
+        tone_mapping: ToneMapping::None,
+        ..Default::default()
+    });
+    w.spawn((
+        Transform {
+            position: Vec3::new(0., 0., 1.),
+            scale: Vec3::new(2., 2., 0.1),
+            ..Default::default()
+        },
+        Mesh::cube(1.),
+        Material::rgb(0., 0., 1.),
+    ));
+    let sprite = w.spawn((
+        Transform::default(),
+        Sprite {
+            alpha,
+            ..Sprite::new("red.tex", [1.5, 1.5])
+        },
+    ));
+    if marked {
+        w.insert(sprite, ViewModel);
+    }
+    w.spawn((Transform::at(0., 0., 5.), Camera::orthographic(4.)));
+    w.propagate();
+    let mut renderer = Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
+    renderer
+        .add_texture(
+            "red.tex",
+            &TextureData {
+                width: 1,
+                height: 1,
+                mips: vec![vec![255, 0, 0, 255]],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut feed = Feed::default();
+    feed.feed(&w, &mut renderer).unwrap();
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 64,
+            height: 64,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let frame = feed.frame(&w, 1., 1.);
+    renderer.draw(&target.create_view(&Default::default()), (64, 64), &frame);
+    Some(fixture::read(&gpu, &target).unwrap().at(32, 32))
+}
+
+#[test]
+fn sprites_marked_viewmodel_draw_in_front_of_walls_for_all_alpha_modes() {
+    for alpha in [AlphaMode::Opaque, AlphaMode::Mask, AlphaMode::Blend] {
+        let Some(plain) = sprite_behind_wall(alpha, false) else {
+            return;
+        };
+        let marked = sprite_behind_wall(alpha, true).unwrap();
+        assert!(
+            plain[2] > plain[0],
+            "wall hides unmarked {alpha:?}: {plain:?}"
+        );
+        assert!(
+            marked[0] > marked[2],
+            "viewmodel sprite shows {alpha:?}: {marked:?}"
+        );
+    }
+}
+
 #[test]
 fn node_materials_tint_and_light_named_nodes_of_one_instance() {
     let Some(gpu) = crate::test_device::device_or_skip(exact_gpu::fixture::device()) else {
