@@ -122,10 +122,10 @@ final class BoxLayerMacTests: XCTestCase {
             n.applyBoxLayer()
             if shadow { XCTAssertNotNil(n.clipBox) }
             let target = try XCTUnwrap(n.clipBox?.layer ?? n.layer)
-            n.layoutScale = CGPoint(x: 0.5, y: 0.5)
+            n.layoutResize = CGSize(width: -80, height: -40)
             n.applySurface()
             XCTAssertTrue(target.mask === n.surface?.clip)
-            n.layoutScale = CGPoint(x: 1, y: 1)
+            n.layoutResize = .zero
             n.applySurface()
             n.display()
             XCTAssertNil(n.surface)
@@ -239,7 +239,7 @@ final class BoxLayerMacTests: XCTestCase {
         let handle = bytes.withUnsafeBufferPointer { exact_calc_parse($0.baseAddress, $0.count) }
         let padding = try XCTUnwrap(CalculatedLength([
             "calc": .number(Double(handle)),
-            "env": [0, 0, 0, 0, 300, 600, 1, 1, 0]
+            "env": [0, 0, 0, 0, 300, 600, 1, 1, 0, 0]
         ]))
         let knots: NodeStyle = ["padding_top": .calculation(padding)]
         var style = knots
@@ -282,15 +282,16 @@ final class BoxLayerMacTests: XCTestCase {
         XCTAssertNil(card.layer?.backgroundColor)
         XCTAssertEqual(card.layer?.cornerRadius, 0)
         XCTAssertEqual(card.layer?.masksToBounds, false, "rounding clips nothing while the overflow is visible")
-        XCTAssertEqual(card.boxFill?.backgroundColor?.alpha, 1)
-        XCTAssertEqual(card.boxFill?.cornerRadius ?? 0, 24, accuracy: 0.001)
+        XCTAssertEqual((card.boxFill as? CAShapeLayer)?.fillColor?.alpha, 1)
+        XCTAssertEqual(card.boxFill?.cornerRadius, 0)
+        XCTAssertNotNil((card.boxFill as? CAShapeLayer)?.path)
         // The layer is flipped as the view is: minimum y is the top.
         XCTAssertEqual(card.boxFill?.maskedCorners, [.layerMinXMinYCorner, .layerMaxXMinYCorner])
         style["overflow_x"] = "hidden"; style["overflow_y"] = "hidden"
         let clipped = node(style)
-        XCTAssertEqual(clipped.layer?.backgroundColor?.alpha, 1, "a clipping box is rounded by its own mask")
-        XCTAssertEqual(clipped.layer?.cornerRadius ?? 0, 24, accuracy: 0.001)
-        XCTAssertNil(clipped.boxFill)
+        XCTAssertNotNil(clipped.layer?.mask, "a clipping box keeps its explicit corner outline")
+        XCTAssertEqual(clipped.layer?.cornerRadius, 0)
+        XCTAssertNotNil(clipped.boxFill as? CAShapeLayer)
     }
 
     /// The live row's waveform bar: a 3 × h pill of one colour.

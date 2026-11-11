@@ -4,7 +4,9 @@
 // as token-level edits (contract/cli/src/tamber_history.rs). Reads only.
 //
 // A design file is a `.tamber` file in the app's directory, or the design
-// app.json names wherever it is (the files `contract tamber serve` edits).
+// app.json names wherever it is, or one of the app's own Contract sources
+// the server has now (LLP 1121 stage 8 D: their state parts are the
+// design's; the files `contract tamber serve` edits).
 // A merge is read against its first parent; renames are a removal and an
 // addition.
 import { spawnSync } from 'node:child_process';
@@ -14,8 +16,11 @@ import { relative, resolve } from 'node:path';
 // git's empty tree: what a root commit's files are compared with.
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
+// Reading history never fetches: in a partial clone a missing object is an
+// error, not a `git fetch` with the repository's helpers (stage 10 A1: a
+// read-scope client reaches this).
 function git(cwd, args, input) {
-  const r = spawnSync('git', args, { cwd, input, maxBuffer: 1 << 30 });
+  const r = spawnSync('git', args, { cwd, input, maxBuffer: 1 << 30, env: { ...process.env, GIT_NO_LAZY_FETCH: '1' } });
   if (r.error) throw new Error(`git: ${r.error.message}`);
   if (r.status !== 0) throw new Error((r.stderr.toString() || `git ${args[0]} failed`).trim());
   return r.stdout;
@@ -29,12 +34,19 @@ function repository(appDir) {
   try { return { root: git(dir, ['rev-parse', '--show-toplevel']).toString().trim(), dir }; } catch { return null; }
 }
 
-/** The pathspecs of the design's files: `.tamber` beside the app, and the
- * design (`designFile`, from the app's directory) wherever it is. */
-function pathspecs(root, dir, designFile) {
+/** The pathspecs of the design's files: `.tamber` beside the app, the
+ * design (`designFile`, from the app's directory) wherever it is, and each
+ * of `contracts` (from the app's directory), or with `'all'` every
+ * `.contract` in the app outside `node_modules` (a revert's: one the app
+ * no longer reads is refused by name, not left out). */
+function pathspecs(root, dir, designFile, contracts = []) {
   const app = relative(root, dir);
   const glob = s => s.replace(/[*?[\\]/g, c => `\\${c}`);
-  return [`:(glob)${app ? `${glob(app)}/` : ''}*.tamber`, `:(literal)${relative(root, resolve(dir, designFile))}`];
+  const under = app ? `${glob(app)}/` : '';
+  const sources = contracts === 'all'
+    ? [`:(glob)${under}**/*.contract`, `:(glob,exclude)${under}**/node_modules/**`]
+    : contracts.map(f => `:(literal)${relative(root, resolve(dir, f))}`);
+  return [`:(glob)${under}*.tamber`, `:(literal)${relative(root, resolve(dir, designFile))}`, ...sources];
 }
 
 /** Each `<rev>:<path>`'s bytes as text, or null where it is missing: one
@@ -58,7 +70,7 @@ function texts(root, names) {
 /** One commit as history shows it: its facts, and each design file it
  * changed (against its first parent) with its text before and after. */
 function commitOf(root, dir, sha, specs) {
-  const [parents, author, email, date, ...message] = git(root, ['show', '-s', '--format=%P%x00%an%x00%ae%x00%aI%x00%B', sha]).toString().split('\0');
+  const [parents, author, email, date, ...message] = git(root, ['show', '--no-show-signature', '-s', '--format=%P%x00%an%x00%ae%x00%aI%x00%B', sha]).toString().split('\0');
   const parent = parents.split(' ').filter(Boolean)[0] ?? null;
   const listed = git(root, ['diff-tree', '-r', '-z', '--no-renames', '--name-status', parent ?? EMPTY_TREE, sha, '--', ...specs]).toString().split('\0').filter(Boolean);
   const changed = [];
@@ -78,19 +90,19 @@ function commitOf(root, dir, sha, specs) {
 /** The diff of each of `files` in commit `c`, by app path: one git diff a
  * file, by its literal path, so a name git would quote is no matter. */
 function diffs(root, c) {
-  return Object.fromEntries(c.files.map(f => [f.file, git(root, ['diff', '--no-color', '--no-renames', '--no-ext-diff', c.parent ?? EMPTY_TREE, c.commit, '--', `:(literal)${f.repoPath}`]).toString()]));
+  return Object.fromEntries(c.files.map(f => [f.file, git(root, ['diff', '--no-color', '--no-renames', '--no-ext-diff', '--no-textconv', c.parent ?? EMPTY_TREE, c.commit, '--', `:(literal)${f.repoPath}`]).toString()]));
 }
 
 /** Up to `limit` commits that touched the design's files, newest first,
  * after skipping `skip`; `more` when there are older ones. */
-export function designLog(appDir, designFile, { limit = 20, skip = 0 } = {}) {
+export function designLog(appDir, designFile, { limit = 20, skip = 0, contracts = [] } = {}) {
   const repo = repository(appDir);
   if (!repo) return { error: { message: 'the app is in no git repository' } };
   const { root, dir } = repo;
-  const specs = pathspecs(root, dir, designFile);
+  const specs = pathspecs(root, dir, designFile, contracts);
   let shas;
   try {
-    shas = git(root, ['log', '--format=%H', `--max-count=${limit + 1}`, `--skip=${skip}`, '--', ...specs]).toString().split('\n').filter(Boolean);
+    shas = git(root, ['log', '--no-show-signature', '--format=%H', `--max-count=${limit + 1}`, `--skip=${skip}`, '--', ...specs]).toString().split('\n').filter(Boolean);
   } catch (e) {
     // A repository with no commit yet has no history.
     if (/does not have any commits|bad default revision/.test(e.message)) return { ok: { commits: [], more: false } };
@@ -105,13 +117,13 @@ export function designLog(appDir, designFile, { limit = 20, skip = 0 } = {}) {
 }
 
 /** Commit `rev`'s design files, before and after it. */
-export function designCommit(appDir, designFile, rev) {
+export function designCommit(appDir, designFile, rev, contracts = []) {
   const repo = repository(appDir);
   if (!repo) return { error: { message: 'the app is in no git repository' } };
   if (typeof rev !== 'string' || !rev || rev.startsWith('-') || /[\0\s]/.test(rev)) return { status: 400, error: { message: '`commit` names a commit' } };
   const { root, dir } = repo;
   let sha;
   try { sha = git(root, ['rev-parse', '--verify', '-q', '--end-of-options', `${rev}^{commit}`]).toString().trim(); } catch { return { status: 404, error: { message: `no commit \`${rev}\`` } }; }
-  const c = commitOf(root, dir, sha, pathspecs(root, dir, designFile));
+  const c = commitOf(root, dir, sha, pathspecs(root, dir, designFile, contracts));
   return { ok: { ...c, files: c.files.map(({ repoPath, ...f }) => f) } };
 }

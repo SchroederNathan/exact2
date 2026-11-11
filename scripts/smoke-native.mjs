@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { jsTargetBuild, serveBuildTree, serveStatic } from '../host/web/serve.mjs';
 import { decodePng } from './png.mjs';
+import { resetLogs } from './agent-test.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const EXPECTED_EVENTS = 'press;change:changed;hover:true;focus;blur;key:Enter;submit;message:hello;';
@@ -71,6 +72,7 @@ export async function nativeSmoke({ host, open, check: record, webDist, shots, d
   // The standard artifact.
   const s = await open({ host });
   try {
+    await liveTimeSmoke(s, check, host);
     let t = await until(s, 'the fixture and the plain box reach ready', (t) => module(t, 'box')?.state === 'ready' && module(t, 'plain')?.state === 'ready');
     let logs = await s.logs();
     const lines = logs.lines.join('\n');
@@ -224,16 +226,16 @@ export async function nativeSmoke({ host, open, check: record, webDist, shots, d
         const done = await s.clock('settle'), st = await s.state();
         check(done.settled === true && st.slots.hatchPresses > 16 && st.hatches?.inFlight === 0, `${host} native: stopped, it settles: ${JSON.stringify(done)} after ${st.slots.hatchPresses} presses`);
       }
-      // Each platform handles the words app.json gives it (LLP
-      // 1075.003.000.001 §4.3, §5): the fixture's `detail-list` is iOS's
-      // alone, so elsewhere its node is shown, never called, and listed.
+      // Words the manifest gives another platform remain visible, uncalled and listed.
       {
         const st = (await s.state()).hatches, all = (await s.op({ op: 'logs', since: 0 })).lines.join('\n');
-        const here = host === 'ios' ? ['badge', 'clock', 'detail-list', 'dot', 'feed', 'presser'] : ['badge', 'clock', 'dot', 'feed', 'presser'];
+        const declared = Object.entries(JSON.parse(readFileSync(new URL('../apps/native-fixture/app.json', import.meta.url), 'utf8')).hatches);
+        const here = declared.filter(([, platforms]) => platforms.includes(host)).map(([word]) => word).sort();
+        const absent = declared.filter(([, platforms]) => !platforms.includes(host)).map(([word]) => word).sort();
         check(JSON.stringify(st?.platform) === JSON.stringify(here), `${host} native: state.hatches names the words this platform handles: ${JSON.stringify(st?.platform)}`);
-        if (host === 'ios') check(st?.unhandled?.length === 0 && st.words?.['detail-list']?.calls?.built === 1, `${host} native: iOS handles detail-list: ${JSON.stringify(st?.unhandled)}`);
-        else check(st?.unhandled?.length === 1 && st.unhandled[0].word === 'detail-list' && !st.words?.['detail-list'] && /hatch element detail-list: (not handled|the plan does not give it to this platform)/.test(all) && byTestId(await s.tree(), 'list-detail')?.props.hatch === 'detail-list',
+        check(JSON.stringify(st?.unhandled?.map(item => item.word).sort()) === JSON.stringify(absent) && absent.every(word => !st.words?.[word] && new RegExp(`hatch element ${word}: (not handled|the plan does not give it to this platform)`).test(all)) && byTestId(await s.tree(), 'list-detail')?.props.hatch === 'detail-list',
           `${host} native: a word this platform does not handle is shown, never called, and listed: ${JSON.stringify(st?.unhandled)}`);
+        if (host === 'ios') check(st.words?.['detail-list']?.calls?.built === 1, `${host} native: iOS handles detail-list`);
       }
       if (host === 'ios') {
         await s.tap('violate'); await settle(s);
@@ -520,7 +522,7 @@ export async function nativeSmoke({ host, open, check: record, webDist, shots, d
         // new page's agent. Polling ready after location.reload can see the
         // old page and pass just before navigation destroys its context.
         await s.carrier.reset({ keep: true });
-        s.now = 0; s.logCursor = 0;
+        s.now = 0; resetLogs(s);
       } else await s.carrier.evaluate(`fetch('./app.plan').then((r) => r.arrayBuffer()).then((b) => exact.reload(new Uint8Array(b)))`);
       t = await until(s, 'the reloaded plan attaches again', (t) => module(t, 'box')?.state === 'ready');
       const after = await s.carrier.evaluate('exact.nativeDefines?.count');
@@ -539,6 +541,20 @@ export async function nativeSmoke({ host, open, check: record, webDist, shots, d
     } finally { await d.close(); }
   }
 
+  if (host === 'ios' && !device) {
+    const d = await open({ host, chrome: 'platform', touch: 'platform' });
+    try {
+      await d.clock('settle');
+      const tap = await d.tap('header-search');
+      await d.clock('settle');
+      check(tap.delivery === 'platform' && (await d.state()).keyboard?.visible,
+        `${host} native: a real header search tap focuses UIKit's search field: ${JSON.stringify(tap)}`);
+      await d.type('header-search', 'fixture');
+      check(byTestId(await d.tree(), 'header-search')?.props.value === 'fixture', `${host} native: the projected search hears typing`);
+    } catch (error) { check(false, `${host} native: header search: ${error.message}`); }
+    finally { await d.close(); }
+  }
+
   // A route pushed in a sheet's own stack (Detail over Sheet), popped by
   // UIKit's bar Back and by the edge swipe, real touches both (a session
   // with UIKit's bars, `--chrome platform`, and the touch runner): each is
@@ -549,6 +565,10 @@ export async function nativeSmoke({ host, open, check: record, webDist, shots, d
   if (host === 'ios' && !device) {
     const d = await open({ host, chrome: 'platform', touch: 'drag' });
     try {
+      const segment = await d.tap('segment-missed');
+      check(segment.native === 'segmented-control' && (await d.state()).slots.segment === 'missed',
+        `${host} native: a platform-chrome header segment activates its route projection`);
+
       const stacks = async () => {
         const st = await d.state(), router = st.slots.nav.tabs.find((t) => t.name === st.slots.nav.tab).stack.map((e) => String(e.id));
         return { router, native: st.navigation?.stack ?? [], presentation: st.navigation?.presentation };
@@ -859,6 +879,7 @@ export async function paintingHatchSmoke({ host, open, check: record, shots }) {
 
   const s = await open({ host });
   try {
+    await liveTimeSmoke(s, check, host);
     // Connected after first pixel: the app, its window, and the nodes there.
     let h = await hatches(s), lines = await journal(s);
     const at = (re) => lines.findIndex((l) => re.test(l));
@@ -1076,4 +1097,18 @@ export async function paintingHatchSmoke({ host, open, check: record, shots }) {
   }
   rmSync(tmp, { recursive: true, force: true });
   console.log(`${host} hatches: ${checks - failed} of ${checks} checks passed in ${((Date.now() - t0) / 1000).toFixed(1)} s (LLP 1075.003.000.001 stage 4)`);
+}
+
+// The same presentation-only minute on every running host (LLP 1126 D6).
+async function liveTimeSmoke(s, check, host) {
+  const read = async () => {
+    const t = await s.tree();
+    const node = id => t.nodes.find(n => n.props.testId === id);
+    return { text: node('live-time')?.props.text, timer: node('live-timer')?.props.text, value: Number(node('live-progress')?.props.value) };
+  };
+  const before = await read();
+  await s.clock('+60000');
+  const after = await read();
+  check(/2/.test(before.text) && /3/.test(after.text) && before.text !== after.text, `${host} time: one minute changes ${JSON.stringify(before.text)} to ${JSON.stringify(after.text)}`);
+  check(before.timer !== after.timer && Math.abs(after.value - before.value - 0.5) < 0.001, `${host} time: timer and interval progress advance without an app task: ${JSON.stringify({ before, after })}`);
 }

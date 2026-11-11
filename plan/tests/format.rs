@@ -2,7 +2,7 @@
 //! and values conform to their shapes or are refused.
 
 use exact_plan::asm::Asm;
-use exact_plan::builder::PlanBuilder;
+use exact_plan::builder::{Face, PlanBuilder};
 use exact_plan::bytes::Reader;
 use exact_plan::{
     BindingKind, BindingsRow, Code, CodeError, EventKind, Opcode, Plan, PlanError, RegionKind,
@@ -112,22 +112,138 @@ fn resource_context_defaults_to_zero_and_decoding_refuses_an_oversized_tail() {
     ));
 }
 
-/// A plan linked into the program decodes to the same plan, its data pool
-/// left in the program's bytes rather than copied.
+/// A plan linked into the program decodes to the same plan, its pools and
+/// its lent tables left in the program's bytes until a row is edited.
 #[test]
-fn a_static_plan_keeps_its_data_pool_in_place() {
-    let plan = sample();
-    assert!(!plan.data.is_empty(), "the sample has constants");
+fn a_static_plan_lends_pools_and_rows_until_mutated() {
+    let mut plan = sample();
+    let mut binding = plan.binding(exact_plan::BindingsId(0));
+    binding.id = 0x1234;
+    binding.kind = BindingKind::Style;
+    binding.written = false;
+    plan.bindings.to_mut().push(binding);
+    plan.nodes.to_mut()[1].bindings.len = 2;
+    plan.nodes.to_mut()[1].order = 0x1234_5678;
+    plan.nodes.to_mut()[1].node_type = 0xab;
+    plan.validate().unwrap();
     let bytes: &'static [u8] = plan.encode().leak();
     let decoded = Plan::decode_static(bytes).unwrap();
+    let owned = Plan::decode(bytes).unwrap();
     assert_eq!(decoded, plan);
-    let range = bytes.as_ptr_range();
+    assert_eq!(decoded, owned);
+    assert_eq!(decoded.encode(), bytes);
+    assert_eq!(decoded.structure(), owned.structure());
+    assert!(decoded.bindings.is_lent());
+    assert!(decoded.nodes.is_lent());
+    assert!(!owned.bindings.is_lent());
+    assert!(!owned.nodes.is_lent());
+    assert!(!plan.bindings.is_lent());
+    assert!(!plan.nodes.is_lent());
+    assert!(!decoded.data.is_empty());
     assert!(matches!(decoded.data, std::borrow::Cow::Borrowed(_)));
-    assert!(range.contains(&decoded.data.as_ptr()));
+    assert!(bytes.as_ptr_range().contains(&decoded.data.as_ptr()));
+    assert!(matches!(owned.data, std::borrow::Cow::Owned(_)));
+    assert!(matches!(decoded.code, std::borrow::Cow::Borrowed(_)));
+    assert!(bytes.as_ptr_range().contains(&decoded.code.as_ptr()));
+    assert!(!decoded.bindings.is_empty());
+    assert!(!decoded.nodes.is_empty());
+    assert_eq!(decoded.bindings.iter().len(), owned.bindings.len());
+    assert_eq!(decoded.nodes.iter().len(), owned.nodes.len());
+    for (i, row) in owned.bindings.iter().enumerate() {
+        assert_eq!(decoded.binding(exact_plan::BindingsId(i as u32)), row);
+    }
+    for (i, row) in owned.nodes.iter().enumerate() {
+        assert_eq!(decoded.node(exact_plan::NodesId(i as u32)), row);
+    }
+    for i in [decoded.bindings.len(), usize::MAX] {
+        assert_eq!(decoded.bindings.get(i), None);
+    }
+    for i in [decoded.nodes.len(), usize::MAX] {
+        assert_eq!(decoded.nodes.get(i), None);
+    }
+    let mut edited = decoded.clone();
+    assert!(edited.bindings.is_lent());
+    assert!(edited.nodes.is_lent());
+    edited.bindings.to_mut()[0].written = false;
+    assert!(!edited.bindings.is_lent());
+    assert!(edited.nodes.is_lent());
+    edited.nodes.to_mut()[0].order = 7;
+    assert!(!edited.nodes.is_lent());
+    assert!(decoded.binding(exact_plan::BindingsId(0)).written);
+    assert_eq!(decoded.node(exact_plan::NodesId(0)).order, 0);
+    assert_ne!(edited, decoded);
+    edited.validate().unwrap();
+    assert_eq!(Plan::decode(&edited.encode()).unwrap(), edited);
+    let pointer = edited.bindings.to_mut().as_ptr();
+    assert_eq!(edited.bindings.to_mut().as_ptr(), pointer);
+    let mut builder = PlanBuilder::from_plan(decoded.clone());
+    builder.node(
+        0,
+        None,
+        None,
+        9,
+        &[decoded.binding(exact_plan::BindingsId(0))],
+        &[],
+        None,
+    );
+    let built = builder.finish().unwrap();
+    assert!(!built.bindings.is_lent());
+    assert!(!built.nodes.is_lent());
+    assert_eq!(built.nodes.len(), decoded.nodes.len() + 1);
+    assert_eq!(built.bindings.len(), decoded.bindings.len() + 1);
+
+    let empty = PlanBuilder::new(0, 0).finish().unwrap().encode().leak();
+    let empty = Plan::decode_static(empty).unwrap();
+    assert!(empty.bindings.is_lent() && empty.bindings.is_empty());
+    assert!(empty.nodes.is_lent() && empty.nodes.is_empty());
+    assert_eq!(empty.bindings.get(0), None);
+    assert_eq!(empty.nodes.iter().next(), None);
+}
+
+#[test]
+fn static_decode_refuses_truncation_corrupt_rows_and_bad_references() {
+    let plan = sample();
+    let bytes: &'static [u8] = plan.encode().leak();
+    for end in 0..bytes.len() {
+        let owned = Plan::decode(&bytes[..end]).unwrap_err();
+        assert_eq!(
+            Plan::decode_static(&bytes[..end]).unwrap_err(),
+            owned,
+            "end {end}"
+        );
+    }
+    let mut other = plan.clone();
+    other.bindings.to_mut()[0].kind = BindingKind::Style;
+    other.bindings.to_mut()[0].written = false;
+    other.nodes.to_mut()[0].parent = Some(exact_plan::NodesId(1));
+    other.nodes.to_mut()[0].bindings.len = 1;
+    let other = other.encode();
+    for at in (0..bytes.len()).filter(|&i| bytes[i] != other[i]) {
+        let mut bad = bytes.to_vec();
+        bad[at] = 0xfe;
+        let owned = Plan::decode(&bad).unwrap_err();
+        assert_eq!(
+            Plan::decode_static(bad.leak()).unwrap_err(),
+            owned,
+            "byte {at}"
+        );
+    }
+    let mut cycle = plan;
+    cycle.nodes.to_mut()[0].parent = Some(exact_plan::NodesId(1));
     assert!(matches!(
-        Plan::decode(bytes).unwrap().data,
-        std::borrow::Cow::Owned(_)
+        Plan::decode_static(cycle.encode().leak()),
+        Err(PlanError::SiteTooDeep { .. })
     ));
+}
+
+/// A face at `weight` (one weight, or a range) of normal width.
+fn face(source: &str, weight: [u16; 2]) -> Face<'_> {
+    Face {
+        source,
+        weight,
+        stretch: [1000, 1000],
+        italic: false,
+    }
 }
 
 #[test]
@@ -136,8 +252,8 @@ fn font_tables_round_trip_and_validate_their_identity_graph() {
     let family = b.font_family(
         "Fixture Sans",
         &[
-            ("assets/FixtureSans.ttf", 400, false),
-            ("assets/FixtureSans-Bold.ttf", 700, false),
+            face("assets/FixtureSans.ttf", [400, 400]),
+            face("assets/FixtureSans-Bold.ttf", [700, 700]),
         ],
     );
     let stack = b.font_stack(&[(StackMemberKind::Family, Some(family))]);
@@ -149,6 +265,7 @@ fn font_tables_round_trip_and_validate_their_identity_graph() {
 
     let mut duplicate_coordinate = plan.clone();
     duplicate_coordinate.faces[1].weight = 400;
+    duplicate_coordinate.faces[1].weight_max = 400;
     assert_eq!(
         duplicate_coordinate.validate(),
         Err(PlanError::DuplicateFace {
@@ -158,6 +275,27 @@ fn font_tables_round_trip_and_validate_their_identity_graph() {
             italic: false,
         })
     );
+
+    // A variable face's ranges: one face beside the static ones is not a
+    // duplicate, and a range that runs backwards is refused.
+    let mut ranged = plan.clone();
+    ranged.faces[1].weight = 100;
+    ranged.faces[1].weight_max = 900;
+    ranged.faces[1].stretch_min = 750;
+    ranged.faces[1].stretch_max = 1250;
+    assert_eq!(ranged.validate(), Ok(()));
+    let mut backwards = ranged.clone();
+    backwards.faces[1].weight_max = 99;
+    assert_eq!(
+        backwards.validate(),
+        Err(PlanError::FaceWeight {
+            face: 1,
+            weight: 100
+        })
+    );
+    let mut narrow = ranged;
+    narrow.faces[1].stretch_max = 700;
+    assert_eq!(narrow.validate(), Err(PlanError::FaceStretch { face: 1 }));
 
     let mut dangling = plan.clone();
     dangling.stack_members[8].family = Some(exact_plan::FamiliesId(99));
@@ -182,7 +320,7 @@ fn font_tables_round_trip_and_validate_their_identity_graph() {
 fn font_sources_are_portable_local_relative_paths() {
     let build = |source: &str| {
         let mut b = PlanBuilder::new(0xdead_beef, 0x1234);
-        let family = b.font_family("Fixture Sans", &[(source, 400, false)]);
+        let family = b.font_family("Fixture Sans", &[face(source, [400, 400])]);
         b.font_stack(&[(StackMemberKind::Family, Some(family))]);
         b.finish()
     };
@@ -216,7 +354,7 @@ fn font_sources_are_portable_local_relative_paths() {
 fn a_bool_is_zero_or_one_and_nothing_else() {
     let written = sample();
     let mut implied = sample();
-    implied.bindings[0].written = false;
+    implied.bindings.to_mut()[0].written = false;
     let (a, b) = (written.encode(), implied.encode());
     let differing: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
     assert_eq!(differing.len(), 1, "the bit is one byte of the plan");
@@ -293,9 +431,14 @@ fn loading_is_a_validation_pass() {
     // A code body that indexes a missing slot is refused by pc and table.
     let mut bad_code = plan.clone();
     let start = bad_code.code.len() as u32;
-    bad_code
-        .code
-        .extend_from_slice(&[Opcode::LoadSlot as u8, 7, 0, 0, 0, Opcode::Return as u8]);
+    bad_code.code.to_mut().extend_from_slice(&[
+        Opcode::LoadSlot as u8,
+        7,
+        0,
+        0,
+        0,
+        Opcode::Return as u8,
+    ]);
     bad_code.derives[0].body = Code {
         offset: start,
         len: 6,
@@ -317,7 +460,7 @@ fn loading_is_a_validation_pass() {
     // A body without a terminating Return is refused.
     let mut no_return = plan.clone();
     let start = no_return.code.len() as u32;
-    no_return.code.push(Opcode::Unit as u8);
+    no_return.code.to_mut().push(Opcode::Unit as u8);
     no_return.derives[0].body = Code {
         offset: start,
         len: 1,
@@ -333,7 +476,10 @@ fn loading_is_a_validation_pass() {
     // An unknown opcode byte is refused.
     let mut unknown = plan.clone();
     let start = unknown.code.len() as u32;
-    unknown.code.extend_from_slice(&[250, Opcode::Return as u8]);
+    unknown
+        .code
+        .to_mut()
+        .extend_from_slice(&[250, Opcode::Return as u8]);
     unknown.derives[0].body = Code {
         offset: start,
         len: 2,
@@ -478,9 +624,14 @@ fn control_flow_is_forward_only_and_instruction_aligned() {
     // A backward jump (`Jump 0; Return`) would loop forever at boot.
     let mut looping = plan.clone();
     let start = looping.code.len() as u32;
-    looping
-        .code
-        .extend_from_slice(&[Opcode::Jump as u8, 0, 0, 0, 0, Opcode::Return as u8]);
+    looping.code.to_mut().extend_from_slice(&[
+        Opcode::Jump as u8,
+        0,
+        0,
+        0,
+        0,
+        Opcode::Return as u8,
+    ]);
     looping.slots[0].init = Code {
         offset: start,
         len: 6,
@@ -500,7 +651,7 @@ fn control_flow_is_forward_only_and_instruction_aligned() {
     body.extend_from_slice(&1.0f64.to_le_bytes());
     body.push(Opcode::Return as u8);
     let len = body.len() as u32;
-    misaligned.code.extend_from_slice(&body);
+    misaligned.code.to_mut().extend_from_slice(&body);
     misaligned.slots[0].init = Code { offset: start, len };
     assert!(matches!(
         misaligned.validate(),
@@ -513,6 +664,7 @@ fn control_flow_is_forward_only_and_instruction_aligned() {
     let mut fine = plan.clone();
     let start = fine.code.len() as u32;
     fine.code
+        .to_mut()
         .extend_from_slice(&[Opcode::Jump as u8, 5, 0, 0, 0, Opcode::Return as u8]);
     fine.slots[0].init = Code {
         offset: start,
@@ -572,8 +724,8 @@ fn a_huge_announced_count_reserves_little_before_it_is_refused() {
     // (count > remaining), and never reserved 16M entries first.
     let plan = sample();
     let mut bytes = plan.encode();
-    // strings count sits right after the 44-byte header.
-    bytes[44..48].copy_from_slice(&(1u32 << 24).to_le_bytes());
+    // strings count sits right after the 52-byte header.
+    bytes[52..56].copy_from_slice(&(1u32 << 24).to_le_bytes());
     assert!(matches!(Plan::decode(&bytes), Err(PlanError::BadCount(_))));
 }
 
@@ -690,6 +842,8 @@ fn router_format_round_trips_and_checks_semantic_links() {
         ("depth", vec!["Router"], "number"),
         ("params", vec!["Router", "string"], "list<string>"),
         ("searchParam", vec!["Entry", "string"], "string"),
+        ("sharedFiles", vec!["Entry", "string"], "SharedFiles"),
+        ("fragment", vec!["Entry"], "string"),
         ("encodeURIComponent", vec!["string"], "string"),
         ("includes", vec!["any", "any"], "bool"),
         ("slice", vec!["any", "number", "number"], "any"),
@@ -725,7 +879,7 @@ fn sites_nest_at_most_max_site_depth_and_types_never_contain_themselves() {
         Err(PlanError::SiteTooDeep { table: "nodes", .. })
     ));
     let mut cycle = deep(2).unwrap();
-    cycle.nodes[0].parent = Some(exact_plan::NodesId(1));
+    cycle.nodes.to_mut()[0].parent = Some(exact_plan::NodesId(1));
     assert!(matches!(
         cycle.validate(),
         Err(PlanError::SiteTooDeep { .. })
@@ -749,7 +903,7 @@ fn a_callback_body_is_entered_and_left_only_at_its_ends() {
         let mut p = plan.clone();
         let start = p.code.len() as u32;
         let len = body.len() as u32;
-        p.code.extend_from_slice(&body);
+        p.code.to_mut().extend_from_slice(&body);
         p.slots[0].init = Code { offset: start, len };
         p.validate()
     };
@@ -832,4 +986,57 @@ fn a_plan_without_compiled_values_keeps_every_other_data_range() {
     same.resources = plan.resources.clone();
     same.data = plan.data.clone();
     assert_eq!(same, plan);
+}
+
+/// The `module_events` table joins the plan (LLP 1133.004 D6): a native
+/// module's event the root hears, a wake event's budget (LLP 1133.017 D5),
+/// and `currententrychange`, `navigatesuccess` and `navigateerror` the event
+/// kinds (LLP 1020.002 D2); `atompress` joins them (LLP 1045.000 D7), then
+/// `newwindow` and `download` (LLP 1020.002 D5), then `capture` (D7), then `userpromptopened` (D9), then an image's `enterpictureinpicture`, `leavepictureinpicture` and `pictureinpictureerror` (LLP 1042 §9). The `tools` table joins it (LLP 1133.023 D5, LLP 1111 D2), and the roster's `sharedFiles` (LLP 1133.024 D3), then `fragment` (LLP 1153 D5). Every host needs a new binary for this plan format. The format digest is pinned: a change to `tables/format.json`, a
+/// comment included, moves it, and every host then needs a new binary (LLP
+/// 1030 D3a).
+#[test]
+fn the_format_digest_is_pinned() {
+    assert_eq!(
+        FORMAT_DIGEST, 0x1ffa66411d8f7ae4,
+        "the plan format digest moved: if intended, name the break and the hosts that move"
+    );
+}
+
+#[test]
+fn invalid_timer_wait_rows_are_refused_by_the_decoder() {
+    for (wait, maximum, frame, tolerance) in [
+        (5, 0, false, 0),
+        (255, 0, false, 0),
+        (0, 1, false, 0),
+        (1, 1, false, 0),
+        (2, 1, false, 0),
+        (1, 0, true, 0),
+        (2, 0, true, 0),
+        (3, 0, true, 0),
+        (4, 0, true, 0),
+        (0, 0, true, 1),
+        (1, 0, false, 1),
+        (2, 0, false, 1),
+        (3, 0, false, 1),
+        (4, 0, false, 1),
+    ] {
+        let mut plan = sample();
+        let row = &mut plan.timers[0];
+        row.wait = wait;
+        row.max_ms = maximum;
+        row.frame = frame;
+        row.tolerance_ms = tolerance;
+        if frame {
+            row.interval_ms = 0;
+            row.once = false;
+        }
+        assert!(
+            matches!(
+                Plan::decode(&plan.encode()),
+                Err(PlanError::TimerWait { timer: 0 })
+            ),
+            "wait={wait} max={maximum} frame={frame} tolerance={tolerance}"
+        );
+    }
 }

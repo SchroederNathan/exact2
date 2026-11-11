@@ -879,13 +879,20 @@ pub unsafe extern "C" fn ibex2_async_begin(
         return 1;
     };
     if op == AsyncOp::FsCompressImage {
-        if raw.len() != 4 {
+        // Exact patch 9 (exact2 LLP 1069.002 A1.11): a fifth, the media type.
+        // Patch 9a (exact2 LLP 1133.019 D17): a sixth, the edit's JSON; or
+        // `transformImage`'s three, its options' JSON third.
+        let transform = raw.len() == 3;
+        if !(3..=6).contains(&raw.len()) {
             return 1;
         }
         for (index, value) in raw.iter().enumerate() {
             match (index, value.borrow()) {
                 (0 | 1, Ok(HostArg::Str(text))) if text.len() <= 32_768 => {}
-                (2 | 3, Ok(HostArg::Number(_))) => {}
+                (2, Ok(HostArg::Str(text))) if transform && text.len() <= 4096 => {}
+                (2 | 3, Ok(HostArg::Number(_))) if !transform => {}
+                (4, Ok(HostArg::Str(text))) if text.len() <= 32 => {}
+                (5, Ok(HostArg::Str(text))) if text.len() <= 4096 => {}
                 _ => return 1,
             }
         }
@@ -935,7 +942,14 @@ pub unsafe extern "C" fn ibex2_async_begin(
     let work = move || {
         let result = match image_job {
             Some(Ok(job)) => job.execute().map(|image| {
-                HostValue::Str(format!("{}\t{}\t{}", image.width, image.height, image.size))
+                let (w, h, size) = (image.width, image.height, image.size);
+                HostValue::Str(match (image.path, image.report) {
+                    // Exact patch 9a: a transform's path and report follow.
+                    (Some(path), report) => {
+                        format!("{w}\t{h}\t{size}\t{path}\t{}", report.unwrap_or_default())
+                    }
+                    (None, _) => format!("{w}\t{h}\t{size}"),
+                })
             }),
             Some(Err(error)) => Err(error),
             None => match fetch_headers {
@@ -962,6 +976,31 @@ fn prepare_image_args(
     grants: std::sync::Arc<GrantSet>,
     task_id: u64,
 ) -> Result<crate::stdlib::fs_image::ImageJob, HostError> {
+    // Exact patch 9a (exact2 LLP 1133.019 D17): one JSON value of options,
+    // which the codec reads. `transformImage` is (from, to, options);
+    // `compressImage` may add its edit after its type.
+    let options = |value: Option<&HostValue>| match value {
+        None | Some(HostValue::Undefined | HostValue::Null) => Ok(None),
+        Some(HostValue::Str(json)) if json.len() <= 4096 => Ok(Some(json.as_str().into())),
+        Some(_) => Err(HostError::InvalidArgument(
+            "image options must be one JSON string of at most 4096 bytes".into(),
+        )),
+    };
+    if let (Some(HostValue::Str(from)), Some(HostValue::Str(to)), Some(HostValue::Str(_))) =
+        (args.first(), args.get(1), args.get(2))
+    {
+        return state.prepare_image(
+            task_id,
+            grants,
+            from,
+            to,
+            crate::stdlib::fs_image::ImageRequest {
+                options: options(args.get(2))?,
+                transform: true,
+                ..Default::default()
+            },
+        );
+    }
     let (
         Some(HostValue::Str(from)),
         Some(HostValue::Str(to)),
@@ -972,6 +1011,17 @@ fn prepare_image_args(
         return Err(HostError::InvalidArgument(
             "compressImage expects from, to, maxDimension, maxBytes".into(),
         ));
+    };
+    // Exact patch 9 (exact2 LLP 1069.002 A1.11): an optional media type last.
+    let format = match args.get(4) {
+        None => crate::stdlib::fs_image::ImageFormat::Jpeg,
+        Some(HostValue::Str(t)) if t == "image/jpeg" => crate::stdlib::fs_image::ImageFormat::Jpeg,
+        Some(HostValue::Str(t)) if t == "image/png" => crate::stdlib::fs_image::ImageFormat::Png,
+        Some(_) => {
+            return Err(HostError::InvalidArgument(
+                "compressImage type must be image/jpeg or image/png".into(),
+            ))
+        }
     };
     if !dimension.is_finite()
         || dimension.fract() != 0.0
@@ -992,6 +1042,9 @@ fn prepare_image_args(
         crate::stdlib::fs_image::ImageRequest {
             max_dimension: *dimension as u32,
             max_bytes: *bytes as u64,
+            format,
+            options: options(args.get(5))?,
+            transform: false,
         },
     )
 }
@@ -1021,6 +1074,14 @@ enum AsyncOp {
     FsRealpath = host_opcodes::async_ops::FS_REALPATH,
     FsAtomicWriteFile = host_opcodes::async_ops::FS_ATOMIC_WRITE_FILE,
     FsCompressImage = host_opcodes::async_ops::FS_COMPRESS_IMAGE,
+    FsLstat = host_opcodes::async_ops::FS_LSTAT,
+    FsReadlink = host_opcodes::async_ops::FS_READLINK,
+    FsAccess = host_opcodes::async_ops::FS_ACCESS,
+    FsChmod = host_opcodes::async_ops::FS_CHMOD,
+    FsSymlink = host_opcodes::async_ops::FS_SYMLINK,
+    FsDigest = host_opcodes::async_ops::FS_DIGEST,
+    FsFlock = host_opcodes::async_ops::FS_FLOCK,
+    FsUnlock = host_opcodes::async_ops::FS_UNLOCK,
     SqliteOpen = host_opcodes::sqlite_async::OPEN,
     SqlitePrepare = host_opcodes::sqlite_async::PREPARE,
     SqliteExecute = host_opcodes::sqlite_async::EXECUTE,
@@ -1050,6 +1111,14 @@ impl AsyncOp {
             host_opcodes::async_ops::FS_REALPATH => Some(AsyncOp::FsRealpath),
             host_opcodes::async_ops::FS_ATOMIC_WRITE_FILE => Some(AsyncOp::FsAtomicWriteFile),
             host_opcodes::async_ops::FS_COMPRESS_IMAGE => Some(AsyncOp::FsCompressImage),
+            host_opcodes::async_ops::FS_LSTAT => Some(AsyncOp::FsLstat),
+            host_opcodes::async_ops::FS_READLINK => Some(AsyncOp::FsReadlink),
+            host_opcodes::async_ops::FS_ACCESS => Some(AsyncOp::FsAccess),
+            host_opcodes::async_ops::FS_CHMOD => Some(AsyncOp::FsChmod),
+            host_opcodes::async_ops::FS_SYMLINK => Some(AsyncOp::FsSymlink),
+            host_opcodes::async_ops::FS_DIGEST => Some(AsyncOp::FsDigest),
+            host_opcodes::async_ops::FS_FLOCK => Some(AsyncOp::FsFlock),
+            host_opcodes::async_ops::FS_UNLOCK => Some(AsyncOp::FsUnlock),
             host_opcodes::sqlite_async::OPEN => Some(AsyncOp::SqliteOpen),
             host_opcodes::sqlite_async::PREPARE => Some(AsyncOp::SqlitePrepare),
             host_opcodes::sqlite_async::EXECUTE => Some(AsyncOp::SqliteExecute),
@@ -1115,6 +1184,20 @@ fn run_async(
         .contains(&(op as u32))
     {
         return crate::sqlite_abi::run(op as u32, args, state, grants);
+    }
+    if op == AsyncOp::FsUnlock {
+        return unlock(args, state);
+    }
+    if op == AsyncOp::FsFlock {
+        let taken = run_fs(
+            crate::stdlib::fs::FsOp::Flock,
+            args,
+            grants,
+            state.app_directories(),
+            state.documents(),
+            state.storage_limits(),
+        )?;
+        return held(taken, state);
     }
     if let Some(fs_op) = fs_op_for(op) {
         return run_fs(
@@ -1215,8 +1298,45 @@ fn fs_op_for(op: AsyncOp) -> Option<crate::stdlib::fs::FsOp> {
         AsyncOp::FsCopyFile => FsOp::CopyFile,
         AsyncOp::FsRealpath => FsOp::Realpath,
         AsyncOp::FsAtomicWriteFile => FsOp::AtomicWriteFile,
+        AsyncOp::FsLstat => FsOp::Lstat,
+        AsyncOp::FsReadlink => FsOp::Readlink,
+        AsyncOp::FsAccess => FsOp::Access,
+        AsyncOp::FsChmod => FsOp::Chmod,
+        AsyncOp::FsSymlink => FsOp::Symlink,
+        AsyncOp::FsDigest => FsOp::Digest,
+        AsyncOp::FsFlock => FsOp::Flock,
+        AsyncOp::FsUnlock => FsOp::Unlock,
         _ => return None,
     })
+}
+
+/// A lock `flock` took moves to the runtime that asked (exact2 LLP 1133.007
+/// D6a): its handle there is the one the code gets.
+fn held(taken: HostValue, state: &crate::task::RuntimeState) -> Result<HostValue, HostError> {
+    let HostValue::Str(transfer) = taken else {
+        return Err(HostError::Failed("flock: no lock".into()));
+    };
+    let file = crate::stdlib::fs_more::take(&transfer)
+        .ok_or_else(|| HostError::Failed("flock: the lock was lost".into()))?;
+    let mut locks = state.file_locks.lock().unwrap_or_else(|e| e.into_inner());
+    locks.0 += 1;
+    let handle = locks.0;
+    locks.1.insert(handle, file);
+    Ok(HostValue::Str(handle.to_string()))
+}
+
+/// Release one of this runtime's locks; another runtime's handle names none.
+fn unlock(args: &[HostValue], state: &crate::task::RuntimeState) -> Result<HostValue, HostError> {
+    let handle = match args.first() {
+        Some(HostValue::Str(h)) => h.parse::<u64>().ok(),
+        Some(HostValue::Number(n)) => Some(*n as u64),
+        _ => None,
+    };
+    let mut locks = state.file_locks.lock().unwrap_or_else(|e| e.into_inner());
+    match handle.and_then(|h| locks.1.remove(&h)) {
+        Some(_) => Ok(HostValue::Undefined),
+        None => Err(HostError::Failed("unlock: no lock with that handle".into())),
+    }
 }
 
 /// Normalize, admit, then act — in that order, always.
@@ -1247,10 +1367,24 @@ fn run_fs(
         None
     };
 
-    // Data is the second argument for single-path writes.
+    // Data is the second argument for single-path writes; D6a's take theirs
+    // as text: a mode, a link's target, an algorithm, a lock's timeout. A
+    // link names its target first, as Node's `symlink(target, path)`.
+    use crate::stdlib::fs::FsOp;
+    let takes = matches!(op, FsOp::Access | FsOp::Chmod | FsOp::Digest | FsOp::Flock);
+    let argument: Option<Vec<u8>> = match (op, args.get(1)) {
+        (FsOp::Symlink, _) => Some(path.as_bytes().to_vec()),
+        (_, Some(HostValue::Number(n))) if takes => Some(format!("{n}").into_bytes()),
+        (_, Some(HostValue::Str(text))) if takes => Some(text.clone().into_bytes()),
+        _ => None,
+    };
+    let path = match op {
+        FsOp::Symlink => path_arg(1)?,
+        _ => path,
+    };
     let data = match args.get(1) {
         Some(HostValue::Bytes(bytes)) => Some(bytes.as_slice()),
-        _ => None,
+        _ => argument.as_deref(),
     };
 
     if matches!(
@@ -1283,11 +1417,13 @@ fn run_fs(
             // turns this flat record into an array without a document codec.
             FsResult::Names(names) => HostValue::Str(names.join("\0")),
             FsResult::Stat(stat) => HostValue::Str(format!(
-                "{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}",
                 stat.size,
                 u8::from(stat.is_file),
                 u8::from(stat.is_directory),
-                stat.modified_ms
+                stat.modified_ms,
+                stat.mode,
+                u8::from(stat.is_symlink)
             )),
         },
     )

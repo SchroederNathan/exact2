@@ -5,7 +5,10 @@
 // with the keys the collection names), installed on list.js's collections
 // by the motion piece when a plan has a reorder drag, so a list without one
 // carries none of it.
-import { clock, every, commit, journal } from "./rt.js";
+import { inertAncestor } from './navigation.js';
+import { rt } from "./rt-link.js"; // (rt.js's own, as a lazy chunk takes them: rt-link.js)
+const { clock, every, commit, journal } = rt;
+import { dragTarget } from './drag-target.js';
 
 // The runner's journal line (rt.js `say`).
 const say = line => journal.push(`t=${clock.now} ${line}`);
@@ -50,7 +53,7 @@ export function install({ internals: { Collection, Lists, Views, find, minEpoch,
       if (!source) return false;
       const p = this.index.pos.get(source);
       this.preview = { binding, token, source, before: this.index.order[p + 1] ?? null, height: this.index.h[p], terminal: false, pinOwned: true, handle, certified: null,
-        outgoing: false, holding: false, stepped: false, grouped: false };
+        outgoing: false, holding: false, dropped: false, stepped: false, grouped: false };
       this.emitPreview();
       return true;
     },
@@ -72,8 +75,35 @@ export function install({ internals: { Collection, Lists, Views, find, minEpoch,
       if (!p || p.terminal || p.holding || !(p.stepped || p.certified && GEOMETRY.every(k => p.certified[k] === g[k]))) return null;
       if (!this.index.pos.has(p.source) || (p.before !== null && !this.index.pos.has(p.before))) return null;
       const drop = [p.source.slice(2), p.before === null ? null : p.before.slice(2)];
+      p.dropped = true;
       this.endPreview();
       return drop;
+    },
+    settleDropAnchor(failed) {
+      const p = this.preview;
+      if (!p?.dropped) return;
+      const at = this.index.pos.get(p.source);
+      if (failed || at === undefined || (this.index.order[at + 1] ?? null) === p.before) p.dropped = false;
+    },
+    dropAnchor() {
+      const p = this.preview, g = this.geometry;
+      if (!p || !p.dropped || !g) return null;
+      return { source:p.source, before:p.before, anchor:this.index.anchor(this.anchorOffset(g.offset, g.port_main), g.port_main, this.follows(), p.source) };
+    },
+    committedAnchor(ordinary, drop) {
+      if (!drop) return ordinary;
+      const order = drop.anchor.order, now = this.index.pos.get(drop.source);
+      if (now !== undefined && (this.index.order[now + 1] ?? null) !== drop.before) return ordinary;
+      this.settleDropAnchor(false);
+      // Updates that do not move a surviving source keep the ordinary anchor.
+      if (now === undefined || order === this.index.order) return ordinary;
+      const old = order.indexOf(drop.source);
+      if (old < 0) return ordinary;
+      let before, after;
+      for (let i = old - 1; i >= 0 && before === undefined; i--) before = this.index.pos.get(order[i]);
+      for (let i = old + 1; i < order.length && after === undefined; i++) after = this.index.pos.get(order[i]);
+      if (!(before > now || after < now)) return ordinary;
+      return drop.anchor;
     },
     // A hold is ended only by its own endings (LLP 1094 D8, `endHold`).
     endPreview() {
@@ -184,13 +214,13 @@ export function install({ internals: { Collection, Lists, Views, find, minEpoch,
       const p = this.preview;
       if (!p || p.terminal || p.holding || !(p.stepped || p.certified && GEOMETRY.every(k => p.certified[k] === g[k]))) return null;
       if (!this.index.pos.has(p.source) || (p.before !== null && !this.index.pos.has(p.before))) return null;
-      p.holding = true; p.certified = null;
+      p.holding = true; p.dropped = true; p.certified = null;
       return [p.source.slice(2), p.before === null ? null : p.before.slice(2)];
     },
     holdOutgoing() { if (this.preview) { this.preview.holding = true; this.preview.certified = null; } },
     endHold(instant) {
       const p = this.preview;
-      if (p) { p.holding = false; p.terminal = true; p.certified = null; }
+      if (p) { p.holding = false; p.dropped = false; p.terminal = true; p.certified = null; }
       const was = this.instant; this.instant = instant; this.emitPreview(); this.instant = was;
     },
     setHidden(ident) { this.hidden = ident; this.emitPreview(); if (ident == null) delete this.hidden; },
@@ -241,21 +271,12 @@ export function install({ internals: { Collection, Lists, Views, find, minEpoch,
   const HEIGHT_NOISE = 0.01;
   const GEOMETRY = ["list", "revision", "scrollSequence", "scrollTop", "portWidth", "portHeight", "rowWidth", "totalExtent"];
   let ReorderOwner = null, ReorderSerial = 0;
-  /** A grip's binding: its `reorderFor` list (the strict ancestor the
-   * compiler resolved) with a `reorderdrop`, every box on the way live. */
+  /** A grip's binding: its unique named ancestor with a `reorderdrop`,
+   * every box on the way live. */
   function reorderBinding(handle) {
-    const el = Views.get(handle), list = el?.$reorderList ?? named(el), c = list?.$list;
-    if (!c || !list.$reorderdrop || !el.isConnected || el.closest("[inert],[disabled]") || !el.getClientRects().length) return null;
+    const el = Views.get(handle), list = dragTarget(el, 'reorderfor'), c = list?.$list;
+    if (!c || !list.$reorderdrop || !el.isConnected || inertAncestor(el) || el.closest("[disabled]") || !el.getClientRects().length) return null;
     return c.reorderBinding(handle);
-  }
-  // A computed `reorderFor` names its list at run time: the one strict
-  // ancestor with that `id` (runner `reorder_binding`).
-  function named(el) {
-    const name = el?.dataset.reorderfor;
-    if (!name) return null;
-    let found = null;
-    for (let a = el.parentElement; a; a = a.parentElement) if (a.id === name) { if (found) return null; found = a; }
-    return found;
   }
   const sameBinding = (a, b) => !!a && !!b && ["handle", "list", "wrapper", "root", "rowEpoch"].every(k => a[k] === b[k]);
   const sameGeometry = (a, b) => !!a && !!b && GEOMETRY.every(k => a[k] === b[k]);
@@ -304,6 +325,13 @@ export function install({ internals: { Collection, Lists, Views, find, minEpoch,
     if (!hasReorder(s.token)) { endSession(s, null, false); return; }
     if (s.target !== s.source && Lists.get(s.target.view) !== s.target) { s.source.setOutgoing(false); s.target = s.source; }
   }
+  function dispatchDrop(target, args, session = null) {
+    const owner = ReorderOwner, token = owner.preview.token;
+    return commit(() => target.el.$reorderdrop(...args), "action", ok => {
+      if (owner.preview?.token === token) owner.settleDropAnchor(!ok);
+      if (!ok && session && Session === session && session.phase === "holding") endSession(session, null, false);
+    });
+  }
   const Reorder = {
     binding: reorderBinding,
     geometry: view => Lists.get(view)?.reorderGeometry() ?? null,
@@ -325,10 +353,15 @@ export function install({ internals: { Collection, Lists, Views, find, minEpoch,
       if (!hasReorder(token) || !sameGeometry(ReorderOwner.reorderGeometry(), geometry)) return false;
       const drop = ReorderOwner.previewDrop(geometry);
       if (!drop) return false;
-      ReorderOwner.el.$reorderdrop(drop[0], drop[1]);
+      dispatchDrop(ReorderOwner, drop);
       return true;
     },
-    cancel(token) { const p = ReorderOwner?.preview; if (p && p.token === token && !p.terminal && p.pinOwned) ReorderOwner.endPreview(); },
+    cancel(token) {
+      const p = ReorderOwner?.preview;
+      if (!p || p.token !== token || p.holding) return;
+      p.dropped = false;
+      if (!p.terminal && p.pinOwned) ReorderOwner.endPreview();
+    },
     frame(token) {
       const f = ReorderOwner?.previewFrame(token) ?? null, s = Session;
       if (!f || !s || s.token !== token) return f;
@@ -424,7 +457,7 @@ export function install({ internals: { Collection, Lists, Views, find, minEpoch,
       s.phase = "holding"; s.deadline = clock.now + HOLD_MS;
       every(HOLD_MS, () => { if (Session === s && s.phase === "holding") return commit(() => { say("reorderdrop: the move did not show within 1 s"); endSession(s, "timeout", false); }, "reorderdrop hold"); return true; }, true);
       s.timer = clock.timers.at(-1);
-      t.el.$reorderdrop(item, before, [listId(s.source), listId(t)]);
+      dispatchDrop(t, [item, before, [listId(s.source), listId(t)]], s);
       return true;
     },
     cancelGroup(token) { const s = grouped(token); if (s && s.phase === "active") endSession(s, null, false); },

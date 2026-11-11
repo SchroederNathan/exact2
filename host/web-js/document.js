@@ -77,18 +77,59 @@ function publish() {
 export function projectRoots(history, navigate, say, after, hostBack, hostGo, routeMatches) {
   const root = document.getElementById("exact-root"), project = () => history.project(root, say);
   history.connect(root, navigate, say, hostBack, hostGo, routeMatches, true);
-  after.push(project); history.activate(root, say);
+  after.push(project, markDocument); history.activate(root, say);
+}
+
+/** Project route visibility before startup. A modal keeps the underlying page
+ * and intervening sheets visible but inert, as navigation.js `project` does. */
+export function markRoutes(root) {
+  for (const nav of [...root.getElementsByTagName("*")].filter(e => e.hasAttribute("navigationBack"))) {
+    const key = nav.getAttribute("navigationKey"), panels = panelsOf(nav);
+    const stacks = (panels.length ? panels : [nav]).map(p => [...p.children].filter(r => r.hasAttribute("navigationKey")));
+    const at = stacks.findIndex(routes => routes.some(r => r.getAttribute("navigationKey") === key));
+    if (at < 0) continue;
+    const mark = (e, hidden, inert) => { if (hidden) e.style.setProperty("visibility", "hidden"); if (inert) e.setAttribute("inert", ""); };
+    panels.forEach((p, i) => mark(p, i !== at, i !== at));
+    stacks.forEach((routes, i) => {
+      const shown = i === at ? routes.findIndex(r => r.getAttribute("navigationKey") === key) : routes.length - 1;
+      const sheet = routes[shown]?.getAttribute("navigationPresentation") === "modal";
+      const beneath = routes.findLastIndex((r, j) => j < shown && r.getAttribute("navigationPresentation") !== "modal");
+      routes.forEach((r, j) => mark(r, j !== shown && !(sheet && j >= beneath && j < shown), j !== shown));
+    });
+  }
 }
 
 /** The elements that may be the page's scroller: `<html data-scrolldocument>`
- * while one is (D4), which the shell's rule reads, as the web host's glue. */
+ * while one is (D4), which the shell's rule reads, as the web host's glue.
+ * One in a route or panel the projection hid is `data-exact-offpage`, an inner
+ * scroller again, so a covered route's content leaves the page's height. When
+ * the page's one scroller changes, it is given the page's scroll it last had:
+ * a route opened anew starts at its top, one shown again where the reader left
+ * it. Each one's place is kept as the page scrolls, since by the time a commit
+ * switches them, moving the focus into the route shown may have scrolled the
+ * page. The page's scroller's ancestors in the root are `data-exact-frame`,
+ * which the shell's rule lays out in flow and as tall as their content (a
+ * `:has()` would cost a style recalculation at every change). */
 export const Docs = new Set();
-let Marked = false;
+let Marked = false, Page = null, Listening = false, Path = [];
+const Scrolled = new WeakMap();
+const hidden = e => { for (let a = e; a; a = a.parentElement) if (a.style?.getPropertyValue("visibility") === "hidden") return true; return false; };
 export function markDocument() {
   if (!Docs.size && !Marked) return;
-  Marked = false;
-  for (const e of Docs) if (!e.isConnected) Docs.delete(e); else Marked ||= e.getAttribute("data-scrolldocument") === "true";
+  const live = [];
+  for (const e of Docs) if (!e.isConnected) Docs.delete(e); else if (e.getAttribute("data-scrolldocument") === "true") (hidden(e) ? e.setAttribute("data-exact-offpage", "") : live.push(e));
+  const page = live.length === 1 ? live[0] : null, scrolls = typeof globalThis.scrollTo === "function" && typeof globalThis.scrollY === "number";
+  if (scrolls && !Listening) { Listening = true; addEventListener("scroll", () => { if (Page?.isConnected) Scrolled.set(Page, [scrollX, scrollY]); }, { passive: true }); }
+  for (const e of live) e.removeAttribute("data-exact-offpage");
+  Marked = live.length > 0;
   document.documentElement?.toggleAttribute?.("data-scrolldocument", Marked);
+  const path = [];
+  for (let a = page?.parentElement; a && a.id !== "exact-root"; a = a.parentElement) path.push(a);
+  for (const a of Path) if (!path.includes(a)) a.removeAttribute("data-exact-frame");
+  for (const a of path) if (!a.hasAttribute("data-exact-frame")) a.setAttribute("data-exact-frame", "");
+  Path = path;
+  // One that left the page (a popped route, or the rendered page's, adopted) hands nothing on.
+  if (page && Page !== page) { if (scrolls && (Page?.isConnected || Scrolled.has(page))) scrollTo(...(Scrolled.get(page) ?? [0, 0])); Page = page; }
 }
 
 // @ref LLP 1075.003 §3.7 — a navigation tab is built the first time it is

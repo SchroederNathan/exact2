@@ -115,7 +115,7 @@ final class SurfaceRecordTests: XCTestCase {
         entry.id = 0
     }
     func testModuleDigestSurvivesReSigningButNotACodeChange() {
-        // A 64-bit Mach-O: __LINKEDIT, the signature command, code, and the signature at 160 (bake/src/receipt.rs).
+        // A 64-bit Mach-O: __LINKEDIT, the signature command, code, and the signature at 160 (update/src/gpu.rs).
         func signed(_ signature: String, code: UInt8) -> Data {
             var b = [UInt8](repeating: 0, count: 160)
             func put<T: FixedWidthInteger>(_ v: T, _ at: Int) { withUnsafeBytes(of: v.littleEndian) { b.replaceSubrange(at..<(at + MemoryLayout<T>.size), with: $0) } }
@@ -152,6 +152,9 @@ final class SurfaceRecordTests: XCTestCase {
         XCTAssertEqual(GpuModule.modulePath(defaultPath:"baked", compat:compat(card), environment:["EXACT_GPU_DYLIB":"override"]), "baked")
         var dev = card; dev["trust"] = "development"
         XCTAssertEqual(GpuModule.modulePath(defaultPath:"baked", compat:compat(dev), environment:["EXACT_GPU_DYLIB":"override"]), "override")
+        // A production bake with no updater (L=0, no trust in its cohort) takes no override, whatever its card says.
+        var zero = compat(dev); zero["embedded"] = ["gpu":dev, "trust":"production"]
+        XCTAssertEqual(GpuModule.modulePath(defaultPath:"baked", compat:zero, environment:["EXACT_GPU_DYLIB":"override"]), "baked")
     }
     func testLostSurfaceLeavesFrameSchedulingUntilRecreated() throws {
         let session = try fixture()

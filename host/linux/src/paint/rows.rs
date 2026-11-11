@@ -12,6 +12,7 @@
 //! a node only makes the row suspect: kept while every node sits where it
 //! sat relative to the row.
 use super::*;
+use exact_ink::counters::{self, Counter};
 use exact_kernel::id::{IdMap, IdSet};
 use exact_kernel::NodeKey;
 
@@ -67,6 +68,7 @@ struct Row {
     size: (f32, f32),
     boxes: Vec<PaintedBox>,
     text: Vec<(NodeKey, Rc<Paragraph>)>,
+    inline: Vec<(ViewId, Rc<inline_frame::PaintedInline>)>,
     images: Vec<(ViewId, Option<std::sync::Weak<Bitmap>>)>,
     /// Where each picture kept apart from the row is drawn.
     slots: Vec<Slot>,
@@ -99,6 +101,7 @@ struct Capture {
     images: Vec<(ViewId, Option<std::sync::Weak<Bitmap>>)>,
     slots: Vec<Slot>,
     text: Vec<(NodeKey, Rc<Paragraph>)>,
+    inline: Vec<(ViewId, Rc<inline_frame::PaintedInline>)>,
     frames: Vec<RowFrame>,
     scrolls: Vec<(ViewId, (f32, f32))>,
 }
@@ -162,6 +165,13 @@ fn within(a: Option<Rect4>, outer: Option<Rect4>) -> Option<Rect4> {
 }
 
 impl Painter {
+    pub(super) fn discard_rows(&mut self) {
+        for row in self.rows.kept.values() {
+            self.backend.row_free(row.id);
+        }
+        self.forget_rows();
+    }
+
     /// Before a frame: drop the rows the host's changes reach.
     pub(crate) fn rows_dirty(&mut self, kernel: &Kernel, dirty: Dirty) {
         self.numerals.committed = dirty.committed;
@@ -449,6 +459,7 @@ impl Painter {
             }
             self.picture(walk, &node, *content, *outer, *ts);
             self.backend.slot_end();
+            counters::add(Counter::ImagePatches, 1);
         }
         let row = self.rows.kept.get_mut(&key).expect("kept");
         for (i, (id, ..)) in changed {
@@ -461,6 +472,12 @@ impl Painter {
     pub(super) fn row_text(&mut self, key: NodeKey, p: &Rc<Paragraph>) {
         if let Some(c) = &mut self.rows.recording {
             c.text.push((key, p.clone()));
+        }
+    }
+
+    pub(super) fn row_inline(&mut self, id: ViewId, p: &Rc<inline_frame::PaintedInline>) {
+        if let Some(c) = &mut self.rows.recording {
+            c.inline.push((id, p.clone()));
         }
     }
 
@@ -528,10 +545,12 @@ impl Painter {
         let scale = (ts.sx, ts.sy);
         let frame = self.rows.frame;
         let kept = self.rows.kept.get(&node.key);
-        let valid = kept.is_some_and(|row| self.row_valid(row, &node, walk, scale, true))
-            || (kept.is_some_and(|row| self.row_valid(row, &node, walk, scale, false))
-                && self.pictures_again(walk, node.key));
+        let valid = kept.is_some_and(|row| self.backend.row_reusable(row.id, origin))
+            && (kept.is_some_and(|row| self.row_valid(row, &node, walk, scale, true))
+                || (kept.is_some_and(|row| self.row_valid(row, &node, walk, scale, false))
+                    && self.pictures_again(walk, node.key)));
         if let Some(row) = self.rows.kept.get(&node.key).filter(|_| valid) {
+            counters::add(Counter::RowsReplayed, 1);
             let d = (origin.0 - row.origin.0, origin.1 - row.origin.1);
             for b in &row.boxes {
                 let mut b = *b;
@@ -543,6 +562,9 @@ impl Painter {
             }
             for (k, p) in &row.text {
                 walk.text.insert(*k, p.clone());
+            }
+            for (id, inline) in &row.inline {
+                walk.inline.insert(*id, inline.translated(d.0, d.1));
             }
             self.damage.unsupported |= row.unsupported;
             let bounds = (
@@ -558,6 +580,33 @@ impl Painter {
             }
             return;
         }
+        counters::observe(|s| {
+            s.add(Counter::RowsRecorded, 1);
+            if let Some(row) = self.rows.kept.get(&node.key) {
+                let reason = if row.stale {
+                    Some(Counter::RowsStale)
+                } else if !self.row_valid(row, &node, walk, scale, false) {
+                    Some(if self.rows.suspect.contains(&node.key) {
+                        Counter::RowsSuspect
+                    } else {
+                        Counter::RowsOther
+                    })
+                } else if row
+                    .images
+                    .iter()
+                    .any(|(id, kept)| !same_picture(walk.scene.images.get(id), kept))
+                {
+                    Some(Counter::RowsPictures)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    s.add(reason, 1);
+                }
+            } else {
+                s.add(Counter::RowsNew, 1);
+            }
+        });
         let old = self.rows.kept.remove(&node.key);
         // Potentials found this epoch, else the old recording's when its
         // subtree is unchanged (recorded again for its size or a picture).
@@ -574,7 +623,7 @@ impl Painter {
         // top-left at 0,0, from document positions alone): the same row records
         // the same ops wherever it scrolled to, so one recorded again unchanged
         // keeps its drawing. Its boxes move to the page after.
-        let local = ts == Transform::identity();
+        let local = self.backend.row_local() && ts == Transform::identity();
         let (walk_offset, content) = if local {
             ((node.frame.x, node.frame.y), (0.0, 0.0))
         } else {
@@ -583,6 +632,7 @@ impl Painter {
         self.backend.row_begin(self.rows.next, content, previous);
         self.rows.recording = Some(Capture::default());
         self.node(walk, id, ts, walk_offset, None);
+        let mut capture = self.rows.recording.take().expect("recording");
         if local {
             for b in &mut walk.boxes[start..] {
                 b.rect.0 += origin.0;
@@ -592,8 +642,13 @@ impl Painter {
                     .affine
                     .map(|(t, r)| (t.post_translate(origin.0, origin.1), r));
             }
+            for (id, inline) in &mut capture.inline {
+                *inline = inline.translated(origin.0, origin.1);
+                if let Some(published) = walk.inline.get_mut(id) {
+                    *published = inline.clone();
+                }
+            }
         }
-        let capture = self.rows.recording.take().expect("recording");
         let row_unsupported = std::mem::replace(&mut self.damage.unsupported, unsupported);
         self.damage.unsupported |= row_unsupported;
         let boxes: Vec<PaintedBox> = walk.boxes[start..].to_vec();
@@ -641,6 +696,7 @@ impl Painter {
                 size: (node.frame.width, node.frame.height),
                 boxes,
                 text: capture.text,
+                inline: capture.inline,
                 images: capture.images,
                 slots: capture.slots,
                 frames: capture

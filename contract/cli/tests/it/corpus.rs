@@ -34,14 +34,17 @@ fn symbols_admit_roles_and_opaque_sf_names_but_refuse_misspelled_roles() {
         "select",
         "select-fill",
         "reorder",
+        "list",
+        "cart",
         "sort",
         "filter",
     ] {
         contract::compile(&format!("component App\n  view\n    image \"symbol:{role}\" -exact-tint-color=\"light-dark(#123456,#abcdef)\"\n")).unwrap();
     }
     contract::compile("component App\n  state selected = true\n  view\n    button role=\"tab\" aria-selected=selected\n      text \"Questions\"\n").unwrap();
+    // An empty name is no symbol, as an empty `sf/` one is (stage 9 H,
+    // vocab.rs's an_empty_symbol_name_is_no_symbol).
     for role in [
-        "",
         "Search",
         "serach",
         "bookmark.filled",
@@ -54,10 +57,7 @@ fn symbols_admit_roles_and_opaque_sf_names_but_refuse_misspelled_roles() {
         .unwrap_err();
         assert!(error.to_string().contains("not a role"), "{error}");
         // LLP 1116 D8: after the roles, the form that names any SF Symbol.
-        let sf = format!(
-            "`symbol:sf/{}`",
-            if role.is_empty() { "star.fill" } else { role }
-        );
+        let sf = format!("`symbol:sf/{role}`");
         assert!(
             error.message.contains("`symbol:sf/<name>`") && error.message.contains(&sf),
             "{error}"
@@ -638,6 +638,23 @@ fn a_module_tag_keeps_svg_names_and_names_the_fix_for_known_ones() {
             "{attr}: {e}"
         );
     }
+    // A state field where an action is wanted says so with the module hint.
+    let src = "component A\n  state n = 0\n  view\n    step-strip width=320 playing=n\n";
+    let e = contract::compile(src).unwrap_err();
+    assert!(
+        e.id == "analyze-unknown-action" && e.message.contains("give the module prop another name"),
+        "{e}"
+    );
+    // An event's name bound to a real action is a handler nothing fires: a
+    // module sends nine events, and `playing` is not one of them.
+    let src = "component A\n  state n = 0\n  action go\n    n = 1\n  view\n    step-strip width=320 playing=go press=go\n";
+    let e = contract::compile(src).unwrap_err();
+    assert!(
+        e.message.contains(
+            "`playing` on `step-strip` is an event the box hears and a module never sends"
+        ) && e.message.contains("give the module prop another name"),
+        "{e}"
+    );
 }
 
 /// LLP 1024 D1: a module tag's leftover attributes are its props, one

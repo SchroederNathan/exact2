@@ -15,9 +15,12 @@ pub const MATERIAL_WGSL: &str = concat!(
 );
 
 /// Appended after [`MATERIAL_WGSL`] in a forward module: `sun_shadow(world, normal)`
-/// (1 without sun shadows), `light_visibility`, `brdf` and `add_local_lights`, over
+/// (1 without sun shadows), `water_caustics(world)` (the factor `Water`'s
+/// caustics put on the sun's light; 1 without), `light_visibility`, `brdf` and `add_local_lights`, over
 /// the shadow maps and lights forward custom pipelines receive in groups 0 and 1.
 pub const MATERIAL_SHADOWS_WGSL: &str = concat!(
+    include_str!("../shaders/caustics.wgsl"),
+    "\n",
     include_str!("../shaders/shadow_sample.wgsl"),
     "\n",
     include_str!("../shaders/fade.wgsl"),
@@ -109,7 +112,7 @@ impl MaterialGpu<'_> {
                     bias: Default::default(),
                 }),
                 multisample: wgpu::MultisampleState {
-                    count: if shadow { 1 } else { 4 },
+                    count: if shadow { 1 } else { self.pipelines.samples },
                     ..Default::default()
                 },
                 multiview_mask: None,
@@ -123,7 +126,8 @@ impl MaterialGpu<'_> {
 pub struct CustomMaterial {
     /// Renderer material from MaterialGpu::material.
     pub material: MaterialId,
-    /// Double-sided, depth-writing 4× HDR pipeline from MaterialGpu::pipeline.
+    /// Double-sided HDR pipeline from MaterialGpu::pipeline, with the scene sample count.
+    /// Writes depth.
     pub forward: wgpu::RenderPipeline,
     /// Matching 1× depth-only pipeline; uses the same vertex deformation.
     pub shadow: wgpu::RenderPipeline,

@@ -6,6 +6,16 @@
 import Foundation
 
 extension ExactEnv {
+    /// Baked host metadata: a bundle normally; the existing product sidecar in bare development builds.
+    nonisolated(unsafe) public static let appMetadata: [String: Any] = {
+        if let info = Bundle.main.infoDictionary, info["CFBundleIdentifier"] != nil { return info }
+        let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        let path = executable.deletingLastPathComponent().appendingPathComponent(executable.lastPathComponent + "-Info.plist")
+        guard let data = try? Data(contentsOf: path),
+              let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return [:] }
+        return info
+    }()
+    public static let appName = appMetadata["CFBundleDisplayName"] as? String ?? appMetadata["CFBundleName"] as? String ?? "Exact"
     /// Whether the dev menu was asked for: `EXACT_DEV_MENU` at launch, else
     /// as the build's environment had it (`ExactDevMenu` in Info.plist; an
     /// installed iOS app is launched with no environment), else the person's
@@ -105,9 +115,8 @@ private extension ISO8601DateFormatter {
 
 extension ExactEnv {
     /// Whether this binary is a build that ships: baked with production
-    /// trust, or stamped `release` or `archive` by `build.mjs`. An app with
-    /// no updater (`deploy.store` "0") records no trust in `compat.json`, so
-    /// the stamp is what says its `--release` build is one. Such a build
+    /// trust, or stamped `release` or `archive` by `build.mjs` (which bakes
+    /// production trust whenever it stamps either). Such a build
     /// measures frames, hatch calls and its plan sites' work for `perf` (LLP
     /// 1079) only from when something first reads them
     /// (`ExactSession.measurePerf`), so one that nobody drives keeps no frame

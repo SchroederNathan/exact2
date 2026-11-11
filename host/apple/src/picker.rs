@@ -39,7 +39,9 @@ pub(crate) fn app_dirs(app_id: &str) -> Result<Option<([PathBuf; 3], Option<Path
     {
         return Err(DataError::Unavailable("unsafe app storage identity".into()));
     }
-    let home = std::env::var_os("HOME")
+    let home = crate::store::group_root(app_id)
+        .map(|p| p.into_os_string())
+        .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .ok_or_else(|| DataError::Unavailable("app storage needs an absolute HOME".into()))?;
@@ -95,6 +97,9 @@ pub(crate) fn empty_fresh_tree(app_id: &str) -> Result<(), DataError> {
     if emptied.contains(&tree) {
         return Ok(());
     }
+    unlinked(&tree)?;
+    // `remove_dir_all` follows no link inside the tree; the directories
+    // above it were just checked.
     match std::fs::remove_dir_all(&tree) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             return Err(DataError::Unavailable(format!(
@@ -105,6 +110,37 @@ pub(crate) fn empty_fresh_tree(app_id: &str) -> Result<(), DataError> {
         _ => {}
     }
     emptied.push(tree);
+    Ok(())
+}
+
+/// Refuses to empty a scratch tree (`<cache base>/exact/<app id>/agent/<name>`)
+/// when it, or a directory between it and the cache base, is a symbolic link:
+/// emptying it through one would delete whatever the link points at, such as
+/// the app's real files.
+fn unlinked(tree: &std::path::Path) -> Result<(), DataError> {
+    let Some(base) = tree.ancestors().nth(4) else {
+        return Ok(());
+    };
+    let mut at = base.to_path_buf();
+    for part in tree.strip_prefix(base).unwrap_or(tree).components() {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(DataError::Unavailable(format!(
+                    "EXACT_AGENT_STORAGE_FRESH: {} is a symbolic link, so the scratch store under it is not emptied: remove the link, or name another store",
+                    at.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(DataError::Unavailable(format!(
+                    "EXACT_AGENT_STORAGE_FRESH: could not inspect {}: {e}",
+                    at.display()
+                )));
+            }
+            Ok(_) => {}
+        }
+    }
     Ok(())
 }
 
@@ -141,16 +177,18 @@ pub fn know_roots(app_id: &str) {
 }
 
 /// Record the app's directories, as storage is configured, and empty
-/// `app:/tmp/picked/`: the last launch's picks are gone (D4). Their handles
-/// are pinned here for a share's reads ([`pin`]).
+/// `app:/tmp/picked/` and `app:/tmp/shared/`: the last launch's picks and
+/// received shares are gone (D4; LLP 1133.024 D3). Their handles are pinned
+/// here for a share's reads ([`pin`]).
 pub fn set_roots(data: PathBuf, cache: PathBuf, temporary: PathBuf) {
     let _ = std::fs::remove_dir_all(temporary.join("picked"));
+    let _ = std::fs::remove_dir_all(temporary.join("shared"));
     let roots = [data, cache, temporary];
     pin(&roots);
     *ROOTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(roots);
 }
 
-fn roots() -> [PathBuf; 3] {
+pub(super) fn roots() -> [PathBuf; 3] {
     let mut held = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
     held.get_or_insert_with(|| {
         let base = std::env::temp_dir().join(format!("exact-agent-{}", std::process::id()));
@@ -195,42 +233,6 @@ pub fn roots_reply() -> String {
     }
     s.push_str("}}");
     s
-}
-
-/// The session's document calls (LLP 1069.010 D1), `owner` its number:
-/// `openDocument` (`{"path"}`: a host route — Finder, the command line,
-/// ⌘O, Open Recent, a path typed into `open-file`) answers `{"path":
-/// "doc:/…"}` for an app granted `fs.read doc:/`, and the path unchanged
-/// for one that reads its files itself; `mintDocument` (`{"path"}`: what a
-/// picker returned, exactly) answers `{"doc"}`; `forgetDocuments` drops
-/// every handle the session minted.
-pub fn documents(op: &str, request: &str, grants: &str) -> String {
-    use exact_runner::agent::{error, field_num, field_str, quote};
-    let owner = field_num(request, "owner").unwrap_or(0.0) as u64;
-    let path = field_str(request, "path").unwrap_or_default();
-    let reply = |key: &str, value: &str| {
-        let mut s = format!("{{\"{key}\":");
-        quote(value, &mut s);
-        s.push('}');
-        s
-    };
-    match op {
-        "forgetDocuments" => {
-            exact_data::documents::forget(owner);
-            "{}".into()
-        }
-        "openDocument" if !exact_runner::save_file::covered(grants, "fs.read", "doc:/") => {
-            reply("path", &path)
-        }
-        "openDocument" => match exact_data::documents::open_route(&path, owner) {
-            Some(doc) => reply("path", &doc),
-            None => reply("path", &path),
-        },
-        _ => match exact_data::documents::mint(std::path::Path::new(&path), owner) {
-            Some(doc) => reply("doc", &doc),
-            None => error(&format!("{path} is not a file or folder")),
-        },
-    }
 }
 
 /// The agent's `appFile` ([`app_file`]) and `shareFile` ([`share_copy`],
@@ -400,6 +402,38 @@ fn copy_confined(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reset refuses a scratch tree reached through a symbolic link above it
+    /// (an `agent` directory linked to the app's real data, say), leaving
+    /// what the link points at as it was; an ordinary tree is let through.
+    #[cfg(unix)]
+    #[test]
+    fn a_reset_refuses_a_scratch_tree_reached_through_a_link() {
+        let base =
+            std::env::temp_dir().join(format!("exact-apple-unlinked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real-data");
+        std::fs::create_dir_all(real.join("s1")).unwrap();
+        std::fs::write(real.join("s1").join("library.json"), "kept").unwrap();
+        std::fs::create_dir_all(base.join("cache/exact/app.id")).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("cache/exact/app.id/agent")).unwrap();
+        let tree = base.join("cache/exact/app.id/agent/s1");
+        let refused = unlinked(&tree).unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("is a symbolic link"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.join("s1").join("library.json")).unwrap(),
+            "kept"
+        );
+        std::fs::remove_file(base.join("cache/exact/app.id/agent")).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        assert!(unlinked(&tree).is_ok());
+        assert!(unlinked(&base.join("cache/exact/app.id/agent/absent")).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     /// A fresh tree: `data`, `cache`, `tmp`, an outside file, and the copy's place.
@@ -421,6 +455,7 @@ mod tests {
 
     const GRANTS: &str = "fs.read app:/data\n";
 
+    #[cfg(unix)]
     #[test]
     fn a_share_copies_only_a_granted_regular_file_and_follows_no_link() {
         let (base, roots) = tree("links");
@@ -469,6 +504,7 @@ mod tests {
     /// The roots are the handles storage pinned: a data root swapped later
     /// for a link to another tree (or any directory) changes nothing a share
     /// reads, and a root that is a link when pinned is refused.
+    #[cfg(unix)]
     #[test]
     fn a_root_swapped_after_pinning_is_not_followed() {
         let (base, roots) = tree("swap");

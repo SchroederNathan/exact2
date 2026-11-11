@@ -150,7 +150,7 @@ Rows rule 2 admits go to the control. The host does one of three things with eac
 | `text-align` | `textAlignment` | `alignment` | applies |
 | `accent-color`, `caret-color` | `tintColor` | `insertionPointColor` (field editor) | applies |
 | `padding-*` | text-rect insets added to the chrome's | added inside the bezel (cell subclass) | applies |
-| `-exact-control-size` | stand-in (UIKit has no field sizes) | `controlSize` | CSS's absolute `font-size` keyword, as 1069.011.001 D8 |
+| `-exact-control-size` | refused | refused | refused (the row sizes a native button; Contract refuses it on a field, `lower-button-style-attr`) |
 
 The table is a starting point. The build fills in each cell from a measured fixture (§4). A cell that doesn't hold becomes a reported stand-in, never a devolve.
 
@@ -379,7 +379,7 @@ Phase 1 probes the chrome across fonts from 11 to 34pt, two families and constra
    Proposed: the second, because hosting SwiftUI for a text view brings its own focus and measurement paths. Apple's own apps rarely border multi-line text, so this is the field's look extended, not a platform control.
 2. **Field styles.** Should fields get a vocabulary like `buttonStyle` (macOS `borderShape` capsule, a plain borderless platform field)? Proposed: not now.
 3. **`select`** is a `Control` already drawn natively. Should D2–D4 cover it? Proposed: yes, as a follow-up.
-4. **The `border-radius` exception** (D2 rule 2) is James's D15. It keeps Lexy's rounded native buttons, at the price of one CSS deviation under `appearance="auto"`. Charlie agrees; James to confirm.
+4. **The `border-radius` exception** (D2 rule 2) is James's D15. It keeps rounded native buttons, at the price of one CSS deviation under `appearance="auto"`. Charlie agrees; James to confirm.
 
 **Settled:**
 - r5 Q2: D2 makes most self-styled buttons bare with no edit, and the codemod covers the rest.

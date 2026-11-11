@@ -101,7 +101,8 @@ and this one does not. Read them first.
   is the app's executable. LLP 1015.
 - `host/apple-update/`, `host/linux-update/` — optional delivery adapters
   above their hosts (LLP 1030 D4). App bake selects the adapter entry for
-  `L=A`, the core entry for `L=0`; neither core host depends on `exact-update`.
+  `L=A`, the core entry for `L=0`. Neither core host links `exact-update`: an
+  `L=0` binary omits the updater, keys, store and check path.
 - `gpu/` — `exact-gpu`, the GPU canvas (LLP 1009): the `Surface` trait an app's
   GPU crate implements against wgpu, the module that runs surfaces on a device,
   and its ABI — a C ABI for the `dylib` the macOS presenter `dlopen`s, wasm-bindgen
@@ -115,8 +116,8 @@ and this one does not. Read them first.
 - `docs/` — the guides for people and agents building apps: `start-here.md` (the one
   required read, LLP 1115 D7) and its recipes, then for lookup Contract for agents,
   for humans, its grammar, the pitfalls, and the developer reference (LLP 1086).
-- `skills/`, `.claude/skills/` — the orchestrate skill and the LLP skills (installed
-  from `ccheever/llp@v0.5.1`; receipt in `.llp/skills-receipt.json`).
+- `skills/`, `.claude/skills/` — the orchestrate and panel skills from cdcstack, and the
+  LLP skills (installed from `ccheever/llp@v0.5.2`; receipt in `.llp/skills-receipt.json`).
 
 The graph is layered on purpose, and that is the whole modularity story: each
 crate depends on strictly less than the one above it — `plan` and `motion` on

@@ -7,25 +7,29 @@
 //! writes as authored ([`crate::css::css_text_relative`]): the page keeps no
 //! kernel to re-resolve them when a font size changes, and the browser does.
 
-use super::{
-    browser_kernel, css_style, font_names, host_css, in_button, props_for, svg_props, tag_for,
-};
+use super::{browser_kernel, font_names, host_css, in_button, props_for, svg_props, tag_for};
 use exact_kernel::{Kernel, SortedMap, ViewId};
 use exact_plan::Plan;
 
 pub use super::element::attribute_rows;
+// A node's state looks as page rules (LLP 1121 D8), for the JS target's sheet.
+use super::mode::looks;
+pub use super::mode::looks::rules as look_rules;
 
 /// An element as the live host would create it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Parts {
     /// The element's tag (a canvas is still `canvas`; the host wraps it).
     pub tag: String,
     /// DOM props by the DOM's names, before the document's attribute rules.
     pub props: SortedMap<String, String>,
-    /// The inline CSS the live host would write, host additions included.
+    /// The CSS for the node's static class, host additions included.
     pub css: String,
     /// Rows this host does not lower, with the reason.
     pub skipped: Vec<(String, &'static str)>,
+    /// Its host-known state looks' declarations (LLP 1121 D8), for
+    /// [`look_rules`].
+    pub looks: Vec<(u8, String)>,
 }
 
 /// The kernel the web host keeps: no layout engine.
@@ -53,16 +57,27 @@ pub fn parts_with(
     let node = kernel.node(id)?;
     let tag = tag_for(&node, in_button(kernel, &node));
     let mut props = props_for(&node);
+    // A decoration's and an atom kind's paint rows as CSS text by name (LLP 1114.007, 1045.000 D3).
+    for name in ["data-decoration-styles", "data-atom-styles"] {
+        if let Some(raw) = props.get(name) {
+            let css = crate::css::decoration_styles(raw, &font_names(plan));
+            props.insert(name.into(), css);
+        }
+    }
     svg_props(kernel, &node, &mut props);
-    let (text, skipped) =
-        crate::css::css_text_relative(&css_style(kernel, &node), &font_names(plan));
+    let style = super::element::css_style_of(
+        &|from, target| kernel.resolve_id(from, target),
+        &node.facts(),
+    );
+    let (mut text, skipped) = crate::css::css_text_relative(&style, &font_names(plan));
+    crate::css::text_style::fills(&node.facts(), &mut text);
     let css = super::element::contents(
         host_css(kernel, &node, text, tag),
         may_fold && super::element::folded(kernel, &node, false),
         super::element::touch_scoped(kernel, &node),
     );
     let holds = child_may_fold && super::element::holds_folded(kernel, &node, &|_| false);
-    let css = super::element::blocks(css, holds);
+    let css = super::element::blocks(css, holds, &node.facts());
     Some(Parts {
         tag: tag.to_string(),
         props,
@@ -71,5 +86,8 @@ pub fn parts_with(
             .into_iter()
             .map(|s| (s.row.name().to_string(), s.reason))
             .collect(),
+        looks: looks::declarations(node.looks(), |l| {
+            crate::css::css_text_relative(l, &font_names(plan)).0
+        }),
     })
 }

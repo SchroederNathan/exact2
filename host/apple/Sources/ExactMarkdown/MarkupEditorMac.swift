@@ -7,12 +7,20 @@ extension NodeView {
     func markdownRestyle() {
         guard props["markup"] == "markdown", let f = textArea as? TextArea, let editor = f.markup as? MarkupEditor, let t = text,
               !f.hasMarkedText(), let storage = f.textStorage else { return }
-        let look = MarkupEditor.Look(
+        var look = MarkupEditor.Look(
             font: { size, weight, family, italic in t.font(size: size, weight: weight, family: family, italic: italic) },
             size: number("font_size", PageFacts.defaultRootFontSize), weight: Int(number("font_weight", 400)), family: Int(number("font_family")),
             italic: (style["font_style"]?.string) == "italic", lineHeight: usedLineHeight, ink: color("text_color", .textColor))
-        editor.restyle(storage, selection: f.selectedRange(), look: look)
-        f.typingAttributes = editor.baseAttributes(look)
+        f.effectiveAppearance.performAsCurrentDrawingAppearance { look.secondaryOpacity = NSColor.secondaryLabelColor.alphaComponent }
+        look.atoms = markdownAtoms
+        look.atoms.emphasized = f.window?.isKeyWindow ?? true
+        look.paragraphDirs = props["paragraphDirs"] ?? ""
+        look.rtl = markdownRTL
+        if let content = f.textContentStorage, content.delegate !== editor { content.delegate = editor }
+        editor.restyle(storage, selection: f.selectedRange(), look: look, undo: f.undoManager)
+        f.typingAttributes = editor.typingAttributes(look, caret: f.selectedRange().location)
+        if storage.length == 0 { f.needsDisplay = true }
+        DispatchQueue.main.async { [weak f] in f?.atomsChanged() }
     }
 
     @discardableResult func markdownFormat(_ command: String, argument: String = "") -> Bool {
@@ -46,7 +54,7 @@ extension NodeView {
     func markdownPublishSelection(force: Bool = false) {
         guard handlers.contains("select"), let f = textArea as? TextArea, let editor = f.markup as? MarkupEditor,
               !editor.applying, !editor.styling, !f.hasMarkedText(),
-              let state = MarkupCommands.selection(f.string, range: f.selectedRange()), force || editor.lastSelectionState != state else { return }
+              let state = MarkupCommands.selection(f.string, range: f.selectedRange(), atoms: AtomHandle.of(markdownAtoms)), force || editor.lastSelectionState != state else { return }
         editor.lastSelectionState = state
         presenter?.session?.selection(node: id, json: state)
     }

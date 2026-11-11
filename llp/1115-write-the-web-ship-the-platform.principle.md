@@ -30,6 +30,14 @@ This replaces "the web is the standard" as the top rule. The web stays what the 
 (the vocabulary, the layout model) and where the author works (the dev loop); it stops being
 what the user sees.
 
+**Frame health (2026-10-28).** Native quality includes how the app moves and
+responds. [LLP 1079.000](1079.000-frame-health-v1.plan.md) makes that measurable:
+120 FPS during high-impact interaction on flagship phones, the display's supported
+rate on desktop, even pacing, and low response latency. Static content stays idle.
+The readout must name its evidence; display-link callbacks alone do not establish
+onscreen presentation. The Apple metrics and prototype readouts are implemented;
+device qualification and UI refinement remain open.
+
 ## 1. Why
 
 A user who opens an Exact app on an iPhone is comparing it, without meaning to, with every
@@ -117,6 +125,13 @@ the schema changes (LLP 1030 D3a). Agreed in advance: "it's ok if things break a
 - **D2. Unset backgrounds are the platform's.** The window/viewport, launch view and sheet
   surfaces fall back to `systemBackground` (iOS) and `windowBackgroundColor` (macOS), never a
   fixed white. (Today a page with no background is white text on white in dark mode.)
+  > **Amended by LLP 1116.021 D7 (2026-10-17).** On iOS a sheet's surface is its route's own
+  > background where the route has one: a sheet whose scroll is a grouped list is on the
+  > grouped background (LLP 1116.007 D5), as a hand-built grouped sheet is, so no white band
+  > shows between it and a keyboard's bar. A route with none keeps `systemBackground`.
+  > **Amended by LLP 1141.001 D3 (2026-10-23).** A route with none, below its sheet's large
+  > detent, leaves the sheet clear so that UIKit draws its glass, as iOS 26 and later draw a
+  > hand-built sheet there; an authored `transparent` is clear at every detent.
 - **D3. Type is the platform's.** The root font size is the platform body size (§3). Headings
   (`role="heading"`/`h1`–`h6`) get the platform's text styles by level, overridable by any
   authored `font-size`/`font-weight`. Bold Text is honoured.
@@ -124,7 +139,8 @@ the schema changes (LLP 1030 D3a). Agreed in advance: "it's ok if things break a
   actions, bar items: the platform tint unless the control's own `color`/`accent-color` is set.
 - **D5. Back is always there.** A pushed route without an authored back control still gets the
   system back button, edge swipe and sheet swipe-down; the host pops and reports it as
-  `history.back()` would. An authored control is still what the button presses.
+  `history.back()` would. An adjacent Back still presses its authored control; native
+  history jumps follow LLP 1115.000 D4.3.
 - **D6. Confirmations are the platform's alert** (`issues/20261009-ios-confirmation-shape.md`):
   an `alertdialog` becomes `UIAlertController(.alert)` with its title and Cancel kept; `showModal`
   is honoured on iOS; the compiler stops requiring `closedby="any"` for it. *Landed (wave 2,
@@ -173,6 +189,15 @@ the schema changes (LLP 1030 D3a). Agreed in advance: "it's ok if things break a
   build ships its Develop menu hidden (LLP 1115.000 D7.8), since there it is a menu-bar item
   every person sees and its chords take ⌘R and ⌘D: `defaults write <bundle id> ExactDevMenu
   -bool YES` shows it, as Safari's settings show Safari's, unless the build said `0`.
+
+  **Frame-health control (iOS implemented, 2026-10-28):**
+  [LLP 1079.000 §7.2](1079.000-frame-health-v1.plan.md#72-app-indicator) adds
+  **Show Frame Health** / **Hide Frame Health** to a native grouped navigation sheet.
+  Build Information has its own screen. The card starts hidden,
+  moves when dragged, and lets touches outside it reach the app. It sits below sheets
+  and alerts, uses existing snapshots, and does no recurring work at idle. The Mac's
+  equivalent Develop controls are implemented. The implementation preserves the
+  menu gates above and never overrides collector qualification or opt-out.
 
 ## 6. Waves
 

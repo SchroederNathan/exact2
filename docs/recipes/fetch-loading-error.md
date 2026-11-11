@@ -1,78 +1,85 @@
 # Recipe: fetch with loading, error and retry
 
-A screen that loads over the network: a spinner first, the error as words with Try Again,
-then pull to refresh.
-
 ```contract
-routes nav
-  home "/"
-
 shape Feed
-  ok: bool
-  error: string
+  owner: string
   posts: string[]
 
 component App
-  resource feed = loadFeed() as shape Feed else empty(ok=true)
+  state account = "default"
+  resource feed = loadFeed(account) as shape Feed else empty()
   action reload
     refresh feed
   view
-    main navigationKey=`${top(nav).id}` navigationBack="back" testId="app" width="100%" height="100%"
-      for e in stack(nav) key=e.id
-        column navigationKey=`${e.id}` navigationScroll="feed-list" position="absolute" inset=0
-          header padding="8px 16px"
-            text "Feed" role="heading" aria-level=1
-          scroll id="feed-list" refresh=reload refreshing=(pending(feed) and feed.posts.length > 0) flex=1 min-height=0
-            if pending(feed) and feed.posts.length == 0
-              row justify-content="center" padding=40
-                progress aria-label="Loading"
-            else if not feed.ok
-              column align-items="center" gap=8 padding=32 testId="feed-error"
-                text feed.error color="-exact-secondary-label" text-align="center"
-                button press=reload testId="retry"
-                  text "Try Again"
-            else
-              for p in feed.posts key=p
-                text p padding="10px 16px"
+    column
+      button press=reload testId="refresh"
+        text "Refresh"
+      scroll refresh=reload refreshing=(pending(feed) and feed.owner == account) flex=1 min-height=0
+        if pending(feed)
+          progress aria-label="Loading" testId="loading"
+        if failed(feed)
+          text "Couldn't load the feed." testId="error"
+          button press=reload testId="retry"
+            text "Try Again"
+        if feed.owner == account
+          if feed.posts.length == 0 and not failed(feed)
+            text "No posts yet."
+          for p, i in feed.posts key=p
+            text p testId=`post-${i}`
 ```
 
-```ts
-import type { Answer, Result, Sources } from './app.contract.d.ts';
+`empty()` sets `owner` to `""`; account IDs must be nonempty. The owner check
+hides A's retained rows after switching to B, even if B fails. A failed refresh
+of A keeps its rows beside Retry; a valid empty answer replaces them.
+Use the same check for a server or workspace: its answer names that owner.
 
-export const appId = 'com.example.feed';
+```ts
+import type { Answer, Result } from './app.contract.d.ts';
+
 const API = 'https://jsonplaceholder.typicode.com';
 export const grants = `net.fetch ${API}`;
 
-const failed = (error: string): Result<'loadFeed'> => ({ ok: false, error, posts: [] });
+function isPost(p: unknown): p is { title: string } {
+  return p !== null && typeof p === 'object' && 'title' in p && typeof p.title === 'string';
+}
 
-const sources: Sources = {
-  loadFeed: async () => {
-    try {
-      const res = await fetch(`${API}/posts?_limit=10`, { exactTimeout: 10000 });
-      if (!res.ok) return failed('The server had a problem. Try again.');
-      const posts = (await res.json()) as Array<{ title: string }>;
-      return { ok: true, error: '', posts: posts.map((p) => p.title) };
-    } catch (e) {
-      if ((e as { code?: string }).code === 'bake') throw e; // no network at build
-      return failed('Check your connection and try again.');
-    }
-  },
+export const answer: Answer = async (_source, [owner]): Promise<Result<'loadFeed'>> => {
+  const response = await fetch(`${API}/posts?_limit=10`, { exactTimeout: 10000 });
+  if (!response.ok) {
+    throw new Error('The feed request failed.');
+  }
+  const body: unknown = await response.json();
+  if (!Array.isArray(body) || !body.every(isPost)) {
+    throw new Error('The feed response is invalid.');
+  }
+  return { owner, posts: body.map((p): string => p.title) };
 };
-export const answer: Answer = (source, args, store, storage, native) => sources[source](args, store, storage, native);
 ```
 
 ```contract-test
-test "the feed shows an error, then retries"
+test "a failed refresh retains rows and retries"
+  clock data
   fail fetch "https://jsonplaceholder.typicode.com"
-  expect tree has "feed-error"
+  tap "refresh"
+  expect tree has "loading"
+  expect tree has "post-0"
+  clock data
+  expect tree has "post-0"
+  expect tree has "error"
   pass fetch "https://jsonplaceholder.typicode.com"
   tap "retry"
   clock data
-  expect tree missing "feed-error"
+  expect tree missing "error"
 ```
 
-- The error is data the source answers (`ok: false` and a sentence a person can act on); the
-  view branches on it, never on a status code. `else empty(ok=true)` hides it on the first frame.
-- `progress` without a `value` is the activity indicator; `refresh=` is pull to refresh and
-  `refreshing` holds its spinner. Map rows field by field: an extra field fails the resource.
-- Grant each origin; `exactTimeout` bounds a request. Your own server: [rest-backend](rest-backend.md).
+`fail fetch` rejects; it cannot delay or supply an HTTP status/body. Use a
+[test server](rest-backend.md) for those.
+
+For private data, also gate by the authorized principal and auth generation:
+A → B → A must reject the first A session's answers. Check it before writing a cache
+after an await. Await session prerequisites in the source; dependencies do not
+sequence requests. See the
+[data guide](../contract-for-agents.md#data-requests-and-side-effects).
+
+Development `state.resourceStatus` reports retained answers and argument equality; `failed` and `failures` give the error and count. It changes neither
+retention nor authorization. `with` only admits persisted answers at boot.

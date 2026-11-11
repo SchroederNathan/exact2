@@ -6,6 +6,9 @@ use super::{Data, DataError, Number, Reader, Writer};
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
+/// The longest bulk JSON writes as its numbers; a longer one is summarized.
+pub const INLINE_BULK: usize = 64;
+
 /// Encode a value; JSON refuses infinities and NaNs.
 pub fn to_string<T: Data>(value: &T) -> Result<String, DataError> {
     let mut w = Encoder::default();
@@ -16,6 +19,20 @@ pub fn to_string<T: Data>(value: &T) -> Result<String, DataError> {
 pub fn from_str<T: Data>(text: &str) -> Result<T, DataError> {
     let mut value = T::default();
     read_into(text, &mut value)?;
+    Ok(value)
+}
+/// Parse a complete tuning record; missing named fields are errors.
+pub fn from_complete_str<T: Data>(text: &str) -> Result<T, DataError> {
+    if text.len() > MAX_LOAD_BYTES {
+        return Err(DataError::new("input exceeds load size limit"));
+    }
+    let mut value = T::default();
+    let mut r = Decoder::new(text);
+    r.complete = true;
+    value
+        .read(&mut r)
+        .and_then(|()| r.finish())
+        .map_err(|e| e.at(super::type_name::<T>()))?;
     Ok(value)
 }
 /// Read into an existing value using Data's patch/replacement rules.
@@ -82,12 +99,36 @@ impl Encoder {
     }
 }
 impl Writer for Encoder {
+    /// A bulk of [`INLINE_BULK`] elements or fewer is its numbers, the form
+    /// the decoder reads back; a longer one is a summary that says it is one
+    /// (`summary`), so a reader cannot take it for missing data (LLP 1143 D4).
     fn bytes(&mut self, value: super::Bulk<'_>) {
+        use super::Bulk;
+        // A non-finite float is no JSON number: such a bulk is summarized, as a long one is.
+        let finite = !matches!(value, Bulk::F32(v) if v.iter().any(|n| !n.is_finite()));
+        if finite && value.len() <= INLINE_BULK {
+            self.text.push('[');
+            for i in 0..value.len() {
+                if i > 0 {
+                    self.text.push(',');
+                }
+                self.number(match value {
+                    Bulk::U8(v) => Number::Unsigned(v[i].into()),
+                    Bulk::U16(v) => Number::Unsigned(v[i].into()),
+                    Bulk::U32(v) => Number::Unsigned(v[i].into()),
+                    Bulk::F32(v) => Number::F32(v[i]),
+                });
+            }
+            self.text.push(']');
+            return;
+        }
         let mut hash = super::hash::Hasher::default();
         hash.bytes(value);
         write!(
             self.text,
-            "{{\"bytes\":{},\"hash\":\"0x{:016x}\"}}",
+            "{{\"summary\":\"{} × {}\",\"bytes\":{},\"hash\":\"0x{:016x}\"}}",
+            value.kind().name(),
+            value.len(),
             value.byte_len(),
             hash.finish()
         )
@@ -174,6 +215,7 @@ pub struct Decoder<'a> {
     pos: usize,
     frames: Vec<ReadFrame>,
     budget: Budget,
+    complete: bool,
 }
 struct ReadFrame {
     end: u8,
@@ -188,6 +230,7 @@ impl<'a> Decoder<'a> {
             pos: 0,
             frames: vec![],
             budget: Budget::default(),
+            complete: false,
         }
     }
     /// Reject trailing input or an unfinished container.
@@ -339,6 +382,10 @@ impl<'a> Decoder<'a> {
     }
 }
 impl Reader for Decoder<'_> {
+    fn complete(&self) -> bool {
+        self.complete
+    }
+
     fn bytes(&mut self, _kind: BulkKind) -> Result<Option<&[u8]>, DataError> {
         self.ws();
         if self.peek() == Some(b'[') {

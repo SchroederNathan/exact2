@@ -15,6 +15,8 @@ pub(crate) mod alert;
 pub(crate) mod button;
 pub(crate) mod control_text;
 pub(crate) mod defaults;
+mod inline_image;
+pub mod text_style;
 
 use taffy::NodeId;
 
@@ -50,7 +52,13 @@ pub struct NodeArena {
     prop_counts: Vec<u32>,
     type_counts: Vec<u32>,
     flags: Vec<NodeFlags>,
+    /// Each root's latest publication, numbered across all roots from
+    /// `last_pass` (0: none). A freed root's publications are over.
     layout_passes: Vec<u64>,
+    last_pass: u64,
+    /// The root and publication that last changed each node's geometry. Its
+    /// `GEOMETRY_CHANGED` holds while that is still the root's latest; the
+    /// root may since have been freed, reused or trimmed away, which ends it.
     geometry_passes: Vec<(u32, u64)>,
     frames: Vec<Frame>,
     // @ref LLP 1043.000 §3 D4 — no per-node vector or allocation.
@@ -67,8 +75,17 @@ pub struct NodeArena {
     /// current role and font, under the measurer's revision the kernel last
     /// measured at (`Kernel::measures_symbol`).
     pub(crate) measured_symbols: SlotSet,
+    /// What a host last reported for a mark it sizes alike for every node
+    /// (`control::shared_size`), by kind and font size bits.
+    pub(crate) mark_sizes: Vec<((crate::ControlKind, u32), (f32, f32))>,
+    /// The kind and font size each standing mark report was made under (`Kernel::mark_withdrawn`).
+    pub(crate) mark_reports: IdMap<u32, (crate::ControlKind, u32)>,
     /// Slots that are `position: sticky` (LLP 1083 D3).
     pub(crate) sticky_slots: SlotSet,
+    /// Slots in HTML's top layer: popovers, unless their author made them
+    /// sticky (`top_layer::lifted`). Each is laid out in the viewport, a
+    /// block the kernel implies (`Kernel::imply_blocks`).
+    pub(crate) top_layer_slots: SlotSet,
     /// The timeline-bearing nodes and what each follower's name resolves
     /// to (LLP 1057.003 D4), kept by the linked lookup after each commit.
     pub(crate) timelines: crate::timeline::Registry,
@@ -80,6 +97,12 @@ pub struct NodeArena {
     /// its next commit applies what it says.
     pub(crate) display_scale: Option<f32>,
     pub(crate) display_scale_next: Option<f32>,
+    /// Bold Text is on (LLP 1115.000 D12.3): the person's setting, which the
+    /// host says and its next commit applies.
+    pub(crate) bold_text: bool,
+    pub(crate) bold_text_next: Option<bool>,
+    /// Which font stacks are the system's, by id, as the plan says.
+    pub(crate) system_stacks: Vec<bool>,
     /// Scrollable overflow from the last layout: the content's extent in the
     /// node's own space (width, height), Taffy's `content_size`.
     contents: Vec<(f32, f32)>,
@@ -96,6 +119,12 @@ pub struct NodeArena {
     /// route nodes at most, so a list by slot rather than a column (and not a
     /// map, whose code every web core would carry).
     covers: Vec<(u32, crate::kernel::HostCover)>,
+    /// The margins the platform's own list gives a grouped list's cards and
+    /// cells, by the list's slot: a few lists at most, as the covers.
+    grouped_margins: Vec<(u32, crate::grouped::GroupedMargins)>,
+    /// The margin the platform's cell gives a cells list's rows at each end,
+    /// by the list's slot (LLP 1138): a few lists at most.
+    list_margins: Vec<(u32, [f32; 2])>,
     /// Alert roots whose host supplies the CSS `::before` title item. The
     /// engine derives the item from the root's live label and inherited text.
     pub(crate) alert_prefixes: SlotSet,
@@ -113,6 +142,10 @@ pub struct NodeArena {
     control_styles: Option<Box<[StyleProps; 10]>>,
     pub(crate) field_content: IdMap<u32, Frame>,
     pub(crate) button_bases: IdMap<u32, Option<f32>>,
+    /// Each node's host-known state looks (LLP 1121 D8, `Op::SetLooks`):
+    /// a state and its resolved patch, ascending; a node with none has no
+    /// entry.
+    looks: IdMap<u32, Rc<[(u8, StyleProps)]>>,
     /// The scale each fitted paragraph's last layout chose, below 1 only
     /// (`-exact-fit: shrink`, LLP 1116.001 D1.4; `layout::fit`).
     pub(crate) fit_scales: IdMap<u32, f32>,
@@ -145,6 +178,7 @@ impl Clone for NodeArena {
             type_counts: self.type_counts.clone(),
             flags: self.flags.clone(),
             layout_passes: self.layout_passes.clone(),
+            last_pass: self.last_pass,
             geometry_passes: self.geometry_passes.clone(),
             frames: self.frames.clone(),
             flow: self.flow.clone(),
@@ -153,16 +187,24 @@ impl Clone for NodeArena {
             relative_slots: self.relative_slots.clone(),
             symbols_owed: self.symbols_owed.clone(),
             measured_symbols: self.measured_symbols.clone(),
+            mark_sizes: self.mark_sizes.clone(),
+            mark_reports: self.mark_reports.clone(),
             sticky_slots: self.sticky_slots.clone(),
+            top_layer_slots: self.top_layer_slots.clone(),
             timelines: self.timelines.clone(),
             root_font_size_next: self.root_font_size_next,
             display_scale: self.display_scale,
             display_scale_next: self.display_scale_next,
+            bold_text: self.bold_text,
+            bold_text_next: self.bold_text_next,
+            system_stacks: self.system_stacks.clone(),
             contents: self.contents.clone(),
             insets: self.insets.clone(),
             nonzero_insets: self.nonzero_insets.clone(),
             intrinsic: self.intrinsic.clone(),
             covers: self.covers.clone(),
+            grouped_margins: self.grouped_margins.clone(),
+            list_margins: self.list_margins.clone(),
             alert_prefixes: self.alert_prefixes.clone(),
             blocks: self.blocks.clone(),
             taffy: self.taffy.clone(),
@@ -175,6 +217,7 @@ impl Clone for NodeArena {
             control_styles: self.control_styles.clone(),
             field_content: self.field_content.clone(),
             button_bases: self.button_bases.clone(),
+            looks: self.looks.clone(),
             fit_scales: self.fit_scales.clone(),
             document_language: self.document_language.clone(),
             document_style: self.document_style.clone(),
@@ -225,6 +268,7 @@ impl NodeArena {
         self.renew_text_namespace();
         self.field_content.clear();
         self.button_bases.clear();
+        self.looks.clear();
         self.fit_scales.clear();
         self.flow.clear();
         self.exclusion_slots.clear();
@@ -232,7 +276,10 @@ impl NodeArena {
         self.relative_slots.clear();
         self.symbols_owed.clear();
         self.measured_symbols.clear();
+        self.mark_sizes.clear();
+        self.mark_reports.clear();
         self.sticky_slots.clear();
+        self.top_layer_slots.clear();
         self.timelines = Default::default();
         for slot in 0..self.live.len() {
             self.live[slot] = false;
@@ -241,6 +288,7 @@ impl NodeArena {
             self.styles[slot] = self.shared.default_style();
             self.props[slot].clear();
             self.flags[slot] = NodeFlags::default();
+            self.layout_passes[slot] = 0;
             self.prop_counts.clear();
             self.type_counts.clear();
             self.frames[slot] = Frame::default();
@@ -252,6 +300,8 @@ impl NodeArena {
         self.nonzero_insets.clear();
         self.intrinsic.clear();
         self.covers.clear();
+        self.grouped_margins.clear();
+        self.list_margins.clear();
         self.alert_prefixes.clear();
         self.blocks = Default::default();
         self.free = (0..self.live.len() as u32).rev().collect();
@@ -364,6 +414,25 @@ impl NodeArena {
         &self.styles[slot as usize]
     }
 
+    /// The node's host-known state looks (LLP 1121 D8), ascending by
+    /// state; empty for a node with none.
+    pub fn looks(&self, slot: u32) -> &[(u8, StyleProps)] {
+        self.looks.get(&slot).map_or(&[], |l| l)
+    }
+
+    /// Replace the node's looks; whether they changed.
+    pub(crate) fn set_looks(&mut self, slot: u32, looks: &[(u8, StyleProps)]) -> bool {
+        if self.looks(slot) == looks {
+            return false;
+        }
+        if looks.is_empty() {
+            self.looks.remove(&slot);
+        } else {
+            self.looks.insert(slot, looks.into());
+        }
+        true
+    }
+
     /// Props.
     pub fn props(&self, slot: u32) -> &PropList {
         &self.props[slot as usize]
@@ -373,7 +442,8 @@ impl NodeArena {
     pub fn flags(&self, slot: u32) -> NodeFlags {
         let mut flags = self.flags[slot as usize];
         let (root, pass) = self.geometry_passes[slot as usize];
-        if self.layout_passes[root as usize] != pass {
+        // A root trimmed away is past the column's end.
+        if self.layout_passes.get(root as usize) != Some(&pass) {
             flags.remove(NodeFlags::GEOMETRY_CHANGED);
         }
         flags
@@ -501,6 +571,19 @@ impl NodeArena {
         })
     }
 
+    /// A copy for a trial layout that is dropped after it
+    /// (`Kernel::measure_block`): the same text, so each paragraph keeps its
+    /// stamp, and a measurer that holds paragraphs by stamp answers the trial
+    /// from what it holds instead of taking the text for new (a plain clone
+    /// is another kernel's, in a namespace of its own).
+    pub(crate) fn trial_copy(&self) -> Self {
+        let mut copy = self.clone();
+        copy.text_revisions.clone_from(&self.text_revisions);
+        copy.text_domain = self.text_domain.clone();
+        copy.text_serial = self.text_serial;
+        copy
+    }
+
     pub(crate) fn renew_text_namespace(&mut self) {
         self.text_domain = TextDomain::default();
         self.text_serial = 0;
@@ -531,6 +614,19 @@ impl NodeArena {
         self.node_types[slot as usize] == NodeType::Text
             && self.parents[slot as usize]
                 .is_some_and(|p| self.node_types[p as usize] == NodeType::Text)
+    }
+
+    /// A Markdown leaf's atom kinds and faces (LLP 1045.000 D2); empty for
+    /// any other node.
+    pub fn markup_atoms(&self, slot: u32) -> crate::text::MarkupAtoms<'_> {
+        let props = &self.props[slot as usize];
+        if self.markup(slot) != crate::text::Markup::Markdown {
+            return crate::text::MarkupAtoms::default();
+        }
+        crate::text::MarkupAtoms {
+            kinds: props.str(PropId::Atoms).unwrap_or(""),
+            faces: props.str(PropId::AtomFaces).unwrap_or(""),
+        }
     }
 
     /// What the leaf's string is (LLP 1045 D3): its `markup` prop.
@@ -564,6 +660,8 @@ impl NodeArena {
                 self.copy_inherited(slot, rows, take)
             });
         paragraph.markup = self.markup(slot);
+        // Bold Text, as its runs are (LLP 1115.000 D12.3).
+        self.embolden(slot, &mut paragraph.strut);
         if scale != 1.0 {
             paragraph.strut = paragraph.strut.scaled(scale);
         }
@@ -585,6 +683,21 @@ impl NodeArena {
     /// A fitted paragraph's runs are at the scale its layout chose.
     pub fn text_runs<'a>(&'a self, slot: u32, out: &mut Vec<TextRun<'a>>) {
         self.text_runs_at(slot, self.fit_scale(slot), out);
+    }
+
+    pub(crate) fn reservation_text<'a>(
+        &self,
+        slot: u32,
+        text: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        let rows = crate::text::RunRows::from_rows(self.style(slot), |rows, take| {
+            self.copy_inherited(slot, rows, take)
+        });
+        rows.hyphens.shown(crate::text::case::shown(
+            rows.transform,
+            text,
+            Default::default(),
+        ))
     }
 
     /// [`Self::text_runs`] at `scale` of their size (a fit's measurement).
@@ -616,7 +729,8 @@ impl NodeArena {
         let s = slot as usize;
         match self.node_types[s] {
             NodeType::TextInput => {
-                let style = rows.style();
+                let mut style = rows.style();
+                self.embolden(slot, &mut style);
                 // An input has a line box even when empty (the web's
                 // `<input>`): its value, else its placeholder, else one space.
                 let props = &self.props[s];
@@ -640,6 +754,7 @@ impl NodeArena {
                 out.push(TextRun {
                     text: text.into(),
                     style,
+                    inline: None,
                 });
                 // A textarea's final Return creates a caret line. Paragraph
                 // shapers can omit a terminal break, so retain that line with
@@ -651,6 +766,7 @@ impl NodeArena {
                     out.push(TextRun {
                         text: "\u{200b}".into(),
                         style,
+                        inline: None,
                     });
                 }
             }
@@ -666,19 +782,34 @@ impl NodeArena {
                         ))
                     };
                     boundary.push(text);
+                    let mut style = rows.style();
+                    // Bold Text (LLP 1115.000 D12.3), as `text_style` reads it.
+                    self.embolden(slot, &mut style);
                     out.push(TextRun {
                         text: shown,
-                        style: rows.style(),
+                        style,
+                        inline: None,
                     });
                 } else {
                     for child in &self.children[s] {
-                        if self.node_types[*child as usize] == NodeType::Text {
-                            self.text_runs_after(
-                                *child,
-                                rows.child(&self.styles[*child as usize]),
-                                out,
-                                boundary,
-                            );
+                        match self.node_types[*child as usize] {
+                            NodeType::Text => {
+                                let rows = self.run_style_rows(*child, rows);
+                                self.text_runs_after(*child, rows, out, boundary);
+                            }
+                            // Its alignment reads its parent's font (CSS 2
+                            // §10.8.1), so its run is in the paragraph's style.
+                            NodeType::Image if self.is_run_image(*child) => {
+                                out.push(TextRun {
+                                    text: crate::text::inline_box::INLINE_BOX_TEXT.into(),
+                                    style: rows.style(),
+                                    inline: Some(
+                                        crate::text::inline_box::inline_image(self, *child)
+                                            .reserved,
+                                    ),
+                                });
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -715,14 +846,17 @@ impl NodeArena {
         runs.into_iter().nth(at).map(|run| run.text)
     }
 
-    /// The leaves [`Self::text_runs`] makes a run of, in its order.
-    fn text_leaves(&self, slot: u32, out: &mut Vec<u32>) {
+    /// The leaves [`Self::text_runs`] makes a run of, in its order: its
+    /// texts, and its images (LLP 1011.002).
+    pub fn text_leaves(&self, slot: u32, out: &mut Vec<u32>) {
         if self.props[slot as usize].str(PropId::Text).is_some() {
             return out.push(slot);
         }
         for child in &self.children[slot as usize] {
-            if self.node_types[*child as usize] == NodeType::Text {
-                self.text_leaves(*child, out);
+            match self.node_types[*child as usize] {
+                NodeType::Text => self.text_leaves(*child, out),
+                NodeType::Image if self.is_run_image(*child) => out.push(*child),
+                _ => {}
             }
         }
     }
@@ -789,14 +923,17 @@ impl NodeArena {
 
     pub(crate) fn free_slot(&mut self, slot: u32) {
         self.field_content.remove(&slot);
+        self.mark_reports.remove(&slot);
         self.exclusion_slots.remove(slot);
         self.frag.forget(slot);
         self.relative_slots.remove(slot);
         self.symbols_owed.remove(slot);
         self.measured_symbols.remove(slot);
         self.button_bases.remove(&slot);
+        self.looks.remove(&slot);
         self.fit_scales.remove(&slot);
         self.sticky_slots.remove(slot);
+        self.top_layer_slots.remove(slot);
         self.layout_dirty.remove(slot);
         self.flow.remove(&slot);
         let s = slot as usize;
@@ -811,13 +948,16 @@ impl NodeArena {
         self.styles[s] = self.shared.default_style();
         self.props[s] = PropList::new();
         self.flags[s] = NodeFlags::default();
+        self.layout_passes[s] = 0;
         self.frames[s] = Frame::default();
         self.contents[s] = (0.0, 0.0);
         self.set_inset(slot, None);
         self.intrinsic.remove(&slot);
         self.covers.retain(|(s, _)| *s != slot);
+        self.grouped_margins.retain(|(s, _)| *s != slot);
+        self.list_margins.retain(|(s, _)| *s != slot);
         self.alert_prefixes.remove(slot);
-        self.blocks.set(slot, None);
+        self.blocks.remove(slot);
         self.taffy[s] = None;
         if self.is_root[s] {
             self.roots.retain(|r| *r != slot);
@@ -857,8 +997,14 @@ impl NodeArena {
         self.child_indices[slot as usize]
     }
 
+    /// The latest publication's number across all roots.
+    pub(crate) fn last_pass(&self) -> u64 {
+        self.last_pass
+    }
+
     pub(crate) fn begin_layout_publication(&mut self, root: u32) {
-        self.layout_passes[root as usize] += 1;
+        self.last_pass += 1;
+        self.layout_passes[root as usize] = self.last_pass;
     }
 
     pub(crate) fn mark_geometry_changed(&mut self, slot: u32, root: u32) {
@@ -1023,6 +1169,40 @@ impl NodeArena {
         }
     }
 
+    /// The margins the platform's list gives the grouped list `slot`.
+    pub(crate) fn grouped_margins(&self, slot: u32) -> Option<crate::grouped::GroupedMargins> {
+        self.grouped_margins
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .map(|(_, m)| *m)
+    }
+
+    pub(crate) fn has_grouped_margins(&self) -> bool {
+        !self.grouped_margins.is_empty()
+    }
+
+    /// The margin the platform's cell gives the cells list `slot`'s rows.
+    pub(crate) fn list_margins(&self, slot: u32) -> Option<[f32; 2]> {
+        self.list_margins
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .map(|(_, m)| *m)
+    }
+
+    pub(crate) fn set_list_margins(&mut self, slot: u32, margins: Option<[f32; 2]>) {
+        self.list_margins.retain(|(s, _)| *s != slot);
+        self.list_margins.extend(margins.map(|m| (slot, m)));
+    }
+
+    pub(crate) fn set_grouped_margins(
+        &mut self,
+        slot: u32,
+        margins: Option<crate::grouped::GroupedMargins>,
+    ) {
+        self.grouped_margins.retain(|(s, _)| *s != slot);
+        self.grouped_margins.extend(margins.map(|m| (slot, m)));
+    }
+
     pub(crate) fn set_content(&mut self, slot: u32, content: (f32, f32)) {
         self.contents[slot as usize] = content;
     }
@@ -1135,9 +1315,7 @@ mod tests {
     fn compact_inheritance_matches_full_styles_through_overrides_and_detach() {
         use crate::style::StyleValue;
         let number = StyleValue::Number;
-        fn text(s: &str) -> StyleValue<'_> {
-            StyleValue::Text(s.into())
-        }
+        let text = |s: &'static str| StyleValue::Text(s.into());
         let samples = [
             (StyleId::Direction, text("rtl")),
             (StyleId::CaretColor, text("light-dark(#ffffff, #112233)")),
@@ -1145,12 +1323,16 @@ mod tests {
             (StyleId::FontSize, number(24.0)),
             (StyleId::FontWeight, number(700.0)),
             (StyleId::FontStyle, text("italic")),
+            (StyleId::FontStretch, text("75%")),
+            (StyleId::FontVariationSettings, text(r#""GRAD" 150"#)),
+            (StyleId::FontOpticalSizing, text("none")),
             (StyleId::FontFamily, number(3.0)),
             (StyleId::Cursor, text("grab")),
             (StyleId::TextAlign, text("right")),
             (StyleId::LineHeight, number(1.5)),
             (StyleId::LetterSpacing, number(2.0)),
             (StyleId::FontVariantNumeric, text("tabular-nums")),
+            (StyleId::FontVariantLigatures, text("none")),
             (StyleId::TextColor, text("light-dark(#112233, #ffffff)")),
             (StyleId::WhiteSpace, text("pre-wrap")),
             (StyleId::DynamicRangeLimit, text("constrained")),
@@ -1195,6 +1377,7 @@ mod tests {
             (StyleId::ColorInterpolationFilters, text("sRGB")),
             (StyleId::TextBoxEdge, text("cap-alphabetic")),
             (StyleId::TextWrapStyle, text("balance")),
+            (StyleId::FontSmoothing, text("antialiased")),
         ];
         let mut covered = StyleMask::EMPTY;
         for (id, value) in samples {
@@ -1277,137 +1460,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod paragraph_stamp_tests {
-    use super::*;
-    use crate::{layout::LayoutTree, selector::SelectorIndex, txn, wire::Op};
-    use std::sync::Arc;
-
-    #[test]
-    fn rollover_is_atomic_and_invalid_or_noop_batches_do_not_rotate() {
-        let mut arena = NodeArena::new();
-        let mut layout = LayoutTree::new();
-        let mut selectors = SelectorIndex::new();
-        let commit = |a: &mut NodeArena, l: &mut LayoutTree, s: &mut SelectorIndex, ops: &[Op]| {
-            txn::apply(
-                txn::Target {
-                    arena: a,
-                    layout: l,
-                    selectors: s,
-                },
-                ops,
-                0,
-                0,
-                0,
-            )
-        };
-        commit(
-            &mut arena,
-            &mut layout,
-            &mut selectors,
-            &[
-                Op::CreateView {
-                    id: 1,
-                    node_type: NodeType::Text,
-                },
-                Op::CreateView {
-                    id: 2,
-                    node_type: NodeType::Text,
-                },
-            ],
-        )
-        .unwrap();
-        let a = arena.slot_of(1).unwrap();
-        let b = arena.slot_of(2).unwrap();
-        let old = [arena.paragraph_stamp(a), arena.paragraph_stamp(b)];
-        arena.text_serial = u64::MAX - 1;
-        let set = |id| Op::SetProp {
-            id,
-            prop: PropId::Text,
-            value: "new".into(),
-        };
-        assert!(commit(&mut arena, &mut layout, &mut selectors, &[set(1), set(99)]).is_err());
-        assert_eq!(old, [arena.paragraph_stamp(a), arena.paragraph_stamp(b)]);
-        assert_eq!(arena.text_serial, u64::MAX - 1);
-        commit(
-            &mut arena,
-            &mut layout,
-            &mut selectors,
-            &[Op::ClearProp {
-                id: 1,
-                prop: PropId::Text,
-            }],
-        )
-        .unwrap();
-        assert_eq!(old, [arena.paragraph_stamp(a), arena.paragraph_stamp(b)]);
-        commit(&mut arena, &mut layout, &mut selectors, &[set(1), set(2)]).unwrap();
-        for (slot, previous) in [a, b].into_iter().zip(old) {
-            assert!(!previous
-                .unwrap()
-                .same_metrics(&arena.paragraph_stamp(slot).unwrap()));
-            assert_eq!(arena.props(slot).str(PropId::Text), Some("new"));
-        }
-        assert_eq!(arena.text_serial, 1);
-    }
-
-    #[test]
-    fn current_slot_storage_and_namespace_lifetimes_do_not_retain_history() {
-        let mut arena = NodeArena::new();
-        let slot = arena.alloc(1, NodeType::Text).unwrap();
-        let old = arena.paragraph_stamp(slot).unwrap();
-        let weak = Arc::downgrade(&arena.text_domain.0);
-        let fork = arena.clone();
-        assert!(!old.same_metrics(&fork.paragraph_stamp(slot).unwrap()));
-        arena.reset();
-        assert!(
-            weak.upgrade().is_some(),
-            "the caller still holds a payload-free stamp"
-        );
-        drop(old);
-        assert!(
-            weak.upgrade().is_none(),
-            "neither reset nor a live public fork retains the retired namespace"
-        );
-        drop(fork);
-        for _ in 0..500 {
-            let slot = arena.alloc(1, NodeType::Text).unwrap();
-            arena.free_slot(slot);
-            assert_eq!(arena.text_revisions[slot as usize], Default::default());
-        }
-        assert_eq!(arena.text_revisions.len(), arena.slot_count());
-        assert_eq!(
-            arena.slot_count(),
-            1,
-            "high-water storage, not allocation history"
-        );
-        let slot = arena.alloc(1, NodeType::Text).unwrap();
-        let held = arena.paragraph_stamp(slot).unwrap();
-        let weak = Arc::downgrade(&arena.text_domain.0);
-        drop(arena);
-        assert!(weak.upgrade().is_some());
-        drop(held);
-        assert!(weak.upgrade().is_none());
-    }
-
-    #[test]
-    fn node_generation_wrap_does_not_reuse_a_paragraph_proof() {
-        let mut arena = NodeArena::new();
-        let slot = arena.alloc(1, NodeType::Text).unwrap();
-        let old = arena.paragraph_stamp(slot).unwrap();
-        arena.free_slot(slot);
-        arena.generations[slot as usize] = u32::MAX;
-        let reused = arena.alloc(1, NodeType::Text).unwrap();
-        let new = arena.paragraph_stamp(reused).unwrap();
-        assert_eq!(
-            old.owner(),
-            new.owner(),
-            "exercise existing u32 generation wrap"
-        );
-        assert!(
-            !old.same_metrics(&new),
-            "allocation serial must still differ"
-        );
-    }
-}
+mod paragraph_stamp_tests;
 
 /// One more (`up`) or one fewer node in a per-id count.
 fn bump(counts: &mut Vec<u32>, index: usize, up: bool) {

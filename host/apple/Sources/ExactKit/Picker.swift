@@ -72,7 +72,12 @@ final class Picker: NSObject {
     /// Chosen documents under `startAccessingSecurityScopedResource`, until
     /// the session ends (LLP 1069.010 D1).
     var scoped: [URL] = []
+    /// The holds of document pickers a drive shows for real (`--touch
+    /// platform`), by element: what the person's choice answers.
+    var documentTickets: [UInt32: UInt64] = [:]
     #if canImport(UIKit)
+    /// Those pickers, by element: what `back` or the agent's answer closes.
+    var documentShown: [UInt32: UIViewController] = [:]
     private var requests: [ObjectIdentifier: Request] = [:]
     /// Exporting document pickers showing (LLP 1069.010 D3): the element
     /// the outcome goes to, and the scratch directory to remove.
@@ -116,7 +121,7 @@ final class Picker: NSObject {
         if reply["answered"] as? String == "cancel" { cancel(view); return }
         let text = request["text"] as? String ?? ""
         var paths = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        if paths.count == 1 { paths = paths[0].split(separator: " ").map(String.init) }
+        if !text.contains("\n") { paths = text.split(whereSeparator: \.isWhitespace).map(String.init) }
         let accept = (session.presenter.views[view]?.props["accept"] ?? "").split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
         deliver(view, accept: accept, files: paths.map { (URL(fileURLWithPath: $0), ($0 as NSString).lastPathComponent) })
@@ -313,10 +318,9 @@ extension Picker {
 #elseif canImport(UIKit)
 extension Picker: UIDocumentPickerDelegate {
     func present(_ r: Request) {
-        guard var controller = session.presenter.root.window?.rootViewController else {
+        guard let controller = ViewPresentation.presenter(for: session.presenter.views[r.view] ?? session.presenter.root) else {
             session.log("picker: refused: no window"); cancel(r.view); return
         }
-        while let presented = controller.presentedViewController { controller = presented }
         let media = !r.accept.isEmpty && r.accept.allSatisfy { $0.hasPrefix("image/") || $0.hasPrefix("video/") }
         if media {
             // A production plan that can show it is refused at boot without

@@ -6,29 +6,39 @@
 //! Kernel validation precedes every write; a refusal leaves the kernel untouched.
 mod admission;
 mod advance;
+mod native_timers;
+pub use native_timers::NativeTimer;
+use native_timers::Timer;
 mod background;
 mod commit;
 mod control;
 mod errors;
+pub use errors::RunnerError;
 mod event;
 pub mod faults;
 mod field;
 mod fonts;
 pub mod foresee;
+mod in_flight;
+mod module_work;
+mod trace;
 pub use field::{FieldSelection, InputDetails, SelectionDirection};
 mod host_kinds;
 mod pointer;
-pub use pointer::{DropEvent, PointerEvent, WheelEvent};
+pub use pointer::{AtomEvent, DropEvent, MouseEvent, PointerEvent, WheelEvent};
 mod intersect;
 mod reorder;
 mod reorder_codec;
 mod reorder_group;
 pub use intersect::Intersection;
 pub use shown::BlockPlacement;
+mod box_resize;
 mod resize;
 pub use resize::{ResizeRect, UNDELIVERED as RESIZE_UNDELIVERED};
+mod held;
 mod live;
 mod mode;
+pub use held::Asked;
 mod root_font;
 mod shown;
 mod sounds;
@@ -39,7 +49,10 @@ pub use event::{
     KeyboardEvent, ScrollEvent,
 };
 pub use live::{LiveApplied, LiveRefusal};
-pub use tamber::{Color as ColorKind, Kind, Place, Tamber, Token};
+pub use tamber::{
+    Color as ColorKind, Font, Kind, Length as LengthKind, Number as NumberKind, Place, Tamber,
+    Token, Type as TypeKind,
+};
 mod canvas2d;
 pub use canvas2d::{
     engine as canvas_engine, CanvasEngine, CanvasList, DrawReply, DrawRequest, Drawn, Geometry,
@@ -48,15 +61,17 @@ pub use canvas2d::{
 mod carry;
 mod checkpoint;
 mod collection;
+mod snapshot;
 mod source;
 mod tabs;
 pub use source::{
     Announce, BackgroundState, DataError, DataSource, InFlight, Interrupt, Native, NativeCall,
-    NativeHandler, Overlaid, PreloadWake, Target, Write, BACKGROUND,
+    NativeHandler, Overlaid, PreloadWake, SnapshotModule, Target, Write, BACKGROUND,
 };
 mod delivery;
 mod links;
 pub use links::{CanvasLink, FormatLink, GeometryLink, RouterLink, RunnerLinks, SurfaceAnswer};
+pub use text_axes::TextAxesLink;
 mod device;
 mod device_links;
 mod document;
@@ -64,8 +79,13 @@ pub use device::{Hold, HoldAnswer};
 pub use device_links::{AuthLinks, DeviceLinks, PickerLinks};
 pub mod picker;
 pub use picker::{Picked, PickerRequest, PICKED};
+mod dated;
 mod fragments;
 mod gates;
+mod waits;
+pub use waits::{
+    frame_at_or_after, virtual_frame, Admitted, IdleObservation, TaskTiming, Wait, WaitKinds, Waits,
+};
 mod into_view;
 pub(crate) mod kept;
 #[cfg(test)]
@@ -73,37 +93,51 @@ mod kept_tests;
 mod lines;
 mod lists;
 mod media_session;
+mod overrun;
 mod page;
 mod perf;
 pub mod persist;
 mod query;
 mod queue;
+mod resource_inspection;
+mod world_origin;
 pub use queue::QUEUE_BOUND;
+mod history;
 pub mod router;
 pub use lists::{ListTextPolicy, ListTextPosition};
 mod settlement;
 mod sockets;
 pub use sockets::{SocketReader, SocketState};
+mod activities;
+mod apply;
+mod live_time;
 pub mod midi;
+mod modules;
+pub use modules::{AppState, CallHow, CallOrigin, PresenceAnswer, PresenceAsk, WakeHow};
+#[cfg(test)]
+mod abort_tests;
 mod split;
 mod surface_record;
+mod text_axes;
 mod time;
 mod transport;
 #[cfg(test)]
 mod transport_tests;
+mod uploads;
 mod viewport;
 mod writes;
 pub use carry::Carried;
 pub use checkpoint::Checkpoint;
 pub use router::{routing, RouterChange, Routing};
 pub use split::{press_writes_router, StackSplit};
+pub use uploads::{UploadEnd, UploadMark};
 
 use crate::instance::{Ids, InstanceError, InstanceStep, SurfaceUpdate, Tree, Update};
 use crate::request::{Answer, Dispatch, Outcome, Request, RequestOut};
 use crate::store::{Store, StoreWrite};
-use crate::vm::{self, Env, Frame, RowSlots, Trap};
-use exact_kernel::{CommitReceipt, Kernel, KernelError, ViewId};
-use exact_plan::{ActionsId, Code, EventKind, MutationsId, NodesId, Plan, PlanError, Value};
+use crate::vm::{self, Env, Frame, RowSlots};
+use exact_kernel::{CommitReceipt, Kernel, ViewId};
+use exact_plan::{ActionsId, Code, EventKind, MutationsId, NodesId, Plan, Value};
 
 /// A host-facing effect an action asked for; executed after commit, in order.
 #[derive(Debug, Clone, PartialEq)]
@@ -138,109 +172,16 @@ pub struct Advanced {
     pub now_ms: f64,
     /// The refusal that stopped the advance or the collection edge action.
     pub error: Option<RunnerError>,
-}
-
-/// Why the runner refused. The kernel is unchanged.
-#[allow(missing_docs)]
-#[derive(Debug)]
-pub enum RunnerError {
-    KernelSchemaMismatch {
-        plan: u64,
-        kernel: u64,
-    },
-    /// The plan belongs to another app (LLP 1023 D5): its header names one identity, this binary's data crate another.
-    AppMismatch {
-        plan: String,
-        host: String,
-    },
-    Plan(PlanError),
-    NotOneRoot(usize),
-    Trap(Trap),
-    Instance(InstanceError),
-    Kernel(KernelError),
-    Data {
-        resource: String,
-        error: DataError,
-    },
-    Shape {
-        resource: String,
-        /// Where the answer first differs from the declared shape.
-        why: String,
-    },
-    UnknownView(ViewId),
-    /// A typed host event carries invalid numeric values. No action ran.
-    InvalidEvent {
-        event: &'static str,
-    },
-    /// A control's `input` or `change` carries a value it could never report (LLP 1069.001 D4): a select's value no enabled option has.
-    InvalidValue {
-        event: &'static str,
-        reason: String,
-    },
-    NoHandler {
-        view: ViewId,
-        event: &'static str,
-    },
-    Arity {
-        action: String,
-        expected: usize,
-        actual: usize,
-    },
-    /// Derives and resources depend on each other in a cycle; nothing settles.
-    Cycle,
-    /// An earlier update failed after the instance tree had begun to change; the runner no longer matches its kernel and must be restarted (D5).
-    Poisoned,
-    /// `advance` was given a non-finite time.
-    NonFiniteClock,
-    /// A viewport dimension is non-finite or non-positive.
-    InvalidViewport,
-    /// A date fact is non-finite, negative, or its offset past ±18 hours.
-    InvalidTime,
-    /// A locale or time zone is empty, over-long, or not in its form.
-    InvalidPlace,
-    /// The declared router shapes, table, launch fallback or value is invalid.
-    Router(String),
-    /// A clock value exceeds the exact integer-millisecond domain.
-    ClockOutOfRange,
-    /// Adding a timer interval did not advance its next due time.
-    ClockDidNotAdvance {
-        timer: usize,
-    },
-    /// One seek reached the bounded number of timer commits it may perform.
-    TimerFireLimit {
-        limit: usize,
-    },
-    /// A send would be the 65th waiting for a `queue` mutation (LLP 1092 D4).
-    QueueFull {
-        mutation: String,
-    },
-    /// A gated task's `key=` is no key (a non-finite number; LLP 1092 D8).
-    TaskKey {
-        task: String,
-    },
-    /// A region sits at the plan root; v1 requires one root node.
-    RootRegion,
-    /// A slot initializer or write does not conform to the slot's declared type.
-    SlotType {
-        slot: String,
-    },
-    /// A derive's value does not conform to its declared type.
-    DeriveType {
-        derive: String,
-    },
-    /// An action argument does not conform to the parameter's declared type.
-    ArgumentType {
-        action: String,
-        param: String,
-    },
-    /// An action argument or a slot write is a string longer than [`crate::vm::MAX_STRING`] bytes.
-    StringTooLong {
-        name: String,
-    },
+    /// [`Runner::advance_until_request`] stopped after a commit that sent a
+    /// request, short of its cutoff or at it: the host lands the reply
+    /// before it advances again.
+    pub stopped_on_request: bool,
 }
 
 #[derive(Clone)]
 struct ResourceState {
+    /// Development inspection only; zero means the request was not observed.
+    inspection_generation: u64,
     args: Vec<Value>,
     value: crate::held::Held,
     /// Store revision this answer observed; checked only for known readers.
@@ -285,6 +226,7 @@ enum Seed<'a> {
 /// answers, and the arguments it was asked with (what `parse` sees).
 #[derive(Clone)]
 struct PendingReq {
+    inspection_generation: u64,
     refusal: Option<(&'static str, bool)>,
     /// The host refused this ordered request before execution (LLP 1041 §8.4).
     /// Earlier source turns may already have executed effects.
@@ -295,20 +237,44 @@ struct PendingReq {
     args: Vec<Value>,
     /// The source's continuation token, when the request is one.
     continuation: Option<u64>,
+    /// The module's own ticket for the fetch this request is
+    /// ([`crate::Request::fetch`]): what an app's abort names it by.
+    fetch: Option<u64>,
     /// The request itself when a re-ask may keep it: a resource's plain
     /// HTTP request (LLP 1054.000.000 D3).
     keepable: Option<Request>,
     /// An answer that keeps coming (LLP 1016.000): what it has delivered.
     stream: Option<StreamCount>,
+    /// An upload's stream ([`Request::upload_progress`]): in flight until its reply.
+    upload: bool,
+    /// The upload has begun to go out (`UPLOAD_SENDING`, or its first bytes
+    /// sent): a failure before that never reached the network (D10).
+    sent: bool,
+    /// A stream's: the grant line that admits it (`state.streams`).
+    grant: Option<String>,
     /// A topic its resource watches changed while it was in flight: its
     /// reply lands, then the resource is asked again (LLP 1016.002 D4).
     ask_again: bool,
+    /// Module work wrote the store while it was in flight, leaving this store
+    /// revision: until another write, its answer stands (LLP 1146 §2.3).
+    module_again: Option<u64>,
+    /// May change its server ([`crate::Request::has_effects`]): kept when let go (LLP 1146 D2).
+    effects: bool,
     /// The sequence when its answer was first asked; its later rounds keep
     /// it. Only an answer asked after a write landed retires that write.
     origin: u64,
     /// A mutation's: the write it carries (`writes.rs`), which only its
     /// reply lands or ends.
     write: Option<u64>,
+    /// Held (LLP 1016.000 D9, [`Request::is_held`]): pending, but no clock waits on it. A long poll (D8),
+    /// `replied` once it has a reply of any kind, is held and named too.
+    held: bool,
+    long_poll: bool,
+    replied: bool,
+    /// Never sent: when a resource an overrun refused is asked again (`overrun.rs`).
+    reask_at: Option<f64>,
+    /// The re-asks after a turn over its budget this ask's streak has made.
+    reasks: usize,
 }
 
 /// An open stream's messages so far, and those the host coalesced away
@@ -324,37 +290,44 @@ pub struct StreamCount {
 }
 
 impl PendingReq {
-    /// In flight: every request, and a stream until its first message.
+    /// In flight: every request, a stream until its first message, and an
+    /// upload until its reply. What `pending(…)` reads, held requests included.
     fn in_flight(&self) -> bool {
-        self.stream.is_none_or(|s| s.messages == 0)
+        self.upload || self.stream.is_none_or(|s| s.messages == 0)
     }
-}
 
-#[derive(Clone)]
-struct Timer {
-    /// The next due time; infinite once a one-shot timer has fired, and
-    /// while a gated task is idle (LLP 1092 D8); a frame task's next
-    /// virtual frame (LLP 1073 D3), `virtual_frame(base, k)`.
-    next_ms: f64,
-    /// Whether the task's gate holds (always, for `mount`).
-    armed: bool,
-    /// The key it was armed with (`key=`), as `for` compares keys.
-    key: Option<String>,
-    /// A frame task's last presented frame (or mount) …
-    base: f64,
-    /// … and which virtual frame after it is next.
-    k: u32,
+    /// Waited on by a clock (a jump, `clock settle`, `clock data`): in flight, not held (D8, D9),
+    /// not a re-ask's wait (no I/O: the agent's settle goes to its time, `overrun.rs`).
+    fn waited(&self) -> bool {
+        self.in_flight() && !self.quiet() && !self.replied && self.reask_at.is_none()
+    }
+
+    /// A request with effects the host has not refused at admission, and no
+    /// re-ask's wait (never sent), so it may reach its server: one let go is
+    /// offered to its source to keep, and the app is held open while it is
+    /// out (LLP 1146 D2).
+    fn admitted_effects(&self) -> bool {
+        self.effects && self.refusal.is_none() && !self.refused && self.reask_at.is_none()
+    }
 }
 
 type FocusPath = Vec<(ViewId, NodesId, Vec<Frame>)>;
 
+/// A send made before the data source was ready: its mutation, source and
+/// arguments, and the origin and invocation of the commit that made it,
+/// which `data_ready` sends it under (LLP 1133.002 D12), as a queue's
+/// waiting send keeps them (`queue.rs`).
+type Unsent = (usize, String, Vec<Value>, (CallOrigin, u64));
+
 /// One plan, one data source, one kernel.
 pub struct Runner<D: DataSource> {
     plan: Plan,
-    /// The plan's string pool, interned once (`vm::intern`).
-    strings: Vec<Value>,
+    /// The plan's strings as values, made as they are read (`vm::intern`).
+    strings: vm::Strings,
     sites: crate::instance::SiteIndex,
     inspection_digest: std::cell::OnceCell<String>,
+    /// [`Runner::keeps_midi`], made at the first agent read.
+    keeps_midi: std::cell::OnceCell<bool>,
     action_binding_origin: std::rc::Rc<()>,
     detached_focus: Vec<(ViewId, FocusPath)>,
     data: D,
@@ -370,8 +343,8 @@ pub struct Runner<D: DataSource> {
     reorder_kept: exact_kernel::style::wide::Keep,
     /// The design digest a live batch left (LLP 1121 stage 4); `None`: its plan's own.
     design: Option<String>,
-    /// A development build, admitting live batches ([`Runner::admit_live`], from its compat).
-    live: bool,
+    /// A development build admitting live batches ([`Runner::admit_live`]), and its last scrub frame.
+    live: live::Live,
     /// What a binding was told of this plan's tokens (a name it lacks), each said once (LLP 1121 D12).
     tamber_said: Vec<String>,
     /// How many times a token's value moved (`set_tokens`): a binding's input.
@@ -383,6 +356,7 @@ pub struct Runner<D: DataSource> {
     /// A grouped drop's source while its `reorderdrop` runs (D2).
     dropping_from: Option<exact_kernel::NodeKey>,
     ids: Ids,
+    pub(crate) orientation: crate::orientation::Said, // the host's readback, what was journaled (LLP 1133.029)
     now_ms: f64,
     timers: Vec<Timer>,
     clock: advance::Clock,
@@ -410,11 +384,34 @@ pub struct Runner<D: DataSource> {
     pending: Vec<PendingReq>,
     /// This commit let a request go: `conclude` tells the source what is still in flight.
     forgot: bool,
+    /// The fetches the app aborted ([`DataSource::take_aborted`]) that name no
+    /// request in flight yet (one a commit is still to hand out, a worker's
+    /// turn still to land), by the module's ticket, with how many
+    /// collections they have waited: matched as their request is enqueued.
+    heard_aborts: Vec<(u64, u32)>,
+    /// The requests whose fetch the app aborted, by ticket, until the host's
+    /// next pump answers them aborted (`take_request_refusal`). Both lists are
+    /// kept outside any commit's rollback: the module has already rejected
+    /// an ordinary fetch, and an adopted one (LLP 1146 D2) waits, pending,
+    /// for this answer to reject it in a module turn, so a refused aborting
+    /// commit still delivers it on the next pump.
+    module_aborts: Vec<u64>,
+    /// The tickets answered aborted, until the host cancels their requests
+    /// whatever their method ([`Runner::take_explicit_aborts`]).
+    explicit_aborts: Vec<u64>,
+    /// Requests let go while still running, by module fetch ticket and
+    /// runner ticket, until their reply ([`Runner::note_retired`]).
+    retired_fetches: Vec<(u64, u64)>,
     /// Failed arguments suppress another ask until they change or refresh.
     failed_args: Vec<Option<Vec<Value>>>,
+    /// The uploads asked and how each stands (LLP 1016.000 D10): none is
+    /// asked again at its arguments.
+    uploads: uploads::Uploads,
     /// Why each resource last failed, shown in `state.failed` while
     /// `failed_args` holds (app farm round 1: a refusal only in the journal).
     failed_why: Vec<Option<crate::failure::Failure>>,
+    /// The re-ask being committed, and the reply being landed (`overrun.rs`).
+    overrun: overrun::Overrun,
     /// `pending` as flags, by resource and by mutation, for expressions.
     pending_res: Vec<bool>,
     pending_mut: Vec<bool>,
@@ -423,7 +420,7 @@ pub struct Runner<D: DataSource> {
     landed: Vec<usize>,
     /// Sends made before the data source was ready, by mutation, sent at
     /// `data_ready` (LLP 1027 D4): pending meanwhile, one per mutation.
-    unsent: Vec<(usize, String, Vec<Value>)>,
+    unsent: Vec<Unsent>,
     /// When each mutation's `then` action is due, as a one-shot timer: infinite until an answer lands.
     then_due: Vec<f64>,
     /// `queue` mutations' waiting sends, `next`s and stalls (LLP 1092).
@@ -431,6 +428,8 @@ pub struct Runner<D: DataSource> {
     next_ticket: u64,
     /// The module's background work's round, when one is out (LLP 1097 D5).
     background: background::Background,
+    /// Module work's requests in flight (LLP 1146 D2).
+    module_work: module_work::ModuleWork,
     /// Files picked this run, for `app:/tmp/picked/` names (LLP 1069.002 D3).
     picked_count: u64,
     /// Second edges waiting for the first action's async targets to settle,
@@ -441,8 +440,10 @@ pub struct Runner<D: DataSource> {
     requests: Vec<RequestOut>,
     /// Socket operations of commits that stood, since the last take (D7).
     sockets: Vec<crate::SocketSend>,
-    /// The host's live count of a socket's buffered bytes (D7), if it has one.
-    socket_reader: Option<sockets::SocketReader>,
+    /// The host's live views of its sockets (D7) and listeners (LLP 1133.005).
+    socket_reader: sockets::Readers,
+    /// The host's live view of its long polls' backoff waits (D8), if it has one.
+    retry_reader: Option<crate::RetryReader>,
     mutation_requests: u64,
     /// Resources an action asked to re-request; consumed by the next settle
     /// that can ask them (LLP 1054.000.000 D2).
@@ -488,6 +489,8 @@ pub struct Runner<D: DataSource> {
     keeping: kept::Keeping,
     /// Resources asked again and again with new arguments (a development build's warning).
     churn: query::Churn,
+    /// The agent's preferred answers of native modules' sources (LLP 1124 D7).
+    extensions: modules::Extensions,
     poisoned: bool,
     /// Evaluate every site on every update (the incremental update's
     /// reference; `set_full_evaluation`).
@@ -506,6 +509,7 @@ pub struct Runner<D: DataSource> {
     settled: Option<settlement::Settled>,
     /// Per derive: its value depends on the durable store (bake provenance).
     derive_store_dependent: Vec<bool>,
+    activities: activities::Activities,
     /// What this binary and its update store know about delivery (LLP 1030
     /// D4, D7): the embedded answer until a host says otherwise.
     delivery: crate::delivery::Delivery,
@@ -515,6 +519,8 @@ pub struct Runner<D: DataSource> {
     page: crate::page::Page,
     // @ref LLP 1027.000.000 — the date, once the host says it.
     time: crate::time::WallTime,
+    live_times: live_time::LiveTimes,
+    text_axes: text_axes::TextAxes,
     place: crate::time::Place,
     surface_records: exact_kernel::SortedMap<String, String>,
     surface_refusals: exact_kernel::SortedMap<String, String>,
@@ -528,9 +534,8 @@ pub struct Runner<D: DataSource> {
     faults: faults::Faults,
     /// Device requests held for the agent (LLP 1069.007 D3): not I/O.
     device_holds: Vec<device::Hold>,
-    /// Notifications the app posted under the agent (`state.notifications`):
-    /// the agent's substitute for the system's (`crate::notify`).
-    notifications: Vec<crate::notify::Notice>,
+    /// Replies landed for held requests, by target (LLP 1016.000 D9): `clock held`'s evidence.
+    held_replies: Vec<(String, u64)>,
     /// The voice table (LLP 1096 D5): what the app's sounds scheduled.
     sounds: crate::sound::Sounds,
     /// The transport (LLP 1125 D3): the sequence playing and its record.
@@ -539,6 +544,8 @@ pub struct Runner<D: DataSource> {
     midi: crate::midi::Midi,
     /// The app's `setRootFontSize` over the host's size (LLP 1069.000 D3).
     root_font: root_font::RootFont,
+    /// What a development host holds over the app's own, and what the app asked of it (LLP 1122 T7).
+    held: held::Held,
     fonts: std::rc::Rc<std::cell::RefCell<crate::bridge::RuntimeFonts>>,
     /// Auth sessions (LLP 1069.006): live ones, and answers to deliver.
     auth: crate::auth::Sessions,
@@ -566,12 +573,6 @@ pub const TIMER_FIRE_LIMIT: usize = 4096;
 /// The seekable clock's virtual display: a frame every 1000/60 ms after a
 /// frame task last fired (LLP 1073 D3).
 pub const VIRTUAL_FRAME_MS: f64 = 1000.0 / 60.0;
-
-/// A frame task's `k`th virtual frame after `base`: `base + k·1000/60`, the
-/// product first, so sixty frames are exactly a second on every host.
-pub fn virtual_frame(base: f64, k: u32) -> f64 {
-    base + f64::from(k) * 1000.0 / 60.0
-}
 
 impl<D: DataSource> Runner<D> {
     /// This runner, linking every device capability: the plain boots'.
@@ -632,69 +633,12 @@ impl<D: DataSource> Runner<D> {
         .map(Runner::linking_every_device)
     }
 
-    /// Everything a reload keeps.
-    pub fn carry(&self) -> Carried {
-        Carried {
-            router: self.carry_router(),
-            data_revision: self.data.revision().map(str::to_owned),
-            keeps_answers: self.keeping.on,
-            slots: self
-                .plan
-                .slots
-                .iter()
-                .zip(&self.slots)
-                .filter(|(s, _)| s.owner.is_none())
-                .map(|(s, v)| (self.plan.str(s.name).to_string(), v.clone()))
-                .collect(),
-            panels: self.carry_panels(),
-            resources: self
-                .plan
-                .resources
-                .iter()
-                .zip(&self.resources)
-                .enumerate()
-                // A request in flight or a placeholder shown until the
-                // source is ready is not an answer to carry, nor one a
-                // write affects: the replacement runner asks it.
-                .filter(|(i, _)| !self.pending_res[*i] && !self.stale[*i] && !self.written(*i))
-                .filter(|(_, (_, s))| s.as_ref().is_none_or(|s| !s.placeholder))
-                .filter_map(|(_, (r, s))| {
-                    s.as_ref().map(|s| {
-                        (
-                            self.plan.str(r.name).to_string(),
-                            self.plan.str(r.source).to_string(),
-                            s.args.clone(),
-                            s.value.get(&self.plan).clone(),
-                        )
-                    })
-                })
-                .collect(),
-            store_readers: self
-                .plan
-                .resources
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| self.store_readers[*i])
-                .map(|(_, resource)| {
-                    (
-                        self.plan.str(resource.name).to_string(),
-                        self.plan.str(resource.source).to_string(),
-                    )
-                })
-                .collect(),
-            now_ms: self.now_ms,
-            store: self.store.snapshot(),
-            forgot_waiting: self.queued(),
-            faults: (!self.faults.is_empty()).then(|| self.faults.spec()),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)] // the host boot facts
     fn boot_inner(
         links: RunnerLinks,
         plan: Plan,
         mut data: D,
-        kernel: Kernel,
+        mut kernel: Kernel,
         seed: Seed<'_>,
         snapshot: Vec<(String, Vec<u8>)>,
         delivery: crate::delivery::Delivery,
@@ -713,7 +657,7 @@ impl<D: DataSource> Runner<D> {
             _ => None,
         };
         let now_ms = match seed {
-            Seed::Fresh => 0.0,
+            Seed::Fresh => crate::time::launch_clock(),
             Seed::At(now_ms) => now_ms,
             Seed::Carried(carried) => carried.now_ms,
             Seed::Checkpoint(checkpoint) => checkpoint.now_ms,
@@ -822,6 +766,7 @@ impl<D: DataSource> Runner<D> {
         // Its own role overrides (LLP 1121 stage 5): bound while it boots, installed once it has.
         let roles = exact_kernel::style::roles::Roles::new(crate::bridge::role_overrides(&plan));
         let booting = exact_kernel::style::roles::bind(&roles);
+        root_font::bold_text_facts(&mut kernel, &plan, viewport.preferences.bold_text); // LLP 1115.000 D12.3
         let mut runner = Runner {
             sites: crate::instance::SiteIndex::linked(&plan, links.keyframes),
             strings: vm::intern(&plan),
@@ -830,6 +775,7 @@ impl<D: DataSource> Runner<D> {
             midi: crate::runner::midi::queue(&plan, &data),
             plan,
             inspection_digest: std::cell::OnceCell::new(),
+            keeps_midi: std::cell::OnceCell::new(),
             action_binding_origin: std::rc::Rc::new(()),
             detached_focus: Vec::new(),
             data,
@@ -843,13 +789,14 @@ impl<D: DataSource> Runner<D> {
             reorder_ops: Vec::new(),
             reorder_kept: Default::default(),
             design: None,
-            live: false,
+            live: Default::default(),
             tamber_said: Vec::new(),
             design_moves: 0,
             roles: exact_kernel::style::roles::Installed::new(roles.clone()),
             reorder_session: None,
             dropping_from: None,
             ids: Ids::default(),
+            orientation: Default::default(),
             now_ms,
             timers: Vec::new(),
             clock: Default::default(),
@@ -857,6 +804,7 @@ impl<D: DataSource> Runner<D> {
             commands: Vec::new(),
             sounds: Default::default(),
             root_font: Default::default(),
+            held: Default::default(),
             fonts: Default::default(),
             into_view: Vec::new(),
             scrolled: Default::default(),
@@ -880,15 +828,23 @@ impl<D: DataSource> Runner<D> {
             queues: Default::default(),
             next_ticket: 1,
             background: Default::default(),
+            module_work: Default::default(),
             picked_count: 0,
             forgot: false,
+            heard_aborts: Vec::new(),
+            module_aborts: Vec::new(),
+            explicit_aborts: Vec::new(),
+            retired_fetches: Vec::new(),
             failed_args: Vec::new(),
+            uploads: Default::default(),
             failed_why: Vec::new(),
+            overrun: Default::default(),
             deferred_edges: Vec::new(),
             held_edges: Vec::new(),
             requests: Vec::new(),
             sockets: Vec::new(),
-            socket_reader: None,
+            socket_reader: Default::default(),
+            retry_reader: None,
             mutation_requests: 0,
             refresh_next: Vec::new(),
             writes: writes::Writes::default(),
@@ -902,10 +858,14 @@ impl<D: DataSource> Runner<D> {
             awaiting: Vec::new(),
             keeping: Default::default(),
             churn: Default::default(),
+            activities: activities::Activities::default(),
+            extensions: Default::default(),
             delivery,
             viewport,
             page: Default::default(),
             time: crate::time::launch_time(),
+            live_times: Default::default(),
+            text_axes: Default::default(),
             place: launched_place.clone().unwrap_or_default(),
             surface_records: Default::default(),
             surface_refusals: Default::default(),
@@ -923,7 +883,7 @@ impl<D: DataSource> Runner<D> {
             journal: std::collections::VecDeque::new(),
             faults: faults::Faults::from_env(),
             device_holds: Vec::new(),
-            notifications: Vec::new(),
+            held_replies: Vec::new(),
             auth: Default::default(),
             device_links: DeviceLinks::CORE,
             input_source: None,
@@ -933,6 +893,7 @@ impl<D: DataSource> Runner<D> {
             conformed: Default::default(),
         };
         runner.init_slots(carried, launch)?;
+        runner.carry_modes(carried.map_or(&[], |c| &c.modes));
         runner.derives = vec![None; runner.plan.derives.len()];
         // Resources: carry only the same named source and a value that still
         // fits the declared shape; a carried value can refuse nothing.
@@ -949,6 +910,7 @@ impl<D: DataSource> Runner<D> {
                     })
                     .filter(|(_, _, _, value)| runner.check_shape(i, value).is_ok())
                     .map(|(_, _, args, value)| ResourceState {
+                        inspection_generation: 0,
                         args: args.clone(),
                         value: crate::held::Held::new(value.clone()),
                         store_revision: runner.store.revision(),
@@ -959,6 +921,9 @@ impl<D: DataSource> Runner<D> {
                     })
             })
             .collect();
+        // @ref LLP 1016.000 D10 — the uploads asked, carried by resource,
+        // source and arguments whatever the data module; a launch starts with none.
+        runner.carry_uploads_in(carried.map_or(&[][..], |c| &c.uploads));
         // @ref LLP 1048.000 D6 — a document's answers seed their resources.
         // The device's own store is an input its render never had.
         let (seeded, note) = match seed {
@@ -966,49 +931,17 @@ impl<D: DataSource> Runner<D> {
             _ => (vec![false; runner.plan.resources.len()], String::new()),
         };
         let device_state = matches!(seed, Seed::Checkpoint(_)) && runner.has_app_store();
-        // Store-reading resources when the data source is not ready (a
-        // TypeScript module before its host loads it, LLP 1027 D4): the
-        // answer kept from the last launch seeds the first frame if its
-        // identifying arguments still match and its value still fits; the compiled
-        // empty-store placeholder is the fallback (settlement); either way
-        // the resource is asked again at `data_ready`.
+        // Store-reading resources when the data source is not ready (a TypeScript module before
+        // its host loads it, LLP 1027 D4): the answer kept from the last launch seeds the first
+        // frame if its identifying arguments still match and its value still fits; the compiled
+        // empty-store placeholder is the fallback (settlement); either way the resource is asked
+        // again at `data_ready`.
         let ready = runner.data.ready();
         runner.keeping.on = !private && (!ready || carried.is_some_and(|c| c.keeps_answers));
         runner.stale = vec![false; runner.plan.resources.len()];
         runner.entropy_readers = vec![false; runner.plan.resources.len()];
         runner.awaiting = vec![false; runner.plan.resources.len()];
-        if !ready {
-            for (i, &taken) in seeded.iter().enumerate() {
-                if !runner.plan.resources[i].reader
-                    || exact_plan::runner_owned_source(
-                        runner.plan.str(runner.plan.resources[i].source),
-                    )
-                {
-                    continue;
-                }
-                // An answer the runtime already has isn't asked again when
-                // the module loads, unless the device's store may change it.
-                if taken && !device_state {
-                    continue;
-                }
-                runner.stale[i] = true;
-                if runner.resources[i].is_some() {
-                    continue;
-                }
-                let seed = runner.kept_seed(i);
-                if let Some((args, value)) = seed {
-                    runner.resources[i] = Some(ResourceState {
-                        args,
-                        value: crate::held::Held::new(value),
-                        store_revision: runner.store.revision(),
-                        placeholder: false,
-                        kept_seed: true,
-                        answered_for: None,
-                        origin: 0,
-                    });
-                }
-            }
-        }
+        runner.seed_at_boot(&seeded, device_state, ready, private);
         if ready && device_state {
             // … and asked now when it can answer, showing the rendered
             // answer until it does.
@@ -1046,12 +979,16 @@ impl<D: DataSource> Runner<D> {
                     now + t.interval_ms as f64
                 },
                 armed: !(t.gated || t.keyed),
+                generation: 0,
                 key: None,
                 base: now,
                 k: 1,
             })
             .collect();
         runner.gate_step()?;
+        // No commit's end follows the boot's settlement: what it did here.
+        runner.hear_forgotten();
+        runner.keep_sent(false);
         runner.transport_stood();
         // First frame.
         let mut ids = std::mem::take(&mut runner.ids);
@@ -1068,6 +1005,7 @@ impl<D: DataSource> Runner<D> {
         runner.ids = ids;
         runner.tree = Some(tree);
         let receipt = runner.apply(ops)?;
+        runner.samples_stood();
         runner.publish_surfaces(surfaces);
         let line = lines::boot(carried.is_some(), runner.kernel.live_count(), receipt.epoch);
         runner.log(line);
@@ -1106,6 +1044,17 @@ impl<D: DataSource> Runner<D> {
     /// layout refusal) so one read sees everything in order.
     pub fn log(&mut self, line: impl Into<String>) {
         let line = line.into();
+        // While measuring, a development host also writes it to its
+        // platform's log (LLP 1143 open question 1).
+        if !self.ids.work.sites.is_empty() {
+            crate::perf::queue(&self.ids.work.journal, line.clone());
+        }
+        self.journal_only(line);
+    }
+
+    /// Append a line to the journal and nowhere else: an alert, which its
+    /// own queue carries to the platform's log.
+    pub(crate) fn journal_only(&mut self, line: String) {
         self.journal.push_back(lines::stamped(self.now_ms, &line));
         if self.journal.len() > JOURNAL_RING {
             self.journal.pop_front();
@@ -1175,20 +1124,6 @@ impl<D: DataSource> Runner<D> {
         &mut self.kernel
     }
 
-    /// Same immutable plan as a targeted node read. No work until an inspector
-    /// requests identity; a replacement runner owns a fresh cache.
-    pub fn inspection_digest(&self) -> &str {
-        self.inspection_digest.get_or_init(|| {
-            use sha2::{Digest, Sha256};
-            use std::fmt::Write;
-            let mut out = String::with_capacity(64);
-            for byte in Sha256::digest(self.plan.encode()) {
-                write!(out, "{byte:02x}").unwrap();
-            }
-            out
-        })
-    }
-
     /// The data source.
     pub fn data(&mut self) -> &mut D {
         &mut self.data
@@ -1197,15 +1132,6 @@ impl<D: DataSource> Runner<D> {
     /// Inspect data-source identity and readiness without executing app logic.
     pub fn data_ref(&self) -> &D {
         &self.data
-    }
-
-    /// What the app posted under the agent, oldest first (`crate::notify`).
-    pub fn notifications(&self) -> &[crate::notify::Notice] {
-        &self.notifications
-    }
-
-    pub(crate) fn notifications_mut(&mut self) -> &mut Vec<crate::notify::Notice> {
-        &mut self.notifications
     }
 
     /// Current value of a slot by name.
@@ -1224,6 +1150,16 @@ impl<D: DataSource> Runner<D> {
             .iter()
             .position(|d| self.plan.str(d.name) == name)
             .and_then(|i| self.derives[i].as_ref())
+    }
+
+    /// The plan's `i`th slot and derive, for a walk of all of them (the
+    /// agent's `state`): looking each up by name is quadratic in the slots.
+    pub(crate) fn slot_at(&self, i: usize) -> Option<&Value> {
+        self.slots.get(i)
+    }
+
+    pub(crate) fn derive_at(&self, i: usize) -> Option<&Value> {
+        self.derives.get(i).and_then(Option::as_ref)
     }
 
     /// Each resource whose last request failed, by name, with why: what
@@ -1327,21 +1263,37 @@ impl<D: DataSource> Runner<D> {
         std::mem::take(&mut self.surfaces)
     }
 
-    /// The commands actions emitted since the last take.
+    /// The commands actions emitted since the last take, and the runner's
+    /// own scroll to a fragment once its route's content has arrived.
     pub fn take_commands(&mut self) -> Vec<Command> {
+        self.fragment_command();
         std::mem::take(&mut self.commands)
     }
 
     /// The store's writes since the last take, in order, for the host to
     /// persist (LLP 1018 D1) — only from commits that applied.
     pub fn take_store_writes(&mut self) -> Vec<StoreWrite> {
-        self.store.take_writes()
+        let writes = self.store.take_writes();
+        self.presence_writes(writes)
     }
 
     /// The names the store holds a value for — never the values (LLP 1018
     /// D5: a token is not the agent's to see).
+    /// A presence name is listed with its occupancy, `token: locked,
+    /// user-presence`, `pending`, `plain` or `absent` (LLP 1133.010 §7).
     pub fn store_names(&self) -> Vec<String> {
-        self.store.names().into_iter().map(str::to_string).collect()
+        let presence = self.presence_list();
+        let mut names: Vec<String> = (self.store.names().into_iter())
+            .filter(|n| !n.starts_with(Store::PRESENCE) && !presence.iter().any(|(p, _)| p == n))
+            .map(str::to_string)
+            .collect();
+        names.extend(
+            presence
+                .into_iter()
+                .map(|(name, said)| format!("{name}: {said}")),
+        );
+        names.sort();
+        names
     }
 
     /// The store, for a test that reads what an action kept.
@@ -1400,69 +1352,6 @@ impl<D: DataSource> Runner<D> {
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
-    fn apply(&mut self, mut ops: Vec<exact_kernel::Op>) -> Result<CommitReceipt, RunnerError> {
-        let _roles = self.bind_roles(); // Its own (LLP 1121 stage 5).
-                                        // The queued patches' colours stay kept until this commit marks them.
-        let (mut prefix, _queued) = self.take_reorder_ops();
-        if !prefix.is_empty() {
-            prefix.append(&mut ops);
-            ops = prefix;
-        }
-        let change = self.router_change()?;
-        self.batch += 1;
-        let language = self.resolved_locale().to_owned();
-        let direction = if self.direction() == "rtl" {
-            exact_kernel::Direction::Rtl
-        } else {
-            exact_kernel::Direction::Ltr
-        };
-        let shown = std::mem::take(&mut self.shown);
-        let mut receipt =
-            match self
-                .kernel
-                .apply_document(0, self.batch, &ops, Some((&language, direction)))
-            {
-                Ok(receipt) => receipt,
-                Err(e) => {
-                    self.notes.clear();
-                    return Err(e.into());
-                }
-            };
-        let renewed = self.settle_shown(shown, &mut receipt);
-        self.tally(&ops, &receipt.touched);
-        for note in std::mem::take(&mut self.notes) {
-            self.log(note);
-        }
-        let arena = self.kernel.arena();
-        receipt.renewed = renewed
-            .into_iter()
-            .filter_map(|view| arena.key_of(view))
-            .collect();
-        // Forget destroyed views once they outnumber the live ones (a
-        // detached kernel holds none, and its runner asks for none).
-        if !self.kernel.is_detached() && self.ids.remembered() > 2 * self.kernel.live_count() + 256
-        {
-            let kernel = &self.kernel;
-            self.ids.retain(|view| kernel.node(view).is_some());
-        }
-        let cleanup = self.reconcile_reorder()?;
-        if !cleanup.is_empty() {
-            self.batch += 1;
-            let tail = self.kernel.apply(0, self.batch, &cleanup)?;
-            self.tally(&cleanup, &tail.touched);
-            receipt.batch = tail.batch;
-            receipt.epoch = tail.epoch;
-            for key in tail.touched {
-                if !receipt.created.contains(&key) && !receipt.touched.contains(&key) {
-                    receipt.touched.push(key);
-                }
-            }
-            receipt.layout_invalidated |= tail.layout_invalidated;
-        }
-        self.commit_router(change);
-        self.retire_holds();
-        Ok(receipt)
-    }
     fn env<'a>(&'a self, params: &'a [Value], frames: &'a [Frame]) -> Env<'a> {
         Env {
             plan: &self.plan,
@@ -1491,5 +1380,7 @@ impl<D: DataSource> Runner<D> {
         Ok(vm::eval(self.plan.code(code), &env, &[])?.value)
     }
 }
+#[cfg(test)]
+mod held_tests;
 #[cfg(test)]
 mod stream_tests;

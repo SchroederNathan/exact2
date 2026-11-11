@@ -4,14 +4,24 @@
     "90": "0x70f5499729b09c87"
   },
   "saves": {
-    "continuation": "d00824193dd823776a807a39e96eac9d8cc07ab70067ecb97748e42838767aa8"
+    "continuation": "3d0e35f7b879346d0b13f85359b54b61a1bcf36071df3d97de672530f5207217"
   },
   "hosts": [
     "linux",
     "web"
   ],
-  "inputs": "0a58f9e62e03a74f6292718e112b00178e30453339f0fc96ee28102e9c04e9ea",
+  "modes": [
+    "0",
+    "1",
+    "fresh-game"
+  ],
+  "profiles": [
+    "gpu-dev"
+  ],
+  "inputs": "d11560d2119c0b08ea07c31bdbf23eabd7423a9bbdb8bc8ecd198d05de4404c4",
+  "sourceInputs": "adfcdddd307d953a726efef23f4973eb51bc1fb9001473bfd6809d214f1951d4",
   "game": "audio-fixture",
   "generated": "bun game/prove.mjs audio-fixture --repin --hosts 'linux,web'",
-  "at": "2c19c834853f9a169c70704b58f0ed255a8d7daa"
+  "at": "61d7d251b21cf54739592befb8aa4d3e033349d4",
+  "reason": "EXSIM v8 (player: u8, pads) over EXGAME v6: continuation bytes change; tick hashes unchanged"
 }

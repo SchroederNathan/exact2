@@ -20,6 +20,7 @@ name = "exact_linux"
 crate-type = ["rlib"]
 
 [dependencies]
+exact-ink = { path = "../ink" }
 exact-grants = { path = "../../grants" }
 exact-canvas = { path = "../../canvas" }
 exact-data = { path = "../../data" }
@@ -32,6 +33,9 @@ exact-raster = { path = "../raster" }
 # SVG islands (LLP 1055.000 §8 ruling 4): a loaded module on Apple, linked
 # here beside the tiny-skia this host already has.
 exact-svg-raster = { path = "../svg-raster" }
+# An SVG file as an image (LLP 1011.001 D2): parsed into the kernel's SVG
+# nodes and resolved to the scene the painter draws as an island.
+exact-svg-file = { path = "../svg-file" }
 exact-route = { path = "../../route" }
 # A `markup="markdown"` text's pieces (LLP 1045 D4): the painter links Rust,
 # so the reader expands its source here, as Apple's archive does.
@@ -47,11 +51,17 @@ exact-runner = { path = "../../runner" }
 # conformance's network runs this host over (src/executor.rs).
 ibex2 = { path = "../../vendor/ibex/crates/ibex2", default-features = false, features = ["websocket", "portable-http"] }
 sha2 = "0.10"
+# The freedesktop recent-files store a kept document is noted in (src/kept.rs);
+# fontconfig-parser already links it.
+roxmltree = "0.20"
+# A remote image's redirects resolve and lose their credentials here (src/image/remote.rs).
+url = "2.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libloading = "0.8"
 base64 = "0.22"
 tiny-skia = "0.12"
+unicode-segmentation = "1.13"
 # Text (LLP 1085.000): Parley lays out, fontique finds and matches faces
 # (its `system` feature off: no fontconfig, no platform font API), swash
 # rasterizes the face Parley chose. Every one is Rust.
@@ -86,7 +96,12 @@ fontconfig-parser = "0.5"
 drm = "0.15"
 evdev = "0.13"
 
+[target.'cfg(unix)'.dependencies]
+# The local listener (LLP 1133.005), linked here as the SVG rasterizer is.
+exact-listen = { path = "../listen" }
+
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_Imaging", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_Controls_RichEdit", "Win32_UI_WindowsAndMessaging", "UI_ViewManagement"] }
 chrono = "0.4"
 chrono-tz = "0.10"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Com"] }
@@ -97,6 +112,9 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 test-wait = []
 
 [dev-dependencies]
+exact-js = { path = "../../js" }
+messages-stress-data = { path = "../../apps/messages-stress/data" }
+exact-update = { path = "../../update" }
 exact-linux = { path = ".", features = ["test-wait"] }
 cc = "1"
 caltrain = { path = "../../apps/caltrain" }

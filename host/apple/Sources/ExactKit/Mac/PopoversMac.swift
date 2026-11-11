@@ -28,7 +28,9 @@
 // toggle, a batch that takes the popover or its invoker away) still closes
 // it, through the same door as before; what AppKit closes itself closes the
 // page's popover with it. The edge is the popover's `position-area`: above
-// for `top`, beside for `right`, below otherwise. Its margin on the side
+// for `top`, beside for `right`, below otherwise; one whose author wrote
+// `left` or `top` points at that point of the viewport instead (LLP 1021
+// D2), as a hand-built app points one at a click. Its margin on the side
 // that faces its invoker stands between the two (AppKit's popover has none
 // of its own, so the rectangle it is anchored to is moved out by it); the
 // popover itself is the size of its border box.
@@ -61,6 +63,22 @@ final class NativePopover: NSObject, NSPopoverDelegate {
         popover.contentSize = home.size
         popover.delegate = self
     }
+    /// Where it points while shown, by its margins (the gap to its invoker):
+    /// the view it was shown against, and the rectangle for given margins in it.
+    var positioning: (view: NSView, rect: (PositionArea.Margins) -> NSRect)?
+    var margins = PositionArea.Margins()
+    /// Its margins changed while shown: the gap to its invoker follows.
+    func reanchor(_ margins: PositionArea.Margins) {
+        guard margins != self.margins else { return }
+        self.margins = margins
+        if let positioning, popover.isShown { popover.positioningRect = positioning.rect(margins) }
+    }
+    /// Its insets moved while shown (LLP 1021 D2): it points at the new point.
+    func repoint() {
+        guard let positioning, popover.isShown else { return }
+        let rect = positioning.rect(margins)
+        if popover.positioningRect != rect { popover.positioningRect = rect }
+    }
     /// The content's size, as layout returned it.
     func fit(_ size: CGSize) {
         guard size.width > 0, size.height > 0, popover.contentSize != size else { return }
@@ -87,13 +105,21 @@ extension MenuHost {
     }
 
     func paint(_ entry: Entry, in window: NSWindow) {
-        guard let presenter else { return }
         entry.layer.autoresizingMask = [.width, .height]
-        // The invoker's page or sheet owns the painted layer.
-        (window === presenter.viewport.window ? presenter.viewport : window.contentView ?? presenter.viewport).addSubview(entry.layer)
+        layerHost(entry, in: window)?.addSubview(entry.layer)
         entry.layer.setPaintForeground()
         entry.layer.addSubview(entry.popover)
         entry.popover.isHidden = false
+    }
+
+    /// The view that owns a painted popover's layer: its invoker's split
+    /// pane, page or sheet. `layout` moves the layer when that changes (a
+    /// split collapsing takes the route back into the page).
+    func layerHost(_ entry: Entry, in window: NSWindow?) -> NSView? {
+        guard let presenter else { return nil }
+        if let pane = presenter.navigation.split.pane(holding: entry.source) { return pane }
+        guard let window else { return nil }
+        return window === presenter.viewport.window ? presenter.viewport : window.contentView ?? presenter.viewport
     }
 
     func restore(_ entry: Entry) {
@@ -142,6 +168,11 @@ extension MenuHost {
         }
     }
 
+    /// The toolbar-item API chooses its own edge and has no gap parameter.
+    static func usesToolbarAnchor(_ pop: NodeView) -> Bool {
+        pop.style["position_area"] == nil && PositionArea.margins(of: pop) == .init()
+    }
+
     /// Whether `window` is one of this session's popovers'.
     func hosts(_ window: NSWindow) -> Bool {
         entries.contains { $0.native?.window === window } || leaving.contains { $0.window === window }
@@ -154,16 +185,40 @@ extension MenuHost {
     func present(_ entry: Entry, from source: NodeView, in window: NSWindow) -> Bool {
         guard let presenter else { return false }
         let pop = entry.popover
+        // At its authored `left`/`top` (LLP 1021 D2): a 1×1 rectangle at that
+        // point of the viewport, as a hand-built app points a popover at a
+        // click, read again as the insets change while it shows (`repoint`).
+        // It is the window's, as the CSS box is the viewport's: not the
+        // invoker's, which the point may lie outside of or scroll away from.
+        let windowContent = window.contentView
+        let pressed = { [weak presenter, weak pop, weak windowContent] () -> NSRect? in
+            guard let presenter, let pop, let windowContent, let at = PositionArea.inset(of: pop, viewport: presenter.clientSize) else { return nil }
+            return NSRect(origin: presenter.point(fromClient: at, in: windowContent), size: CGSize(width: 1, height: 1))
+        }
         // A button in the window's bar has no box in the page: its item's.
         // AppKit shows no popover against an anchor it cannot see (measured:
         // a window not on screen, a hidden view, one scrolled out of sight).
-        let view: NSView, anchor: NSRect
-        if let content = window.contentView, let bar = presenter.toolbar.anchor(of: source, in: content) { (view, anchor) = (content, bar) }
-        else if source.window != nil { (view, anchor) = (source, self.anchor(source, in: source, run: entry.run)) }
+        let view: NSView, invoker: NSRect
+        if let windowContent, pressed() != nil, source.window != nil {
+            (view, invoker) = (windowContent, windowContent.convert(self.anchor(source, in: source, run: entry.run), from: source))
+        } else if let content = windowContent, let bar = presenter.toolbar.anchor(of: source, in: content) { (view, invoker) = (content, bar) }
+        else if source.window != nil { (view, invoker) = (source, self.anchor(source, in: source, run: entry.run)) }
         else { return false }
         guard view.window?.isVisible == true else { return false }
+        // Pointed at in `view`: one opened at its invoker and given insets
+        // later points at them from the invoker's coordinates.
+        let pointed = { [weak view, weak windowContent] () -> NSRect? in
+            guard let view, let rect = pressed() else { return nil }
+            return view === windowContent ? rect : view.convert(rect, from: windowContent)
+        }
+        let anchor = pointed() ?? invoker
         let native = NativePopover(host: self, node: pop, home: entry.frame)
         entry.native = native
+        // AppKit's popover gives its own block and takes it back on its
+        // finish: a region told before is told again if it is painted again,
+        // and one not yet told is not told over AppKit's.
+        entry.block = nil
+        presenter.regionsUntold.removeValue(forKey: pop.id)
         native.popover.behavior = entry.value == "manual" ? .applicationDefined : .transient
         native.popover.animates = !ExactEnv.agentFreezes
         native.content.pointerTracking = { [weak presenter] in presenter?.trackPointer($0) }
@@ -172,8 +227,11 @@ extension MenuHost {
         let screen = (window.screen ?? NSScreen.main)?.visibleFrame.size ?? window.frame.size
         let maximum = CGSize(width: max(1, screen.width - 2 * Self.popoverMargin), height: max(1, screen.height - 2 * Self.popoverMargin))
         let margins = PositionArea.margins(of: pop), edge = Self.edge(PositionArea.of(pop))
-        presenter.blocks.show(pop, in: native.content, block: .atMost(maximum)) { [weak native] size in
+        presenter.blocks.show(pop, in: native.content, block: .atMost(maximum)) { [weak native, weak pop] size in
+            // Its margins as they are now: a change while open resizes it too.
+            let margins = pop.map(PositionArea.margins(of:)) ?? margins
             native?.fit(CGSize(width: size.width - margins.left - margins.right, height: size.height - margins.top - margins.bottom))
+            native?.reanchor(margins)
         }
         // A presenter with no session lays nothing out again: the popover keeps the page's box.
         if presenter.blocks.used[pop.id] == nil { pop.setFrameOrigin(.zero) }
@@ -181,18 +239,30 @@ extension MenuHost {
         // The author's margin stands between the popover and its invoker: the
         // anchor's rectangle moved out by it, in the window's content view,
         // since AppKit keeps a rectangle to the view it is given in.
-        let gap = edge == .minY ? margins.bottom : edge == .maxY ? margins.top : edge == .maxX ? margins.left : margins.right
-        var (at, rect) = (view, anchor)
-        if gap > 0, view.isFlipped, let content = window.contentView {
+        // A margin changed while it is shown moves the rectangle in the same view.
+        let content = view.isFlipped ? window.contentView : nil
+        let at: NSView = margins.gap(edge) > 0 ? content ?? view : view
+        let pointing = { [weak view, weak at] (margins: PositionArea.Margins) -> NSRect in
+            guard let view, let at else { return anchor }
+            let gap = view.isFlipped ? margins.gap(edge) : 0
+            var rect = pointed() ?? invoker
             switch edge {
             case .minY: rect.origin.y -= gap; rect.size.height += gap
             case .maxY: rect.size.height += gap
             case .maxX: rect.size.width += gap
             default: rect.origin.x -= gap; rect.size.width += gap
             }
-            (at, rect) = (content, content.convert(rect, from: view))
+            return at === view ? rect : at.convert(rect, from: view)
         }
-        native.popover.show(relativeTo: rect, of: at, preferredEdge: at.isFlipped ? edge : Self.unflipped(edge))
+        let rect = pointing(margins)
+        native.positioning = (at, pointing)
+        native.margins = margins
+        if Self.usesToolbarAnchor(pop), pointed() == nil, let item = presenter.toolbar.items[source.id], window.toolbar?.items.contains(where: { $0 === item }) == true {
+            native.positioning = nil // a toolbar item's popover points at the item
+            native.popover.show(relativeTo: item)
+        } else {
+            native.popover.show(relativeTo: rect, of: at, preferredEdge: at.isFlipped ? edge : Self.unflipped(edge))
+        }
         guard native.popover.isShown else {
             // AppKit showed none (its invoker is hidden or scrolled out of
             // sight): the page paints it, as it would have. Its subtree goes

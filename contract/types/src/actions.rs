@@ -12,6 +12,35 @@ struct Lets<'a> {
     later: Vec<(&'a str, Span)>,
 }
 
+/// A component's states, mutations and actions by name, each to its first
+/// declaration's index (as a scan finds it). Built once for all of a pass's
+/// bodies and handlers: a scan for each of them is quadratic in a large root.
+pub(super) struct Names<'c> {
+    /// The component the names are of.
+    pub(super) c: &'c Component,
+    states: std::collections::HashMap<&'c str, usize>,
+    mutations: std::collections::HashMap<&'c str, usize>,
+    pub(super) actions: std::collections::HashMap<&'c str, usize>,
+}
+
+impl<'c> Names<'c> {
+    pub(super) fn new(c: &'c Component) -> Self {
+        let first = |it: &mut dyn Iterator<Item = &'c str>| {
+            let mut m = std::collections::HashMap::new();
+            for (i, n) in it.enumerate() {
+                m.entry(n).or_insert(i);
+            }
+            m
+        };
+        Names {
+            c,
+            states: first(&mut c.states.iter().map(|s| s.name.as_str())),
+            mutations: first(&mut c.mutations.iter().map(|m| m.name.as_str())),
+            actions: first(&mut c.actions.iter().map(|a| a.name.as_str())),
+        }
+    }
+}
+
 /// Check an action's body, recording each statement's refusal and moving
 /// on. `lifted` is a child's action expanded into the root: its names were
 /// checked in the child's own scope, where a `let` shadows nothing, and it
@@ -20,27 +49,32 @@ pub(super) fn check_body(
     stmts: &[Stmt],
     scope: &Scope,
     lifted: bool,
-    c: &Component,
+    names: &Names<'_>,
     ct: &mut ComponentTypes,
     shapes: &Shapes,
     sink: &mut Sink,
-) {
+) -> Vec<usize> {
     let mut cx = Cx {
-        c,
+        c: names.c,
+        names,
         ct,
         shapes,
         sink,
         lifted,
+        written: Vec::new(),
     };
     cx.block(stmts, scope, &Lets::default());
+    cx.written
 }
 
 struct Cx<'c, 's> {
     c: &'c Component,
+    names: &'c Names<'c>,
     ct: &'c mut ComponentTypes,
     shapes: &'c Shapes,
     sink: &'s mut Sink,
     lifted: bool,
+    written: Vec<usize>,
 }
 
 impl Cx<'_, '_> {
@@ -142,10 +176,10 @@ impl Cx<'_, '_> {
                         *span,
                     );
                 }
-                let Some(si) = c.states.iter().position(|s| &s.name == target) else {
+                let Some(si) = self.names.states.get(target.as_str()).copied() else {
                     // A mutation's slot may be assigned (`session = none`);
                     // its type is `option<T>` and is never inferred from here.
-                    if let Some(mi) = c.mutations.iter().position(|m| &m.name == target) {
+                    if let Some(mi) = self.names.mutations.get(target.as_str()).copied() {
                         let t = infer(expr, scope, shapes)?;
                         let mt = Ty::Option(Box::new(self.ct.mutations[mi].clone()));
                         if !checks::can_unify(&mt, &t) {
@@ -165,7 +199,10 @@ impl Cx<'_, '_> {
                 };
                 let t = infer(expr, scope, shapes)?;
                 match self.ct.slots[si].unify(&t) {
-                    Some(u) => self.ct.slots[si] = u,
+                    Some(u) => {
+                        self.ct.slots[si] = u;
+                        self.written.push(si);
+                    }
                     None => {
                         return err(
                             "type-assign",
@@ -176,6 +213,15 @@ impl Cx<'_, '_> {
                 }
             }
             Stmt::Command { name, args, span } => {
+                // A native module's send that answers nothing (LLP 1133.004
+                // D5): its one options record, as a `send`'s arguments are.
+                if shapes.effects.contains(name) {
+                    let mut params = Vec::with_capacity(args.len());
+                    for arg in args {
+                        params.push(crate::source_argument(arg, name, scope, shapes)?);
+                    }
+                    return crate::record_source(self.ct, name, params, Ty::Unit, *span);
+                }
                 // An action prop or injected action, called anywhere (LLP
                 // 1089 D1, D7): its arguments here, against its declared
                 // type; the action it names is run, and checked, after
@@ -199,7 +245,7 @@ impl Cx<'_, '_> {
                 span,
                 ..
             } => {
-                let Some(mi) = c.mutations.iter().position(|m| &m.name == target) else {
+                let Some(mi) = self.names.mutations.get(target.as_str()).copied() else {
                     return err(
                         "type-send-not-mutation",
                         format!(
@@ -208,9 +254,25 @@ impl Cx<'_, '_> {
                         *span,
                     );
                 };
+                if matches!(
+                    source.as_str(),
+                    "startActivity" | "updateActivity" | "endActivity"
+                ) {
+                    crate::activities::send(
+                        source,
+                        args,
+                        scope,
+                        shapes,
+                        &self.ct.mutations[mi],
+                        *span,
+                    )?;
+                }
                 let mut params = Vec::with_capacity(args.len());
-                for arg in args {
-                    params.push(crate::source_argument(arg, source, scope, shapes)?);
+                for (i, arg) in args.iter().enumerate() {
+                    params.push(match crate::activity_option_type(source, i) {
+                        Some(ty) => ty,
+                        None => crate::source_argument(arg, source, scope, shapes)?,
+                    });
                 }
                 let result = self.ct.mutations[mi].clone();
                 crate::record_source(self.ct, source, params, result, *span)?;

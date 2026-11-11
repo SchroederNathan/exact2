@@ -32,7 +32,7 @@ extension CanvasesHost {
         if phase == "down" {
             guard let name = node.props["action"], !node.disabled, !node.inert, let canvas = node.inputCanvas, let e = live(canvas.id) else { return false }
             if e.controls[contact] != nil { return true }
-            _ = node.focusSurfacePointer()
+            if contact != NodeView.assistiveContact { _ = node.focusSurfacePointer() }
             e.controls[contact] = SurfaceControl(node:node.id, name:name, offset:node.convert(.zero, to:canvas), position:point)
             entry = e
         } else {
@@ -58,9 +58,16 @@ extension CanvasesHost {
         guard let id, let e = live(id) else { return missing }
         let op = request["op"] as? String ?? ""
         if op == "screenshot", request["form"] as? String == "save" { return save(e) }
+        // A look frame (LLP 1127.000): the module draws it offscreen and its pixels come back in the reply.
+        if op == "screenshot", request["form"] as? String == "look" { return self.agent(id, request) ?? missing }
         if op == "focus" {
             guard e.wantsInput else { return ["error": "view \(id)'s surface does not take input"] }
             return ["ok": e.view.focusCanvas()]
+        }
+        // The agent's pad (LLP 1127.003 D3): the world queues it as a host's pad event.
+        if (op == "type" && (request["key"] as? String)?.hasPrefix("Gamepad") == true) || (op == "tap" && request["stick"] != nil) {
+            guard e.wantsInput else { return ["error": "view \(id)'s surface does not take input"] }
+            return self.agent(id, request) ?? missing
         }
         guard ["layout", "state", "tree"].contains(op) else { return ["error": "world does not answer \(op)"] }
         var request = request

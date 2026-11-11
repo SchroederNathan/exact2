@@ -4,7 +4,7 @@
 
 use crate::compat::Compat;
 use contract::Manifest;
-use exact_update::{Baked, Envelope};
+use exact_update::{gpu_code_digest as code_digest, Baked, Envelope};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -40,15 +40,17 @@ pub(crate) fn emit(
     compat: &mut Compat,
     trust: &str,
     app: &Path,
-    platform: &str,
-    target: &str,
+    destination: (&str, &str),
     manifest: &Manifest,
     out: &Path,
+    entries: &std::collections::BTreeMap<String, contract::snapshot::Entry>,
 ) -> Result<(), String> {
+    let (platform, target) = destination;
     for name in [
         "EXACT_UPDATE_RECEIPT",
         "EXACT_UPDATE_GENESIS",
         "EXACT_BAKE_OUTPUT",
+        "EXACT_BAKE_INPUTS",
         "EXACT_BAKE_ANALYSIS",
         "EXACT_RUST_BUNDLE",
         "EXACT_GPU_PRODUCT",
@@ -75,6 +77,13 @@ pub(crate) fn emit(
     source_map(trust, app, out, &plan, &plan_bytes);
     let plan_card = json!({"sha256": hash(&plan_bytes), "bytes": plan_bytes.len()});
     let mut assets = asset_cards(app, out, manifest)?;
+    let pictures = asset_islands(app, &assets);
+    let (widget_assets, plans) = crate::widgets::emit(
+        out,
+        matches!(platform, "ios" | "macos") && app.join("app.ts").is_file(),
+        entries,
+    )?;
+    assets.extend(widget_assets);
     let rust_assets = if let Some(directory) = std::env::var_os("EXACT_RUST_BUNDLE") {
         stage_rust_bundle(
             Path::new(&directory),
@@ -94,11 +103,14 @@ pub(crate) fn emit(
     };
     assets.extend(rust_assets);
     assets.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    let graph = artifact_graph(&plan, &compat.inputs, &assets, target)?;
+    let graph = artifact_graph(&plan, &compat.inputs, &assets, pictures, target)?;
     std::fs::write(out.join("artifacts.json"), graph.to_string()).map_err(|e| e.to_string())?;
     compat.target = target.into();
-    compat.embedded =
-        json!({"seq":0,"plan":plan_card,"assets":assets,"entryDigest":null,"genesis":true});
+    compat.embedded = json!({"seq":0,"plan":plan_card,"assets":assets,"entryDigest":null,
+        "genesis":true,"trust":trust});
+    if plans.as_object().is_some_and(|p| !p.is_empty()) {
+        compat.embedded["plans"] = plans;
+    }
     // The GPU product is built (and on Apple, signed) before the host. Its
     // exact bytes belong to this app/cohort; a sibling filename is not identity.
     if platform != "web" {
@@ -153,6 +165,7 @@ pub(crate) fn emit(
         std::fs::create_dir_all(&destination)
             .map_err(|e| format!("{}: {e}", destination.display()))?;
         let stem = format!("{platform}-{target}");
+        crate::widgets::copy(out, &destination.join(format!("{stem}.entries")), &assets)?;
         // Never watched: the builder rewrites these from OUT_DIR after every
         // Cargo run, so a watch here would rerun this bake on every next build.
         std::fs::write(destination.join(format!("{stem}.json")), compat.to_json())
@@ -169,8 +182,8 @@ pub(crate) fn emit(
 }
 
 /// The GPU module's baked identity. `trust` is the build's resolved trust
-/// (unset is development), never the cohort input: a no-delivery (store L=0)
-/// cohort omits trust, and the hosts read the explicit build trust here.
+/// (unset is development, as `embedded.trust` records it), never the cohort
+/// input: a no-delivery (store L=0) cohort omits trust.
 /// gpu-dev authenticates the independently completed module receipt at load;
 /// production always embeds the exact GPU digest.
 fn gpu_card(
@@ -261,13 +274,41 @@ fn asset_cards(app: &Path, out: &Path, manifest: &Manifest) -> Result<Vec<Value>
                 .as_array()
                 .ok_or("missing shader roots")?
                 .iter()
-                .map(|v| watch::optional_tree(Path::new(v.as_str().unwrap()), &outputs)),
+                .filter_map(|v| {
+                    watch::shader_tree(
+                        Path::new(v.as_str().unwrap()),
+                        &outputs,
+                        declared.as_deref(),
+                    )
+                }),
         );
     let paths = roots.collect::<std::collections::BTreeSet<_>>();
     for path in paths {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     Ok(cards)
+}
+
+/// Whether an asset of `cards` is an SVG whose picture can show an island
+/// (`exact_svg_file::Loaded::islands`): the host draws an SVG image's masks
+/// and filters through the island module, as it draws an `svg`'s. Each file
+/// is sniffed as the host's loader sniffs it, so the name decides nothing.
+fn asset_islands(app: &Path, cards: &[Value]) -> bool {
+    use std::io::Read;
+    cards
+        .iter()
+        .filter_map(|card| card["name"].as_str())
+        .any(|name| {
+            let path = app.join(name);
+            let mut prefix = Vec::new();
+            std::fs::File::open(&path)
+                .and_then(|file| file.take(4096).read_to_end(&mut prefix))
+                .is_ok_and(|_| exact_svg_file::sniff(&prefix))
+                && std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| exact_svg_file::load(&text).ok())
+                    .is_some_and(|picture| picture.islands())
+        })
 }
 
 // Supply bytes, never just signed names. A binary's entry-zero asset roster is
@@ -318,7 +359,7 @@ fn stage_rust_bundle(
         serde_json::from_slice(&receipt).map_err(|e| format!("Rust bundle receipt: {e}"))?;
     if meta["version"].as_u64() != Some(1)
         || meta["kind"] != "rust"
-        || meta["abi"].as_u64() != Some(2)
+        || meta["abi"].as_u64() != Some(crate::compat::RUST_ABI.into())
     {
         return Err("Rust bundle has an unsupported receipt or ABI".into());
     }
@@ -430,10 +471,25 @@ fn shape(plan: &exact_plan::Plan, ty: exact_plan::TypesId, depth: usize) -> Resu
     })
 }
 
+/// The plan's requirement graph against a cohort's compatibility inputs
+/// (`exact-bake graph`): what a publisher that starts from a signed stream
+/// head, not a native bake, checks a new plan against.
+pub fn plan_graph(plan_bytes: &[u8], inputs: &Value, target: &str) -> Result<Value, String> {
+    let plan = exact_plan::Plan::decode(plan_bytes).map_err(|e| format!("the plan: {e:?}"))?;
+    let mut graph = artifact_graph(&plan, inputs, &[], false, target)?;
+    let node = &mut graph["artifacts"][0];
+    node["sha256"] = json!(hash(plan_bytes));
+    node["bytes"] = json!(plan_bytes.len());
+    Ok(graph)
+}
+
+/// `pictures`: whether an SVG image the app bundles can show an island
+/// (`asset_islands`).
 fn artifact_graph(
     plan: &exact_plan::Plan,
     inputs: &Value,
     assets: &[Value],
+    pictures: bool,
     target: &str,
 ) -> Result<Value, String> {
     let mut sources = serde_json::Map::new();
@@ -492,7 +548,7 @@ fn artifact_graph(
             b.kind == exact_plan::BindingKind::Prop
                 && exact_kernel::PropId::from_wire(b.id) == Some(exact_kernel::PropId::Hatch)
         })
-        .filter_map(|b| crate::colors::literal(plan, b))
+        .filter_map(|b| crate::colors::literal(plan, &b))
         .filter(|word| handled.iter().any(|h| h == word))
         .collect();
     marked.sort_unstable();
@@ -562,10 +618,12 @@ fn artifact_graph(
     // The host's loaded modules the plan can reach (LLP 1047 D1's loaded
     // tier), deferred templates and branches included, each by the rule its
     // host loads it by: the Canvas 2D GPU module for a `Canvas`, the SVG
-    // island module where `svg_islands` holds, the video arm for a `Video`,
-    // the web arm for a `WebView`, and the sound arm for a declared sound
-    // (LLP 1096 D8: a `sound` declaration is not a node). A build whose plan
-    // is fixed leaves out the rest.
+    // island module where `svg_islands` holds or a bundled SVG image can
+    // show an island, the video arm for a `Video` or an image's picture in
+    // picture (LLP 1042 §9), the web arm for a
+    // `WebView`, and the sound arm for a declared sound (LLP 1096 D8: a
+    // `sound` declaration is not a node). A build whose plan is fixed
+    // leaves out the rest.
     let makes = |wanted: exact_kernel::NodeType| {
         plan.nodes
             .iter()
@@ -573,12 +631,18 @@ fn artifact_graph(
     };
     let loads: Vec<&str> = [
         ("canvas", makes(exact_kernel::NodeType::Canvas)),
-        ("svg", exact_runner::svg_islands(plan)),
-        ("video", makes(exact_kernel::NodeType::Video)),
+        ("svg", pictures || exact_runner::svg_islands(plan)),
+        (
+            "video",
+            makes(exact_kernel::NodeType::Video)
+                || exact_runner::uses::uses_picture_in_picture(plan),
+        ),
         ("web", makes(exact_kernel::NodeType::WebView)),
         ("sound", !plan.sounds.is_empty()),
         // LLP 1125 D6: the MIDI arm for a plan that asks for ports or hears an input.
         ("midi", exact_runner::uses::uses_midi(plan)),
+        // LLP 1133.005 D13: the listener for an app whose grants can listen.
+        ("listen", listens(inputs)),
     ]
     .into_iter()
     .filter_map(|(module, reached)| reached.then_some(module))
@@ -600,10 +664,27 @@ fn artifact_graph(
     )
 }
 
+/// Whether the app's grant ceiling has a `net.listen` line or a loopback
+/// `auth.callback` (D9's receiver is the listener's): without either,
+/// everything the listener would do is refused, so the build carries none.
+fn listens(inputs: &Value) -> bool {
+    (inputs["grantCeiling"].as_str().unwrap_or("").lines()).any(|line| {
+        let line = line.trim();
+        exact_runner::listen::grant_prefix(line).is_some()
+            || [
+                "auth.callback http://127.0.0.1/",
+                "auth.callback http://[::1]/",
+            ]
+            .iter()
+            .any(|p| line.starts_with(p))
+    })
+}
+
 /// LLP 1116.011 D2.3: the ground the app's first route stands on, which the
 /// iOS launch screen shows until its first frame: `"grouped"` where the first
-/// route's `background-color` is the role the compiler gives a route that
-/// scrolls a grouped list (`-exact-grouped-background`, LLP 1116.007 D5),
+/// route's `background-color` is the metric the compiler gives a route that
+/// scrolls a grouped list (`-exact-grouped-page-ground`, LLP 1116.007 D5),
+/// iOS's grouped grey, or that role written (`-exact-grouped-background`),
 /// `"system"` for any other (the platform's page, `systemBackground`). A route
 /// is a node with a `navigationKey` and no `navigationBack` (the navigation
 /// root has both); the first in the plan's order, past the page the compiler
@@ -616,7 +697,7 @@ fn launch_background(plan: &exact_plan::Plan) -> &'static str {
     let literal = |node: &exact_plan::NodesRow, kind, id: u16| {
         node.bindings.iter().find_map(|b| {
             let b = plan.binding(b);
-            (b.kind == kind && b.id == id).then(|| crate::colors::literal(plan, b))
+            (b.kind == kind && b.id == id).then(|| crate::colors::literal(plan, &b))
         })
     };
     let route = plan.nodes.iter().find(|node| {
@@ -626,9 +707,12 @@ fn launch_background(plan: &exact_plan::Plan) -> &'static str {
             && literal(node, Prop, PropId::TestId as u16) != Some(Some("not-found"))
     });
     let ground = route.and_then(|node| {
-        literal(node, Style, exact_kernel::StyleId::BackgroundColor as u16).flatten()
+        literal(&node, Style, exact_kernel::StyleId::BackgroundColor as u16).flatten()
     });
-    if ground == Some("-exact-grouped-background") {
+    if matches!(
+        ground,
+        Some("-exact-grouped-page-ground" | "-exact-grouped-background")
+    ) {
         "grouped"
     } else {
         "system"
@@ -656,6 +740,7 @@ pub fn write_development_artifacts(plan: &exact_plan::Plan) -> Result<(), String
         plan,
         &receipt["compat"]["inputs"],
         &[],
+        false,
         "wasm32-unknown-unknown",
     )?;
     let rows = receipt["graph"]["artifacts"]
@@ -684,10 +769,16 @@ fn apply_release(compat: &mut Compat, bytes: &[u8], plan: &[u8]) -> Result<(), S
         || envelope.stream.compatibility_id != compat.id
         || envelope.stream.seq == 0
     {
-        return Err(
-            "publisher receipt does not name this app, channel, cohort and a published sequence"
-                .into(),
-        );
+        return Err(format!(
+            "publisher receipt names {} {} {} seq {}; this binary is {} {} {}",
+            envelope.app_id,
+            envelope.stream.channel,
+            envelope.stream.compatibility_id,
+            envelope.stream.seq,
+            baked.embedded.app_id,
+            baked.embedded.channel,
+            compat.id
+        ));
     }
     if envelope.plan.sha256 != compat.embedded["plan"]["sha256"]
         || envelope.plan.bytes != plan.len() as u64
@@ -719,43 +810,6 @@ fn gpu_product(path: &Path) -> Result<(String, String), String> {
         name.ok_or("GPU product filename is not UTF-8")?.to_string(),
         code_digest(&bytes),
     ))
-}
-
-/// A GPU product's digest: its exact bytes, except that a signed 64-bit
-/// Mach-O's code signature is left out, with the three sizes that follow it
-/// (the signature command's `datasize`, `__LINKEDIT`'s `vmsize` and
-/// `filesize`) read as zero. A re-signer (AppDrop signs every .ipa again
-/// for each recipient) keeps the digest; any change to the code it signs
-/// does not. Anything else is hashed whole. GpuModule.swift's
-/// `codeDigest` and host/apple/assets.mjs's `codeDigest` are this one.
-fn code_digest(bytes: &[u8]) -> String {
-    let word = |at: usize| {
-        bytes
-            .get(at..at + 4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
-    };
-    let macho = || -> Option<Vec<u8>> {
-        if word(0)? != 0xfeed_facf {
-            return None;
-        }
-        let (mut at, mut signature, mut zero) = (32, None, Vec::new());
-        for _ in 0..word(16)? {
-            let (cmd, size) = (word(at)?, word(at + 4)?);
-            if cmd == 0x1d {
-                signature = Some(word(at + 8)?);
-                zero.push((at + 12, 4));
-            } else if cmd == 0x19 && bytes.get(at + 8..at + 24)? == b"__LINKEDIT\0\0\0\0\0\0" {
-                zero.extend([(at + 32, 8), (at + 48, 8)]);
-            }
-            at += size.max(8);
-        }
-        let mut code = bytes.get(..signature?)?.to_vec();
-        for (at, len) in zero {
-            code.get_mut(at..at + len)?.fill(0);
-        }
-        Some(code)
-    };
-    hash(&macho().unwrap_or_else(|| bytes.to_vec()))
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -807,9 +861,22 @@ mod tests {
         b.sound("assets/kick.wav", 4_800, 48_000, 1, "00");
         let with = b.finish().unwrap();
         for (plan, loads) in [(without, json!([])), (with, json!(["sound"]))] {
-            let graph = artifact_graph(&plan, &json!({}), &[], "aarch64-apple-darwin").unwrap();
+            let graph =
+                artifact_graph(&plan, &json!({}), &[], false, "aarch64-apple-darwin").unwrap();
             assert_eq!(graph["loads"], loads);
         }
+    }
+
+    /// LLP 1042 §9: an image's picture in picture is the video arm's, so a
+    /// plan that asks for it loads the arm with no `video` node.
+    #[test]
+    fn a_plan_that_floats_an_image_loads_the_video_arm() {
+        let plan = contract::compile(
+            "component App\n  action float\n    requestPictureInPicture(\"page\")\n  view\n    column\n      button press=float\n        text \"Float\"\n      image \"assets/a.png\" id=\"page\" width=1 height=1\n",
+        )
+        .unwrap();
+        let graph = artifact_graph(&plan, &json!({}), &[], false, "aarch64-apple-darwin").unwrap();
+        assert_eq!(graph["loads"], json!(["video"]));
     }
 
     /// LLP 1075.003.000.001 §4.3: the plan requires the hatch words it marks
@@ -837,7 +904,7 @@ mod tests {
         }
         let plan = b.finish().unwrap();
         let requires = |inputs: Value| {
-            let graph = artifact_graph(&plan, &inputs, &[], "aarch64-apple-darwin").unwrap();
+            let graph = artifact_graph(&plan, &inputs, &[], false, "aarch64-apple-darwin").unwrap();
             graph["artifacts"][0]["requires"]["hatches"].clone()
         };
         // This platform handles `avatar` and `dot`; `badge` is another platform's.
@@ -859,7 +926,7 @@ mod tests {
             .finish()
             .unwrap();
         let requires = |inputs: Value| {
-            let graph = artifact_graph(&plan, &inputs, &[], "aarch64-apple-ios").unwrap();
+            let graph = artifact_graph(&plan, &inputs, &[], false, "aarch64-apple-ios").unwrap();
             graph["artifacts"][0]["requires"]["typescriptRuntime"].clone()
         };
         assert_eq!(
@@ -897,6 +964,7 @@ mod tests {
                 &b.finish().unwrap(),
                 &json!({}),
                 &[],
+                false,
                 "aarch64-apple-darwin",
             )
             .unwrap();
@@ -931,7 +999,7 @@ component App
         let launch = |route: &str, list: &str| {
             let plan = contract::compile(&SCREEN.replace("ROUTE", route).replace("LIST", list))
                 .unwrap_or_else(|e| panic!("{e}"));
-            artifact_graph(&plan, &json!({}), &[], "aarch64-apple-ios-sim").unwrap()
+            artifact_graph(&plan, &json!({}), &[], false, "aarch64-apple-ios-sim").unwrap()
                 ["launchBackground"]
                 .clone()
         };
@@ -953,41 +1021,10 @@ component App
         let bare =
             contract::compile("component App\n  view\n    text \"a\" testId=\"a\"\n").unwrap();
         assert_eq!(
-            artifact_graph(&bare, &json!({}), &[], "aarch64-apple-ios-sim").unwrap()
+            artifact_graph(&bare, &json!({}), &[], false, "aarch64-apple-ios-sim").unwrap()
                 ["launchBackground"],
             json!("system")
         );
-    }
-
-    #[test]
-    fn a_gpu_digest_survives_re_signing_but_not_a_code_change() {
-        // A 64-bit Mach-O: __LINKEDIT, then the signature command, the code,
-        // and the signature at offset 160.
-        let signed = |signature: &[u8], code: u8| {
-            let mut b = vec![0u8; 160];
-            b[..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
-            b[16..20].copy_from_slice(&2u32.to_le_bytes());
-            b[32..36].copy_from_slice(&0x19u32.to_le_bytes());
-            b[36..40].copy_from_slice(&72u32.to_le_bytes());
-            b[40..50].copy_from_slice(b"__LINKEDIT");
-            b[64..72].copy_from_slice(&(signature.len() as u64).to_le_bytes());
-            b[80..88].copy_from_slice(&(signature.len() as u64 + 8).to_le_bytes());
-            b[104..108].copy_from_slice(&0x1du32.to_le_bytes());
-            b[108..112].copy_from_slice(&16u32.to_le_bytes());
-            b[112..116].copy_from_slice(&160u32.to_le_bytes());
-            b[116..120].copy_from_slice(&(signature.len() as u32).to_le_bytes());
-            b[150] = code;
-            b.extend_from_slice(signature);
-            b
-        };
-        let ours = code_digest(&signed(b"ad-hoc", 1));
-        assert_eq!(
-            ours,
-            code_digest(&signed(b"a recipient's longer signature", 1))
-        );
-        assert_ne!(ours, code_digest(&signed(b"ad-hoc", 2)));
-        assert_ne!(ours, hash(&signed(b"ad-hoc", 1)));
-        assert_eq!(code_digest(b"not Mach-O"), hash(b"not Mach-O"));
     }
 
     #[test]
@@ -1041,7 +1078,7 @@ component App
         let inputs =
             json!({"app":"com.exact.caltrain","grantCeiling":"","rustGrants":"","rustMode":"wasm"});
         let module = b"\0asm\x01\0\0\0";
-        let receipt = json!({"version":1,"kind":"rust","abi":2,"appId":inputs["app"],"grants":"",
+        let receipt = json!({"version":1,"kind":"rust","abi":crate::compat::RUST_ABI,"appId":inputs["app"],"grants":"",
             "target":"wasm32-unknown-unknown","executor":"wasm",
             "plan":{"file":"app.plan","sha256":hash(plan),"bytes":plan.len()},
             "module":{"file":"app.module.wasm","sha256":hash(module),"bytes":module.len()}});
@@ -1073,7 +1110,7 @@ component App
             assert_eq!(card["sha256"], hash(&actual));
             assert_eq!(card["bytes"], actual.len());
         }
-        let graph = artifact_graph(&plan, &inputs, &cards, "aarch64-apple-ios").unwrap();
+        let graph = artifact_graph(&plan, &inputs, &cards, false, "aarch64-apple-ios").unwrap();
         for row in graph["artifacts"].as_array().unwrap() {
             assert_eq!(row["requires"]["rustAbi"], 2);
             assert_eq!(row["requires"]["rustMode"], "wasm");
@@ -1110,7 +1147,7 @@ component App
             )
         };
         let cards = stage(target).unwrap();
-        let graph = artifact_graph(&plan, &inputs, &cards, target).unwrap();
+        let graph = artifact_graph(&plan, &inputs, &cards, false, target).unwrap();
         for row in graph["artifacts"].as_array().unwrap() {
             assert_eq!(row["requires"]["rustMode"], "tiered");
             assert_eq!(row["requires"]["rustTarget"], target);
@@ -1285,6 +1322,52 @@ component App
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// LLP 1141.001 D1: a bundled SVG image whose art is under a `mask`
+    /// loads the island module, though the plan has no `mask`; the same
+    /// logo without one, an SVG under another name and a PNG load nothing.
+    #[test]
+    #[cfg(unix)]
+    fn a_masked_svg_image_loads_the_svg_island_module() {
+        let root = std::env::temp_dir().join(format!(
+            "exact-bake-svg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("assets/sponsors")).unwrap();
+        let art = "<path d=\"M0 0H5V5H0Z\" fill=\"#F2545B\"/>";
+        let masked = format!(
+            "<svg width=\"24\" height=\"12\" viewBox=\"0 0 24 12\" xmlns=\"http://www.w3.org/2000/svg\">\
+             <mask id=\"m\" style=\"mask-type:luminance\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"24\" height=\"12\">\
+             <path d=\"M24 0H0V12H24V0Z\" fill=\"white\"/></mask><g mask=\"url(#m)\">{art}</g></svg>"
+        );
+        let plain =
+            format!("<svg viewBox=\"0 0 24 12\" xmlns=\"http://www.w3.org/2000/svg\">{art}</svg>");
+        std::fs::write(root.join("assets/sponsors/plain.svg"), &plain).unwrap();
+        std::fs::write(root.join("assets/icon.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        let plan = exact_plan::builder::PlanBuilder::new(0, 0)
+            .finish()
+            .unwrap();
+        let manifest = Manifest::read(&root).unwrap();
+        let loads = |root: &Path| {
+            let cards = asset_cards(root, &root.join("out"), &manifest).unwrap();
+            let pictures = asset_islands(root, &cards);
+            artifact_graph(&plan, &json!({}), &cards, pictures, "aarch64-apple-ios").unwrap()
+                ["loads"]
+                .clone()
+        };
+        assert_eq!(loads(&root), json!([]));
+        // The host sniffs the bytes, so a masked SVG named `.png` counts too.
+        std::fs::write(root.join("assets/sponsors/logo.png"), &masked).unwrap();
+        assert_eq!(loads(&root), json!(["svg"]));
+        std::fs::remove_file(root.join("assets/sponsors/logo.png")).unwrap();
+        std::fs::write(root.join("assets/sponsors/gold.svg"), &masked).unwrap();
+        assert_eq!(loads(&root), json!(["svg"]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     #[cfg(unix)]
     fn the_embedded_roster_uses_the_copy_gate_and_refuses_symlink_assets() {
@@ -1341,6 +1424,7 @@ component App
             activate: "next-launch".into(),
             target: "aarch64-apple-ios".into(),
             reach: Value::Null,
+            painter: None,
             embedded: json!({"seq":0,"genesis":true,"entryDigest":null,"plan":{"sha256":head.plan.sha256,"bytes":head.plan.bytes},"assets":assets}),
         };
         (

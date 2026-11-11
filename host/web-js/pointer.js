@@ -14,15 +14,16 @@
 // record; moves go out at most once a frame, the latest.
 
 // The record: the point from the element's content box in its own CSS px
-// (a scale undone), DOM's buttons and pressure, the device and its id, the
+// (a scale undone), DOM's button, buttons and pressure, the device and its id, the
 // viewport point (`frame()`'s space, LLP 1094 D11), the modifiers held.
+import { inertAncestor } from './navigation.js';
 export function record(e, ev, lifted = false) {
   const r = e.getBoundingClientRect(), cs = getComputedStyle(e);
   const sx = e.offsetWidth ? r.width / e.offsetWidth : 1, sy = e.offsetHeight ? r.height / e.offsetHeight : 1;
   const left = parseFloat(cs.borderLeftWidth) + parseFloat(cs.paddingLeft), top = parseFloat(cs.borderTopWidth) + parseFloat(cs.paddingTop);
   const type = ev.pointerType === "pen" || ev.pointerType === "touch" ? ev.pointerType : "mouse";
   return [(ev.clientX - r.left) / (sx || 1) - left, (ev.clientY - r.top) / (sy || 1) - top,
-    lifted ? 0 : ev.buttons, lifted ? 0 : Math.min(1, Math.max(0, ev.pressure || 0)), type, ev.pointerId ?? 1, ev.clientX, ev.clientY, ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey];
+    ev.button ?? -1, lifted ? 0 : ev.buttons, lifted ? 0 : Math.min(1, Math.max(0, ev.pressure || 0)), type, ev.pointerId ?? 1, ev.clientX, ev.clientY, ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey];
 }
 let walking = false;
 export function pointer(e, kind, f) {
@@ -58,7 +59,7 @@ export function pointer(e, kind, f) {
       // nor past a handler further in that stopped this up (`$stopped`, rt.js).
       if (live() && !ev.$stopped) s.pointerup?.(record(e, ev.type === "blur" ? s.last : ev, true), ev);
     };
-    const enabled = () => live() && !e.matches(":disabled") && !e.hasAttribute("disabled") && !e.closest("[inert]");
+    const enabled = () => live() && !e.matches(":disabled") && !e.hasAttribute("disabled") && !inertAncestor(e);
     s.hold = ev => {
       // Any button, as the DOM's (studio diary R22: a secondary click's down; `buttons` says which).
       if (!ev.isPrimary || s.held !== null || !enabled()) return;
@@ -80,7 +81,7 @@ export function pointer(e, kind, f) {
     e.addEventListener("pointermove", ev => {
       if (ev.$pointerMover || !s.pointermove) return;
       ev.$pointerMover = e;
-      if (s.held === null && ev.buttons === 0 && !e.matches(":disabled") && !e.hasAttribute("disabled") && !e.closest("[inert]")) moved(ev);
+      if (s.held === null && ev.buttons === 0 && !e.matches(":disabled") && !e.hasAttribute("disabled") && !inertAncestor(e)) moved(ev);
     });
   }
   s[kind] = f;

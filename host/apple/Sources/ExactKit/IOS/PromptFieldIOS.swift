@@ -18,6 +18,15 @@ final class PromptField: NSObject, UITextFieldDelegate {
     private weak var presenter: Presenter?
     private weak var field: UITextField?
     private var heard: String?
+    struct Snapshot {
+        weak var node: NodeView?
+        let incarnation: UInt64
+        let value: String?
+        let text: String
+        let selection: NSRange?
+    }
+    private var restoring: Snapshot?
+    private var relocating = false
     /// The alert's own delegate for the field, which answers what this does
     /// not.
     private weak var alertDelegate: UITextFieldDelegate?
@@ -25,6 +34,24 @@ final class PromptField: NSObject, UITextFieldDelegate {
     /// prompt's first action that is not destructive (`MenuHost`).
     var returned: (() -> Void)?
     init(_ node: NodeView, presenter: Presenter) { self.node = node; self.presenter = presenter }
+    func snapshot() -> Snapshot? {
+        guard let node = live(), let field else { return nil }
+        return Snapshot(node: node, incarnation: node.incarnation, value: node.props["value"],
+                        text: field.text ?? "", selection: node.liveSelection)
+    }
+    func restore(_ state: Snapshot) {
+        guard let node = live(), node === state.node, node.incarnation == state.incarnation,
+              node.props["value"] == state.value, let field else { return }
+        field.text = state.text
+        restoring = state
+    }
+    func restoreSelection() {
+        defer { restoring = nil }
+        guard let state = restoring, let node = live(), node.incarnation == state.incarnation,
+              node.props["value"] == state.value, field?.text == state.text, let selection = state.selection else { return }
+        // UIKit focuses the prompt during presentation; setting its range earlier is lost.
+        _ = node.showSelection(selection)
+    }
 
     /// Give UIKit's field what the authored one says: its value, placeholder,
     /// name and keyboard (`type`, `inputmode`, `autocomplete`, `autocapitalize`,
@@ -39,10 +66,22 @@ final class PromptField: NSObject, UITextFieldDelegate {
             field.isSecureTextEntry = own.isSecureTextEntry
             field.textContentType = own.textContentType
             field.keyboardType = own.keyboardType
-            field.autocapitalizationType = own.autocapitalizationType
-            field.autocorrectionType = own.autocorrectionType
-            field.spellCheckingType = own.spellCheckingType
-            field.returnKeyType = own.returnKeyType
+            // What the author leaves unsaid stays the alert field's own:
+            // no capitalization, no correction (so no QuickType echo of
+            // its text), and the Return key ↵, not the sentences,
+            // correction and Done an authored field takes. A type that
+            // turns correction off says it.
+            let said = { (name: String) in node.props[name] != nil }
+            let plain = ["email", "url", "password"].contains((node.props["type"] ?? "").lowercased())
+            if said("autocapitalize") || plain { field.autocapitalizationType = own.autocapitalizationType }
+            if said("autocorrect") || plain {
+                // Smart quotes and dashes go with correction (`inputSmartQuotes`).
+                field.autocorrectionType = own.autocorrectionType
+                field.smartQuotesType = own.smartQuotesType
+                field.smartDashesType = own.smartDashesType
+            }
+            if said("spellcheck") { field.spellCheckingType = own.spellCheckingType }
+            if said("enterKeyHint") { field.returnKeyType = own.returnKeyType }
         } else {
             field.placeholder = node.props["placeholder"]
         }
@@ -50,6 +89,7 @@ final class PromptField: NSObject, UITextFieldDelegate {
         field.accessibilityIdentifier = node.props["testId"]
         field.isEnabled = !node.disabled
         node.headerField = field
+        node.applyFieldDirection()
         alertDelegate = field.delegate
         field.delegate = self
         Self.installKeys(on: field)
@@ -73,16 +113,18 @@ final class PromptField: NSObject, UITextFieldDelegate {
         return alertDelegate?.textFieldShouldClear?(textField) ?? true
     }
     func textFieldDidBeginEditing(_ textField: UITextField) {
+        presenter?.keyboardPrompt = textField
         alertDelegate?.textFieldDidBeginEditing?(textField)
         if let node = live() { presenter?.focus(node.id) }
     }
     func textFieldDidChangeSelection(_ textField: UITextField) {
         alertDelegate?.textFieldDidChangeSelection?(textField)
         if let node = live() { presenter?.fieldSelections.changed(node) }
+        live()?.applyFieldDirection() // a `direction` that came while it composed (LLP 1001 §1)
     }
     func textFieldDidEndEditing(_ textField: UITextField) {
         alertDelegate?.textFieldDidEndEditing?(textField)
-        live()?.textFieldDidEndEditing(textField) // the `change`, then the blur
+        if !relocating { live()?.textFieldDidEndEditing(textField) } // the `change`, then the blur
     }
     /// Return, one rule on every host (docs/contract-for-agents.md): the
     /// input's `key` handlers first (prevented, nothing more); its `change`;
@@ -120,6 +162,7 @@ final class PromptField: NSObject, UITextFieldDelegate {
         node.typedText(field.text ?? "")
         // The page's value written while text was marked waited (`writeValue`).
         if field.markedTextRange == nil, let held = node.pendingValue { node.writeValue(held, into: field) }
+        node.applyFieldDirection() // a `direction` that came while it composed (LLP 1001 §1)
     }
 
     private func presses(_ presses: Set<UIPress>, phase: UIPress.Phase) -> Set<UIPress> {
@@ -182,8 +225,9 @@ final class PromptField: NSObject, UITextFieldDelegate {
 
     /// The alert is going: the edit commits, and the authored field is its
     /// own again.
-    func end() {
-        if let node = live() { presenter?.commitEdit(node.id, node.fieldText, change: node.handlers.contains("change")) }
+    func end(relocating: Bool = false) {
+        self.relocating = relocating
+        if !relocating, let node = live() { presenter?.commitEdit(node.id, node.fieldText, change: node.handlers.contains("change")) }
         if let node, node.headerField === field { node.headerField = nil }
     }
 }

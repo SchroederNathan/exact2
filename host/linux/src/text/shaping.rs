@@ -85,6 +85,32 @@ pub(super) fn push_style(
             range.clone(),
         );
     }
+    // CSS `font-optical-sizing: auto` (CSS Fonts 4 §2.7): a face's `opsz` is
+    // the size, as the browser and CoreText set it; one without the axis
+    // ignores it, and `none` leaves the face's own. Parley applies it after
+    // fontique's synthesis, and `font-variation-settings` after it, each axis
+    // winning over the weight's, the width's and the size's (CSS Fonts 4
+    // §7.2, LLP 1019 D9).
+    let mut axes = Vec::new();
+    if run.optical_sizing {
+        axes.push(parley::FontVariation::new(
+            parley::setting::Tag::new(b"opsz"),
+            run.size,
+        ));
+    }
+    axes.extend(run.variations.axes().iter().map(|(tag, value)| {
+        parley::FontVariation::new(parley::setting::Tag::new(&tag.to_be_bytes()), *value)
+    }));
+    builder.push(
+        StyleProperty::FontVariations(parley::FontVariations::List(axes.into())),
+        range.clone(),
+    );
+    if run.stretch != 100.0 {
+        builder.push(
+            StyleProperty::FontWidth(parley::FontWidth::from_percentage(run.stretch)),
+            range.clone(),
+        );
+    }
     if run.letter_spacing != 0.0 && run.size > 0.0 {
         builder.push(
             StyleProperty::LetterSpacing(run.letter_spacing),
@@ -93,16 +119,66 @@ pub(super) fn push_style(
     }
     // CSS `tabular-nums` is the chosen face's own `tnum` feature, never a
     // substitute face; a face without it keeps its figures (LLP 1053 G4).
+    // `font-variant-ligatures` turns the face's ligature features on or off
+    // (CSS Fonts 4); HarfRust keeps its defaults for the kinds left unsaid.
+    let mut features = Vec::new();
     if run.font_variant_numeric & 1 != 0 {
+        features.push(parley::FontFeature::new(
+            parley::setting::Tag::new(b"tnum"),
+            1,
+        ));
+    }
+    for (tag, value) in ligature_features(run.font_variant_ligatures) {
+        features.push(parley::FontFeature::new(
+            parley::setting::Tag::new(tag),
+            value,
+        ));
+    }
+    if !features.is_empty() {
         builder.push(
-            StyleProperty::FontFeatures(parley::FontFeatures::from("\"tnum\" 1")),
+            StyleProperty::FontFeatures(parley::FontFeatures::List(features.into())),
             range,
         );
     }
 }
 
+/// The OpenType features `font-variant-ligatures`' bits set, 1 on and 0
+/// off: common ligatures are `liga` and `clig`, discretionary `dlig`,
+/// historical `hlig`, contextual alternates `calt` (CSS Fonts 4).
+fn ligature_features(bits: u8) -> Vec<(&'static [u8; 4], u16)> {
+    use exact_kernel::FontVariantLigatures as L;
+    let kinds: [(L, L, &[&'static [u8; 4]]); 4] = [
+        (
+            L::CommonLigatures,
+            L::NoCommonLigatures,
+            &[b"liga", b"clig"],
+        ),
+        (
+            L::DiscretionaryLigatures,
+            L::NoDiscretionaryLigatures,
+            &[b"dlig"],
+        ),
+        (L::HistoricalLigatures, L::NoHistoricalLigatures, &[b"hlig"]),
+        (L::Contextual, L::NoContextual, &[b"calt"]),
+    ];
+    let mut out = Vec::new();
+    for (on, off, tags) in kinds {
+        let value = if bits & on.keyword_bits() != 0 {
+            1
+        } else if bits & off.keyword_bits() != 0 {
+            0
+        } else {
+            continue;
+        };
+        out.extend(tags.iter().map(|tag| (*tag, value)));
+    }
+    out
+}
+
 /// A hard line: its text and its one shaped layout.
 pub(super) struct HardLine {
+    /// Byte offset in the canonical runs, after the preceding separator.
+    pub(super) start: usize,
     pub(super) text: String,
     layout: Mutex<Broken>,
     /// The resolved base direction (CSS `direction`, or the first strong
@@ -138,21 +214,34 @@ pub(super) struct ShapedSource {
 /// lease. A width locks each layout while it breaks it.
 pub(super) struct ShapeData {
     pub(super) lines: Vec<HardLine>,
-    strut: (f32, f32),
+    pub(super) strut: (f32, f32),
+    /// The strut's font's ascent and descent: an empty line's text box.
+    pub(super) strut_font: (f32, f32),
     pub(super) run_metrics: Vec<FontMetrics>,
 }
 
 /// A hard line's runs: (range in the line, run index).
 type Pieces = Vec<(Range<usize>, usize)>;
+/// A hard line's inline boxes: (byte offset in the line, run index).
+type Boxes = Vec<(usize, usize)>;
 
 /// The paragraph's text split into hard lines as cosmic-text split it: at
 /// each paragraph separator (`\r\n` one), the last empty piece dropped,
-/// and one empty line for no text. Each line's pieces: (range in the
-/// line, run index).
-fn hard_lines(spec: &Spec) -> Vec<(String, Pieces)> {
-    let mut out: Vec<(String, Pieces)> = vec![(String::new(), Vec::new())];
+/// and one empty line for no text. Each line keeps its byte offset and
+/// pieces: (range in the line, run index). An inline box's run has no text,
+/// only its place in the line (LLP 1011.002).
+fn hard_lines(spec: &Spec) -> Vec<(usize, String, Pieces, Boxes)> {
+    let mut out: Vec<(usize, String, Pieces, Boxes)> =
+        vec![(0, String::new(), Vec::new(), Vec::new())];
+    let mut offset = 0;
     let mut after_cr = false;
     for (index, run) in spec.runs.iter().enumerate() {
+        if run.inline.is_some() {
+            after_cr = false;
+            let (_, text, _, boxes) = out.last_mut().expect("one line");
+            boxes.push((text.len(), index));
+            continue;
+        }
         let mut rest = run.text.as_str();
         while !rest.is_empty() {
             let split = rest.find([
@@ -165,9 +254,10 @@ fn hard_lines(spec: &Spec) -> Vec<(String, Pieces)> {
                 }
                 None => (rest, None),
             };
+            let consumed = sep.map_or(rest.len(), |(at, ch)| at + ch.len_utf8());
             if !piece.is_empty() {
                 after_cr = false;
-                let (text, pieces) = out.last_mut().expect("one line");
+                let (_, text, pieces, _) = out.last_mut().expect("one line");
                 let start = text.len();
                 text.push_str(piece);
                 pieces.push((start..text.len(), index));
@@ -175,17 +265,21 @@ fn hard_lines(spec: &Spec) -> Vec<(String, Pieces)> {
             match sep {
                 Some((at, ch)) => {
                     // `\r\n` is one break.
-                    if !(ch == '\n' && after_cr && piece.is_empty()) {
-                        out.push((String::new(), Vec::new()));
+                    let next = offset + consumed;
+                    if ch == '\n' && after_cr && piece.is_empty() {
+                        out.last_mut().expect("one line").0 = next;
+                    } else {
+                        out.push((next, String::new(), Vec::new(), Vec::new()));
                     }
                     after_cr = ch == '\r';
                     rest = &rest[at + ch.len_utf8()..];
                 }
                 None => rest = "",
             }
+            offset += consumed;
         }
     }
-    if out.len() > 1 && out.last().is_some_and(|l| l.0.is_empty()) {
+    if out.len() > 1 && out.last().is_some_and(|l| l.1.is_empty() && l.3.is_empty()) {
         out.pop();
     }
     out
@@ -245,7 +339,7 @@ impl ShapedSource {
         let mut text_bytes = 0;
         let pieces = hard_lines(&spec);
         let mut lines = Vec::with_capacity(pieces.len());
-        for (h, (text, runs)) in pieces.into_iter().enumerate() {
+        for (h, (start, text, runs, boxes)) in pieces.into_iter().enumerate() {
             #[cfg(test)]
             SHAPE_LINES.with(|n| n.set(n.get() + 1));
             text_bytes += text.len();
@@ -267,6 +361,16 @@ impl ShapedSource {
                     *index as u32,
                     &families[*index],
                 );
+            }
+            for &(index, run) in &boxes {
+                let b = spec.runs[run].inline.expect("a box's run");
+                builder.push_inline_box(parley::InlineBox {
+                    id: run as u64,
+                    kind: parley::InlineBoxKind::InFlow,
+                    index,
+                    width: b.width.max(0.0),
+                    height: b.height.max(0.0),
+                });
             }
             builder.set_base_direction(base);
             // The line box keeps the CSS direction even where the first
@@ -292,6 +396,7 @@ impl ShapedSource {
                 );
             }
             lines.push(HardLine {
+                start,
                 text,
                 rtl: layout.is_rtl(),
                 layout: Mutex::new(Broken {
@@ -311,6 +416,7 @@ impl ShapedSource {
             data: Arc::new(ShapeData {
                 lines,
                 strut,
+                strut_font: (ascent, descent),
                 run_metrics,
             }),
             accessible_capacity_bytes: 0,
@@ -665,6 +771,23 @@ impl ShapedSource {
         } else {
             (line.w - (original.1 - original.0) + (new_extent.1 - new_extent.0)).max(0.0)
         };
+        // An image past the ellipsis's edge goes with the glyphs it cut: its
+        // box answers no place (LLP 1011.002).
+        let line_index = out.lines.len() as u32 - 1;
+        let spec = &self.spec;
+        out.boxes.retain(|b| {
+            let width = spec
+                .runs
+                .get(b.run as usize)
+                .and_then(|r| r.inline)
+                .map_or(0.0, |i| i.width);
+            b.line != line_index
+                || if rtl {
+                    b.x >= pen + advance
+                } else {
+                    b.x + width <= pen
+                }
+        });
         out.glyphs.truncate(a);
         out.glyphs.extend(next);
         let last = out.lines.last_mut().expect("a line");
@@ -686,9 +809,9 @@ impl ShapedSource {
         if let Some((_, widest)) = self.balanced(width) {
             w = w.max(widest);
         }
-        for line in &lines.lines {
+        for (i, line) in lines.lines.iter().enumerate() {
             w = w.max(line.w);
-            let (above, below, is_explicit) = line_box(
+            let (mut above, mut below, is_explicit) = line_box(
                 lines.glyphs_of(line).iter(),
                 &lines.faces,
                 spec,
@@ -696,6 +819,12 @@ impl ShapedSource {
                 strut,
                 run_metrics,
             );
+            // CSS 2 §10.8: an image's margin box grows the line to hold it.
+            for b in lines.boxes.iter().filter(|b| b.line as usize == i) {
+                let (a, d) = box_extent(spec, &mut catalog, b.run as usize);
+                above = above.max(a);
+                below = below.max(d);
+            }
             explicit |= is_explicit;
             baselines.push(h + above);
             h += above + below;
@@ -771,6 +900,21 @@ fn line_inset(
     (run.indent - marker, run.indent)
 }
 
+/// How far an inline box's run reaches above and below the baseline, by
+/// its `vertical-align` against the run's own font (LLP 1011.002 D3).
+pub(super) fn box_extent(spec: &Spec, catalog: &mut catalog::Catalog, run: usize) -> (f32, f32) {
+    let Some(b) = spec.runs.get(run).and_then(|r| r.inline) else {
+        return (0.0, 0.0);
+    };
+    let [ascent, _, x_height, descent] = catalog.edge_metrics(&spec.runs[run]);
+    let above = b.ascent(exact_kernel::FontEdges {
+        ascent,
+        descent,
+        x_height,
+    });
+    (above, b.height - above)
+}
+
 /// A line's box (CSS 2 §10.8): the strut, grown by each glyph's own face
 /// where its run's `line-height` is normal, or by its run's authored box.
 /// Returns the space above and below the baseline, and whether an explicit
@@ -838,7 +982,8 @@ pub(super) fn line_box<'a>(
 pub struct LayoutRun<'a> {
     /// Its hard line's index.
     pub line_i: usize,
-    /// Its hard line's text (glyph ranges index it).
+    /// The source text indexed by its glyph ranges: a hard line for ordinary
+    /// layout, the whole paragraph for flow across collapsed hard breaks.
     pub text: &'a str,
     /// The hard line's base direction.
     pub rtl: bool,
@@ -884,7 +1029,11 @@ impl<'a> Iterator for Runs<'a> {
             };
         Some(LayoutRun {
             line_i: line.hard as usize,
-            text: &hard.text,
+            text: p
+                .flow
+                .as_ref()
+                .filter(|f| !f.incomplete)
+                .map_or(&hard.text, |f| &f.text),
             rtl: hard.rtl,
             glyphs: record.glyphs_of(line),
             line_y,

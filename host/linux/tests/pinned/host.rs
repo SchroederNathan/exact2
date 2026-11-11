@@ -6,14 +6,19 @@
 //! wire.
 
 use crate::pin_font;
-use exact_kernel::{Kernel, NodeType, Op, PropId};
+use exact_kernel::NodeType;
+#[cfg(unix)]
+use exact_kernel::{Kernel, Op, PropId};
 use exact_linux::agent::handle;
+#[cfg(unix)]
 use exact_linux::image::Images;
 use exact_linux::paint::PaintedBox;
 use exact_linux::Presenter;
 use exact_runner::{DataError, DataSource, Value};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 fn assets() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/caltrain"))
@@ -129,6 +134,24 @@ fn layout_json_is_the_agent_api_shape() {
         &l[..200]
     );
     assert_eq!(l.matches("\"sx\":").count(), 1, "one scroll container");
+    // Its range (LLP 1012 `rx`/`ry`): the stations scroll down, not sideways, as far as a long wheel takes them
+    let reply: serde_json::Value = serde_json::from_str(&l).unwrap();
+    let scroller = reply["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n.get("sx").is_some())
+        .unwrap();
+    assert_eq!(scroller["rx"], 0, "{scroller}");
+    let ry = scroller["ry"].as_f64().unwrap();
+    assert!(ry > 0.0, "{scroller}");
+    let id = scroller["id"].as_u64().unwrap() as u32;
+    let _ = p.wheel(id, 0.0, 100_000.0);
+    assert_eq!(
+        p.scroll_of(id).1 as f64,
+        ry,
+        "the wheel stops at the end of the range"
+    );
     assert!(!l.contains("planDigest"));
     let id = p.host().runner().roots()[0];
     let plain: serde_json::Value = serde_json::from_str(&p.layout_json(Some(id), false)).unwrap();
@@ -594,6 +617,7 @@ fn a_reload_carries_state_and_starts_the_pictures_over() {
         locale: "fr-CA".into(),
         time_zone: "America/Toronto".into(),
         seed: 123_456_789.0,
+        format_locale: String::new(),
     };
     assert!(p.set_place(&place).is_none());
     assert!(p.set_time(1_790_000_000_000.0, -240.0).is_none());

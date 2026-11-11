@@ -98,9 +98,10 @@ the document as for any page. Ordinary scroll containers remain platform-owned. 
 > and stays CSS; elasticity, momentum, the wheel's step and the scroller's style are AppKit's.
 > LLP 1115.000 D8.2 and D8.5 are the current implementation: AppKit runs a person's scroll,
 > and its key actions and line size set the keyboard scroll. D8.4 is partly built: an ordinary
-> Mac element reveal animates for omitted, `auto` and `smooth`, while `instant`, Reduce Motion
-> and the agent's frozen clock land at once. An authored `scrollTop` write cancels an in-flight
-> reveal, then follows its own `scroll-behavior`. Focus reveal, keyed lists and UIKit are separate.
+> element reveal on the Mac and on UIKit animates for omitted, `auto` and `smooth`, while
+> `instant`, Reduce Motion and the agent's frozen clock land at once. An authored `scrollTop`
+> write cancels an in-flight reveal, then follows its own `scroll-behavior`. Focus reveal and
+> keyed lists are separate.
 > Inner scrollers remain overlay until D8.3 lands with the kernel's gutter.
 
 **The page.** The window's content view is an `NSScrollView` (the
@@ -463,10 +464,11 @@ key, outer text-paragraph ordinal and UTF-16 offset. The runner projects text
 from the same row template, one unloaded row at a time, without committing
 kernel operations; mounted rows retain their current local state. AppKit and
 browser selection use this path for partial and full-document copy. The host
-names its text policy: the web counts button-label paragraphs but leaves their
-default-unselectable text out; AppKit omits native button titles from paragraph
-numbering and resolves `auto` as `TextSelectable.swift` does, including pressable
-and chrome labels. Authored `user-select` still decides. The runner applies the
+names its text policy: the web counts control-label paragraphs (a button, a
+link, a pressable or a control's role, as its stylesheet draws them) but leaves
+their default-unselectable text out; AppKit omits native button titles from
+paragraph numbering and resolves `auto` as `TextSelectable.swift` does,
+including pressable and chrome labels. Authored `user-select` still decides. The runner applies the
 same policy to mounted and unmounted rows. Copy does not mount the selected
 range. This does not claim virtual accessibility
 navigation, Linux geometry, or the image budget below is complete.
@@ -843,6 +845,31 @@ makes the list longer re-arms the end too, since the page arrived before that
 row rather than past it. Without this, the feed bench's timeline stalled after
 one page in about one run in ten. `pagetail.contract` pins it.
 
+**2026-10-26 (Charlie's ruling, `rules/DEFERRED.md`, "reach-margin"):** an edge
+qualifies when its row is within the edge band of the port, not within the
+geometric window. Before and after the port the band is `reach-margin` (LLP 1145
+D4; one port by default), and on the side the report's velocity travels toward it
+adds the lead the collection window takes for that travel (`lead`'s quarter second
+of travel, up to two ports; LLP 1050.000 §6). The default band is therefore the
+window's own lead, and a fling that the window loads ahead for fires the edge
+event too: at -4,000 px/s in a 320 px port, `reachstart` fires once the first row
+is within 960 px of the port, where it waited for 320 before. A margin the author
+sets keeps its distance from the rest band, so a smaller margin than the default
+leads a fling by the same travel. An edge re-arms when its row is outside the band of the report
+it is in, or, once its row is another than the one it fired at, outside the band at
+rest. Without the second, a page smaller than a fling's band (20 rows of 32 px
+against 960) would leave the new first row inside it and the edge disarmed until
+the reader scrolled away; with it, a reader still flinging is offered the next page,
+and one who stopped is offered it at the rest margin, as before the lead. Rows that
+change only elsewhere (a message appended to a transcript whose reader is near its
+start) leave the edge's row as it was and re-arm nothing. Either waits until the
+geometric window (the port and one port each side, what a report at
+rest mounts) has current measurements; past that window the band's rows are
+estimates. A band that shrinks as a fling slows can re-arm an edge the reader is
+still near; the handler then sees the rows it saw, so it asks for the same page. The
+runner (`runner/src/instance/collection/reach.rs`) and the JS target
+(`host/web-js/list.js` `edge`) compute it; no other host computes edges.
+
 ### 6.6 Paired runner evidence, 2026-09-16
 
 `bun scripts/metrics.mjs --list-memory --collections --repeats 3 --json`
@@ -928,6 +955,8 @@ does not alter the measured runner or replace the paired diagnostic above.
 **2026-10-02 `scroll-start`:** a virtualized list may open at its end: `scroll-start="end"` (literal `start`, the default, or `end`; `lower-attr-value`; `lower-list-virtualized` off a virtualized list), CSS Scroll Snap 2's container-level name. Before any report it builds its last rows (the bootstrap count, or `initial-item-count`) and sends a sequence-0 correction to its estimated extent, which the host clamps, the same opening a kept position or a `scrollIntoView` makes. Until it has opened it anchors the end on every report, `scrollFollowEnd` or not. It has opened when a report at the end changes nothing: every mounted row measured, the extent left as it was, nothing owed or corrected. The reader leaves it by travel in two reports running, as a `scrollIntoView` is cancelled. A report short of the end is not the reader: UIKit lays out rows at their real size and clamps its port before the runner has measured them (Signal Clone on the simulator landed 164 pt short until this rule). Rows that come later, before the first report or after a report of the empty list, open at the end too. After it opens, `scrollFollowEnd` decides. Runner (`collection/start.rs`) and the JS target (`list.js`); consumer: the Signal Clone transcript, which needed `scrollTop=(1000000 + n)` plus a `scrollIntoView(…, block="end")` once its first command landed. The kernel prop is `scrollStart`.
 
 **2026-10-04 anchoring as CSS's, at the start and across a resize:** a list at its start anchors nothing unless it follows its end, as CSS scroll anchoring selects no anchor at a zero offset (Chromium's `ScrollAnchor` clears itself there): a row inserted on top shows (mail F8: a mail list's newest message, a row Undo puts back), on every host, since the runner's `capture_anchor` and the JS target's `SizeIndex.anchor` decide it; scrolled away from the start the first visible key keeps its place as before. An end it follows wins where the start is also the end (a short transcript). Chromium anchors only in the block direction, so it never anchors a horizontal scroller; a row list here applies the same per-axis rule (at its start edge, nothing), a deviation. And an anchor's correction now lands in the batch that also resizes the port (feed F14: a refresh prepends posts as the pull-to-refresh zone above the list closes): Apple and the wasm web host had taken that resize for a jump and dropped the correction, so the content jumped by the posts' height; Linux takes a correction planned before its pass's resize too. A row root may move where it paints (`translate`, `rotate`, `scale`, a relative inset, `z-index`) without leaving its flow, as in CSS (files F14: the runner refused a dynamic `translate` and the list drew nothing on native hosts).
+
+**2026-10-18 a followed end across a resize the reader did not make:** a report whose port changed size while the reader was not moving it (`CollectionFill::velocity` zero) keeps an end the previous report was at (`collection/inset.rs` `report_anchor`, `list.js` `reportAnchor`). The anchor is taken at the new offset on the old port, and a host's clamp can put that offset short of both ends: on iOS the keyboard going down grows a transcript's port in two frames between reports (without, then with, the bottom safe area), UIKit clamps the offset to the end of the first, and the end was dropped, so the next message landed below the port (round 23's chat-rooms). A reader dragging as the port resizes (an interactive keyboard dismissal) still decides where it is.
 
 **2026-09-19 tall-card bootstrap estimate:** shared `virtualized=true` lists accept the existing `estimated-item-height` as one positive literal. The runner seeds its height index from that hint and bounds bootstrap by the previous 16 × 32-point provisional budget (at most sixteen rows); measured heights replace the estimate. Invalidated heights revert to the authored estimate. Compiler cases and a 25,000-row integration exercise verify bounded bootstrap, replacement by actual measurements, distant scroll and return without rebuilding the source. Six compiler collection tests, 64 runner collection tests, targeted package tests and clippy pass. Shop's alternating simulator comparison reports median exec-to-first-draw 566.2 → 426.4 ms over five launches per build. Web must also exclude collection snapshot views from legacy list registration: the authored estimate otherwise activates `exact_list` on a shared collection and poisons the runner. The reproduced failure is fixed and Shop's full-feed browser/iOS probes pass. These are consumer-specific measurements, not whole-runtime or physical-phone parity.
 
@@ -1243,3 +1272,56 @@ and JS target use the same index and bounded correction path as other row
 jumps. No top-level cache is added. The tests and remaining native GUI
 qualification are recorded there; this does not widen §6.9's scroll-padding
 admission or add scroll-margin, smooth element jumps or authored scrollend.
+
+### 6.11 Rows the author keeps mounted (2026-10-28)
+
+A window mounts the rows near the port and the rows §6.2 pins. A screen
+reader moves through what is mounted: VoiceOver on a long transcript cannot
+move from the first message to the last, and a row that plays audio loses its
+player when the reader scrolls away. `@legendapp/list` answers both with
+`alwaysRender`; the T3 Code timeline keeps its first and last message mounted
+with it (upstream `6838e31b9c`).
+
+```contract
+list virtualized=true height=600 keep-mounted=[first(ids), ids.at(-1)]
+  for m in messages key=m.id
+    Message(m=m)
+```
+
+- **Value.** `keep-mounted` takes a list of row keys as the `for`'s `key=`
+  gives them: strings, numbers or bools, or options of one, `none` naming no
+  row. It may be computed and change. The compiler refuses keys of another
+  type than the `for`'s key (`lower-attr-type`), and the attribute anywhere
+  but `list virtualized=true` (`lower-list-virtualized`).
+- **On the list, not the row.** A flag on the row template would have to be
+  evaluated for every item, mounted or not, to find the rows it keeps; that
+  is the work the window exists to avoid. Keys on the list are found in the
+  index the list already keeps.
+- **Window.** A kept row the list holds is owed wherever the window is, like a
+  pin: it is built in a report with any limit, never retired as the window
+  passes it, and published with its `listitem` position like any row. A key
+  the list does not hold is passed over; a repeated key keeps its first row.
+  When the set changes, the commit that changes it mounts the rows it now
+  names and retires the rows it no longer names unless the window holds them;
+  when it mounts a row the revision moves, so the host measures it.
+- **Bound.** At most 64 keys, the bound `initial-item-count` has: kept rows
+  add at most that many to any window, so a list's first build is at most 128
+  rows. Another value (more keys, a non-key) is invalid at computed-value
+  time: the list keeps none and the journal says so, as for any refused prop.
+  The set is the author's and does not grow as the reader scrolls, so §6.2's
+  memory requirement holds. When a limited report caps the rows that linger
+  past the window, kept rows count toward neither the window nor that cap.
+- **Hosts.** The runner owns it (`runner/src/instance/collection/keep.rs`), so
+  every host the runner windows for keeps the rows: the Apple hosts, Linux,
+  Windows and the wasm web host. A kept row is an ordinary mounted row, a
+  subview of the scroll document at its offset, which the platform exposes to
+  accessibility as it does the window's rows. The JS target's `list.js` reads
+  it as the runner does. Scrolling a kept row into view when VoiceOver lands
+  on it is the platform's, as for any element of a scroll view, and the
+  window follows that scroll.
+- **What the window assumed.** The mounted rows are no longer one run. A
+  `scrollIntoView` settles when the run of mounted rows reaching its target is
+  measured, with each mounted row before that run; a host's fill-ahead stops
+  at the list's end only when the run covering the port reaches the end row
+  (`CollectionIOS.swift` and `collection-glue.js` `rowsToCover`, as macOS's
+  `preparedCover` already treats a gap).

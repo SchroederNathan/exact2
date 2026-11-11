@@ -59,7 +59,9 @@ function descendants(path) {
 // A database owns its file exclusively and pins each ancestor with a shared
 // lock. Unrelated files remain usable; replacing an open database or moving its
 // parent fails instead of silently discarding SQLite's later commit.
-export async function lockPaths(appId, paths, timeout = 10000) {
+// `timers`: the realm's own; a module Worker's are taken before its prelude takes the module's (module-worker.js).
+const ownTimers = { set: (f, ms) => setTimeout(f, ms), clear: id => clearTimeout(id) };
+export async function lockPaths(appId, paths, timeout = 10000, timers = ownTimers) {
   if (!globalThis.navigator?.locks) throw failure('Web Locks are unavailable');
   const requested = new Map();
   for (let path of paths) {
@@ -72,7 +74,7 @@ export async function lockPaths(appId, paths, timeout = 10000) {
   }
   const held = [];
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), timeout);
+  const timer = timers.set(() => abort.abort(), timeout);
   async function release() {
     for (const lock of held) lock.release();
     await Promise.all(held.map(lock => lock.done));
@@ -99,7 +101,7 @@ export async function lockPaths(appId, paths, timeout = 10000) {
   } catch (error) {
     await release();
     throw error;
-  } finally { clearTimeout(timer); }
+  } finally { timers.clear(timer); }
 }
 function requireBelowRoot(path) {
   if (rootPaths.includes(path)) throw failure('operation needs a path below the app root');
@@ -341,24 +343,28 @@ export function createFileStore(appId) {
   });
 }
 
+/** One mutation of `appId`'s store: after the module's earlier ones, under
+ * Web Locks on `paths` and their ancestors. */
+function mutateIn(appId, paths, operation, timers = ownTimers) {
+  const previous = mutationTails.get(appId) || Promise.resolve();
+  const result = previous.then(async () => {
+    const release = await lockPaths(appId, paths, undefined, timers);
+    try { return await operation(); }
+    finally { await release(); }
+  });
+  const settled = result.then(() => {}, () => {});
+  mutationTails.set(appId, settled);
+  void settled.then(() => {
+    if (mutationTails.get(appId) === settled) mutationTails.delete(appId);
+  });
+  return result;
+}
+
 /** Public capability. Every operation is admitted before opening IndexedDB. */
-export function createFileSystem(appId, grants) {
+export function createFileSystem(appId, grants, timers = ownTimers) {
   const store = createFileStore(appId);
   const fs = { directories: roots, dispose() { store.close(); } };
-  function mutate(paths, operation) {
-    const previous = mutationTails.get(appId) || Promise.resolve();
-    const result = previous.then(async () => {
-      const release = await lockPaths(appId, paths);
-      try { return await operation(); }
-      finally { await release(); }
-    });
-    const settled = result.then(() => {}, () => {});
-    mutationTails.set(appId, settled);
-    void settled.then(() => {
-      if (mutationTails.get(appId) === settled) mutationTails.delete(appId);
-    });
-    return result;
-  }
+  const mutate = (paths, operation) => mutateIn(appId, paths, operation, timers);
   for (const method of ['readFile', 'readdir', 'stat', 'realpath']) {
     fs[method] = async path => store[method](authorize(grants, 'fs.read', path));
   }
@@ -378,24 +384,52 @@ export function createFileSystem(appId, grants) {
       return mutate(method === 'rename' ? [from, to] : [to], () => store[method](from, to));
     };
   }
-  // `compressImage(from, to, {maxDimension, maxBytes})` (LLP 1069.002 A1):
-  // both grants are checked and the options too before anything is read;
-  // the codec runs outside the mutation lock, and only the write takes it.
+  // `copyFile` from a document the person chose (documents-glue.js
+  // `copyFile`): `to` is admitted before `open` gives the document's File,
+  // which becomes the file's contents, as a picked file's does (LLP 1069.002 D5).
+  fs.copyIn = async (to, open) => {
+    to = authorize(grants, 'fs.write', to);
+    requireBelowRoot(to);
+    const file = await open();
+    return mutate([to], () => store.putBlob(to, file));
+  };
+  // `compressImage(from, to, {maxDimension, maxBytes, type, rotate, flip, crop})`
+  // (LLP 1069.002 A1, LLP 1133.019 D15): both grants are checked and the
+  // options too before anything is read; the codec runs outside the mutation
+  // lock, and only the write takes it.
   fs.compressImage = async (from, to, options) => {
     if (typeof from !== 'string' || typeof to !== 'string' || !from.startsWith('app:/') || !to.startsWith('app:/'))
       throw failure('compressImage: needs app:/ paths', 'failed');
     const image = await import('./storage-image.js');
-    const { maxDimension, maxBytes } = image.limits(options);
+    const { maxDimension, maxBytes, type } = image.limits(options);
+    const edit = image.editOptions('storage.fs.compressImage()', options, false);
     from = authorize(grants, 'fs.read', from);
     to = authorize(grants, 'fs.write', to);
     requireBelowRoot(to);
     // An entry is one IndexedDB record, read whole by any operation (`stat`
     // too); its size is checked before it becomes a Blob or is decoded.
     const { blob } = await store.blob(from, undefined, image.MAX_BYTES);
-    const out = await image.compress(blob, maxDimension, maxBytes);
+    const out = await image.compress(blob, maxDimension, maxBytes, undefined, type, edit);
     const size = out.bytes.byteLength;
     await mutate([to], () => store.atomicWriteOwnedFile(to, out.bytes));
-    return { path: to, type: 'image/jpeg', size, width: out.width, height: out.height };
+    return { path: to, type, size, width: out.width, height: out.height };
+  };
+  // `transformImage(from, to, options)` (LLP 1133.019 D14), as `compressImage`
+  // is run; a `to` with no extension gains the written type's, under its grant.
+  fs.transformImage = async (from, to, options) => {
+    if (typeof from !== 'string' || typeof to !== 'string' || !from.startsWith('app:/') || !to.startsWith('app:/'))
+      throw failure('transformImage: needs app:/ paths', 'failed');
+    const image = await import('./storage-image.js');
+    const checked = image.editOptions('storage.fs.transformImage()', options, true);
+    from = authorize(grants, 'fs.read', from);
+    to = authorize(grants, 'fs.write', to);
+    requireBelowRoot(to);
+    const { blob } = await store.blob(from, undefined, image.MAX_BYTES, 'transformImage');
+    const out = await image.transform(blob, checked);
+    const path = /\.[^/]*$/.test(to) ? to : authorize(grants, 'fs.write', `${to}.${image.extension(out.type)}`);
+    const { bytes, ...facts } = out, size = bytes.byteLength; // the write detaches the bytes
+    await mutate([path], () => store.atomicWriteOwnedFile(path, bytes));
+    return { path, size, ...facts };
   };
   return Object.freeze(fs);
 }
@@ -426,4 +460,64 @@ export async function requestBody(appId, grants, path) {
     });
     return blob.type ? blob.slice(0, blob.size, '') : blob;
   } finally { store.close(); }
+}
+
+/** `fetch(url, {exactBodyTo})` (LLP 1108 D6 R2, 2026-10-26): the app file a
+ * 2xx reply's body becomes, admitted under `fs.write` with its parent folder
+ * checked before the request is sent. `put` counts the body through a stream
+ * into a Blob the browser holds (never bytes in the module), refused past its
+ * limit, then makes it the file's entry in one IndexedDB transaction under
+ * the module's mutation lock, so the file appears whole or not at all.
+ * Every refusal names the path and why, as the native executor's does.
+ * `close` lets the store go when the reply is never written. Trusted host only. */
+export const MAX_BODY_TO_BYTES = 1024 * 1024 * 1024;
+export async function bodyTarget(appId, grants, path) {
+  const named = (why, code) => Object.assign(new Error(`exactBodyTo ${path}: ${String(why).replace(/^filesystem: /, '')}`), { kind: 'Unavailable', code });
+  let normalized;
+  try { normalized = authorize(grants, 'fs.write', path); requireBelowRoot(normalized); }
+  catch (error) { throw named(error.message, /denied: /.test(error.message) ? 'denied' : 'failed'); }
+  const key = typeof appId === 'string' && appId ? storageKey(appId) : null;
+  if (key == null) throw named(appId ? agentStorageRefusal : 'this host has no app files (no storage here)', 'agent');
+  const store = createFileStore(key);
+  try {
+    const parent = await store.stat(parentOf(normalized)).catch(error => { throw named(error.message, error.code); });
+    if (!parent.isDirectory) throw named(`not a directory: ${parentOf(normalized)}`, 'ENOTDIR');
+    const target = await store.stat(normalized).catch(error => { if (error.code !== 'ENOENT') throw named(error.message, error.code); });
+    if (target?.isDirectory) throw named('write needs a regular file', 'EISDIR');
+  } catch (error) { store.close(); throw error; }
+  return {
+    // Until the file starts to be replaced, the request's end refuses the write: `refusal()`, asked just before, says
+    // whether the request has ended and with what, and `ended` aborts when it may have, rejecting the write at once.
+    // Once the file starts to be replaced the write waits for it, so a request never fails while its file changes.
+    async put(response, limit, ended, refusal = () => undefined) {
+      try {
+        // A browser rejects the read with its own words, so the overflow is kept to say why.
+        let size = 0, over = null;
+        const counted = response.body?.pipeThrough(new TransformStream({ transform(chunk, out) {
+          if ((size += chunk.byteLength) > limit) throw (over = Object.assign(new Error('HTTP response exceeds limit'), { kind: 'Refused' }));
+          out.enqueue(chunk);
+        } }));
+        const blob = counted ? await new Response(counted).blob().catch(error => { throw over ?? error; }) : new Blob([]);
+        let replacing = false, refused;
+        const replaced = mutateIn(key, [normalized], () => {
+          refused = refusal();
+          if (refused) throw refused;
+          replacing = true;
+          return store.putBlob(normalized, blob);
+        }).catch(error => { throw error === refused ? error : named(error.message, error.code); });
+        if (ended) {
+          await new Promise((done, failed) => {
+            const end = () => { if (!replacing) failed(refusal() ?? ended.reason); };
+            ended.addEventListener('abort', end, { once: true });
+            if (ended.aborted) end();
+            replaced.then(done, failed).finally(() => ended.removeEventListener('abort', end));
+          });
+        } else {
+          await replaced;
+        }
+        return size;
+      } finally { store.close(); }
+    },
+    close() { store.close(); },
+  };
 }

@@ -1,9 +1,31 @@
 # Vendored Ibex split crates — Exact integration ledger
 
+## Windows WebSocket readiness
+
+`crates/ibex2/src/transport/websocket.rs` subscribes to writable readiness only
+while output is pending. Windows rearms readiness after a blocked read; keeping
+writable interest on an empty output queue makes an outstanding receive spin.
+The idle-receive regression in `websocket_tests.rs` checks that the pump stays
+parked and still wakes on cancellation.
+
+## Mac widget Keychain (LLP 1126.001 WP16)
+
+`crates/ibex2/src/secrets/darwin_keychain.mm` selects the restricted
+`ExactKeychainAccessGroup` in the data-protection Keychain for a provisioned
+Apple widget cohort. Ordinary Mac apps keep the login Keychain. The containing
+app migrates its service's login items on its first provisioned launch;
+copy failure keeps the old item, and an existing shared item wins. Migration
+runs once per process, from `prepare` only. An unreadable item is skipped;
+errors are logged without withholding the app's I/O. Retained items can be
+retried on the next launch. The move is one-way. Extensions never migrate.
+The Objective-C fixture in
+`host/apple/tests/fixtures/keychain-migration.mm` exercises retries and failures
+with substituted Security calls; signed Keychain access still needs profiles.
+
 ## Snapshot and update recipe
 
 - Upstream: `https://github.com/expo/ibex.git` at
-  `e742c7284a767edbfb711db3333f7610c24f99f8` (2026-10-14).
+  `a0183568e8229b8243629cdb26cd4a88ac4e2abd` (2026-10-30).
 - Source trees: `crates/{ibex2,ibex2-sqlite,hermes-lean-sys,hermes-lean-sys-installer}`.
 - Data inputs: `scripts/icu74-filter-{root-en,en-intl}.json` and
   `third_party/wpt/urltestdata.json`.
@@ -33,6 +55,39 @@ transport tunnels through the environment's proxy as fetch does
 (`transport/websocket.rs` and its tests, the only vendored inputs that changed
 since `e60b3e0`). Manifests, locks and integration seams are unchanged.
 
+The October 18 refresh compared that `e742c72` upstream tree, Exact
+`a28fc4f18fda0da187f0a8e564f8407c57748dd8`'s vendor tree, and the new
+`bbf47f3` upstream tree before replacement. Upstream now supplies the socket
+queue count, scheme-wide grants, allocation-reduced descriptor reads and the
+collection between the hardening guard and `harden.js`; their active local
+patches are retired below. The refresh also adopts fail-closed portable fetch
+for an unsupported environment SOCKS proxy, including a `NO_PROXY` bypass and
+one proxy snapshot per transport. The eight changed upstream inputs are
+`bindings/install.cc`, `grant.rs`, `stdlib/websocket.rs`, the two Darwin
+WebSocket files, `rustls_http.rs`, `transport/websocket.rs`, and its tests.
+The v5 engine trust table, manifests, data inputs and standalone locks did not
+change. After replacement, the complete Exact delta apart from this ledger is
+ten files: the two locks, three workspace boundaries, two stub build seams,
+the app-facing storage declaration, Keychain group selection and read-only
+directory snapshots.
+
+The October 30 refresh compared `bbf47f3`, Exact `d16c84ee03`'s vendor tree, and
+the new `a018356` upstream tree (the merges of expo/ibex#3 and #4). Upstream now
+supplies `AbortSignal.any`'s Web IDL sequence conversion and the abort hooks'
+view of a composed signal's `sources`, so local patches 25 and 22 are retired;
+the portable transport's resend of a request whose kept connection closes
+unanswered (`transport/rustls_http.rs`, which exact2's Linux OAuth requests
+met); and Fetch's `Headers` guard, which a fetched response's headers take and
+an embedder may give its own through `InstallOptions::headers_hooks`. The nine
+changed upstream inputs are `include/ibex2_jsi.h`, `bindings/abort.js`,
+`bindings/fetch.js`, `bindings/headers.js`, `bindings/install.cc`,
+`secrets/mod.rs`, `transport/darwin_websocket.rs`, `transport/rustls_http.rs`
+and `transport/websocket_tests.rs`; five were also Exact's. `install.cc`,
+`ibex2_jsi.h` and the websocket tests merged without overlap, and `abort.js` is
+upstream's. `rustls_http.rs` sends patch 23's counted reader through the resend
+(`send`), the reader rewound so its bytes sent are told again from zero.
+Manifests, locks, data inputs and the bundle pin did not change.
+
 For another refresh, export the four named crate trees and all three data inputs
 from the selected commit into a temporary directory. Recover the current local
 delta against the pin above before replacing them; classify each difference
@@ -57,10 +112,10 @@ bun -e 'const fs=require("node:fs"),read=p=>Bun.TOML.parse(fs.readFileSync(p,"ut
 
 Numbers preserve the former ledger so a patch never disappears without its
 replacement and consumer evidence. Rows 3–7 and 9–13 retire the corresponding
-local source patches. The evidence below qualifies the macOS consumers and
-portable adapter; platform-specific limits are named rather than inferred from
-source replacement. The consumer deltas are two explicit stub build scripts, two standalone locks,
-and the workspace boundaries below.
+October 13 source patches. The four named rows added on October 18 retire the
+last reusable source patches. Platform-specific limits are named rather than
+inferred from source replacement. The remaining consumer deltas are the seams
+listed below.
 
 | Former Exact patch | Upstream replacement | Exact consumer evidence |
 |---|---|---|
@@ -75,13 +130,27 @@ and the workspace boundaries below.
 | 12. Bounded native filesystem results | Explicit `ResultLimits`; bounded reads/enumeration and batched recursive removal | Exact 16 MiB native/app/document cap tests pass, preserving the typed result-limit error |
 | 13. Async fetch | Fallible preparation, infallible accepted activation, terminal retirement, bounded portable workers | Admission refusal, physical retirement, all six base-start failure positions and bounded-worker lifetime tests pass |
 | Windows chosen-document EISDIR | Same retained-handle native document executor | Source patch retired against upstream native Windows tests; native Windows Exact storage, document and ordinary TypeScript host requalification is recorded below |
+| Socket queued-message count | `MessageSender::buffered_messages`, implemented by the portable sender and the Darwin sender under its lock; the Darwin source test observes a paused native send complete | Exact's native executor checks a batch whole before the transport's 256-message limit; `executor_socket_tests::a_batch_is_refused_whole_past_the_buffer_or_after_a_close` is the direct consumer |
+| Scheme-wide network grants | Ibex `GrantSet` owns `http:`/`https:` fetch grants and `ws:`/`wss:` socket grants, with independent family admission tests | `exact-grants` compares Ibex and Exact against `host/web/tests/fixtures/grants.json`; the web matcher consumes that same corpus |
+| Presence policy on `secret.keep` | Ibex `GrantSet` reads `secret.keep <name> <policy> [optional] [platform words]` (exact2 LLP 1133.010 D4) and refuses `exact.presence.` names; the grant stays the name's | `exact-grants` compares Ibex and Exact against `host/web/tests/fixtures/grants.json`'s presence cases |
+| Allocation-reduced descriptor reads | Ibex captures `hasOwnProperty` and reuses property identifiers while still walking captured own-property descriptors | The linked-lean `exact-js` bootstrap tests refuse Proxy-hidden abort hooks and prove every descriptor-reachable payload is frozen |
+| Collection after the hardening guard | Ibex collects only after a trusted bootstrap guard ran, before evaluating `harden.js` | The same linked-lean bootstrap tests exercise the guarded and unguarded paths with production bindings |
+
+Upstream `f28b08d`'s portable-fetch tests run the unsupported SOCKS cases in
+child processes, prove refusal before DNS or a direct connection, prove
+`NO_PROXY` bypass, and prove a pooled transport retains one supported proxy
+snapshot. Exact's render and non-Apple executors consume that portable path.
 
 Patch 9's app interface stays Exact's and is replayed on a refresh:
 `bindings/storage.d.ts` declares `compressImage(from, to, {maxDimension,
-maxBytes})` resolving to `{path, type, size, width, height}`, as Exact's docs
+maxBytes, type})` resolving to `{path, type, size, width, height}`, as Exact's docs
 give it, and Exact's prelude (`js/src/prelude.js`) adapts that to upstream's
 positional binding (`compressImage(from, to, maxDimension, maxBytes)`, replying
-`width\theight\tsize`). The October 13 refresh replaced the declaration with
+`width\theight\tsize`). Exact adds a fifth positional argument, the media type
+(exact2 LLP 1069.002 A1.11, 2026-10-20): `boundary_abi.rs` reads it into
+`fs_image::ImageRequest::format` (`ImageFormat::Jpeg` when absent, `Png`; any
+other value is an invalid argument), and the codec is Exact's. Replay both on a
+refresh. The October 13 refresh replaced the declaration with
 the positional form; `contract/cli/tests/it/typescript.rs` now pins it. Upstream
 now preserves Exact's app error branches: a source over the read cap is
 `compressImage: too-large:`, and a trial deadline before publication is
@@ -89,6 +158,25 @@ now preserves Exact's app error branches: a source over the read cap is
 patch; exact internal markers and typed deadline errors are matched upstream.
 The source pin also deallocates an upload's bytes before invoking its last-release
 callback, so the executor cannot refund memory while the allocation is retained.
+
+Patch 9a (exact2 LLP 1133.019 D14, D15, D17, 2026-10-24) is Exact's alone and is
+replayed on a refresh. `bindings/install.cc` names a second fs method,
+`transformImage`, on op 121. Its native arguments are `(from, to, optionsJson)`;
+`compressImage` may add a sixth, its edit's JSON. `boundary_abi.rs` admits both
+shapes and passes the JSON unread in `fs_image::ImageRequest::options`, with
+`transform` set for the three-argument form. `ImageRequest` is `Clone`, not
+`Copy`, and has a `Default`. A transform's `max_dimension` and `max_bytes` are
+the service's own (`ImageJob::prepare`), and its failures are named
+`transformImage:` (`failed_as`, `WorkControl::check`). The codec's
+`CompressedImage` gains `report` (a JSON object, passed through) and `extension`.
+A transform whose `to` leaf has no `.` is written at `to.<extension>`, after
+`fs.write` is admitted for that path, in the parent already pinned
+(`AtomicTarget::extended`). `ImageFile` gains `path` and `report`, and a
+transform replies `width\theight\tsize\tpath\treport`. `bindings/storage.d.ts`
+declares `transformImage`, `TransformImageOptions`, `TransformedImage`,
+`ImageCrop`, and `rotate`, `flip` and `crop` on `CompressImageOptions`.
+`fs_image.rs`'s `a_transform_passes_its_options_and_extends_an_extensionless_target`
+and `contract/cli/tests/it/typescript.rs` pin it.
 The standalone manifests, dependency graph and locks are unchanged by this refresh.
 
 ### Historical v4 Windows consumer qualification — 2026-10-13
@@ -170,6 +258,22 @@ configuration and emits empty engine/compiler metadata with no native link.
 Normal builds still validate and link the receipted lean VM. These remain
 Exact-only; paired `HERMESC_PATH` export is now generic upstream support.
 
+`secrets/darwin_keychain.mm` selects the bundle's
+`ExactKeychainAccessGroup` only when `ExactAppIdentifier` equals the Keychain
+service. Exact's app and WidgetKit extension can therefore read the app's
+granted secrets through their shared group without changing another Ibex
+consumer's service. `host/apple/bundle.mjs` publishes the two values, and
+`host/apple/widget-keychain.test.mjs` is the opt-in simulator integration
+witness. This is Exact application policy and remains local.
+
+On Unix, `AppDirectories::snapshot` pins only roots that already exist and
+leaves the others absent for that invocation. A read-only widget refresh can
+therefore run first-launch application logic without creating the app's data,
+cache or temporary directories. `exact-js` selects it only for a snapshot;
+`missing_snapshot_roots_do_not_prevent_activation_or_create_app_directories`
+is the direct consumer test. This is LLP 1126 D8 application policy and
+remains local.
+
 The standalone locks above remain local. Application policy stays in Exact:
 request scheduling and byte budgets, whole-exchange deadlines, source grants,
 document session identity, JSON result vocabulary, native image codec, and
@@ -202,21 +306,180 @@ expected write as a `stat`, a comparison and the write, queued together; the
 web glue and Exact's Rust storage do the same. Replay the declarations on a
 refresh.
 
-## Local patch, upstream-bound: a socket's buffered message count
+## Local patch 15, Exact's kept documents: a selected file named as chosen
 
-Exact's runner-owned sockets (LLP 1016.000 D7) refuse a mutation's batch
-whole when the transport could not queue it. Both transports bound their
-outbound queue at 256 messages as well as 16 MiB and, past either, close the
-connection while `send_*` returns `Ok` (WHATWG's "full"), so a caller cannot
-refuse first without the count. The patch adds
-`MessageSender::buffered_messages()` (default 0) in
-`crates/ibex2/src/stdlib/websocket.rs`, implemented by the portable
-`TcpSender` (`queued_messages`) and by `DarwinSender` through a new
-`ibex2_darwin_ws_buffered_messages` in `transport/darwin_websocket.mm`
-(`pendingMessages`, read under the socket's lock). It is additive; no
-existing behaviour changes. To go upstream to expo/ibex; replay it on a
-refresh until it is there. Consumer: `host/apple/src/executor_socket.rs`
-(`Core::socket`) and its scripted test.
+`stdlib/documents.rs` adds `DocumentLease::selected_file_named(directory,
+leaf, name, guard)`: a selected file the guest path names `name` while its
+leaf in the retained parent is `leaf`. `selected_file` is that with the two
+equal. Exact keeps a chosen file across launches under the name it was
+chosen by (exact2 LLP 1069.010.000 D4), and a Mac bookmark follows the file
+when it is renamed, so the two differ after a rename. The provider still
+decides what the name admits; Ibex still opens only `leaf`, refuses every
+path beneath it, and refuses `rm`, `mkdir` and `readdir` on it. `bindings/storage.d.ts` declares
+`fs.recentDocuments()` and `fs.forgetDocument(path)`, which Exact's prelude
+answers from the host's kept list; no Ibex source runs either. Replay both on
+a refresh.
+
+## Local patch 16, bindings' bytecode read where it is linked
+
+`bindings.rs` links each binding's `.hbc` and `HARDEN_BYTECODE` at a 16-byte
+boundary (`aligned_bytecode!`), and `bindings/install.cc`'s `CompiledBytes`
+lends such a span to Hermes instead of copying it, since Hermes keeps a
+module's buffer for the runtime's life and the statics live as long; a span
+not so aligned is still copied. `include/ibex2_jsi.h` says so at
+`CompiledScript`. In euxy on iOS the copies were 81 KB of malloc at idle.
+Replay on a refresh.
+
+## Local patch 17, a host-task worker gives its stack back when idle
+
+`pool.rs`: on Apple platforms a worker that finishes a job with none queued
+releases its stack pages below its frame (`MADV_FREE_REUSABLE`). The two
+workers kept through a quiet spell otherwise keep every page a job reached
+dirty for the process's life: 80 KB in euxy on iOS after its launch's reads.
+Replay on a refresh.
+
+## Local patch 18, `copyFile` from a chosen document into an app file
+
+`stdlib/documents.rs` adds `copy_document`, which `fs::run_with_documents`
+runs for `copyFile` from a `doc:` path to an `app:` path (exact2 LLP 1069.010
+D1, ruled 2026-10-26); every other two-path document operation is still
+refused. It admits `fs.read` on the document, then
+`AppDirectories::copy_in` admits `fs.write` on the destination, and only then
+is the provider asked. The source opens as `readFile` opens it
+(`app_fs::document_file`, Unix and Windows) and the host copies its bytes, so
+no result envelope bounds them. Replay on a refresh.
+
+## Local patch 19, an app file staged in pieces and published whole
+
+`stdlib/app_fs_unix.rs` and `app_fs_windows.rs` add `AppDirectories::stage(grants,
+path)` and `Staged` (`write_all`, `publish`), for `fetch(url, {exactBodyTo})` (exact2
+LLP 1108 D6 R2, ruled 2026-10-26): the host writes a reply's body into an app file as it
+arrives. `stage` admits `fs.write` on the path, refuses a missing parent or a target that
+is not a regular file, and creates `.exact-<hex>.partial` beside the target through the
+pinned parent. `publish` syncs it and renames it over the target; a `Staged` dropped
+unpublished removes it. The stub for other platforms refuses. Replay on a refresh.
+
+## Local patch 20, the `local-network` grant source
+
+`grant.rs` adds `fetch.local-network` and `websocket.local-network` (exact2 LLP
+1133.036 D5, ruled 2026-10-26), written `net.fetch local-network` and
+`net.websocket local-network`, with the word `development` for loopback too. It
+admits a host the URL writes as an RFC 1918, link-local or unique-local
+address (an IPv4-mapped IPv6 address by its IPv4), a link-local IPv6 address,
+or a `.local` name; never a name that merely resolves to one. exact2's
+`grants` crate holds the same test. Replay on a refresh.
+
+## Local patch 21, a host's check at every fetch hop and WebSocket open
+
+`boundary.rs` adds `HopGate` and `HostError::NotAllowed { reason }` (shown
+`NotAllowedError: <reason>`); `host.rs` gives `Fetch` and `WebSocket` an
+optional gate (`with_gate`); `stdlib/fetch.rs` (`fetch_stream_gated`,
+`admit_hop`), `fetch_async.rs` (`start_gated`) and `websocket.rs`
+(`open_gated`) ask it after the grants admit each hop, a redirect's included,
+and before anything is sent (exact2 LLP 1133.036 D6): exact2's Apple executor
+refuses a tool's, a wake's or a package event's reach to the local network
+while the person has not decided. Without a gate nothing changes. Replay on a
+refresh.
+
+## Local patch 23, an upload's bytes sent
+
+`stdlib/fetch.rs` gives `Request` an optional `sent` hook (`Sent`), told
+`(loaded, total)` as the body goes out and `(total, total)` by the time the
+headers have arrived (exact2 LLP 1016.000 D10, XMLHttpRequest's upload
+progress), and an optional start hook beside it. `fetch_stream_gated` tells
+the start hook once, when `admit_hop` has passed the first hop's grant check
+and local-network gate, so a request they refuse never started (the
+embedder's `exact:sending`). The hook answers whether the upload may go out:
+an embedder that has let it go answers `false`, which stops it as an abort
+does, and the loop checks the signal again after it. So an embedder that
+aborts an upload, then reads which uploads started, is never wrong about one.
+A request upstream's portable transport sends again, on a new connection,
+when a kept connection closes unanswered, rewinds the counted reader, so its
+bytes sent are told again from zero, as Chrome resets an upload stream to
+resend (`rustls_http.rs`'s `send`; tested in
+`an_unanswered_request_on_a_kept_connection_is_sent_again_on_a_new_one`).
+`transport/darwin_http.mm` records URLSession's `didSendBodyData` on the
+exchange, and `ibex2_darwin_http_headers` takes the bytes the caller last saw,
+returning 2 when they change before the headers, so `transport/darwin.rs`
+tells the hook on the opening thread and waits again.
+`transport/rustls_http.rs` sends such a body through a reader that tells the
+hook each read ureq takes, with an explicit `content-length`. Without a hook
+nothing changes. `fetch_stream_gated`, every request's hop loop, moves the
+body into each hop's request and back instead of cloning it, so a request
+holds one copy of its body while it goes out, the platform's aside.
+
+Tests: `darwin_stream_tests.rs`
+`an_uploads_bytes_sent_are_told_before_its_headers`, `stream_tests.rs`
+`the_portable_transport_tells_an_uploads_bytes_sent` and `stdlib/fetch.rs`
+`an_upload_let_go_as_it_starts_never_reaches_transport`,
+which run with this crate's manifest and in no lane. exact2's workspace tests
+the hooks through its executor: the start, and none for a request the grants
+refuse, in `exact-apple`'s `an_upload_the_grants_refuse_never_starts`;
+URLSession in `exact-apple`'s async-lane
+`an_upload_through_urlsession_tells_its_progress_and_waits_out_a_slow_reply`;
+and the portable transport in `exact-js`'s
+`an_upload_maps_its_bytes_sent_as_they_go_then_its_reply`. Replay on a refresh.
+
+## Local patch 24, Exact's desktop processes: the transport and file operations
+
+For exact2 LLP 1133.007. `process/` starts a child in a process group of
+its own with default signals and only its three pipes (`posix_spawn` on
+macOS, `fork` and `execve` with `PR_SET_PDEATHSIG` on Linux), `argv[0]` as
+the caller names it, the parent's pipe ends raising no `SIGPIPE` on Apple
+platforms, and answers what the host's supervision needs: waiting,
+readiness of a pipe, signalling a group and listing its members, a
+process's start time and session, the boot's identity, the password
+database's home directory and login shell, and a wait at the process's
+exit (`wait_at_exit`). It moves the child's descriptors above 2 before
+putting them in place, and `fork` runs with every signal blocked until the
+child's handlers are defaults. A `PATH` lookup skips relative entries.
+`stdlib/fs.rs` resolves `home:/` and `bundle:/` (the namespaces `grant.rs`
+reads) against roots the host sets (`set_roots`), the bundle read only,
+each path admitted as spelt and run from its root's retained descriptor
+with every component opened `O_NOFOLLOW` (`app_fs_unix.rs` `run_below`,
+which `app:/` paths share), so no link below a root is followed; a native
+absolute path is run the same way, admitted as spelt by the deepest grant
+line that admits it, that line reached from `/` at each operation, its
+links followed only until a directory an `fs.write` line (native or
+`home:`) or an app directory names, compared by device and inode
+(`reach`), and every name below that opened `O_NOFOLLOW`; a link on the
+way that the running user owns, or that sits in a directory the user
+owns or can write, is refused, naming it (`made_by_this_user`), so only
+links such as macOS's `/var` and `/tmp` are followed; `access` checks its leaf with `AT_SYMLINK_NOFOLLOW`;
+`open_read` opens a path to read it the same way, for a child's stdin; and `stat`
+reads `mode` and `isSymbolicLink`; `fs_more.rs` adds `lstat`, `readlink`,
+`access`, `chmod`, `symlink`, `digest` and `flock`/`unlock`, host opcodes
+122 to 129 in `host_opcodes.rs` and `boundary_abi.rs`, the methods in
+`bindings/install.cc` and `storage.d.ts`; a lock moves to the
+`RuntimeState` that asked, whose `unlock` alone releases it and whose
+shutdown releases them all. The process lines are exact2's own and never
+reach `grant.rs`. Bionic's `faccessat` refuses every flag, so on Android
+`crate::AT_EACCESS` is none and `access` checks its leaf without
+`AT_SYMLINK_NOFOLLOW`, after the `fstatat` that found it no link. Replay on a refresh.
+
+## Local patch 25, a database file held by one SQLite library at a time
+
+For exact2 LLP 1154 D3: an embedder may link a second SQLite library beside
+this one (a native module's), and two in one process are safe only while no
+file is open in both, since closing any descriptor of a file drops every
+POSIX lock the process holds on it (sqlite.org/howtocorrupt.html §2.2.1).
+`ibex2-sqlite`'s `held.rs` keeps the process's registry: `SqliteProvider::open`
+counts each connection's file before SQLite opens it and refuses one that
+`reserve(path)` has reserved; `reserve` refuses a file a connection has open,
+and its `Reservation` ends the reservation when dropped and says whether the
+file `existed()`; a connection's count ends at a successful close or when it
+drops. A file is one entry by its name under its canonical directory and by
+its device and inode, so a case alias or a hard link is the same file: an
+absent file is created empty (`O_EXCL`) under the registry's lock when its
+entry is made, by either side, and an entry keeps the identity it learned
+then for its life, matching by name only where an identity is unknown: the
+holder's descriptor keeps the inode from reuse, and a name unlinked and made
+again names another file. `stdlib/app_fs_unix.rs`
+`AppDirectories::sqlite_path` checks that the database is a regular file with
+`fstatat(AT_SYMLINK_NOFOLLOW)` beneath the pinned parent instead of opening
+and closing it, so resolving a path, a refused one's included, never touches
+another library's locks. exact2 tests both through `exact-js`
+(`tests/it/native_storage.rs`). Replay on a refresh.
 
 ## Qualification boundaries
 

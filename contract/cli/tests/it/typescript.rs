@@ -75,6 +75,12 @@ async function storageTypes() {
   const shrunk: {path: string; type: 'image/jpeg'; size: number; width: number; height: number} = image;
   // @ts-expect-error the engine's positional binding is not the app interface
   await storage.fs.compressImage(path, path, 1024, 1_000_000);
+  // `fs.transformImage` (LLP 1133.019 D14): the edit in, what was written out.
+  const edit = await storage.fs.transformImage(path, storage.fs.directories.temporary + '/edit', {rotate: 90, crop: {x: 0, y: 0, width: 10, height: 10}, metadata: 'no-location'});
+  const kept: {path: string; type: string; colorSpace: 'srgb' | 'display-p3' | 'other'; hdr: boolean; metadata: 'keep' | 'no-location' | 'none'} = edit;
+  await storage.fs.compressImage(path, path, {maxDimension: 512, maxBytes: 100_000, rotate: 90, flip: 'horizontal'});
+  // @ts-expect-error flip is a word, not a boolean
+  await storage.fs.transformImage(path, path, {flip: true});
 }
 // @ts-expect-error store.set has no success value
 const success: boolean = store.set('token', 'value');
@@ -142,18 +148,26 @@ fn compress_image_is_declared_as_the_docs_give_it() {
         "compressImage(from: string, to: string, options: CompressImageOptions): Promise<CompressedImage>;",
         "readonly maxDimension: number;",
         "readonly maxBytes: number;",
-        "readonly type: \"image/jpeg\";",
+        "readonly type?: \"image/jpeg\" | \"image/png\";",
+        "readonly type: \"image/jpeg\" | \"image/png\";",
         "readonly width: number;",
         "readonly height: number;",
         "readonly size: number;",
         "readonly path: string;",
+        "transformImage(from: string, to: string, options?: TransformImageOptions): Promise<TransformedImage>;",
+        "readonly resizeQuality?: \"pixelated\" | \"low\" | \"medium\" | \"high\";",
+        "readonly colorSpace: \"srgb\" | \"display-p3\" | \"other\";",
+        "readonly metadata: \"keep\" | \"no-location\" | \"none\";",
     ] {
         assert!(declared.contains(line), "storage.d.ts lost `{line}`");
     }
     // The engine's positional binding is the prelude's to adapt, never the app's.
     assert!(!declared.contains("compressImage(from: string, to: string, maxDimension"));
     let reference = include_str!("../../../../docs/reference.md");
-    assert!(reference.contains("`storage.fs.compressImage(from, to, {maxDimension, maxBytes})`"));
+    assert!(
+        reference.contains("`storage.fs.compressImage(from, to, {maxDimension, maxBytes, type})`")
+    );
+    assert!(reference.contains("`storage.fs.transformImage(from, to, options)`"));
 }
 
 #[test]
@@ -473,6 +487,59 @@ fn build_reports_all_reachable_ambient_apis_before_bake() {
     assert!(text.contains("Math.random()"), "{text}");
 }
 
+/// An import of a file git ignores (Expose's `./local`, which its hosts'
+/// build scripts write) that this checkout lacks says so, and how one gets
+/// it, beside the bundler's "could not resolve".
+#[test]
+fn a_missing_ignored_import_says_it_is_local() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "app.contract",
+        "component App\n  view\n    text \"Hello\"\n",
+    );
+    fixture.write(
+        "app.ts",
+        "import { bakedKey } from './local';\nexport const key = () => bakedKey;\n",
+    );
+    fixture.write(".gitignore", "local.ts\n");
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&fixture.0)
+        .status()
+        .unwrap();
+    assert!(git.success());
+    let output = Command::new(env!("CARGO_BIN_EXE_contract"))
+        .args(["build", "app.contract", "--json"])
+        .current_dir(&fixture.0)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("`./local` is `./local.ts`, a file git ignores here"),
+        "{text}"
+    );
+    // Once it exists, the build goes on.
+    fixture.write("local.ts", "export const bakedKey = \"\";\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_contract"))
+        .args(["build", "app.contract", "--json"])
+        .current_dir(&fixture.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    // An import that is simply missing says nothing of git.
+    fixture.write(
+        "app.ts",
+        "import { other } from './nowhere';\nexport const key = () => other;\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_contract"))
+        .args(["build", "app.contract", "--json"])
+        .current_dir(&fixture.0)
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("git ignores"));
+}
+
 #[test]
 fn ambient_check_resolves_extensionless_mounted_modules() {
     let fixture = Fixture::new();
@@ -570,9 +637,14 @@ fn types_check_is_read_only_and_build_reports_only_changed_declarations() {
         std::fs::read_to_string(fixture.0.join("app.contract.d.ts")).unwrap(),
         "stale"
     );
+    // Under --json the array is the whole reply: the declaration is rewritten unsaid.
     let built = run(&["build", "app.contract", "--json"]);
     assert!(built.status.success(), "{built:?}");
     assert_eq!(built.stdout, b"[]\n");
+    assert!(built.stderr.is_empty(), "{built:?}");
+    assert!(check().status.success());
+    fixture.write("app.contract.d.ts", "stale");
+    let built = run(&["build", "app.contract"]);
     assert!(String::from_utf8_lossy(&built.stderr)
         .contains("app.contract.d.ts: regenerated, since a source's signature changed"));
     assert!(check().status.success());
@@ -600,12 +672,12 @@ fn a_data_module_returning_an_unknown_token_fails_tsc() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("app.tamber"),
-        "tamber t\n\ntheme\n  brand = #c8102e\n  surface.card = #ffffff\n",
+        "tamber t\n\ntheme\n  brand = #c8102e\n  surface.card = #ffffff\n  space.row = 12px\n",
     )
     .unwrap();
     std::fs::write(
         dir.join("app.contract"),
-        "component App\n  view\n    column background-color=\"surface.card\"\n      text \"a\" color=\"brand\"\n",
+        "component App\n  view\n    column background-color=\"surface.card\" padding=\"space.row\"\n      text \"a\" color=\"brand\"\n",
     )
     .unwrap();
     let plan = contract::compile_path(&dir.join("app.contract")).unwrap();
@@ -625,6 +697,15 @@ fn a_data_module_returning_an_unknown_token_fails_tsc() {
     let output = fixture.check(&module("\"surface.nonesuch\""));
     assert!(!output.status.success(), "an unknown token passed tsc");
     assert!(String::from_utf8_lossy(&output.stdout).contains("error TS"));
+    // Stage 6 G: each kind its own union; a colour is no length.
+    let length = |token: &str| {
+        format!("import type {{ LengthToken }} from './app.contract';\nexport const gap = (): LengthToken => {token};\n")
+    };
+    assert!(fixture.check(&length("\"space.row\"")).status.success());
+    assert!(
+        !fixture.check(&length("\"brand\"")).status.success(),
+        "a colour passed as a length"
+    );
 }
 
 #[test]

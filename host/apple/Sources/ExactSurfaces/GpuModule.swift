@@ -54,7 +54,8 @@ final class GpuModule {
     static var bakedCompatibility: [String: Any] { BakedCompatibility.json }
     static func modulePath(defaultPath: String, compat: [String: Any], environment: [String: String]) -> String {
         let gpu = (compat["embedded"] as? [String: Any])?["gpu"] as? [String: Any]
-        return gpu?["trust"] as? String == "development" ? environment["EXACT_GPU_DYLIB"] ?? defaultPath : defaultPath
+        let development = gpu?["trust"] as? String == "development" && !BakedCompatibility.production(compat)
+        return development ? environment["EXACT_GPU_DYLIB"] ?? defaultPath : defaultPath
     }
     static func verify(path: String, compat: [String: Any], artifact: String = "") -> GpuLoadError? {
         func refusal(_ reason: String) -> GpuLoadError { GpuLoadError(message:"GPU module \(path): \(reason)") }
@@ -76,7 +77,7 @@ final class GpuModule {
         } catch { return refusal(error.localizedDescription) }
         return nil
     }
-    /// The bake's GPU digest (bake/src/receipt.rs, `code_digest`): the bytes,
+    /// The bake's GPU digest (update/src/gpu.rs, `code_digest`): the bytes,
     /// less a signed 64-bit Mach-O's code signature and the three sizes that
     /// follow it, so a re-signer (AppDrop) keeps it and a code change does not.
     static func codeDigest(_ bytes: Data) -> String {
@@ -100,6 +101,8 @@ final class GpuModule {
     }
 
     typealias LoadFn = @convention(c) () -> UInt32
+    typealias TierFn = @convention(c) (UInt32) -> UInt32
+    typealias RetierFn = @convention(c) () -> Void
     typealias CreateFn = @convention(c) (UnsafePointer<UInt8>?, Int, UnsafeMutableRawPointer?, UInt32, UInt32) -> UInt32
     typealias BindFn = @convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> UInt32
     typealias BindAtFn = @convention(c) (UInt32, UnsafePointer<UInt8>?, Int, Double) -> UInt32
@@ -151,6 +154,8 @@ final class GpuModule {
     /// Whether a canvas's last render went without a drawable (the module
     /// acquires off the main thread and says when one arrives).
     var starved: WantsFn?
+    /// Whether a canvas's last render drew into the frame the next flush submits.
+    var drew: WantsFn?
     /// Whether a canvas's first frame has been handed to the compositor: a
     /// presenter that reuses a layer keeps it hidden until then.
     var seen: WantsFn?
@@ -294,7 +299,17 @@ final class GpuModule {
         }
         let module = GpuModule(create: create, bind: bind, render: render, dirty: dirty, destroy: destroy, texture: texture, textureMetal: sym("gpu_texture_metal", TextureMetalFn.self), sync: sym("gpu_sync", SyncFn.self), childrenMode: childrenMode, readback: readback, child: child, childrenCount: childrenCount, placement: placement, shader: sym("gpu_shader", ShaderFn.self), validateShader: sym("gpu_shader_validate", ShaderFn.self), clearShaders: sym("gpu_shaders_clear", ClearShadersFn.self), errorLen: errorLen, errorPtr: errorPtr, wantsInput: sym("gpu_wants_input", WantsFn.self), input: sym("gpu_input", BindFn.self), messages: sym("gpu_messages", WantsFn.self), published: sym("gpu_published", WantsFn.self), agent: sym("gpu_agent", BindFn.self), outPtr: sym("gpu_out_ptr", ErrorPtrFn.self))
         module.flushFn = flush
+        // The GPU tier (LLP 1139.003 D2): the drive's, told before the device
+        // is made, under the agent; else the module's own from its device.
+        let tier = sym("gpu_tier", TierFn.self)
+        if PageFacts.substituted { _ = tier?(PageFacts.agentGpuTier) }
         if load() != 0 { return .failure(GpuLoadError(message: "gpu_load: \(module.error())")) }
+        if let tier, !PageFacts.substituted { PageFacts.gpuTier = tier(3) }
+        if let tier, let retier = sym("gpu_retier", RetierFn.self) {
+            PageFacts.retiers[artifact] = { code in _ = tier(code); retier() }
+        } else {
+            PageFacts.retiers[artifact] = nil
+        }
         module.recover = sym("gpu_recover", LoadFn.self)
         module.deviceID = sym("gpu_device_registry_id", DeviceIDFn.self)
         module.deviceLost = sym("gpu_device_is_lost", LostFn.self)
@@ -307,6 +322,7 @@ final class GpuModule {
         module.carry = sym("gpu_carry", WantsFn.self); module.restore = sym("gpu_restore", RestoreFn.self)
         sym("gpu_seekable", SeekableFn.self)?(ExactEnv.agentFreezes)
         module.starved = sym("gpu_starved", WantsFn.self)
+        module.drew = sym("gpu_drew", WantsFn.self)
         module.highDynamicRange = sym("gpu_high_dynamic_range", WantsFn.self)
         module.headroom = sym("gpu_headroom", HeadroomFn.self)
         module.landed = sym("gpu_landed", WantsFn.self)

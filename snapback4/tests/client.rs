@@ -10,8 +10,10 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+// Since 0.4.33 dev refuses a persona the schema does not declare: these are every one the tests send.
 const SCHEMA: &str = r#"
 use identity
+use personas alice, bob, erin, frank, gina, hana, ida, kai, lena, mona, ned, nia, ola, pia, rae, sam
 table messages:
   author: principal
   body: text <=50
@@ -486,6 +488,8 @@ fn a_rust_source_drives_the_typed_client_through_host_requests() {
         "sent"
     );
     let poll = client.changes(host, 0).unwrap();
+    // Wake by audience: the poll declares interest, so a bystander is not woken by a stranger's commit.
+    assert!(poll.path.contains("&interest=1"), "{}", poll.path);
     let outcome = run(host_request(&poll, &origin, &headers));
     assert!(!client
         .changed(host, &poll.exchange, host_reply(&outcome))
@@ -1107,6 +1111,15 @@ fn identity_is_available_without_storage_or_partition() {
             .unwrap(),
         identity["ok"]
     );
+}
+
+#[test]
+fn the_apps_device_lines_are_left_to_the_os() {
+    // A bare row (`device.background-sync`, LLP 1133.017 D14) and one with a
+    // purpose, beside the I/O lines the device keeps.
+    let grants = "net.fetch http://127.0.0.1:4400\nsqlite.open app:/data\ndevice.background-sync\ndevice.notifications purpose.notifications";
+    let module = Module::new("test.exact.snapback4", grants).unwrap();
+    assert_eq!(exact_runner::DataSource::grants(&module), grants);
 }
 
 #[test]

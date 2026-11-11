@@ -416,16 +416,26 @@ web's JS target reads it as no value before a row's map does), so a component's 
 data's error too (Charlie, 2026-09-22, a separate decision): the later
 rows take the identities `d1:<key>`, `d2:<key>` in order — no canonical key
 text starts with `d` — and each such row's creation writes one journal
-line. With values conforming at every boundary, what remains is a plan
-defect or a trap while the tree changes; for a type-checked plan, a string
-past `MAX_STRING` built by a binding, or a route segment a binding asks
-`encodeRouteSegment` to encode and it refuses.
+line. A prop or style binding that traps is invalid at computed-value time
+in the same way: its row is unset and one journal line names the trap,
+once until the binding evaluates to a value again (LLP 1017.003 D3). With
+values conforming at every boundary, what remains is a plan defect or a
+trap, while the tree changes, at one of the five sites D3 names: a region's
+subject, a row key, a row's state initializer, a surface argument, or a
+virtualized list's reads of its own options at creation.
 
 **The clock.** `advance(now_ms)` fires every due timer in order (earliest
 first, plan index on ties), each at its own due time, then moves the clock.
 It is a seek: the countdown after `advance(60_000)` equals the countdown after
 sixty `advance`s of a second; a backwards call is a no-op and a non-finite one
-is refused (`NonFiniteClock`).
+is refused (`NonFiniteClock`). A fresh runner's clock starts at zero, unless
+its boot is told where a host's live clock reads (`time::Launch::clock`,
+2026-10-18): then it starts there, so what the boot arms (`after(ms)`, a
+task's first beat) is due `ms` after the boot however long the process ran
+before it. Apple's clock counts from the process's start and the web's from
+the page's, so a window, widget or page booted later fired every boot-armed
+timer shorter than its age at its first advance. A carried or checkpointed
+runner keeps its own clock; a seek clock's boot (the agent's) starts at zero.
 
 ## 7. Boundaries
 
@@ -573,7 +583,23 @@ dismiss pairs every down with its up. The innermost enabled node that hears any 
 the three also holds the pointer for its `pointermove`s until it lifts (LLP
 1056 §8.6); a `pointermove` takes nothing from an ancestor's down or up.
 A handler's `stopPropagation()` stops the down or the up there (the one
-rule, below). The up is heard on the document on the web (a
+rule, below). A `pointerdown` handler's `preventDefault()` cancels the
+press's default, as Chrome cancels a prevented pointerdown's, by mouse and by
+touch (measured on Chrome 156; `host/web/tests/prevent-focus.test.mjs`): the
+focus stays where it is, no caret is placed and no selection starts. The
+`press` still fires, and the `pointerup`s and a held pointer's moves go on.
+The web prevents the DOM `pointerdown` (`glue.js`, the JS target's `rt.js`);
+macOS keeps a prevented editor's down from the window and has a node give
+itself the focus only after its `pointerdown` (`MouseChain.prevented`); UIKit
+keeps each prevented touch's view out of the focus until a turn after its
+lift, ends no editing for it and starts no selection under it
+(`Presenter.preventedTouches`). An action's own `focus()` still moves the focus. Declared: on UIKit a
+field that already has the focus still places its caret where the touch
+lifts (UIKit's own text gesture on its first responder, with no hook to
+cancel it alone); the focus stays and no selection starts. Declared: the
+shared Linux presenter (Linux, Android, Windows) does not yet keep the
+focus; rt1 owns it, sharing these tests, and removes this line when it
+lands. The up is heard on the document on the web (a
 pointer capture would also retarget the click and press on a lift
 elsewhere), where the pointer leaving the document (out of the window, into
 a frame) or the window losing focus also ends it, and a node the tree has
@@ -595,8 +621,35 @@ UIKit.
 - **macOS** (`MouseChainMac`): `mouseDown`/`mouseUp`, from the hit view up
   through authored parents, held on the presenter until the button comes
   up. A native button's own tracking loop reports both (its up before the
-  action it sends). A held node's release drops it from the hold, and a
-  reset clears the hold.
+  action it sends). A text area or an input's editor runs AppKit's tracking
+  loop too; `tracksPointer` reports the down before it and the up after it.
+  NSWindow makes the hit view first responder before it sends `mouseDown`,
+  so in a session's window its monitor sends the down first
+  (`Presenter.pressEditorFirst`): a press that moves the focus into one
+  delivers `pointerdown`, then the old field's `change` and `blur` and the
+  new one's `focus`, then `pointerup`, as Chrome does, and the tracking
+  reports only the up. An early down whose tracking never starts (a
+  `pointerdown` handler took the editor away) is released at the button's
+  up, or when the session's view leaves its window; an up that a loop of
+  its own `pointerdown` took while the down bubbled (a sheet's animation)
+  is kept from the window, which has not had the down, and queued again
+  once the down has bubbled, so the window has the down and then the up
+  and every node hears its down first. A window under a
+  sheet takes no early down. A control-click (AppKit's contextual click), a click AppKit keeps
+  from the editor (a first click into a window that is not key, unless the
+  editor takes it) and an editor under another view go as before. A
+  prevented early down keeps the editor out of the focus (above). A node
+  that takes the click focus and hears `pointerdown` (itself or up the
+  authored tree) is not one AppKit focuses before its `mouseDown`
+  (`needsPanelToBecomeKey`): its `mouseDown` gives it the focus after its
+  `pointerdown`, unless that prevented it. A drag of selected text out of a text area or an
+  input's editor is AppKit's dragging session, which runs after the loop
+  returns: `pointerup` comes as the drag starts, where Chrome sends
+  `pointercancel` (declared, not measured). A disabled editor tracks
+  nothing: its press
+  is the node's, as a disabled box's is, and its up the release. A press on
+  an inline atom (a pill) is the text area's node's down and up. A held
+  node's release drops it from the hold, and a reset clears the hold.
 - **Linux** (`presenter/pointer.rs`, 2026-10-04): beside the contact, from
   the node under the press up; a cancel is an up. A contact that a handler
   retires (the pressed node removed or disabled) is cancelled when the walk
@@ -609,10 +662,10 @@ UIKit.
 
 Tests: `contract/cli/tests/it/pointer.rs` (the runner and DOM's order),
 `testAPointerNodeObservesItsTouchWithoutPreventingAnything` (iOS),
-`testPointerDownAndUpReachTheNearestPointerNodeAroundThePress` and
-`PopoverMacTests` (macOS), the Linux presenter's `touch_tests.rs`, and
-`host/web/tests/pointer.test.mjs` (Chrome: order, bubbling, a lift elsewhere,
-the secondary button, a disabled node).
+`testPointerDownAndUpReachTheNearestPointerNodeAroundThePress`,
+`EditorPointerMacTests` and `PopoverMacTests` (macOS), the Linux presenter's
+`touch_tests.rs`, and `host/web/tests/pointer.test.mjs` (Chrome: order,
+bubbling, a lift elsewhere, the secondary button, a disabled node).
 
 **`stopPropagation()`, one rule** (decided under Charlie's delegation,
 2026-10-15, after Astra's review). Every bubbling event (`key`, `keyup`,
@@ -713,6 +766,82 @@ and record; Linux's `capture_precedes_target_and_bubble_and_controls_the_default
 `KeyUpMacTests` and `PressFocusIOSTests` hold the native order and stop; the
 `capture-keys` web conformance plan drives both browser runtimes in Chrome.
 
+**Keys with nothing focused** (2026-10-21; implementer Claude Opus 5.5).
+With no focused node, at launch or after the focused node unmounts, a key's
+path is the session's first root: after the `aria-keyshortcuts` shortcuts,
+its `keycapture`, `key` and `keyup` handlers hear it, in that order, and a
+`preventDefault()` cancels the key's default (Tab's move to the first stop).
+This is the DOM's: with nothing focused Chrome targets `<body>` and the key
+reaches `window` listeners, and HTML's focus fixup moves the focus to
+`<body>` when the focused element is removed. The root takes no focus: no
+`focus` event, no ring, no Tab stop. No name, fact or Tab stop is added, so
+held modifiers stay `keyup` plus `exactPage().hasFocus` (2026-10-11, above).
+A cut, copy or paste with nothing focused goes to the root's handler too, as
+the DOM's goes to `<body>`.
+
+- **Web** (`rt.js` `atBody`, `glue.js` `attach`): a listener on `<html>`
+  takes each keydown, keyup and clipboard event whose target is `<body>` or
+  `<html>` (nothing focused; never a copy a text flow forwards to a detached
+  node) to the first root's handlers as it bubbles, its capture
+  before its `key`: after the shortcuts' capture listener at the document,
+  and before the document's defaults, so the root's `preventDefault()` keeps
+  a sheet's Escape (`navigation.js`) and a list's ⌘A (`list-selection.js`),
+  as on macOS and Linux.
+- **macOS** (`KeyEvents.swift` `keyPath`): a key at a window that is its own
+  first responder, or whose first responder is the session's view or
+  viewport, starts at the root; Edit's Cut, Copy, Paste and Paste and Match
+  Style reach `RootEdits`, which follows the window in its responder chain
+  and enables the item while the root hears it, for the session that owns
+  the window's keys (`ExactView.ownsShortcutFocus`). Two limits: a window
+  controller an embedder attaches after the session's view joined the
+  window takes the controller's place after the window and drops
+  `RootEdits` (keys are unaffected), and a sheet's own window (a dialog)
+  with nothing focused hears no cut, copy or paste.
+- **iOS** (`ExactView`, the first responder while nothing else is, again
+  once the focused node unmounts): a hardware key's presses, and the edit
+  actions, at the root; the agent's key with nothing focused likewise. A
+  key already down when the focused node unmounts brings its keyup to the
+  responder UIKit pressed it at, not to the root. No test drives
+  `pressesBegan` (UIKit makes no `UIPress` with a key for one);
+  `FieldClipboardIOSTests` holds the root's edit actions and its key path.
+- **Linux and Windows** (`key_event`, `hardware_key`): the root is the key's
+  target with no focus; Tab then moves to the first stop unless prevented.
+- **Terminal** (`keys.rs`): the root's `key` handler hears the key before its
+  default, the scroll.
+- **Android:** unchanged; keys reach only a focused field.
+
+Tests: `KeyUpMacTests` (at launch and after the focused field unmounts),
+`FieldClipboardMacTests` (the root's paste), `FieldClipboardIOSTests` (the
+root's edit actions and key path), Linux's
+`with_nothing_focused_the_root_hears_keys`, the terminal's
+`with_nothing_focused_the_root_hears_keys`, and the `body-keys` conformance
+plan (Chrome, JS against wasm, and the Linux host).
+
+**A non-modal popover on Linux and Windows** (the shared presenter,
+`presenter/alert.rs`; theme2 15:34 and the lead's 2026-10-31 00:13 ruling)
+follows HTML. Opening it leaves the focus where it was, unless something
+inside autofocuses; a `dialog` shown as a popover runs the dialog focusing
+steps. The page stays live: keys other than the popover's Escape, Tab, wheel,
+reveal and the accessibility tree all reach it. A press outside an auto
+popover dismisses it and goes on to what it lands on. A press on any button
+whose popover command targets it is that button's toggle. Tab enters the
+popover's stops right after where its invoker sorts. A manual popover hears
+no close request and gives no focus back. Modal dialogs and alerts keep the
+inert page and move the focus in. **Not yet conforming:**
+- From a focused node that is no stop inside a popover (an autofocused
+  `tabindex=-1`), Tab steps from that node's tree position at the default
+  tabindex rank. A positive-`tabindex` stop after it inside the popover is
+  then skipped, and Shift+Tab can land on it; HTML searches plain tree order
+  from such a starting point. This is dtool3's owned item, next.
+- One box at a time: a popover from a dialog, or a nested auto popover,
+  replaces the open box (owned, dtool3).
+- Light dismiss runs on pointerdown; HTML records the press there and
+  dismisses on the matching pointerup, and Chrome on the click (owned, dtool3).
+
+Tests: `presenter/alert_popover_tests.rs`, `alert_input_tests.rs` (modal
+kinds), `tests/authored_dialog.rs` and `tests/authored_dialog_windows.rs`, and
+the `reads` conformance plan with `--linux`.
+
 **A chord during an input method's composition, and held modifiers**
 (2026-10-07, #140). Chrome hands the page a ⌘ chord's keydown while the text
 is still composed (`isComposing`; CDP's `Input.imeSetComposition` then the
@@ -739,6 +868,47 @@ page's `window` `blur`). Tests: `KeyUpMacTests` (the chord, ⌘Enter and the
 Send button, Shift's release), `FieldCompositionIOSTests`, and
 `contract/cli/tests/it/keyup.rs`'s held-modifier reset.
 
+**`KeyboardEvent.isComposing`** (2026-10-24). The record gains the DOM's
+`isComposing` last: the key came between an input method's
+`compositionstart` and `compositionend` (UI Events), so a handler can skip
+the Enter that picks a candidate, as web code does (`not e.isComposing`).
+Chrome 156 reports it on every key during a composition: the Enter, a
+modifier's own press and release, and a ⌘ chord (CDP's
+`Input.imeSetComposition`, then the keys).
+
+- **ABI:** kinds 6, 43 and 44 take an optional fourth line, `true` or
+  `false` (`KeyboardEvent::parse`); a missing one is false, so a chord alone
+  and the three-line wire keep their meaning.
+- **Web** (`glue.js` and `document-glue.js` `keyChord`; the JS target's
+  `onKey`): `event.isComposing` as Chrome reports it, or a keydown whose
+  `keyCode` is 229 or whose `key` is `Process`, the marks of a key an input
+  method processed (UI Events, legacy key codes), as web code tests
+  `e.isComposing || e.keyCode === 229` (2026-10-26). WebKit sends the Enter
+  that commits a composition after `compositionend`, `isComposing` false and
+  `keyCode` 229, where Chrome's arrives composing. The web hosts' own keys
+  skip such a keydown too: `submit`, a declared shortcut, a pressable's
+  Enter, a prompt's Return and a GPU canvas's keys.
+- **macOS and iOS** (`Presenter.composes`, `NodeView.composes`): true on a
+  modifier's own press or release while the field has marked text, the only
+  composing keys that reach handlers there (`passesComposition`). A ⌘ chord
+  is false, and so are the keys after it, ⌘'s own release included: its
+  keydown commits the composition before its handlers run (above), where
+  Chrome's chord and the keys after it arrive still composing.
+  On macOS 27.2, Korean 2-Set inserts each syllable into an AppKit text
+  field without marked text, a stock `NSTextField` included, so no key there
+  is composing and the Enter after a syllable reaches handlers, where
+  Chrome's is composing
+  (`issues/closed/20261025-macos-korean-composes-without-marked-text.md`).
+- **Linux, Windows, the terminal and Android:** false. No input method's
+  composition reaches their key handlers.
+
+Tests: `runner/src/runner/event/keyboard.rs`, `contract/cli/tests/it/keyup.rs`
+(a composer skipping the candidate's Enter), `KeyUpMacTests` (Shift released
+and ⌘ pressed during a composition), `FieldCompositionIOSTests`, and the web's
+`focus.test.mjs` (the wire), `js-runtime.test.mjs` (the JS target's record) and
+`composing-key.test.mjs` (a keyCode-229 keydown in Chromium, Firefox and WebKit)
+and `surface-record.test.mjs` (a GPU canvas's).
+
 `swiperight` is the next EventKind after `dblclick`: a recognized, payload-free
 host event. It preserves authored action arguments and journals once on a
 completed swipe. Move/cancel samples do not enter the runner.
@@ -760,6 +930,9 @@ It does not bubble. The root is the nearest ancestor CSS scroll container
 and requires CSS number syntax (digits after a decimal point or exponent).
 Percentages follow Chrome: root height for top/bottom, root width for left/right. The margin expands only the root;
 intervening clips still apply. This is geometric intersection, not occlusion or painted visibility.
+A placed native scrollport is also an observer root, including at offset zero.
+Fixed pane allocations keep their clips. Ancestors above an explicit observer
+root only map coordinates, as [Intersection Observer §3.2.7](https://w3c.github.io/IntersectionObserver/#compute-the-intersection) requires.
 
 The browser's IntersectionObserver with threshold 0 supplies initial delivery
 (including an offscreen node), then enter/leave. Edge contact may report true
@@ -768,7 +941,8 @@ change alone does not deliver. Removed nodes stop observing without a synthetic
 leave; a new mount gets a fresh initial delivery. Callback entries retain browser
 order within a root/margin observer; different observers have no ordering
 guarantee. Static rendering dispatches nothing.
-A changed nearest root restarts observation with a fresh initial delivery.
+A changed nearest authored root restarts observation with a fresh initial delivery.
+Native viewport geometry updates preserve the implicit-root observation.
 
 Host coverage: both web targets use the same browser adapter. AppKit, UIKit
 (including tvOS) and Linux use one runner sampler over laid-out frames and

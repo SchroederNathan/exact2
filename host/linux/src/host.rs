@@ -1,18 +1,14 @@
 //! The runner wrapped for a painter: commits → layout → motion, with the
 //! kernel read directly — no batch, no mirror.
-//!
 //! @ref LLP 1015 §1; LLP 1008 §1 (the same orchestration, whose batch
 //! exists because a foreign view tree consumes it — here nothing does)
 //!
 //! After every commit the host lays the roots out with the kernel's layout
 //! under the viewport, feeds the motion engine the commit (LLP 1003 §4),
-//! seeks it to the app's clock, and keeps each node's presentation values.
-//! The painter then reads frames, styles, and props from the kernel and the
-//! presentation values from here. The kernel is the single source of truth
-//! and the only copy.
+//! seeks the app's clock and keeps node presentation values.
 
 use crate::paint::Presented;
-use exact_kernel::motion::{layout_presented, motion_node, node_key, MotionSync, PaintMotion};
+use exact_kernel::motion::{motion_node, MotionSync, PaintMotion};
 use exact_kernel::{Kernel, NodeKey, TextMeasurer, ViewId};
 use exact_motion::{Engine, Property};
 use exact_plan::Plan;
@@ -48,9 +44,11 @@ mod paint_motion;
 #[path = "presence.rs"]
 mod presence;
 #[path = "press.rs"]
-mod press;
+pub(crate) mod press;
 #[path = "scale.rs"]
 mod scale;
+#[path = "store_writer.rs"]
+mod store_writer;
 #[path = "system_support.rs"]
 mod system;
 #[path = "transform_binding.rs"]
@@ -59,13 +57,19 @@ mod transform_binding;
 mod value_watch;
 pub use error::{HostError, LET_GO_AFTER};
 
-use system::{persist_store_writes, physical_memory, store_snapshot};
+pub use store_writer::drain as drain_store_writes;
+pub use store_writer::take_warnings as take_store_warnings;
+#[cfg(test)]
+use system::StoreWrites;
+use system::{physical_memory, store_snapshot};
 
 /// Caller-owned plan bytes, or linked bytes whose data pool stays in place.
 #[derive(Clone, Copy)]
 pub(crate) enum PlanBytes<'a> {
     Copied(&'a [u8]),
     Static(&'static [u8]),
+    #[cfg(target_os = "macos")]
+    Painted(&'a [u8], &'a dyn Fn(&Plan)),
 }
 
 impl PlanBytes<'_> {
@@ -73,6 +77,12 @@ impl PlanBytes<'_> {
         match self {
             PlanBytes::Copied(bytes) => Plan::decode(bytes),
             PlanBytes::Static(bytes) => Plan::decode_static(bytes),
+            #[cfg(target_os = "macos")]
+            PlanBytes::Painted(bytes, ready) => {
+                let plan = Plan::decode(bytes)?;
+                ready(&plan);
+                Ok(plan)
+            }
         }
     }
 }
@@ -93,6 +103,11 @@ pub struct Host<D: DataSource> {
     pub(crate) flow_damage: crate::paint::damage::Changes,
     /// What changed for the painter's kept rows since its last frame.
     pub(crate) row_dirty: crate::paint::rows::Dirty,
+    pub(crate) scroll_anchors: crate::scroll_anchor::State,
+    /// The nodes whose `:hover` look holds, the one whose `:focus-visible`
+    /// does (LLP 1121 D8), and the state held (LLP 1122 D8; the presenter's,
+    /// `presenter/feedback.rs`, `presenter/held.rs`): a new host holds none.
+    pub(crate) looks_shown: press::Shown,
     height_bindings: height_binding::Bindings,
     transform_bindings: transform_binding::Bindings,
     height_projection: Option<exact_kernel::PresentedHeight>,
@@ -116,7 +131,7 @@ pub struct Host<D: DataSource> {
     /// A pending activation's executor wake, so the display loop does not poll.
     preload_wake: exact_runner::PreloadWake,
     router_op: Option<exact_runner::RouterChange>,
-    navigation: crate::navigation::Navigation,
+    pub(crate) navigation: crate::navigation::Navigation,
     presence: presence::Presence,
     presses: BTreeMap<NodeKey, press::Feedback>,
     /// The 2D canvases' bitmaps (LLP 1056 D7).
@@ -192,7 +207,7 @@ impl<D: DataSource> Host<D> {
     ) -> Result<(Host<D>, Option<String>), HostError> {
         let plan = Plan::decode(plan_bytes).map_err(HostError::Plan)?;
         Self::boot_decoded(
-            plan, data, measurer, width, height, carried, delivery, launch, region, None,
+            plan, data, measurer, width, height, carried, delivery, launch, region, None, None,
         )
     }
 
@@ -210,6 +225,7 @@ impl<D: DataSource> Host<D> {
         launch: &str,
         region: Option<crate::content_region::ContentRegionRegistration>,
         font_sync: Option<crate::text::Shared>,
+        mut boot_images: Option<(&mut crate::image::Images, f32)>,
     ) -> Result<(Host<D>, Option<String>), HostError> {
         // @ref LLP 1075.003.000 §3.3 — whether the plan marks nodes for a hatch.
         let hatched = plan.bindings.iter().any(|b| {
@@ -241,7 +257,15 @@ impl<D: DataSource> Host<D> {
         crate::picker::know_roots(data.app_id());
         // A named drive's secrets, read before the runner takes the source.
         // A carried reload keeps its memory store and does not touch the files.
-        let store_snapshot = store_snapshot(data.app_id(), carried.is_some());
+        let mut store_snapshot = store_snapshot(data.app_id(), carried.is_some());
+        // Locked secrets' backend, reconciled before boot (LLP 1133.010 D4).
+        let presence = crate::presence_secrets::backend(data.app_id(), data.grants());
+        presence
+            .iter()
+            .filter(|_| carried.is_none())
+            .for_each(|p| store_snapshot.extend(p.snapshot.clone()));
+        #[cfg(target_os = "macos")]
+        let boot_trace = exact_ink::device::apple::Trace::new(c"boot runner through first commit");
         let mut runner = Runner::boot_with_delivery(
             plan,
             data,
@@ -253,8 +277,18 @@ impl<D: DataSource> Host<D> {
             launch,
         )
         .map_err(HostError::Runner)?;
+        #[cfg(target_os = "macos")]
+        drop(boot_trace);
+        #[cfg(any(windows, target_os = "macos"))]
+        crate::app::boot_phase(c"runner-ready");
+        if let Some(p) = presence {
+            runner.install_presence(p.backend, p.keystore);
+        }
         if let Some(action) = region.and_then(|r| r.activate) {
             runner.act(action, Vec::new()).map_err(HostError::Runner)?;
+        }
+        if let Some((images, scale)) = &mut boot_images {
+            images.prepare_boot(runner.kernel(), &runner.roots(), *scale);
         }
         let mut host = Host {
             runner,
@@ -269,6 +303,8 @@ impl<D: DataSource> Host<D> {
             height_owner: None,
             flow_damage: Default::default(),
             row_dirty: Default::default(),
+            scroll_anchors: Default::default(),
+            looks_shown: Default::default(),
             height_bindings: Default::default(),
             transform_bindings: Default::default(),
             height_projection: None,
@@ -336,8 +372,24 @@ impl<D: DataSource> Host<D> {
                 .map_err(HostError::Layout)?,
             );
         }
-        let error = host.layout().err();
+        let mut error = crate::traced(c"boot first layout", || host.layout()).err();
         host.observe_layout();
+        #[cfg(any(windows, target_os = "macos"))]
+        crate::app::boot_phase(c"layout-ready");
+        if let Some((images, scale)) = boot_images {
+            images.enable_decode();
+            let reports = images.sync_visible(host.kernel(), &host.preorder(), scale, |id| {
+                !host.route_visibility(id).0
+                    && host.kernel().node(id).is_some_and(|n| {
+                        let f = n.frame;
+                        f.x < width
+                            && f.y < height
+                            && f.x + f.width.max(1.) > 0.
+                            && f.y + f.height.max(1.) > 0.
+                    })
+            });
+            error = error.or(host.set_intrinsics(reports));
+        }
         host.present();
         Ok((host, error))
     }
@@ -633,7 +685,14 @@ impl<D: DataSource> Host<D> {
     /// Next Contract timer deadline in the runner's clock domain.
     /// @ref LLP 1043.000 §3 D8 — the display loop sleeps until useful work.
     pub fn timer_due_ms(&self) -> Option<f64> {
-        self.runner.timer_due_ms()
+        self.runner.timer_wake_ms()
+    }
+
+    /// Whether a jump to `to` has work to land first: a timer due by then, or
+    /// a data module's timer the last step released whose reply is still out
+    /// (exact-runner's `data_timers.rs`).
+    pub fn timer_due_by(&self, to: f64) -> bool {
+        self.runner.timer_due_ms().is_some_and(|d| d <= to) || self.runner.data_timer_landing()
     }
 
     /// Whether a frame task wants every display frame (LLP 1073 D5).
@@ -644,6 +703,16 @@ impl<D: DataSource> Host<D> {
     /// Whether motion is running (the presenter runs frames).
     pub fn motion(&self) -> bool {
         !self.engine.quiescent() || self.press_settle().is_some()
+    }
+
+    /// The next sampled visual change, in the host's milliseconds. A change
+    /// due now needs display callbacks; a later change needs only a timer.
+    pub fn motion_due_ms(&self) -> Option<f64> {
+        if self.press_settle().is_some() {
+            Some(self.now_ms)
+        } else {
+            self.engine.next_change().map(|seconds| seconds * 1000.0)
+        }
     }
 
     /// The roots, in order.
@@ -670,10 +739,10 @@ impl<D: DataSource> Host<D> {
         }
         .or_else(|| self.paint.view_dark(node.key));
         shown.lowered = self.lowered_mask(node.key);
-        shown.press = self
-            .presses
-            .get(&node.key)
-            .map_or(1., |f| f.factor(self.now_ms));
+        // @ref LLP 1061 D7, LLP 1121 D8 — the press and the looks that hold;
+        // the painter shows their colours from the same progress.
+        let looks = self.looks_shown.on(id);
+        press::present(&node, self.press_progress(node.key), looks, &mut shown);
         shown
     }
 
@@ -694,7 +763,7 @@ impl<D: DataSource> Host<D> {
     }
 
     /// The agent API's read operations (LLP 1012): `tree`, `state`, `logs`
-    /// from the runner; `settle` from the engine.
+    /// from the runner; `settle` from the engine, and a resource's re-ask.
     pub fn agent(&self, request: &str) -> String {
         if exact_runner::agent::field_str(request, "op").as_deref() == Some("settle") {
             return match self
@@ -703,6 +772,12 @@ impl<D: DataSource> Host<D> {
                 .map(|t| t * 1000.)
                 .into_iter()
                 .chain(self.press_settle())
+                .chain(self.runner.text_axes_settle_ms())
+                // A re-ask after a turn over its budget: no I/O to wait on, so
+                // the clock goes to it (exact-runner's `overrun.rs`).
+                .chain(self.runner.reask_due_ms())
+                // An answer waiting on its own timer (`data_timers.rs`): the clock goes to it too.
+                .chain(self.runner.data_timer_due_ms())
                 .reduce(f64::max)
             {
                 Some(t) => format!("{{\"settle\":{}}}", exact_runner::agent::num(t)),
@@ -729,8 +804,7 @@ impl<D: DataSource> Host<D> {
         self.runner.has_announced()
     }
 
-    /// An executor for the app's grants, which the source's announced topics
-    /// also wake (LLP 1016.002).
+    /// An executor for the app's grants, which the source's announced topics also wake (LLP 1016.002).
     pub fn executor(&mut self) -> crate::executor::Executor {
         let executor = crate::executor::Executor::start(&self.grants());
         if let Some(roots) = self.app_roots() {
@@ -739,6 +813,9 @@ impl<D: DataSource> Host<D> {
         self.preload_wake.set(executor.waker());
         self.runner.listen(executor.waker());
         self.runner.set_socket_reader(executor.socket_reader());
+        self.runner.set_retry_reader(executor.retry_reader());
+        self.runner.set_listen_reader(executor.listen_reader());
+        self.runner.set_work_clock(executor.work_clock());
         self.doc_watch = Some(crate::doc_watch::DocWatch::new(0, &mut self.runner)); // one session (LLP 1069.010 slice 3)
         executor
     }
@@ -857,7 +934,7 @@ impl<D: DataSource> Host<D> {
         let event = self.document_value(view, event);
         let press = matches!(event, Event::Press | Event::PressWith(_));
         let refused = |host: &Self, dialog| {
-            let refusal = if dialog && host.neutral_dialog_invoker(view) {
+            let refusal = if host.neutral_dialog_invoker(view) {
                 None
             } else {
                 host.navigation.refusal(host.runner.kernel(), view, dialog)
@@ -878,6 +955,19 @@ impl<D: DataSource> Host<D> {
             self.runner.dispatch_at(view, event, self.now_ms)
         });
         self.commit(&a.receipts, a.error.map(|e| format!("{e:?}")))
+    }
+
+    /// [`Self::dispatch_at`] with nothing the clock owes run first, for a target just
+    /// checked (an image's `load`); the clock then moves to the commit's, as there.
+    pub(crate) fn dispatch_now(&mut self, view: ViewId, event: Event) -> Option<String> {
+        let event = self.document_value(view, event);
+        let dispatched = crate::traced(c"exact dispatch", || self.runner.dispatch(view, event));
+        self.now_ms = self.runner.now_ms().max(self.now_ms);
+        let at_ms = self.now_ms;
+        match dispatched {
+            Ok(receipt) => self.commit(&[Timed { at_ms, receipt }], None),
+            Err(e) => self.commit(&[], Some(format!("{e:?}"))),
+        }
     }
 
     // Current eligibility only DENIES an old picture's target. It never finds
@@ -905,48 +995,6 @@ impl<D: DataSource> Host<D> {
         true
     }
 
-    pub(crate) fn dispatch_retained(
-        &mut self,
-        key: NodeKey,
-        binding: &exact_runner::runner::ActionBinding,
-        kind: exact_plan::EventKind,
-        now_ms: f64,
-    ) -> Result<bool, String> {
-        let event = match kind {
-            exact_plan::EventKind::Press => Event::Press,
-            exact_plan::EventKind::Swiperight => Event::Swiperight,
-            _ => return Ok(false),
-        };
-        // BEFORE host clock/focus/commit. Runner repeats its opaque binding check
-        // at dispatch; a refusal takes neither the sample nor an ordinary action.
-        if !now_ms.is_finite()
-            || now_ms < self.now_ms
-            || !self.retained_action_eligible(key)
-            || self.runner.validate_action_binding(binding, kind).is_err()
-        {
-            return Ok(false);
-        }
-        let result = self.runner.dispatch_bound(binding, event);
-        if matches!(
-            result,
-            Err(exact_runner::runner::ActionBindingError::Refused(_))
-        ) {
-            return Ok(false);
-        }
-        self.now_ms = now_ms;
-        let error = match result {
-            Ok(receipt) => self.commit(
-                &[Timed {
-                    at_ms: now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Err(error) => self.commit(&[], Some(format!("{error:?}"))),
-        };
-        error.map_or(Ok(true), Err)
-    }
-
     /// Move the clock: every timer due fires at its own due time (LLP 1012
     /// §2). The clock lands where the runner says — a timer's refusal stops
     /// it at that timer's due time and is the error; the commits before it
@@ -957,9 +1005,9 @@ impl<D: DataSource> Host<D> {
 
     /// [`Host::advance`], stopping after a timer that sends as well: an
     /// agent's jump ([`exact_runner::Runner::advance_until_request`]).
+    /// While a node declares a layout transition, in steps (`presence.rs`).
     pub fn advance_until_request(&mut self, now_ms: f64) -> Option<String> {
-        let a = self.runner.advance_until_request(now_ms);
-        self.advanced(a).0
+        self.advance_in_layout_steps(now_ms)
     }
 
     /// The `then`s an agent's input settled, the clock unmoved
@@ -984,7 +1032,7 @@ impl<D: DataSource> Host<D> {
         self.advanced(a)
     }
 
-    fn advanced(&mut self, a: exact_runner::Advanced) -> (Option<String>, bool) {
+    pub(crate) fn advanced(&mut self, a: exact_runner::Advanced) -> (Option<String>, bool) {
         self.now_ms = a.now_ms.max(self.now_ms);
         let error = a.error.map(|e| format!("{e:?}"));
         self.commit_effects(&a.receipts, error)
@@ -1107,10 +1155,33 @@ impl<D: DataSource> Host<D> {
 
     /// The viewer's place and launch seed, together in one commit.
     pub fn set_place(&mut self, place: &exact_runner::time::Place) -> Option<String> {
-        match self
-            .runner
-            .set_place(&place.locale, &place.time_zone, Some(place.seed))
-        {
+        let answer = self.runner.set_place_formatted(
+            &place.locale,
+            &place.time_zone,
+            Some(place.seed),
+            Some(&place.format_locale),
+        );
+        self.told(answer, "place")
+    }
+
+    /// A share's files under its token as they stand (LLP 1133.024 D3).
+    pub fn set_shared(
+        &mut self,
+        token: &str,
+        files: exact_runner::share_in::SharedFiles,
+    ) -> Option<String> {
+        let answer = self.runner.set_shared(token, files);
+        self.told(answer, "share")
+    }
+
+    /// A told fact's answer: its commit, nothing when the fact is unchanged,
+    /// or the refusal named by `what`.
+    fn told(
+        &mut self,
+        answer: Result<Option<exact_kernel::CommitReceipt>, exact_runner::RunnerError>,
+        what: &str,
+    ) -> Option<String> {
+        match answer {
             Ok(Some(receipt)) => self.commit(
                 &[Timed {
                     at_ms: self.now_ms,
@@ -1119,23 +1190,14 @@ impl<D: DataSource> Host<D> {
                 None,
             ),
             Ok(None) => None,
-            Err(e) => Some(format!("place: {e:?}")),
+            Err(e) => Some(format!("{what}: {e:?}")),
         }
     }
 
     /// The date (LLP 1027.000.000): re-answer `exactTime` in one commit.
     pub fn set_time(&mut self, epoch_at_zero: f64, utc_offset: f64) -> Option<String> {
-        match self.runner.set_time(epoch_at_zero, utc_offset) {
-            Ok(Some(receipt)) => self.commit(
-                &[Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => None,
-            Err(e) => Some(format!("time: {e:?}")),
-        }
+        let answer = self.runner.set_time(epoch_at_zero, utc_offset);
+        self.told(answer, "time")
     }
 
     /// The device's posture and the viewport segments (LLP 1078 D4), set
@@ -1181,38 +1243,25 @@ impl<D: DataSource> Host<D> {
 
     /// The display preferences (LLP 1061 D5): re-answer `exactViewport()` in one commit.
     pub fn set_preferences(&mut self, preferences: exact_runner::Preferences) -> Option<String> {
-        match self.runner.set_preferences(preferences) {
-            Ok(Some(receipt)) => self.commit(
-                &[Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => None,
-            Err(e) => Some(format!("preferences: {e:?}")),
-        }
+        let answer = self.runner.set_preferences(preferences);
+        self.told(answer, "preferences")
     }
 
     /// The page's visibility, connectivity and share sheet (LLP 1069.000
     /// D2): re-answer `exactPage()` in one commit.
     pub fn set_page(&mut self, page: exact_runner::Page) -> Option<String> {
-        match self.runner.set_page(page) {
-            Ok(Some(receipt)) => self.commit(
-                &[Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => None,
-            Err(e) => Some(format!("page: {e:?}")),
-        }
+        let answer = self.runner.set_page(page);
+        self.told(answer, "page")
     }
 
     /// Seek presentation. Returns whether the registered Height changed layout;
     /// paint-only properties never trigger layout or text measurement.
     pub fn tick(&mut self, now_ms: f64) -> bool {
+        self.tick_effects(now_ms).0
+    }
+
+    pub(crate) fn tick_effects(&mut self, now_ms: f64) -> (bool, bool) {
+        let press = self.press_settle().is_some();
         self.now_ms = now_ms.max(self.now_ms);
         self.retire_presses();
         let seek = self.engine.advance(self.now_ms / 1000.0);
@@ -1227,11 +1276,11 @@ impl<D: DataSource> Host<D> {
         if changed {
             self.observe_layout();
         }
-        self.present();
-        changed
+        let paint = self.present();
+        (changed, paint || press)
     }
 
-    fn commit(&mut self, receipts: &[Timed], error: Option<String>) -> Option<String> {
+    pub(crate) fn commit(&mut self, receipts: &[Timed], error: Option<String>) -> Option<String> {
         let error = crate::traced(c"exact commit", || self.commit_effects(receipts, error).0);
         crate::doc_watch::sync(&mut self.doc_watch, &mut self.runner);
         error
@@ -1246,6 +1295,9 @@ impl<D: DataSource> Host<D> {
         let mut paint = error.is_some() || self.content_region.is_some();
         for t in receipts {
             let r = &t.receipt;
+            self.navigation
+                .split
+                .renewed(self.runner.kernel(), &r.renewed);
             self.flow_damage.commit(self.runner.kernel(), r);
             self.row_dirty.commit(r, t.at_ms.min(self.now_ms));
             self.values.fields_committed(self.runner.kernel(), r);
@@ -1281,6 +1333,7 @@ impl<D: DataSource> Host<D> {
                 if let Some(id) = self.keys.get(key).copied() {
                     self.presented.remove(&id);
                     self.renewed.push(id);
+                    self.scroll_anchors.renewed(id, *key);
                     self.values.committed(id, None);
                 }
             }
@@ -1295,9 +1348,10 @@ impl<D: DataSource> Host<D> {
         // A nameless drive keeps secrets in the runner only (LLP 1018). A
         // named `--storage` drive writes them into that scratch tree, so a
         // reload reads them back (platformer R10). The log is taken either way.
+        // Written by the store's own thread (`store_writer.rs`), so no frame waits on a file's sync.
         let writes = self.runner.take_store_writes();
         let app_id = self.runner.data().app_id().to_string();
-        for line in persist_store_writes(&app_id, &writes) {
+        for line in store_writer::submit(&app_id, writes) {
             self.runner.log(line);
         }
         paint |= self.project_navigation();
@@ -1340,8 +1394,6 @@ impl<D: DataSource> Host<D> {
         });
         self.observe_layout();
         paint |= layout.as_ref().copied().unwrap_or(true);
-        // Transitions the reader plays leave the engine before it presents.
-        self.play_transitions();
         // Consume the final sample even when the seek has made motion quiescent.
         paint |= self.present();
         (error.or(layout.err()), paint)
@@ -1386,6 +1438,11 @@ impl<D: DataSource> Host<D> {
         self.navigation.visibility(self.runner.kernel(), id)
     }
 
+    pub(crate) fn route_visibility_to(&self, id: ViewId, root: Option<ViewId>) -> (bool, bool) {
+        self.navigation
+            .visibility_to(self.runner.kernel(), id, true, root)
+    }
+
     /// The first navigation root's stack as its key last named it: its
     /// routes through the one that shows (`presenter/arrive.rs`).
     pub(crate) fn shown_stack(&self) -> Option<&[ViewId]> {
@@ -1395,80 +1452,6 @@ impl<D: DataSource> Host<D> {
     /// A shell presents the top layer (`presenter/top.rs`), or none does.
     pub(crate) fn top_layer(&mut self, on: bool) {
         self.navigation.top_layer = on;
-    }
-
-    /// Every presentation value the engine changed, kept by node.
-    fn present(&mut self) -> bool {
-        let mut changed = false;
-        for p in self.engine.frame() {
-            let key = node_key(p.node);
-            let Some(view) = self.keys.get(&key).copied() else {
-                continue;
-            };
-            if p.property == Property::Height || self.presents_nothing(view, &p) {
-                continue;
-            }
-            changed = true;
-            self.row_dirty.node(key);
-            // A path's `d` is read from the engine where it is painted.
-            if p.property == Property::D {
-                continue;
-            }
-            if Property::PAINT.contains(&p.property) {
-                self.present_paint(p);
-                continue;
-            }
-            let base = self.presented(view);
-            let entry = self.presented.entry(view).or_insert(base);
-            match p.property {
-                Property::Translate => {
-                    entry.translate = (p.value.x as f32, p.value.y as f32);
-                    entry.translate_percent = (p.value.z as f32, p.value.w as f32);
-                }
-                Property::Layout => {
-                    entry.layout = layout_presented(&self.engine, p.node, p.value).map(|v| v as f32)
-                }
-                Property::Scale => entry.scale = p.value.x as f32,
-                Property::Rotate => entry.rotate = p.value.x as f32,
-                Property::Opacity => entry.opacity = p.value.x as f32,
-                Property::R => entry.svg[0] = Some(p.value.x as f32),
-                Property::StrokeDashoffset => entry.svg[1] = Some(p.value.x as f32),
-                // @ref LLP 1055.000 D15 — geometry, in `Presented::svg`'s order.
-                Property::Cx => entry.svg[2] = Some(p.value.x as f32),
-                Property::Cy => entry.svg[3] = Some(p.value.x as f32),
-                Property::X => entry.svg[4] = Some(p.value.x as f32),
-                Property::Y => entry.svg[5] = Some(p.value.x as f32),
-                Property::Rx => entry.svg[6] = Some(p.value.x as f32),
-                Property::Ry => entry.svg[7] = Some(p.value.x as f32),
-                _ => unreachable!("height is projected through layout; paint is above"),
-            }
-        }
-        changed
-    }
-
-    /// Whether a value the engine restates is the committed style's own, for
-    /// a node nothing is presented for: a new or renewed node's transform and
-    /// opacity rows (four a node, every node of a rebound list row), which
-    /// show what the style shows.
-    fn presents_nothing(&self, view: ViewId, p: &exact_motion::Presentation) -> bool {
-        if self.presented.contains_key(&view) {
-            return false;
-        }
-        let Some(node) = self.runner.kernel().node(view) else {
-            return false;
-        };
-        let s = node.style;
-        let v = p.value;
-        match p.property {
-            Property::Translate => {
-                (s.translate.x, s.translate.y) == (v.x as f32, v.y as f32)
-                    && (s.translate_percent.x, s.translate_percent.y) == (v.z as f32, v.w as f32)
-            }
-            Property::Scale => s.scale == v.x as f32,
-            Property::Rotate => s.rotate == v.x as f32,
-            Property::Opacity => s.opacity == v.x as f32,
-            _ => false,
-        }
     }
 
     /// Every live node in preorder.

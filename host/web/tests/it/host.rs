@@ -103,7 +103,7 @@ fn symbol_roles_carry_host_paths_and_decorative_images() {
     assert!(first.contains("\"src\":\"symbol:search\""));
     assert!(first.contains("\"data-symbol-path\":\"M16 10"));
     assert!(first.contains("\"alt\":\"\"") && first.contains("\"alt\":\"Add a stop\""));
-    assert!(first.contains("--exact-tint:light-dark("), "{first}");
+    assert!(first.contains("--exact-tint:currentcolor"), "{first}"); // a symbol's own tint: its colour
     let changed = host.dispatch(view_with_test_id(&host, "change"), Event::Press);
     assert!(changed.contains("\"data-symbol-path\":\"\""), "{changed}");
 }
@@ -149,6 +149,37 @@ fn a_filled_role_is_a_filled_silhouette_and_its_outline_is_stroked() {
         "cleared: {unsaved}"
     );
     assert!(!unsaved.contains("\"data-symbol-fill\":\"\""), "{unsaved}");
+}
+
+/// LLP 1121 D10: an icon token's form draws its path under its viewBox,
+/// filled; one whose SVG is no template is the file; an SF Symbol that is a
+/// role's Apple name is the role.
+#[test]
+fn an_icon_draws_its_path_under_its_viewbox_or_its_file() {
+    let plan = contract::compile(
+        "component App\n  view\n    column\n      image \"symbol:icon|star|0 -960 960 960|M0-960h960Z|icons/a.svg\"\n      image \"symbol:icon||0 0 24 24||icons/two.svg\"\n",
+    )
+    .unwrap();
+    let (_, first) = Host::boot(
+        &plan.encode(),
+        caltrain_data::Caltrain,
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    assert!(
+        first.contains("\"data-symbol-path\":\"M0-960h960Z\""),
+        "{first}"
+    );
+    assert!(
+        first.contains("\"data-symbol-viewbox\":\"0 -960 960 960\""),
+        "{first}"
+    );
+    assert!(first.contains("\"data-symbol-nonzero\":\"\""), "{first}");
+    assert!(
+        first.contains("\"src\":\"assets/icons/two.svg\""),
+        "{first}"
+    );
 }
 
 fn view_with_test_id(host: &Host<caltrain_data::Caltrain>, test_id: &str) -> u32 {
@@ -361,7 +392,7 @@ fn declared_font_identity_reaches_the_readiness_barrier_and_css() {
     let catalog = host.font_catalog();
     assert_eq!(
         catalog,
-        "[{\"family\":\"ExactPlanStack8\",\"declared\":\"Fixture Sans\",\"source\":\"assets/DejaVuSans.ttf\",\"weight\":400,\"style\":\"normal\"},{\"family\":\"ExactPlanStack8\",\"declared\":\"Fixture Sans\",\"source\":\"assets/DejaVuSans-Bold.ttf\",\"weight\":700,\"style\":\"normal\"}]"
+        "[{\"family\":\"ExactPlanStack8\",\"declared\":\"Fixture Sans\",\"source\":\"assets/DejaVuSans.ttf\",\"weight\":\"400\",\"stretch\":\"100%\",\"style\":\"normal\"},{\"family\":\"ExactPlanStack8\",\"declared\":\"Fixture Sans\",\"source\":\"assets/DejaVuSans-Bold.ttf\",\"weight\":\"700\",\"stretch\":\"100%\",\"style\":\"normal\"}]"
     );
     assert!(
         !batch.contains("\"fonts\""),
@@ -681,6 +712,20 @@ fn dialog_invokers_preserve_html_commands_and_live_action_labels() {
     assert!(batch.contains("Delete 2 messages"), "{batch}");
 }
 
+/// LLP 1019 D9: `font-variation-settings` is written as CSS writes it.
+#[test]
+fn font_variation_settings_are_their_css() {
+    use exact_kernel::{StyleId, StyleProps, StyleValue};
+    let mut style = StyleProps::default();
+    let value = StyleValue::Text("'GRAD' 150,'wdth' 60".into());
+    style
+        .set_dynamic(StyleId::FontVariationSettings, &value)
+        .unwrap();
+    let (css, _) = css_text(&style, &[]);
+    let want = r#"font-variation-settings:"GRAD" 150, "wdth" 60;"#;
+    assert!(css.contains(want), "{css}");
+}
+
 /// A scheme-aware colour is handed to the browser, not resolved here.
 ///
 /// This is the whole reason the kernel keeps `light-dark()` as a pair rather
@@ -945,7 +990,7 @@ component App
     )
     .unwrap();
     let batch = host.resize(exact_runner::Viewport::sized(1280.0, 900.0), 200.0);
-    assert!(batch.contains("SlotType"), "{batch}");
+    assert!(batch.contains("NonFiniteValue"), "{batch}");
     assert!(batch.contains("\"text\":\"1280\""), "{batch}");
     assert_eq!(host.runner().viewport().width, 1280.0);
     assert_eq!(host.runner().kernel().epoch(), 2);
@@ -1003,7 +1048,7 @@ fn router_batches_follow_launch_and_committed_actions() {
         ])]]
     );
     assert_eq!(batch.matches("\"op\":\"router\"").count(), 1);
-    assert!(batch.contains("\"url\":\"/prompt/5/write\",\"removed\":[]"));
+    assert!(batch.contains(r#"/write","fragment":"","scroll":false,"activation":0,"removed":[]"#));
     println!("launch batch: {batch}");
     let unchanged = host.resize(exact_runner::Viewport::sized(1280.0, 900.0), 0.0);
     assert!(!unchanged.contains("\"op\":\"router\""));
@@ -1011,7 +1056,7 @@ fn router_batches_follow_launch_and_committed_actions() {
     let id = host.runner().kernel().node_by_key(key).unwrap().id;
     let batch = host.dispatch_at(id, Event::Press, 0.0);
     assert_eq!(batch.matches("\"op\":\"router\"").count(), 1);
-    assert!(batch.contains("\"url\":\"/\",\"removed\":[]"));
+    assert!(batch.contains(r#""url":"/","fragment":"","scroll":false,"activation":0,"removed":[]"#));
     assert_eq!(host.location(), "/");
     let (home, _) = Host::boot(
         &plan.encode(),

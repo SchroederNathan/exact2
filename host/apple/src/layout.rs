@@ -1,9 +1,40 @@
 //! Layout receipts survive silent list settling until the presenter sees them.
 use super::*;
+#[cfg(test)]
+#[path = "advance_tests.rs"]
+mod advance_tests;
 #[path = "closed.rs"]
 pub(super) mod closed;
+#[path = "separator.rs"]
+pub(super) mod separator;
+
+/// The props `emit_layout` derives from a node's layout, not its author's.
+pub(super) const DERIVED_PROPS: [&str; 3] = ["fitScale", "flexGrows", "textOffset"];
 
 impl<D: DataSource> Host<D> {
+    /// Configure support, admit one batch, or run the frame tasks after admission.
+    pub fn timer_waits(&mut self, kinds: u8, cutoff: f64, mode: u32) -> String {
+        let kinds = exact_runner::WaitKinds::from_bits(kinds);
+        if mode == 0 {
+            self.runner.hold_waits(kinds);
+            let mut batch = Batch::new();
+            self.state_onto(&mut batch);
+            return self.write(batch, None);
+        }
+        if mode == 2 {
+            let a = self.runner.complete_frame_tasks(cutoff);
+            return self.advanced(a);
+        }
+        let admitted = self.runner.release_waits(kinds, cutoff);
+        let continuing = admitted.continuing;
+        let mut out = self.advanced(admitted.advanced);
+        if continuing {
+            out.pop();
+            out.push_str(",\"waitContinue\":true}");
+        }
+        out
+    }
+
     /// Writes `batch` for the presenter; every batch with ops is written
     /// here. From a failed layout until one settles, whatever turn made the
     /// batch, its layout geometry is taken out, including what an earlier
@@ -18,7 +49,13 @@ impl<D: DataSource> Host<D> {
             batch.withhold(!batch.layout_provisional);
         }
         batch.facts = self.facts_moved();
+        batch.landing = self.runner.data_timer_landing();
         batch.wakelock = self.wakelock_moved();
+        batch.orientationlock = self.orientation_moved();
+        batch.must_finish = self.finish_moved();
+        // A package view's displayed state, by the same rule, now the
+        // presenter's covers are set (LLP 1133.008 D8 item 2).
+        self.runner.report_views();
         batch.finish(
             self.runner.timer_due_ms(),
             !self.engine.quiescent(),
@@ -38,7 +75,15 @@ impl<D: DataSource> Host<D> {
     pub(super) fn state_onto(&self, batch: &mut Batch) {
         batch.spatial = self.engine.spatial();
         batch.frames = self.runner.wants_frames();
+        if self.runner.uses_native_timers() {
+            batch.native_timers = Some(self.runner.native_timers());
+        }
+        if self.runner.plan().timers.iter().any(|t| t.wait != 0) {
+            batch.waits = Some(self.runner.waits());
+        }
         batch.seq = self.runner.seq_range();
+        batch.alerts = self.runner.take_alerts();
+        batch.journal = self.runner.take_journal();
         batch.canvas_frames(self.runner.canvas_wants_frame());
         self.canvas_owed_onto(batch);
     }
@@ -84,8 +129,15 @@ impl<D: DataSource> Host<D> {
         }
     }
     /// Lay every root out under the viewport and emit the parent-relative
-    /// frames and scroll content sizes that changed.
+    /// frames and scroll content sizes that changed. One that fails is
+    /// owed (`layout_owed`) until one succeeds.
     pub(super) fn layout(&mut self, batch: &mut Batch) -> Result<(), String> {
+        let laid = self.layout_pass(batch);
+        self.layout_owed = laid.is_err();
+        laid
+    }
+
+    fn layout_pass(&mut self, batch: &mut Batch) -> Result<(), String> {
         if let Some((callback, ctx, installed)) = self.font_hook.as_mut() {
             if self.runner.runtime_font_count() != *installed {
                 let runtime = self.runner.runtime_font_stacks();
@@ -122,6 +174,7 @@ impl<D: DataSource> Host<D> {
                 if self.content_region.is_some() {
                     self.region_layout(root, Offer::definite(w, h), batch)?;
                 } else {
+                    self.runner.count_kernel_layout();
                     let receipt = self
                         .runner
                         .kernel_mut()
@@ -249,9 +302,9 @@ impl<D: DataSource> Host<D> {
             // views drop this state with their mirror, and [] clears old ink.
             // Region-owned views still receive flow invalidation even when
             // their frames come from the selected native artifact below.
-            if self.layout_withheld || m.flow != node.flow_shapes() {
+            if self.layout_withheld || *m.flow != *node.flow_shapes() {
                 batch.flow(id, node.flow_shapes());
-                m.flow = node.flow_shapes().to_vec();
+                m.flow = node.flow_shapes().into();
             }
             if native_protected {
                 continue;
@@ -295,7 +348,7 @@ impl<D: DataSource> Host<D> {
                 if m.props.get("spellcheck") != spelling.as_ref() {
                     if let Some(value) = spelling {
                         batch.props(id, &[("spellcheck", value.clone())], &[]);
-                        m.props.insert("spellcheck".into(), value);
+                        m.props.insert("spellcheck", value);
                     } else {
                         batch.props(id, &[], &["spellcheck"]);
                         m.props.remove("spellcheck");
@@ -308,7 +361,7 @@ impl<D: DataSource> Host<D> {
                 match fit {
                     Some(scale) => {
                         batch.props(id, &[("fitScale", scale.clone())], &[]);
-                        m.props.insert("fitScale".into(), scale);
+                        m.props.insert("fitScale", scale);
                     }
                     None => {
                         batch.props(id, &[], &["fitScale"]);
@@ -316,25 +369,82 @@ impl<D: DataSource> Host<D> {
                     }
                 }
             }
+            self.emit_separators(id, batch);
+            let kernel = self.runner.kernel();
+            let Some(node) = kernel.node(id) else {
+                continue;
+            };
+            let m = self.mirror.entry(id).or_default();
+            // LLP 1131 D2: a scroller, or a box holding one, takes what its
+            // neighbours leave, which the iOS host asks before drawing the
+            // scroller under them: an item of a column flex container
+            // growing by 1 or more with no `max-height`, which takes every
+            // point of the free space (CSS Flexbox §9.7; a factor under 1
+            // takes only that share).
+            let column = node.parent.and_then(|p| kernel.node(p)).is_some_and(|p| {
+                p.style.display == exact_kernel::Display::Flex
+                    && matches!(
+                        p.style.flex_direction,
+                        exact_kernel::FlexDirection::Column
+                            | exact_kernel::FlexDirection::ColumnReverse
+                    )
+            });
+            let grows = (column
+                && node.style.flex_grow >= 1.0
+                && !node.style.mask.has(exact_kernel::StyleId::MaxHeight))
+            .then(|| "true".to_string());
+            if m.props.get("flexGrows") != grows.as_ref() {
+                match grows {
+                    Some(value) => {
+                        batch.props(id, &[("flexGrows", value.clone())], &[]);
+                        m.props.insert("flexGrows", value);
+                    }
+                    None => {
+                        batch.props(id, &[], &["flexGrows"]);
+                        m.props.remove("flexGrows");
+                    }
+                }
+            }
+            // Where a flex text's lines go down its content box (CSS's
+            // anonymous flex item), which its paragraph is laid out from.
+            let offset = kernel.text_line_offset(&node);
+            let offset = (offset > 0.0).then(|| crate::style::num(offset));
+            if m.props.get("textOffset") != offset.as_ref() {
+                match offset {
+                    Some(value) => {
+                        batch.props(id, &[("textOffset", value.clone())], &[]);
+                        m.props.insert("textOffset", value);
+                    }
+                    None => {
+                        batch.props(id, &[], &["textOffset"]);
+                        m.props.remove("textOffset");
+                    }
+                }
+            }
             let field_content = published_content_box(&node, kernel);
             let field_cell = node.is_cell_field();
             if self.layout_withheld
-                || m.field_content != field_content
+                || m.field_content.as_deref() != field_content.as_ref()
                 || m.field_cell != field_cell
             {
-                m.field_content = field_content;
+                m.field_content = field_content.map(Box::new);
                 m.field_cell = field_cell;
                 batch.field_content(id, field_content, field_cell);
             }
-            if m.frame != Some(rel) || m.block.is_some() != block.is_some() {
+            let framed = m.frame != Some(rel);
+            if framed || m.block.is_some() != block.is_some() {
                 moved.insert(id);
                 m.frame = Some(rel);
                 batch.frame(id, rel.0, rel.1, rel.2, rel.3);
             }
-            if m.block != block {
-                m.block = block;
-                if let Some((w, h)) = block {
-                    batch.block(id, w, h);
+            let implied = kernel.host_block_implied(id);
+            if m.block != block || m.implied != implied || (framed && block.is_some()) {
+                let had = m.block.is_some();
+                (m.block, m.implied) = (block, implied);
+                match block {
+                    Some(size) => batch.block(id, size, (rel.0, rel.1)),
+                    None if had => batch.unblock(id),
+                    None => {}
                 }
             }
             if let Some(c) = content {
@@ -349,6 +459,7 @@ impl<D: DataSource> Host<D> {
             }
         }
         self.emit_fitted(&visited, &moved, batch);
+        self.emit_extents(!visited.is_empty(), batch);
         self.snap_layout(batch);
         self.emit_sticky(batch);
         self.emit_fragments(batch);
@@ -359,11 +470,59 @@ impl<D: DataSource> Host<D> {
         }
         self.layout_withheld = false;
         self.emit_ranks(batch);
-        // Layout/receipt work may change the live window. Motion-only ticks and
-        // stale feedback never traverse the tree to collect this metadata.
+        self.emit_collections(batch)
+    }
+
+    /// An advance whose commits changed no node ([`Host::commit_tree`]): no
+    /// layout unless a held height moved, but what layout keeps besides
+    /// boxes still follows the commits. A commit can change a list's data
+    /// without a node (an item's field no mounted row shows, an item past
+    /// the window): its metadata, which the presenter checks scroll and
+    /// measurement feedback against, is published, and its generation is
+    /// what the next layout judges row moves from (`judge_list_moves`, as
+    /// layout would have; its boxes queue nothing here). A whole layout
+    /// runs instead while one is owed (the last failed or did not run) or
+    /// withheld, while boxes wait in `pending_layout`, for fonts installed
+    /// since the last, and in a native content region, whose lists' next
+    /// snapshot only layout prepares (`native_prepare_candidate`).
+    pub(super) fn inert_layout(
+        &mut self,
+        batch: &mut Batch,
+        committed: bool,
+    ) -> Result<(), String> {
+        let fonts = self
+            .font_hook
+            .as_ref()
+            .is_some_and(|(_, _, installed)| self.runner.runtime_font_count() != *installed);
+        let owed = self.layout_owed || self.layout_withheld || !self.pending_layout.is_empty();
+        if owed || fonts || (committed && self.native_mode()) {
+            return self.layout(batch);
+        }
+        if !self.height_layout_if_needed(batch)? && committed {
+            self.judge_list_moves();
+            self.emit_collections(batch)?;
+        }
+        Ok(())
+    }
+
+    /// The lists' metadata, when it moved. Layout and receipt work may change
+    /// the live window; motion-only ticks and stale feedback never traverse
+    /// the tree to collect it.
+    fn emit_collections(&mut self, batch: &mut Batch) -> Result<(), String> {
         let collections = if self.native_mode() {
+            self.collection_heads = None;
             self.native_collections_json()?
         } else {
+            // Revisions cover rows, extent and corrections. A newer feedback
+            // sequence alone needs no snapshot or serialization.
+            let mut heads = self.runner.collections_shallow();
+            for head in &mut heads {
+                head.scroll_sequence = 0;
+            }
+            if self.collection_heads.as_ref() == Some(&heads) {
+                return Ok(());
+            }
+            self.collection_heads = Some(heads);
             self.runner.collections_json()
         };
         if collections != self.collections_json {
@@ -375,6 +534,36 @@ impl<D: DataSource> Host<D> {
 }
 
 impl<D: DataSource> Host<D> {
+    /// Each root that does not clip publishes its `document_extent` as its
+    /// content, which the presenter's document scrolls: measured whenever
+    /// anything was laid out anew, since a box deep below a root may have
+    /// moved without the root.
+    fn emit_extents(&mut self, laid_out: bool, batch: &mut Batch) {
+        if !laid_out && !self.layout_withheld {
+            return;
+        }
+        let kernel = self.runner.kernel();
+        let extents: Vec<_> = kernel
+            .roots()
+            .into_iter()
+            .filter(|id| !self.native_protected_id(*id))
+            .filter_map(|id| kernel.node(id))
+            .filter(|n| {
+                n.props.str(PropId::SemanticTag) != Some("dialog")
+                    && n.props.str(PropId::Popover).is_none()
+                    && style::effective_overflow(n) == (Overflow::Visible, Overflow::Visible)
+            })
+            .map(|n| (n.id, document_extent(&n, kernel)))
+            .collect();
+        for (id, c) in extents {
+            let m = self.mirror.entry(id).or_default();
+            if self.layout_withheld || m.content != Some(c) {
+                m.content = Some(c);
+                batch.content(id, c.0, c.1);
+            }
+        }
+    }
+
     /// A `fit-content` route's extent (LLP 1075.003 §9.11): the height it
     /// asks for laid out alone at its width, its own height left to its
     /// content (`Kernel::fit_content_height`), so the sheet it sizes never
@@ -420,17 +609,17 @@ impl<D: DataSource> Host<D> {
                 continue;
             };
             let key = node.key;
-            let cover = match kernel.arena().cover(key.index) {
-                Some(exact_kernel::HostCover::Edges([_, _, bottom, _])) => bottom,
-                _ => 0.0,
-            };
+            // The cover's bottom as layout pads it: none where the route's
+            // bottom-edge scroller takes it as UIKit's inset.
+            let cover = kernel.cover_bottom(key);
             let (pl, pt, pr, pb) = kernel.layout_padding(key).unwrap_or_default();
             let (bl, bt, br, bb) = kernel.resolved_border(key).unwrap_or_default();
             let sig = [node.frame.width, pl, pt, pr, pb, bl, bt, br, bb, cover];
             if !self.layout_withheld && !refit.contains(&id) && last == Some(sig) {
                 continue;
             }
-            let Some(height) = kernel.fit_content_height(key) else {
+            self.runner.count_kernel_layout();
+            let Some(height) = self.runner.kernel_mut().fit_content_height(key) else {
                 continue;
             };
             self.fit_routes[i].1 = Some(sig);
@@ -468,14 +657,16 @@ pub(super) fn published_content_box(
     let (left, top, right, bottom) = kernel.resolved_padding(node.key).unwrap_or_default();
     let button = exact_kernel::ControlKind::of(node.node_type, node.props)
         == Some(exact_kernel::ControlKind::Button);
-    let side = |id: exact_kernel::StyleId, value: f32| {
-        (!button || node.style.mask.has(id)).then_some(value)
+    // A list's row inset is a side the host places the title by too (LLP 1138).
+    let row = button && kernel.takes_row_inset(node.key);
+    let side = |id: exact_kernel::StyleId, value: f32, inset: bool| {
+        (!button || node.style.mask.has(id) || inset).then_some(value)
     };
     let padding = [
-        side(exact_kernel::StyleId::PaddingTop, top),
-        side(exact_kernel::StyleId::PaddingRight, right),
-        side(exact_kernel::StyleId::PaddingBottom, bottom),
-        side(exact_kernel::StyleId::PaddingLeft, left),
+        side(exact_kernel::StyleId::PaddingTop, top, false),
+        side(exact_kernel::StyleId::PaddingRight, right, row),
+        side(exact_kernel::StyleId::PaddingBottom, bottom, false),
+        side(exact_kernel::StyleId::PaddingLeft, left, row),
     ];
     let written = button && padding.iter().any(Option::is_some);
     (written || x != 0.0 || y != 0.0 || width != f.width || height != f.height).then_some(
@@ -511,8 +702,50 @@ pub(super) fn content_size(node: &NodeRef<'_>, kernel: &Kernel) -> (f32, f32) {
         // A child in a containing block of its own is in another space.
         let own = |c: &NodeRef<'_>| kernel.host_block(c.id).is_some();
         if let Some(c) = kernel.node(child).filter(|c| !own(c)) {
-            w = w.max(c.frame.x - node.frame.x + c.frame.width + pad_right);
-            h = h.max(c.frame.y - node.frame.y + c.frame.height + pad_bottom);
+            // An absolutely positioned box counts by its border box alone:
+            // the end padding follows in-flow content (CSS Overflow 3 §2.2).
+            // A popover lays out absolute too (the kernel's top layer), unless sticky.
+            let (right, bottom) = if c.layout_position() == exact_kernel::PositionType::Absolute {
+                (0.0, 0.0)
+            } else {
+                (pad_right, pad_bottom)
+            };
+            w = w.max(c.frame.x - node.frame.x + c.frame.width + right);
+            h = h.max(c.frame.y - node.frame.y + c.frame.height + bottom);
+        }
+    }
+    (w, h)
+}
+
+/// What a root that does not clip adds to the document: its border box and
+/// every laid-out box below it, down to a box that clips or scrolls (whose
+/// own box counts, not what it holds), as a browser's viewport scrolls the
+/// root element's overflow (CSS Overflow 3 §2.2). The root's end padding is
+/// not added: the viewport is the scroll container, not the root. A box in
+/// another containing block, the top layer, an `svg`'s inside and the head
+/// are elsewhere. Boxes are where layout put them: a transform below the root
+/// is not projected (the presenter projects the root's own).
+pub(super) fn document_extent(root: &NodeRef<'_>, kernel: &Kernel) -> (f32, f32) {
+    let (x0, y0) = (root.frame.x, root.frame.y);
+    let (mut w, mut h) = (root.frame.width, root.frame.height);
+    let mut below = root.children();
+    while let Some(id) = below.pop() {
+        let Some(c) = kernel.node(id) else { continue };
+        let elsewhere = kernel.host_block(id).is_some()
+            || c.node_type.is_svg_element()
+            || c.node_type.is_metadata()
+            || c.props.str(PropId::SemanticTag) == Some("dialog")
+            || c.props.str(PropId::Popover).is_some();
+        if elsewhere {
+            continue;
+        }
+        // An empty box adds nothing, as Chromium's rectangle union skips one; what it holds may.
+        if c.frame.width > 0.0 && c.frame.height > 0.0 {
+            w = w.max(c.frame.x - x0 + c.frame.width);
+            h = h.max(c.frame.y - y0 + c.frame.height);
+        }
+        if style::effective_overflow(&c) == (Overflow::Visible, Overflow::Visible) {
+            below.extend(c.children());
         }
     }
     (w, h)
@@ -549,6 +782,40 @@ mod tests {
         .unwrap()
         .0
     }
+    #[test]
+    fn measured_layout_counts_actual_entries_and_stops_when_disabled() {
+        let mut h = fixture();
+        h.runner.measure(true, true);
+        h.runner.measure_kernel_layouts();
+        let read = |h: &Host<NoData>| {
+            let reply = exact_runner::perf::reply(&h.runner, "{}");
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap()["work"]["counts"]
+                ["kernelLayouts"]
+                .as_u64()
+                .unwrap()
+        };
+        let before = read(&h);
+        h.layout(&mut Batch::new()).unwrap();
+        assert_eq!(read(&h), before + h.runner.roots().len() as u64);
+        let before_trial = read(&h);
+        let root = h.runner.roots()[0];
+        let _ = h.measure_block(
+            root,
+            exact_kernel::HostBlock {
+                width: exact_kernel::BlockAxis::Is(300.0),
+                height: exact_kernel::BlockAxis::AtMost(300.0),
+            },
+        );
+        assert_eq!(
+            read(&h),
+            before_trial + 1,
+            "trial layouts also enter the kernel"
+        );
+        h.runner.measure(false, false);
+        h.layout(&mut Batch::new()).unwrap();
+        assert!(exact_runner::perf::reply(&h.runner, "{}").contains("measures no work"));
+    }
+
     fn id(host: &Host<NoData>, name: &str) -> ViewId {
         let k = host.runner.kernel();
         k.node_by_key(k.find_by_test_id(name)[0]).unwrap().id
@@ -839,6 +1106,7 @@ mod tests {
         assert_eq!(
             host.mirror[&(bare as ViewId)]
                 .field_content
+                .as_deref()
                 .map(|c| c.rect.y),
             Some(22.0),
             "min(30, 20) is still 20"
@@ -864,6 +1132,56 @@ mod tests {
         assert!(
             !rects(&cleared).contains_key(&pct),
             "30 points is the box 10% of 300 made: {cleared}"
+        );
+    }
+
+    /// A list growing in a column has the `flexGrows` its layout gives it,
+    /// and a commit that changes its rows leaves it: emitting the list's
+    /// props kept it, and no batch clears it to set it again.
+    #[test]
+    fn a_rows_change_leaves_a_growing_lists_derived_props() {
+        let plan = contract::compile(
+            r#"component App
+  state n = 2
+  action more
+    n = n + 1
+  view
+    column testId="root" display="flex" flex-direction="column" height=400
+      button testId="more" press=more
+        text "More"
+      list testId="list" flex=1 min-height=0
+        for i in range(n) key=i
+          text `${i}`
+"#,
+        )
+        .unwrap()
+        .encode();
+        let (mut h, boot) = Host::boot(
+            &plan,
+            NoData,
+            Box::new(exact_kernel::MonospaceMeasurer::default()),
+            400.,
+            400.,
+        )
+        .unwrap();
+        let list = id(&h, "list");
+        let grows = |batch: &str| {
+            let v: serde_json::Value = serde_json::from_str(batch).unwrap();
+            (v["ops"].as_array().cloned().unwrap_or_default().into_iter())
+                .filter(|op| op["id"] == list && op["op"] == "props")
+                .map(|op| (op["set"]["flexGrows"].clone(), op["clear"].to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert!(boot.contains("\"flexGrows\":\"true\""), "{boot}");
+        let more = id(&h, "more");
+        let batch = h.dispatch_at(more, exact_runner::Event::Press, h.engine().now() * 1000.);
+        assert!(batch.contains("\"op\":\"children\""), "{batch}");
+        assert!(
+            grows(&batch)
+                .iter()
+                .all(|(set, clear)| set.is_null() && !clear.contains("flexGrows")),
+            "{:?}",
+            grows(&batch)
         );
     }
 }

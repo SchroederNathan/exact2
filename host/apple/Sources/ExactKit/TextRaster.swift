@@ -10,10 +10,38 @@ struct TextRasterKey: Hashable {
     let box: CGRect
     let scale: CGFloat
     var clip: CGRect? = nil
+    /// Where ink is kept, in the box's space, with `maxInkOverflow` past it
+    /// (runs' shadows `maxShadowReach`): on iOS, where the box has a space of
+    /// its own, the view's bounds; nil means the box, which is then the
+    /// view's bounds.
+    var room: CGRect? = nil
     func hash(into h: inout Hasher) {
         h.combine(spec); h.combine(size.width); h.combine(size.height)
         for v in [box.minX, box.minY, box.width, box.height, scale] { h.combine(v) }
         if let clip { for v in [clip.minX, clip.minY, clip.width, clip.height] { h.combine(v) } }
+        if let room { for v in [room.minX, room.minY, room.width, room.height] { h.combine(v) } }
+    }
+
+    /// This key whatever its room: the kept-pixel cache's (`TextRasterizer.keep`).
+    var anyRoom: TextRasterKey { var key = self; key.room = nil; return key }
+
+    /// Whether pixels painted for this key are exactly `key`'s: the same
+    /// words in a box of the same size at the same scale, their ink and box
+    /// cut the same by both keys' rooms and clips (a band's rows). `ink` and
+    /// `shadows` are what the lines painted, uncut (`TextRasterImage`):
+    /// shadows past a room widen what the job keeps, so pixels whose shadows
+    /// pass either room serve only their own. A view's padding that changes
+    /// about its text keeps the text's pixels.
+    func serves(_ key: TextRasterKey, ink: CGRect, shadows: CGRect) -> Bool {
+        guard spec == key.spec, size == key.size, box == key.box, scale == key.scale else { return false }
+        func kept(_ k: TextRasterKey) -> CGRect? {
+            let limit = (k.room ?? k.box).insetBy(dx: -TextRasterJob.maxInkOverflow, dy: -TextRasterJob.maxInkOverflow)
+            guard shadows.isNull || limit.contains(shadows) else { return nil }
+            return limit.intersection(k.clip ?? .infinite)
+        }
+        guard let was = kept(self), let will = kept(key) else { return room == key.room && clip == key.clip }
+        let shown = ink.union(box)
+        return ink.intersection(was) == ink.intersection(will) && shown.intersection(was) == shown.intersection(will)
     }
 }
 
@@ -37,6 +65,13 @@ struct TextRasterImage {
     var cast: IOSurface? = nil
     #endif
     var castHeadroom: Float = 0
+    /// What the lines painted, and their shadows alone, uncut by the job's
+    /// limit or clip, in the box's space (`TextRasterKey.serves`).
+    var ink = CGRect.null, shadows = CGRect.null
+    /// The one colour the paragraph paints in, when `image` is its coverage
+    /// alone (one byte a pixel) for a layer to show in that colour
+    /// (`TextRasterJob.tints`); nil when `image` holds the colours.
+    var tint: CGColor? = nil
 }
 
 extension TextRasterImage {
@@ -54,11 +89,29 @@ struct TextRasterExtent {
     let pixels: CGSize?
 }
 
+/// Which way a tall paragraph's port travels: down, toward the end, until
+/// it moves. Read from the port, not from its band, whose room is mostly
+/// ahead of the port. It turns once the port comes back a quarter port from
+/// the farthest it went, so a finger's jitter paints no new band.
+struct PortTravel {
+    private(set) var down = true
+    private var farthest: CGFloat?
+    mutating func follow(_ port: CGRect) -> Bool {
+        let top = port.minY
+        guard let farthest else { self.farthest = top; return down }
+        if down ? top > farthest : top < farthest { self.farthest = top }
+        else if abs(top - farthest) >= port.height / 4 { down.toggle(); self.farthest = top }
+        return down
+    }
+}
+
 struct TextRasterJob {
-    let source: NSAttributedString
+    var source: NSAttributedString
     let ranges: [CFRange]
     let baselines: [CGFloat]
     let flush: CGFloat
+    /// CSS `white-space` (`Spec.whiteSpace`): which trailing spaces a line aligns with (`TextEngine.penOffset`).
+    var whiteSpace = 0
     /// CSS `text-align: justify`, at the box's width (`TextEngine.justified`).
     var justifies = false
     /// Where each line starts (`LineInsets`): `text-indent`, list indents.
@@ -67,6 +120,8 @@ struct TextRasterJob {
     let size: CGSize
     let scale: CGFloat
     var clip: CGRect? = nil
+    /// Where ink is kept (`TextRasterKey.room`); nil, the box.
+    var room: CGRect? = nil
     /// CSS `text-overflow: ellipsis`: a line wider than the box ends in "…"
     /// as it paints (`Paragraph.ellipsized`, the draw path's).
     var ellipsis = false
@@ -80,8 +135,35 @@ struct TextRasterJob {
     /// Core Animation doesn't map a layer shadow's color to the limit. Runs'
     /// own HDR shadows (`exactShadow`) are painted there too.
     var shadow: TextRunShadow? = nil
+    /// Paint one-colour text as coverage alone, for a layer that colours it
+    /// as it composites (`TextRasterImage.tint`): a quarter of the bytes,
+    /// and Core Graphics' cheaper glyph path, as a `UILabel`'s backing store.
+    var tints = false
+    /// `-webkit-font-smoothing: antialiased` (`Spec.antialiased`).
+    var antialiased = false
+    var measuredGlyphs: MeasuredGlyphs? = nil
+    var measuredColor: CGColor? = nil
 
     static let maxInkOverflow: CGFloat = 256
+    /// What a job's pixels answer for, and where its bitmap lies, from the
+    /// ink its lines `painted`: the box and that ink, and for a band (`clip`)
+    /// its rows of the `room`, ink or none. A cropped bitmap holds the ink
+    /// alone; a band with none in it (one in the padding) is one clear pixel
+    /// at its corner, which answers for the band without a band's bitmap.
+    static func extents(painted: CGRect, bounds: CGRect, room: CGRect, limit: CGRect, clip: CGRect?, crop: Bool,
+                        scale: CGFloat) -> (covered: TextRasterExtent, frame: TextRasterExtent) {
+        func aligned(_ r: CGRect) -> TextRasterExtent { alignedExtent(r, bounds: bounds, limit: limit, clip: clip, scale: scale) }
+        let covered = aligned((painted.isNull ? bounds : bounds.union(painted)).union(clip == nil ? .null : room))
+        guard crop else { return (covered, covered) }
+        if !painted.isNull {
+            let ink = aligned(painted)
+            if !ink.rect.isNull, !ink.rect.isEmpty { return (covered, ink) }
+        }
+        guard clip != nil, !covered.rect.isNull, !covered.rect.isEmpty else { return (covered, covered) }
+        let pixel = CGRect(origin: covered.rect.origin, size: CGSize(width: 1 / scale, height: 1 / scale))
+        return (covered, TextRasterExtent(rect: pixel, pixels: CGSize(width: 1, height: 1)))
+    }
+
     /// `input` within `limit` (the box and its ink allowance) and `clip`, out
     /// to whole device pixels. The box itself is kept as laid out. A span
     /// is `right - left` pixels: `(right / scale - left / scale) * scale`
@@ -104,33 +186,34 @@ struct TextRasterJob {
     /// and a shadow cast 512 points to one side about 2 MB.
     static let maxShadowReach: CGFloat = 512
     private static let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+    private static let gray = CGColorSpaceCreateDeviceGray()
     private static let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
     private static let extended = CGColorSpace(name: CGColorSpace.extendedSRGB)!
     /// The bitmap's space and its colours' peak (LLP 1100 D2, D8): extended
     /// sRGB (at half float) for a colour past SDR white, Display P3 for a
     /// wide one, else sRGB.
-    private var format: (space: CGColorSpace, headroom: Float, deep: Bool) {
+    private func format(_ runs: [CTRun]) -> (space: CGColorSpace, headroom: Float, deep: Bool) {
         var wide = false, deep = false, headroom: Float = 0
         // ColorSync round-off at gamut boundaries must not widen ordinary white.
         let outside = { (color: CGColor) in
             color.components?.prefix(3).contains { $0 < -0.00001 || $0 > 1.00001 } == true
         }
-        let all = NSRange(location: 0, length: source.length)
-        for key in [NSAttributedString.Key.foregroundColor, .strokeColor, .exactBackground, .exactShadow] {
-            source.enumerateAttribute(key, in: all) { value, _, _ in
-                let ref = value.map { $0 as CFTypeRef }
-                let cg = (value as? InlineBackground)?.color ?? (value as? TextRunShadow)?.color ?? (value as? PlatformColor)?.cgColor
-                    ?? ref.flatMap { CFGetTypeID($0) == CGColor.typeID ? ($0 as! CGColor) : nil }
+        for run in runs {
+            let attributes = CTRunGetAttributes(run) as NSDictionary
+            guard attributes[NSAttributedString.Key.exactHidden] as? Bool != true else { continue }
+            for key in [NSAttributedString.Key.foregroundColor, .strokeColor, .underlineColor, .strikethroughColor, .exactBackground, .exactShadow] {
+                let value = attributes[key]
+                let cg = Self.paintColor(value)
                 // A run's HDR shadow is in the cast, not these pixels.
-                if value is TextRunShadow, ColorRange.isHDR(cg) { return }
+                if value is TextRunShadow, ColorRange.isHDR(cg) { continue }
                 headroom = max(headroom, ColorRange.headroom(cg))
-                guard let cg else { return }
+                guard let cg else { continue }
                 if let srgb = cg.converted(to: Self.extended, intent: .relativeColorimetric, options: nil) {
                     wide = wide || outside(srgb)
                 }
                 if let p3 = CGColorSpace(name: CGColorSpace.extendedDisplayP3),
-                   let converted = cg.converted(to: p3, intent: .relativeColorimetric, options: nil) {
-                    deep = deep || outside(converted)
+                   let p3Color = cg.converted(to: p3, intent: .relativeColorimetric, options: nil) {
+                    deep = deep || outside(p3Color)
                 }
             }
         }
@@ -140,14 +223,33 @@ struct TextRasterJob {
     /// A tall paragraph's band around `port`: 32 points past the box each
     /// side, and as far as the shadows in its pixels reach sideways (LLP
     /// 1077 D3, at most `maxShadowReach`), as tall as `maximumBytes` allows.
-    static func band(_ spec: Spec, width: CGFloat, port: CGRect, scale: CGFloat, maximumBytes: CGFloat) -> CGRect {
-        let reach = spec.shadowReach
-        let wide = width + 64 + reach.left + reach.right
-        let rowBytes = max(1, wide * scale * scale * 4)
+    /// `down`: the port travels that way (true, toward the paragraph's end),
+    /// so three quarters of the room is ahead of it; nil centres it.
+    static func band(_ spec: Spec, width: CGFloat, port: CGRect, scale: CGFloat, maximumBytes: CGFloat, down: Bool? = nil) -> CGRect {
+        var band = bandColumns(spec, width: width)
+        let rowBytes = max(1, band.width * scale * scale * 4)
         let height = max(port.height, min(port.height * 2, maximumBytes / rowBytes))
-        return CGRect(x: -32 - reach.left, y: max(-32, port.minY - (height - port.height) / 2), width: wide, height: height)
+        let behind = (height - port.height) * (down.map { $0 ? 0.25 : 0.75 } ?? 0.5)
+        band.origin.y = max(-32, port.minY - behind); band.size.height = height
+        return band
+    }
+    /// A band's columns in a box `width` wide (`band`), with no rows.
+    static func bandColumns(_ spec: Spec, width: CGFloat) -> CGRect {
+        let reach = spec.shadowReach
+        return CGRect(x: -32 - reach.left, y: 0, width: width + 64 + reach.left + reach.right, height: 0)
+    }
+    /// Whether a band `clip` that holds `port` still serves it, the port
+    /// travelling `down` or up in a paragraph `height` tall: until the port
+    /// is within half a port of the band's edge ahead, short of the end.
+    static func keeps(_ clip: CGRect, port: CGRect, down: Bool, height: CGFloat) -> Bool {
+        let ahead = down ? clip.maxY - port.maxY : port.minY - clip.minY
+        return (down ? clip.maxY >= height : clip.minY <= 0) || ahead >= port.height / 2
     }
     func render(lines reused: [CTLine]? = nil) -> TextRasterImage? {
+        if let measuredGlyphs, let measuredColor, !ellipsis, clamped == nil, !justifies, shadow == nil,
+           ColorRange.headroom(measuredColor) <= 1 && !ColorRange.needsExtendedComponents(measuredColor) {
+            return render(measuredGlyphs, color: measuredColor)
+        }
         var lines: [CTLine]
         if let reused {
             precondition(Thread.isMainThread, "cached lines stay on their owning thread")
@@ -167,8 +269,9 @@ struct TextRasterJob {
         }
         let positions = zip(lines, baselines).map { line, baseline in
             let inset = insets.at(CTLineGetStringRange(line).location)
-            return CGPoint(x: box.minX + inset.left + TextEngine.penOffset(line, flush: flush, room: Double(box.width - inset.width), rtl: insets.rtl),
-                           y: box.minY + baseline.rounded())
+            return CGPoint(x: box.minX + inset.left + TextEngine.penOffset(line, flush: flush, room: Double(box.width - inset.width), rtl: insets.rtl,
+                                                                           whiteSpace: whiteSpace, source: source),
+                           y: box.minY + TextEngine.paintedBaseline(baseline, scale: scale))
         }
         if ellipsis {
             lines = lines.map { line in
@@ -182,8 +285,9 @@ struct TextRasterJob {
         // overhang can paint beyond any edge; include that ink in the bitmap.
         let bounds = CGRect(origin: .zero, size: size)
         var painted = CGRect.null
-        // Ink may pass the box by `maxInkOverflow`; runs' shadows further.
-        var limit = bounds.insetBy(dx: -Self.maxInkOverflow, dy: -Self.maxInkOverflow)
+        // Ink may pass the room by `maxInkOverflow`; runs' shadows further.
+        let room = room ?? bounds
+        var limit = room.insetBy(dx: -Self.maxInkOverflow, dy: -Self.maxInkOverflow), shadowed = CGRect.null
         for (line, position) in zip(lines, positions) {
             let ink = CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
             if !ink.isNull, !ink.isEmpty {
@@ -196,8 +300,8 @@ struct TextRasterJob {
                     shadows = shadows.union(glyphs.offsetBy(dx: s.offset.width, dy: s.offset.height).insetBy(dx: -spread, dy: -spread))
                 }
                 if !shadows.isNull {
-                    painted = painted.union(shadows)
-                    let most = bounds.insetBy(dx: -Self.maxShadowReach, dy: -Self.maxShadowReach)
+                    painted = painted.union(shadows); shadowed = shadowed.union(shadows)
+                    let most = room.insetBy(dx: -Self.maxShadowReach, dy: -Self.maxShadowReach)
                     limit = limit.union(shadows.intersection(most))
                 }
             }
@@ -207,17 +311,9 @@ struct TextRasterJob {
                 let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, nil))
                 if width > 0 { painted = painted.union(CGRect(x: position.x, y: position.y - ascent, width: width, height: ascent + descent)) }
             }
-            for (fill, _) in TextLinePaint.backgrounds(line, at: position) { painted = painted.union(fill) }
+            for fill in TextLinePaint.backgrounds(line, at: position) { painted = painted.union(fill.rect) }
         }
-        func aligned(_ r: CGRect) -> TextRasterExtent {
-            Self.alignedExtent(r, bounds: bounds, limit: limit, clip: clip, scale: scale)
-        }
-        let coveredExtent = aligned(painted.isNull ? bounds : bounds.union(painted))
-        var frameExtent = coveredExtent
-        if crop, !painted.isNull {
-            let ink = aligned(painted)
-            if !ink.rect.isNull, !ink.rect.isEmpty { frameExtent = ink }
-        }
+        let (coveredExtent, frameExtent) = Self.extents(painted: painted, bounds: bounds, room: room, limit: limit, clip: clip, crop: crop, scale: scale)
         let covered = coveredExtent.rect, frame = frameExtent.rect
         let pixelWidth = frameExtent.pixels?.width ?? (frame.width * scale).rounded(.up)
         let pixelHeight = frameExtent.pixels?.height ?? (frame.height * scale).rounded(.up)
@@ -225,16 +321,29 @@ struct TextRasterJob {
               pixelWidth > 0, pixelHeight > 0,
               pixelWidth < CGFloat(Int.max), pixelHeight < CGFloat(Int.max) else { return nil }
         let width = Int(pixelWidth), height = Int(pixelHeight)
-        let (space, headroom, deep) = format
+        // Truncation inserts runs whose paint need not occur in the source.
+        let runs = lines.flatMap { CTLineGetGlyphRuns($0) as! [CTRun] }
+        let (space, headroom, deep) = format(runs)
+        if let tint = tints && headroom == 0 && !deep ? oneColor(runs) : nil {
+            guard let mask = bitmap(width: width, height: height, space: Self.srgb, headroom: 0, deep: false, alphaOnly: true, paint: {
+                paint(lines, positions, frame: frame, height: height, scale: scale, pass: .ink, into: $0)
+            }) else { return nil }
+            var out = TextRasterImage(mask.pixels, frame: frame, covered: covered, headroom: 0)
+            out.ink = painted; out.shadows = shadowed
+            // The colour's alpha is in the coverage already.
+            out.tint = tint.copy(alpha: 1)
+            return out
+        }
         // Runs' own HDR shadows, each once.
         var casters: [TextRunShadow] = []
-        source.enumerateAttribute(.exactShadow, in: NSRange(location: 0, length: source.length)) { value, _, _ in
-            if let s = value as? TextRunShadow, ColorRange.isHDR(s.color), !casters.contains(s) { casters.append(s) }
+        for run in runs where (CTRunGetAttributes(run) as NSDictionary)[NSAttributedString.Key.exactHidden] as? Bool != true {
+            if let s = TextRunShadow.of(run), ColorRange.isHDR(s.color), !casters.contains(s) { casters.append(s) }
         }
         guard let ink = bitmap(width: width, height: height, space: space, headroom: headroom, deep: deep, keepsImage: shadow != nil, paint: {
             paint(lines, positions, frame: frame, height: height, scale: scale, pass: .ink, into: $0)
         }) else { return nil }
         var out = TextRasterImage(ink.pixels, frame: frame, covered: covered, headroom: headroom)
+        out.ink = painted; out.shadows = shadowed
         // What casts each HDR shadow: the ink itself for the paragraph's,
         // the glyphs of its runs for a run's own.
         var casts: [(CGImage, TextRunShadow)] = []
@@ -264,6 +373,87 @@ struct TextRasterJob {
         return out
     }
 
+    /// Paint the owner's glyph values without constructing another typesetter.
+    private func render(_ glyphs: MeasuredGlyphs, color: CGColor) -> TextRasterImage? {
+        guard glyphs.lines.count == baselines.count else { return nil }
+        let bounds = CGRect(origin: .zero, size: size)
+        let positions = zip(glyphs.lines, baselines).map {
+            CGPoint(x: box.minX + $0.origin, y: box.minY + TextEngine.paintedBaseline($1, scale: scale))
+        }
+        var painted = CGRect.null
+        for (line, position) in zip(glyphs.lines, positions) {
+            let ink = line.ink
+            if !ink.isNull, !ink.isEmpty {
+                painted = painted.union(CGRect(x: position.x + ink.minX, y: position.y - ink.maxY,
+                    width: ink.width, height: ink.height).insetBy(dx: -1 / scale, dy: -1 / scale))
+            }
+            if crop, line.box.width > 0 { painted = painted.union(line.box.offsetBy(dx: position.x, dy: position.y)) }
+        }
+        let limit = (room ?? bounds).insetBy(dx: -Self.maxInkOverflow, dy: -Self.maxInkOverflow)
+        let (covered, extent) = Self.extents(painted: painted, bounds: bounds, room: room ?? bounds, limit: limit, clip: clip, crop: crop, scale: scale)
+        let frame = extent.rect
+        let w = extent.pixels?.width ?? (frame.width * scale).rounded(.up)
+        let h = extent.pixels?.height ?? (frame.height * scale).rounded(.up)
+        guard w.isFinite, h.isFinite, w > 0, h > 0, w < CGFloat(Int.max), h < CGFloat(Int.max) else { return nil }
+        let width = Int(w), height = Int(h)
+        // The fast path admits sRGB ink; wide/HDR colors retain the full paint path.
+        guard let pixels = bitmap(width: width, height: height, space: Self.srgb, headroom: 0, deep: false, alphaOnly: tints, paint: { ctx in
+            ctx.translateBy(x: 0, y: CGFloat(height))
+            ctx.scaleBy(x: scale, y: -scale)
+            ctx.translateBy(x: -frame.minX, y: -frame.minY)
+            ctx.setShouldSmoothFonts(!antialiased)
+            ctx.setFillColor(color)
+            for (line, position) in zip(glyphs.lines, positions) {
+                ctx.saveGState()
+                ctx.translateBy(x: position.x, y: position.y)
+                ctx.scaleBy(x: 1, y: -1)
+                ctx.textMatrix = .identity
+                ctx.textPosition = .zero
+                for run in line.runs where !run.glyphs.isEmpty {
+                    CTFontDrawGlyphs(run.font, run.glyphs, run.positions, run.glyphs.count, ctx)
+                }
+                ctx.restoreGState()
+            }
+            ctx.flush()
+        }) else { return nil }
+        var out = TextRasterImage(pixels.pixels, frame: frame, covered: covered.rect, headroom: 0)
+        out.ink = painted
+        if tints { out.tint = color.copy(alpha: 1) }
+        return out
+    }
+
+    /// The colour every glyph and decoration paints in, when nothing else in
+    /// the paragraph has one (no stroke, inline background, run shadow or
+    /// decoration of another colour) and no glyph brings its own (an emoji's).
+    private func oneColor(_ runs: [CTRun]) -> CGColor? {
+        var color: CGColor?
+        for run in runs {
+            let attributes = CTRunGetAttributes(run) as NSDictionary
+            if attributes[NSAttributedString.Key.exactHidden] as? Bool == true { continue }
+            let ink = Self.paintColor(attributes[NSAttributedString.Key.foregroundColor])
+            guard let ink, color == nil || color == ink,
+                  attributes[NSAttributedString.Key.exactBackground] == nil, attributes[NSAttributedString.Key.exactShadow] == nil,
+                  attributes[NSAttributedString.Key.shadow] == nil, attributes[NSAttributedString.Key.strokeColor] == nil,
+                  ((attributes[NSAttributedString.Key.strokeWidth] as? NSNumber)?.doubleValue ?? 0) == 0,
+                  [NSAttributedString.Key.underlineColor, .strikethroughColor].allSatisfy({ key in
+                      attributes[key].map { Self.paintColor($0) == ink } ?? true
+                  })
+            else { return nil }
+            color = ink
+            let value = attributes[kCTFontAttributeName] as CFTypeRef?
+            if let value, CFGetTypeID(value) == CTFontGetTypeID(),
+               CTFontGetSymbolicTraits(value as! CTFont).contains(.traitColorGlyphs) { return nil }
+        }
+        return color
+    }
+
+    private static func paintColor(_ value: Any?) -> CGColor? {
+        if let color = (value as? InlineBackground)?.color ?? (value as? TextRunShadow)?.color ?? (value as? PlatformColor)?.cgColor { return color }
+        guard let value else { return nil }
+        let ref = value as CFTypeRef
+        return CFGetTypeID(ref) == CGColor.typeID ? (ref as! CGColor) : nil
+    }
+
     #if os(iOS) || os(tvOS)
     private typealias Pixels = CGImage
     #else
@@ -271,13 +461,14 @@ struct TextRasterJob {
     #endif
 
     /// One bitmap: `deep` is half float in extended sRGB, tagged with its
-    /// headroom; else four bytes a pixel. `keepsImage`: the pixels as an
-    /// image too, to draw from.
-    private func bitmap(width: Int, height: Int, space: CGColorSpace, headroom: Float, deep: Bool, keepsImage: Bool = false,
-                        paint: (CGContext) -> Void) -> (pixels: Pixels, image: CGImage?)? {
-        let pixelBytes = deep ? 8 : 4
+    /// headroom; `alphaOnly` one byte a pixel, coverage alone; else four
+    /// bytes a pixel. `keepsImage`: the pixels as an image too, to draw from.
+    private func bitmap(width: Int, height: Int, space: CGColorSpace, headroom: Float, deep: Bool, alphaOnly: Bool = false,
+                        keepsImage: Bool = false, paint: (CGContext) -> Void) -> (pixels: Pixels, image: CGImage?)? {
+        let pixelBytes = deep ? 8 : alphaOnly ? 1 : 4
         let bitmapInfo = deep
             ? CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.floatComponents.rawValue | CGBitmapInfo.byteOrder16Little.rawValue
+            : alphaOnly ? CGImageAlphaInfo.alphaOnly.rawValue
             : CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
         #if os(macOS)
         guard width > 0, height > 0,
@@ -307,7 +498,7 @@ struct TextRasterJob {
         guard !rowOverflow, !overflow else { return nil }
         return withScratch(bytes) { scratch -> (pixels: Pixels, image: CGImage?)? in
             guard let ctx = CGContext(data: scratch, width: width, height: height, bitsPerComponent: deep ? 16 : 8,
-                                      bytesPerRow: row & ~63, space: space, bitmapInfo: bitmapInfo)
+                                      bytesPerRow: row & ~63, space: alphaOnly ? Self.gray : space, bitmapInfo: bitmapInfo)
             else { return nil }
             paint(ctx)
             guard var image = ctx.makeImage() else { return nil }
@@ -332,7 +523,7 @@ struct TextRasterJob {
         ctx.translateBy(x: 0, y: CGFloat(height))
         ctx.scaleBy(x: scale, y: -scale)
         ctx.translateBy(x: -frame.minX, y: -frame.minY)
-        ctx.setShouldSmoothFonts(true)
+        ctx.setShouldSmoothFonts(!antialiased)
         for (line, position) in zip(lines, positions) { TextLinePaint.draw(line, at: position, in: ctx, scale: scale, pass: pass) }
         ctx.flush()
     }

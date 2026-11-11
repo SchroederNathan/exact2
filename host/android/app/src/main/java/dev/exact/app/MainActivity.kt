@@ -1,14 +1,18 @@
 package dev.exact.app
 
 import android.content.pm.ActivityInfo
+import android.os.Build
 import android.os.Bundle
 import dev.exact.canvas.AgentDrive
 import dev.exact.canvas.Drive
 import dev.exact.canvas.ExactActivity
+import dev.exact.canvas.Legacy
+import dev.exact.canvas.NativeModules
 
 /** An app on the Canvas host, edge to edge: its text fields take keys and the software keyboard. */
 class MainActivity : ExactActivity() {
     override val input = true
+    override val modules = NativeModules.load()
     /** Compose Material 3's, when the plan has a date or time control (`src/compose`). */
     override val pickers get() = materialPickers ?: super.pickers
 
@@ -22,7 +26,7 @@ class MainActivity : ExactActivity() {
     /** The axis of the display's own panel (its mode's physical size), whatever the rotation and this window's
      * share of the display. */
     private fun naturalOrientation(): Int {
-        val mode = display?.mode
+        val mode = (if (Build.VERSION.SDK_INT >= 30) display else Legacy.display(this))?.mode
         val portrait = mode == null || mode.physicalHeight >= mode.physicalWidth
         return if (portrait) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
     }

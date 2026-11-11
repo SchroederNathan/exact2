@@ -165,7 +165,7 @@ fn enum_refusals_list_accepted_values_and_each_suggestion_compiles() {
     for (attr, row, invalid) in [
         ("align-items", StyleId::AlignItems, "middle"),
         ("display", StyleId::Display, "flexbox"),
-        ("overflow", StyleId::OverflowX, "clip"),
+        ("overflow", StyleId::OverflowX, "truncate"),
         ("object-fit", StyleId::ObjectFit, "stretch"),
         ("font-style", StyleId::FontStyle, "slanted"),
         ("position", StyleId::PositionType, "fixed"),
@@ -368,7 +368,7 @@ fn aspect_ratio_takes_the_css_grammar() {
         ("e", "2/1"),
     ] {
         assert_eq!(
-            style_of(&r, id).aspect_ratio,
+            style_of(&r, id).rare.aspect_ratio,
             AspectRatio::parse(css).unwrap(),
             "{id}"
         );
@@ -598,29 +598,6 @@ fn pre_and_backdrop_filter_reach_the_kernel_and_the_rest_of_css_filters_is_refus
         assert_eq!(error.id, "lower-attr-value");
         assert!(error.message.contains(named), "{error}");
     }
-    // @ref LLP 1053.000 D4 — every platform material by name; others refused.
-    for name in [
-        "ultra-thin",
-        "chrome-dark",
-        "prominent",
-        "sidebar",
-        "hud-window",
-        "glass-clear",
-    ] {
-        contract::compile(&format!(
-            "component App\n  view\n    box backgroundMaterial=\"{name}\"\n"
-        ))
-        .unwrap();
-    }
-    let error =
-        contract::compile("component App\n  view\n    box backgroundMaterial=\"frosted\"\n")
-            .unwrap_err();
-    assert!(
-        error
-            .message
-            .contains("`backgroundMaterial=\"frosted\"` is not a material; materials: ultra-thin,"),
-        "{error}"
-    );
 }
 
 /// LLP 1053.000.000.000 D1: `glassGroup="auto"`, alone or in a choice with
@@ -974,7 +951,6 @@ fn css_grid_rows_compile_with_the_closed_kernel_grammar() {
         ("grid-column", "calc(1 + 1)"),
         ("justify-items", "last baseline"),
         ("justify-items", "left legacy"),
-        ("justify-items", "var(--items)"),
         ("grid-template-columns", "repeat(10001, 1px)"),
         ("grid-column", "10001"),
         (
@@ -1293,6 +1269,22 @@ fn a_css_width_transition_names_the_engine_limit_not_a_syntax_error() {
         e.message.contains("opacity") && e.message.contains("border-color"),
         "{e}"
     );
+    // Each layout property's refusal leads with the row that animates it
+    // (LLP 1063 D6), and every example it gives compiles; an inset's needs a
+    // positioned box, so it is not a no-op on a static one.
+    for p in "width min-width margin flex-basis gap right left top bottom".split(' ') {
+        let m = refused(&format!("transition=\"{p} 200ms ease\"")).message;
+        assert!(
+            m.find("-exact-layout-transition") < m.find("opacity"),
+            "{m}"
+        );
+        let examples: Vec<&str> = m.split('`').filter(|s| s.starts_with("box ")).collect();
+        assert_eq!(examples.len(), 1, "{m}");
+        let inset = matches!(p, "right" | "left" | "top" | "bottom");
+        assert_eq!(examples[0].contains("position=\"absolute\""), inset, "{m}");
+        let app = format!("component App\n  state small = false\n  view\n    box position=\"relative\" height=200\n      {}\n", examples[0]);
+        contract::compile(&app).unwrap_or_else(|e| panic!("{p}: {e}"));
+    }
     assert!(!e.message.contains("not a CSS"), "{e}");
     let malformed = refused("transition=\"opacity 20ms gibberish\"");
     assert!(malformed.message.contains("invalid transition components"));
@@ -1404,8 +1396,7 @@ component App
 #[test]
 fn css_native_interaction_gaps_are_named_precisely() {
     for (name, value, reason) in [
-        ("resize", "vertical", "user-controlled box geometry"),
-        ("user-select", "all", "selection ownership"),
+        ("user-select", "contain", "selection ownership"),
         ("border", "1px double red", "native painters"),
         ("text-decoration", "underline wavy", "native text painters"),
     ] {
@@ -1415,6 +1406,7 @@ fn css_native_interaction_gaps_are_named_precisely() {
         assert!(!error.contains("unknown attribute"), "{error}");
     }
     contract::compile("component App\n  view\n    textarea rows=3 maxlength=5 resize=\"none\" user-select=\"none\"\n").unwrap();
+    contract::compile("component App\n  view\n    text \"x\" user-select=\"all\"\n").unwrap();
 }
 
 #[test]

@@ -17,15 +17,10 @@ fn unavailable(message: impl Into<String>) -> DataError {
 }
 
 /// A module's scoped snapshot of the committed store: its own `secret.keep`
-/// names, never the runner's kept answers or persisted states (LLP
-/// 1027.002 D3, change 1; LLP 1116 D5).
+/// names and their presence occupancy, never the runner's kept answers or
+/// persisted states (LLP 1027.002 D3, change 1; LLP 1116 D5; LLP 1133.010 D5).
 pub fn snapshot(store: &Store, grants: &str) -> Vec<(String, Vec<u8>)> {
-    let granted = Store::new(grants, []).granted().to_vec();
-    store
-        .snapshot()
-        .into_iter()
-        .filter(|(name, _)| !Store::runner_owned(name) && granted.iter().any(|g| g == name))
-        .collect()
+    store.call_snapshot(Store::new(grants, []).granted())
 }
 
 /// One turn's reply: the writes it made to `local`, in order; how many
@@ -46,6 +41,12 @@ pub fn encode(result: Result<Answer, DataError>, local: &mut Store, logs: Vec<St
     let mut body = json!({"turn": 1, "reads": local.reads(), "topics": local.take_topics(), "writes": writes, "logs": logs});
     match result {
         Ok(Answer::Now(value)) => body["value"] = Json::String(base64(&value.to_bytes())),
+        // A long poll no host may run (LLP 1016.000 D8) is refused before it crosses: the envelope carries
+        // no surface, so its far side couldn't tell.
+        Ok(Answer::Later(request)) if request.long_poll_refusal().is_some() => {
+            let why = request.long_poll_refusal().unwrap_or_default();
+            body["error"] = error_json(&unavailable(why));
+        }
         Ok(Answer::Later(request)) => body["request"] = request_json(&request),
         Err(error) => body["error"] = error_json(&error),
     }
@@ -131,6 +132,8 @@ fn error_json(error: &DataError) -> Json {
         DataError::BadArguments(m) => ("BadArguments", m),
         DataError::DeferredAtBake(m) => ("DeferredAtBake", m),
         DataError::Unavailable(m) | DataError::Interface(m) => ("Unavailable", m),
+        // Transient: a peer that predates it reads it as `Unavailable` (`error_from`'s catch-all).
+        DataError::Overrun(m) => ("Overrun", m),
         // Its class travels with it (LLP 1109 D3).
         DataError::Failed(code, m, reason) => {
             return json!({"kind": "Failed", "code": code.name(), "message": m, "reason": reason});
@@ -145,6 +148,7 @@ fn error_from(error: &Json) -> DataError {
         Some("UnknownSource") => DataError::UnknownSource(message),
         Some("BadArguments") => DataError::BadArguments(message),
         Some("DeferredAtBake") => DataError::DeferredAtBake(message),
+        Some("Overrun") => DataError::Overrun(message),
         Some("Failed") => match error["code"].as_str().and_then(FailureCode::from_name) {
             Some(code) => {
                 let reason = error["reason"].as_str().unwrap_or("").to_string();
@@ -170,9 +174,18 @@ fn request_json(request: &Request) -> Json {
         "headers": request.headers,
         "body": base64(&request.body),
         "stream": request.stream,
+        "upload_progress": request.upload_progress.then_some(true),
+        "long_poll": request.long_poll.as_ref().map(|p| json!({
+            "cursor": p.cursor, "from": p.from, "same_cursor_event": p.same_cursor_event,
+        })),
         "timeout_ms": request.timeout_ms,
         "body_from": request.body_from,
+        "body_to": request.body_to,
         "redirect": (request.redirect != Redirect::Follow).then(|| request.redirect.name()),
+        "held": request.held.then_some(true),
+        "due_ms": request.due_ms,
+        "wake_ms": request.wake_ms,
+        "fetch": request.fetch,
     })
 }
 
@@ -197,8 +210,18 @@ fn request_from(json: &Json) -> Result<Request, DataError> {
         })
         .transpose()?
         .unwrap_or_default();
-    Ok(Request {
+    // A listener's connections are handles a worker's turn cannot hold, as
+    // a socket's are (LLP 1133.005).
+    if !json["listen"].is_null() {
+        return Err(unavailable(
+            "exactListen is unavailable in a worker-placed source; place it on main",
+        ));
+    }
+    let request = Request {
         surface: None,
+        // The runner stamps who asked when the request goes out.
+        reach: Default::default(),
+        listen: None,
         continuation: json["continuation"].as_u64(),
         http: match &json["max_response_bytes"] {
             Json::Null => HttpScheduling::Ordered,
@@ -217,8 +240,35 @@ fn request_from(json: &Json) -> Result<Request, DataError> {
         body: json["body"].as_str().and_then(unbase64).unwrap_or_default(),
         stream: json["stream"].as_bool().unwrap_or(false),
         // A worker's stream only listens: its handle is the main thread's
-        // (LLP 1016.000 D7, worker-placed streams).
+        // (LLP 1016.000 D7, worker-placed streams). Nor does it read a byte
+        // stream: a body that is not events is its one answer.
         socket: false,
+        bytes: false,
+        // An upload (LLP 1016.000 D10): its progress and reply are a
+        // stream's messages and end, which the main thread delivers as for any.
+        upload_progress: json["upload_progress"].as_bool().unwrap_or(false),
+        // A long poll (LLP 1016.000 D8) a worker's source asked for: its
+        // terms, checked as the prelude checks them.
+        long_poll: match &json["long_poll"] {
+            Json::Null => None,
+            poll => {
+                let name = |key: &str| {
+                    (poll[key].as_str())
+                        .filter(|s| (1..=256).contains(&s.chars().count()))
+                        .map(str::to_string)
+                        .ok_or_else(|| unavailable("turn reply: invalid long poll terms"))
+                };
+                Some(Box::new(exact_runner::LongPoll {
+                    cursor: name("cursor")?,
+                    from: name("from")?,
+                    same_cursor_event: match &poll["same_cursor_event"] {
+                        Json::Null => false,
+                        Json::Bool(b) => *b,
+                        _ => return Err(unavailable("turn reply: invalid long poll terms")),
+                    },
+                }))
+            }
+        },
         timeout_ms: match &json["timeout_ms"] {
             Json::Null => None,
             value => Some(
@@ -233,9 +283,26 @@ fn request_from(json: &Json) -> Result<Request, DataError> {
             Json::String(path) => Some(path.clone()),
             _ => return Err(unavailable("turn reply: an invalid exactBodyFrom")),
         },
+        body_to: match &json["body_to"] {
+            Json::Null => None,
+            Json::String(path) => Some(path.clone()),
+            _ => return Err(unavailable("turn reply: an invalid exactBodyTo")),
+        },
         redirect: Redirect::parse(json["redirect"].as_str())
             .map_err(|_| unavailable("turn reply: an invalid redirect mode"))?,
-    })
+        held: json["held"].as_bool().unwrap_or(false),
+        due_ms: json["due_ms"].as_u64(),
+        wake_ms: json["wake_ms"].as_u64(),
+        fetch: json["fetch"].as_u64(),
+    };
+    // A long poll's terms, checked as every host checks them (LLP 1016.000 D8), and an upload's.
+    match request
+        .long_poll_refusal()
+        .or(request.upload_progress_refusal())
+    {
+        Some(why) => Err(unavailable(format!("turn reply: {why}"))),
+        None => Ok(request),
+    }
 }
 
 /// Standard base64 with padding, as the runner's agent module spells it.
@@ -295,6 +362,83 @@ mod tests {
             Answer::Later(r) => assert_eq!(r, storage),
             _ => panic!("a storage yield"),
         }
+    }
+
+    /// A turn over its budget keeps its class across the envelope, so a
+    /// worker's or a mixed member's is asked again as an in-process one is;
+    /// a kind an older peer doesn't know reads as `Unavailable`.
+    #[test]
+    fn an_overrun_keeps_its_class_across_the_envelope() {
+        let why = "`r` took 180.0 ms of its own (CPU) time, over the 100 ms budget for one turn";
+        let back = error_from(&error_json(&DataError::Overrun(why.into())));
+        assert!(
+            matches!(back, DataError::Overrun(ref m) if m == why),
+            "{back:?}"
+        );
+        let older = error_from(&json!({"kind": "SomethingNewer", "message": why}));
+        assert!(
+            matches!(older, DataError::Unavailable(ref m) if m == why),
+            "{older:?}"
+        );
+    }
+
+    #[test]
+    fn a_worker_stream_is_neither_a_socket_nor_a_byte_stream() {
+        let request = Request {
+            stream: true,
+            socket: true,
+            bytes: true,
+            ..Request::get("https://x.test/screen.avcc").independent_http(4096)
+        };
+        let outcome = encode(Ok(Answer::Later(request)), &mut Store::default(), vec![]);
+        match apply(outcome, &mut Store::default(), &mut Vec::new()).unwrap() {
+            Answer::Later(r) => assert!(r.stream && !r.socket && !r.bytes, "{r:?}"),
+            _ => panic!("a yield"),
+        }
+    }
+
+    #[test]
+    fn a_worker_fetch_keeps_the_module_ticket_an_abort_names_it_by() {
+        let request = Request {
+            fetch: Some(42),
+            ..Request::get("https://x.test/held")
+        };
+        let outcome = encode(Ok(Answer::Later(request)), &mut Store::default(), vec![]);
+        match apply(outcome, &mut Store::default(), &mut Vec::new()).unwrap() {
+            Answer::Later(r) => assert_eq!(r.fetch, Some(42)),
+            _ => panic!("a yield"),
+        }
+    }
+
+    #[test]
+    fn a_worker_s_long_poll_keeps_its_terms() {
+        let request = Request {
+            stream: true,
+            ..Request::get("https://x.test/changes?since=0")
+                .independent_http(4096)
+                .long_poll("since", "seq")
+        };
+        let outcome = encode(
+            Ok(Answer::Later(request.clone())),
+            &mut Store::default(),
+            vec![],
+        );
+        match apply(outcome, &mut Store::default(), &mut Vec::new()).unwrap() {
+            Answer::Later(r) => assert_eq!(r.long_poll, request.long_poll),
+            _ => panic!("a yield"),
+        }
+    }
+
+    #[test]
+    fn a_long_poll_no_host_may_run_is_refused_before_it_crosses() {
+        // The envelope carries no surface: a long poll on one (here a continuation) is refused on this side.
+        let request = Request::continuation(3).long_poll("since", "seq");
+        let outcome = encode(Ok(Answer::Later(request)), &mut Store::default(), vec![]);
+        let refused = apply(outcome, &mut Store::default(), &mut Vec::new()).unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("exactLongPoll"),
+            "{refused:?}"
+        );
     }
 
     #[test]

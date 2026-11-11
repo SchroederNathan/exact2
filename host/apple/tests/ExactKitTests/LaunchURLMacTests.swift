@@ -89,6 +89,40 @@ final class LaunchURLMacTests: XCTestCase {
 
         """
 
+    /// A launch no link started opens at the manifest's `start_url`; one a
+    /// link started opens where the link goes.
+    func testALaunchWithNoLinkOpensAtTheStartLocation() throws {
+        let bytes = try plan("""
+            routes nav
+              home "/"
+              today "/today"
+              opened "/open"
+              notfound
+
+            component App
+              action back
+                nav = back(nav)
+              view
+                main navigationKey=`${top(nav).id}` navigationBack="back"
+                  text `at ${top(nav).url}`
+                  for e in stack(nav) key=e.id
+                    column navigationKey=`${e.id}`
+                      text `${e.name}`
+
+            """)
+        let was = ExactSession.startLocation
+        ExactSession.startLocation = "/today"
+        defer { ExactSession.startLocation = was }
+        for (link, at) in [(nil, "at /today"), ("exacttest://auth/x", "at /open?u=exacttest%3A%2F%2Fauth%2Fx")] {
+            let session = ExactApp.shared.makeSession()
+            session.protocolHandlers = handlers
+            defer { session.destroy() }
+            if let link { XCTAssertTrue(session.openURL(try XCTUnwrap(URL(string: link)))) }
+            XCTAssertNil(session.boot(plan: bytes, size: CGSize(width: 390, height: 844)).error)
+            XCTAssertTrue(session.agent(#"{"op":"tree"}"#).contains("\"\(at)\""), "\(link ?? "no link"): \(session.agent(#"{"op":"tree"}"#).prefix(600))")
+        }
+    }
+
     func testALaunchURLWithNoNavigationRootIsJournaled() throws {
         let lines = try logs(launching: "exacttest://auth/x?request=1", rootless)
         XCTAssertTrue(lines.contains { $0.hasSuffix("launch URL refused: no navigation root handler (/auth/x?request=1)") }, "\(lines)")
@@ -179,6 +213,16 @@ final class LaunchURLMacTests: XCTestCase {
         XCTAssertTrue(state.contains("/open?u=exacttest%3A%2F%2Fauth%2Fsecond%23two"), state)
     }
 
+    /// The agent's `type <root> <url>` (euxy FRICTION 13): a URL with a
+    /// scheme arrives as the system's `openURL` would deliver it, a path as written.
+    func testATypedURLArrivesAsTheSystemWouldDeliverIt() throws {
+        let session = ExactApp.shared.makeSession()
+        session.protocolHandlers = handlers
+        defer { session.destroy() }
+        XCTAssertEqual(session.typedLocation("exacttest://auth/x#frag"), "/open?u=exacttest%3A%2F%2Fauth%2Fx%23frag")
+        XCTAssertEqual(session.typedLocation("/saved?q=1"), "/saved?q=1")
+    }
+
     func testAdapterBatchDeliversEveryProtocolLinkInOrder() throws {
         let session = ExactApp.shared.makeSession()
         session.protocolHandlers = handlers
@@ -193,6 +237,90 @@ final class LaunchURLMacTests: XCTestCase {
         XCTAssertEqual(session.launchLocation, "/open?u=exacttest%3A%2F%2Fauth%2Ffirst%23one")
     }
 
+    /// A Mac browser (LLP 1030 D2): an `https` link cold and an `http` one
+    /// warm reach the template whole, and so does an HTML file Finder
+    /// brings, as its `file:` URL; any other file stays a document, and an
+    /// HTML file is one too for an app that claims no web links.
+    func testABrowserTakesWebLinksAndHTMLFilesAtItsTemplate() throws {
+        let source = """
+            routes nav
+              home "/"
+              opened "/open"
+
+            component App
+              state seen = ""
+              action back
+                nav = back(nav)
+              action follow(location: string)
+                seen = `${seen}|${location}`
+              view
+                main navigationKey=`${top(nav).id}` navigationBack="back" navigate=follow
+                  text `${top(nav).url}` testId="where"
+                  text `${seen}` testId="seen"
+                  for e in stack(nav) key=e.id
+                    column navigationKey=`${e.id}`
+                      text `${e.name}`
+
+            """
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("weblinks-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let page = dir.appendingPathComponent("page.html"), xhtml = dir.appendingPathComponent("page.xhtml"), notes = dir.appendingPathComponent("notes.txt")
+        for file in [page, xhtml, notes] { try Data("<p>hi</p>".utf8).write(to: file) }
+
+        let session = ExactApp.shared.makeSession()
+        session.protocolHandlers = [["protocol": "https", "url": "/open?u=%s"], ["protocol": "http", "url": "/open?u=%s"]]
+        defer { session.destroy() }
+        var documents: [URL] = []
+        func deliver(_ urls: [URL]) {
+            IncomingURLBatch.deliver(urls, development: { _ in false }, webPage: session.isWebPageFile,
+                                     document: { documents.append($0) }, location: { XCTAssertTrue(session.openURL($0)) })
+        }
+        deliver([try XCTUnwrap(URL(string: "https://example.com/a?b=1#c"))])
+        XCTAssertEqual(session.launchLocation, "/open?u=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1%23c")
+        XCTAssertNil(session.boot(plan: try plan(source), size: CGSize(width: 390, height: 844)).error)
+        XCTAssertTrue(session.agent(#"{"op":"tree"}"#).contains("/open?u=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1%23c"))
+
+        deliver([try XCTUnwrap(URL(string: "http://example.com/")), page, notes, xhtml])
+        XCTAssertEqual(documents, [notes])
+        let seen = session.agent(#"{"op":"state"}"#)
+        let encoded = { (url: URL) in "/open?u=" + (url.absoluteString.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-_.!~*'()"))) ?? "") }
+        XCTAssertTrue(seen.contains("|/open?u=http%3A%2F%2Fexample.com%2F|\(encoded(page))|\(encoded(xhtml))"), seen)
+        XCTAssertEqual(session.typedLocation("https://example.com/"), "/open?u=https%3A%2F%2Fexample.com%2F")
+
+        let plain = ExactApp.shared.makeSession()
+        plain.protocolHandlers = handlers
+        defer { plain.destroy() }
+        XCTAssertFalse(plain.isWebPageFile(page))
+        XCTAssertEqual(plain.typedLocation("https://example.com/a"), "/a")
+    }
+
+    /// The web-page type a Mac browser declares (`ExactWebPage`) is Launch
+    /// Services' alone: no picker offers it and no drop takes an HTML file
+    /// for it, beside the app's own types or without them; an app whose own
+    /// `file_handlers` name HTML still takes one.
+    func testTheWebPageTypeIsNeitherPickedNorDropped() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("webpage-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let page = dir.appendingPathComponent("page.html"), notes = dir.appendingPathComponent("notes.md")
+        for file in [page, notes] { try Data("<p>hi</p>".utf8).write(to: file) }
+        let web: [String: Any] = ["CFBundleTypeName": "Web page", "CFBundleTypeRole": "Viewer", "LSHandlerRank": "Alternate",
+                                  "LSItemContentTypes": ["public.html", "public.xhtml"], "ExactWebPage": true]
+        let markdown: [String: Any] = ["CFBundleTypeRole": "Viewer", "LSItemContentTypes": ["net.daringfireball.markdown"], "CFBundleTypeExtensions": ["md"]]
+        let browser: [String: Any] = ["CFBundleDocumentTypes": [web]]
+        XCTAssertTrue(Picker.declarations(in: browser).isEmpty)
+        XCTAssertEqual(Picker.types(in: browser), [])
+        XCTAssertFalse(ExactDocuments.accepts(page, metadata: browser))
+        let both: [String: Any] = ["CFBundleDocumentTypes": [markdown, web]]
+        XCTAssertEqual(Picker.declarations(in: both).count, 1)
+        XCTAssertFalse(Picker.types(in: both).contains(.html))
+        XCTAssertFalse(ExactDocuments.accepts(page, metadata: both))
+        XCTAssertTrue(ExactDocuments.accepts(notes, metadata: both))
+        let viewer: [String: Any] = ["CFBundleDocumentTypes": [["CFBundleTypeRole": "Viewer", "LSItemContentTypes": ["public.html"]], web]]
+        XCTAssertTrue(ExactDocuments.accepts(page, metadata: viewer))
+    }
+
     func testNotificationClickUsesLaunchLocationThenWarmNavigateOnce() throws {
         let bytes = try plan(routed)
         let session = ExactApp.shared.makeSession(label: "notification-\(UUID().uuidString)")
@@ -200,8 +328,8 @@ final class LaunchURLMacTests: XCTestCase {
         NotificationPresenter.shared.app = ExactApp.shared
         var activations = 0
         NotificationPresenter.shared.activate = { if $0 === session { activations += 1 } }
-        let info: [AnyHashable: Any] = ["navigate": "/thread/42", "session": session.label,
-                                        "owner": session.notificationOwnerID, "process": ExactApp.shared.notificationProcessID]
+        let info: [AnyHashable: Any] = ["exact": ["navigate": "/thread/42", "session": session.label,
+                                        "owner": session.notificationOwnerID, "process": ExactApp.shared.notificationProcessID]]
         let date = Date()
         func texts() throws -> [String] {
             let data = try XCTUnwrap(session.agent("{\"op\":\"tree\"}").data(using: .utf8))
@@ -218,8 +346,8 @@ final class LaunchURLMacTests: XCTestCase {
         NotificationPresenter.shared.deliver(id: "thread-42", date: date, info: info)
         XCTAssertEqual(try texts(), cold)
         XCTAssertEqual(activations, 1)
-        NotificationPresenter.shared.deliver(id: "thread-43", date: date, info: ["navigate": "/thread/43", "session": session.label,
-                                                                           "owner": session.notificationOwnerID])
+        NotificationPresenter.shared.deliver(id: "thread-43", date: date, info: ["exact": ["navigate": "/thread/43", "session": session.label,
+                                                                           "owner": session.notificationOwnerID]])
         XCTAssertTrue(try texts().contains("/thread/43"))
         XCTAssertEqual(activations, 2)
     }
@@ -237,8 +365,8 @@ final class LaunchURLMacTests: XCTestCase {
         presenter.app = ExactApp.shared
         let received = expectation(description: "notification delegate completion")
         respond(action: UNNotificationDefaultActionIdentifier, id: UUID().uuidString,
-                date: Date(), info: ["navigate": "/thread/42", "session": session.label,
-                                     "owner": session.notificationOwnerID]) {
+                date: Date(), info: ["exact": ["navigate": "/thread/42", "session": session.label,
+                                     "owner": session.notificationOwnerID]]) {
             received.fulfill()
         }
         XCTAssertNil(session.boot(plan: bytes, size: CGSize(width: 390, height: 844)).error)
@@ -265,8 +393,8 @@ final class LaunchURLMacTests: XCTestCase {
         presenter.activate = { _ in activations += 1 }
         let received = expectation(description: "notification dismissal completion")
         respond(action: UNNotificationDismissActionIdentifier, id: UUID().uuidString,
-                date: Date(), info: ["navigate": "/thread/42", "session": session.label,
-                                     "owner": session.notificationOwnerID]) {
+                date: Date(), info: ["exact": ["navigate": "/thread/42", "session": session.label,
+                                     "owner": session.notificationOwnerID]]) {
             received.fulfill()
         }
         wait(for: [received], timeout: 2)
@@ -284,8 +412,8 @@ final class LaunchURLMacTests: XCTestCase {
         XCTAssertEqual(b.label, c.label, "the label collision this click must survive")
         let presenter = NotificationPresenter.shared
         presenter.app = app
-        let info: [AnyHashable: Any] = ["navigate": "/thread/42", "session": c.label,
-                                        "owner": c.notificationOwnerID, "process": app.notificationProcessID]
+        let info: [AnyHashable: Any] = ["exact": ["navigate": "/thread/42", "session": c.label,
+                                        "owner": c.notificationOwnerID, "process": app.notificationProcessID]]
         presenter.deliver(id: UUID().uuidString, date: Date(), info: info)
         XCTAssertNil(b.launchLocation)
         XCTAssertEqual(c.launchLocation, "/thread/42")
@@ -303,8 +431,8 @@ final class LaunchURLMacTests: XCTestCase {
         defer { session.destroy(); NotificationPresenter.shared.app = nil; NotificationPresenter.shared.activate = nil }
         let presenter = NotificationPresenter.shared
         presenter.app = app
-        presenter.deliver(id: UUID().uuidString, date: Date(), info: ["navigate": "/thread/42", "session": session.label,
-                                                                 "owner": UUID().uuidString, "process": UUID().uuidString])
+        presenter.deliver(id: UUID().uuidString, date: Date(), info: ["exact": ["navigate": "/thread/42", "session": session.label,
+                                                                 "owner": UUID().uuidString, "process": UUID().uuidString]])
         XCTAssertEqual(session.launchLocation, "/thread/42")
     }
 
@@ -318,8 +446,8 @@ final class LaunchURLMacTests: XCTestCase {
         for (id, location) in [("first", " \tthread/./42#reply "), ("second", "app://thread/../thread/43?view=full#reply")] {
             let received = expectation(description: "notification delegate completion \(id)")
             respond(action: UNNotificationDefaultActionIdentifier, id: UUID().uuidString, date: Date(),
-                    info: ["navigate": location, "session": session.label,
-                           "owner": oldOwner, "process": oldProcess]) { received.fulfill() }
+                    info: ["exact": ["navigate": location, "session": session.label,
+                           "owner": oldOwner, "process": oldProcess]]) { received.fulfill() }
             wait(for: [received], timeout: 2)
             let data = try XCTUnwrap(session.agent("{\"op\":\"tree\"}").data(using: .utf8))
             let tree = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -336,8 +464,8 @@ final class LaunchURLMacTests: XCTestCase {
         defer { first.destroy(); second.destroy(); NotificationPresenter.shared.app = nil }
         NotificationPresenter.shared.app = app
         NotificationPresenter.shared.deliver(id: UUID().uuidString, date: Date(),
-                                             info: ["navigate": "/thread/42", "session": "old-main",
-                                                    "owner": UUID().uuidString, "process": UUID().uuidString])
+                                             info: ["exact": ["navigate": "/thread/42", "session": "old-main",
+                                                    "owner": UUID().uuidString, "process": UUID().uuidString]])
         XCTAssertEqual(first.launchLocation, "/thread/42")
         XCTAssertNil(second.launchLocation)
     }

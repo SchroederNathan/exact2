@@ -4,6 +4,7 @@ import AppKit
 #else
 import UIKit
 #endif
+import ExactCore
 
 struct FieldInput {
     var inputType: String
@@ -12,7 +13,8 @@ struct FieldInput {
     var isComposing = false
 
     func payload(_ value: String, _ selection: FieldSelection) -> String {
-        "\(inputType),\(cancelable ? 1 : 0),\(isComposing ? 1 : 0),\(data?.utf8.count ?? -1),\(data ?? "")\(selection.payload(value))"
+        FieldWire.input(type: inputType, data: data, cancelable: cancelable, composing: isComposing,
+                        value: value, start: selection.start, end: selection.end, direction: selection.direction)
     }
 }
 
@@ -67,7 +69,7 @@ extension FieldSelections {
     }
 
     func shouldEdit(_ node: NodeView, range: NSRange, replacement: String, marked: Bool) -> Bool {
-        guard Self.tracks(node), !editing.contains(node.id) else { return true }
+        guard Self.tracks(node), !editing.contains(node.id), !Self.applying(node) else { return true }
         let value = node.fieldText, selection = current(node)
         let ime = marked || composing.contains(node.id)
         let type = ime ? "insertCompositionText" : editIntent[node.id] ??
@@ -98,7 +100,7 @@ extension FieldSelections {
     // UIKeyInput and marked-text entry points need not ask UIKit's delegate.
     // A delegate called inside the same operation must not ask a second time.
     func nativeEdit(_ node: NodeView?, replacement: String, marked: Bool, _ perform: () -> Void) {
-        guard let node, Self.tracks(node), !editing.contains(node.id) else { return perform() }
+        guard let node, Self.tracks(node), !editing.contains(node.id), !Self.applying(node) else { return perform() }
         guard shouldEdit(node, range: current(node).range, replacement: replacement, marked: marked) else { return }
         editing.insert(node.id)
         defer { editing.remove(node.id) }

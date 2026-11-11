@@ -10,8 +10,13 @@ import AppKit
 package final class ChainingScrollView: NSScrollView {
     /// Empty document and clip hits take this view. The node owns their
     /// mouse contact, even if a handler removes the scroll view mid-press.
-    weak var pointerOwner: NodeView?
+    weak var pointerOwner: NodeView? { didSet { followScrollerStyle() } }
     package override func accessibilityChildrenInNavigationOrder() -> [any NSAccessibilityElementProtocol]? { treeNavigationOrder }
+    // A Markdown field's atoms follow it among the scrolled children (`NodeView.withAtoms`).
+    package override func accessibilityChildren() -> [Any]? {
+        let children = super.accessibilityChildren()
+        return pointerOwner?.scroll === self ? pointerOwner?.withAtoms(children, inScroll: true) : children
+    }
     private var mouseHeld = false
     private var removeAfterMouseUp = false
     /// Removed mid-press, the view stays, transparent, until the up, which
@@ -59,15 +64,42 @@ package final class ChainingScrollView: NSScrollView {
     /// thread follows it (LLP 1002 D4; LLP 1044 F3).
     package override class var isCompatibleWithResponsiveScrolling: Bool { true }
 
-    /// Always overlay: a `scroll` node's scrollbars take no layout space
-    /// (LLP 1010: the kernel's `scrollbar_width` is 0). AppKit sets every
-    /// scroll view to the system's preferred style when it posts
-    /// `NSPreferredScrollerStyleDidChangeNotification` — on a Mac with a
-    /// mouse, legacy, whose 15-point scrollers would take a node's clip
-    /// narrower and shorter than the box the kernel laid out.
-    package override var scrollerStyle: NSScroller.Style {
-        get { super.scrollerStyle }
-        set { super.scrollerStyle = .overlay }
+    private var styleObserver: NSObjectProtocol?
+    package override init(frame: NSRect) {
+        super.init(frame: frame)
+        followScrollerStyle()
+        styleObserver = NotificationCenter.default.addObserver(forName: NSScroller.preferredScrollerStyleDidChangeNotification,
+            object: nil, queue: .main) { [weak self] _ in self?.followScrollerStyle() }
+    }
+    required init?(coder: NSCoder) { nil }
+    deinit { if let styleObserver { NotificationCenter.default.removeObserver(styleObserver) } }
+
+    private func followScrollerStyle() {
+        // Region surfaces own their layout separately; this claim is for
+        // ordinary overflow boxes, whose children the kernel lays out.
+        scrollerStyle = ExactEnv.agentFreezes || pointerOwner == nil ? .overlay : NSScroller.preferredScrollerStyle
+        tile()
+        pointerOwner?.fitScroll()
+    }
+
+    package override func tile() {
+        if let owner = pointerOwner, userInterfaceLayoutDirection != owner.userInterfaceLayoutDirection {
+            userInterfaceLayoutDirection = owner.userInterfaceLayoutDirection
+        }
+        super.tile()
+        guard let owner = pointerOwner else { return }
+        // Clip geometry can differ through rounding or insets even without
+        // a scrollbar. Only a visible legacy scroller occupies a gutter.
+        let right = scrollerStyle == .legacy && verticalScroller?.isHidden == false ? verticalScroller?.frame.width ?? 0 : 0
+        let bottom = scrollerStyle == .legacy && horizontalScroller?.isHidden == false ? horizontalScroller?.frame.height ?? 0 : 0
+        owner.presenter?.covers.report("scroller-\(owner.id)", [owner.id: .gutter(right: right, bottom: bottom)])
+    }
+
+    /// Taffy reserves an RTL vertical gutter on the left. AppKit keeps
+    /// its scroller on the right even with an RTL layout direction.
+    var kernelDocumentOrigin: CGPoint {
+        let gutter = scrollerStyle == .legacy && verticalScroller?.isHidden == false ? verticalScroller?.frame.width ?? 0 : 0
+        return CGPoint(x: userInterfaceLayoutDirection == .rightToLeft ? gutter : 0, y: 0)
     }
 
     /// Whether a wheel this view takes is applied here, at once, and not
@@ -77,8 +109,20 @@ package final class ChainingScrollView: NSScrollView {
     /// and animates a notch; and a gesture the agent hands over whole from
     /// one call is not tracked as the event queue's is: measured on macOS
     /// 27.0, AppKit applies one event of it). For a person a `scroll` node
-    /// is scrolled by AppKit (LLP 1115.000 D8.2), as the page is.
-    static var appliesAtOnce = ExactEnv.agentMode
+    /// is scrolled by AppKit (LLP 1115.000 D8.2), as the page is, and so it
+    /// is while a drive holds the frames for a person's own flings (`perf
+    /// frames hold` under platform timing, LLP 1144 D1): momentum and rubber
+    /// band included.
+    static var appliesAtOnce = ExactEnv.agentFreezes
+    /// The driver's trackpad gesture (`tap … wheel … fling|hold|release`,
+    /// LLP 1142 D3) comes through the window server, whose gesture AppKit
+    /// tracks as a person's, marked with this in `kCGEventSourceUserData`.
+    /// It is AppKit's to run under the agent too.
+    static let driverMark: Int64 = 0x4558_4143_5444
+    /// The driver's events a scroller handed to AppKit, and the last such
+    /// scroller: what the driver reads back to confirm delivery.
+    static var driverWheels = 0
+    static weak var driverOwner: ChainingScrollView?
     /// Which axes scroll (the node's effective `overflow_x`/`overflow_y`).
     var collectionWillScroll: (() -> Void)?
     var scrollsX = true
@@ -134,10 +178,11 @@ package final class ChainingScrollView: NSScrollView {
 
     /// Where `dx`/`dy` goes. `phased` is whether the event carries a gesture
     /// phase — a lift or a momentum end, which have no delta at all.
-    func routing(dx: CGFloat, dy: CGFloat, phased: Bool, in extent: Extent) -> Routing {
+    func routing(dx: CGFloat, dy: CGFloat, phased: Bool, in extent: Extent, driver: Bool = false) -> Routing {
         // What this view takes is AppKit's to scroll; the agent's wheel is
-        // applied here (`appliesAtOnce`).
-        let taken: Routing = Self.appliesAtOnce ? .here : .appKit
+        // applied here (`appliesAtOnce`), unless the driver posted it
+        // through the window server (`driverMark`).
+        let taken: Routing = Self.appliesAtOnce && !driver ? .here : .appKit
         // A gesture's phase transitions carry no delta — the lift that ends a
         // trackpad scroll is a zero-delta `.ended`, and momentum ends the
         // same way — and AppKit's elastic state machine needs them: without
@@ -180,6 +225,11 @@ package final class ChainingScrollView: NSScrollView {
                     scrolls: vertical ? scrollsY : scrollsX,
                     limit: vertical ? extent.maxY : extent.maxX,
                     at: vertical ? extent.origin.y : extent.origin.x) ? taken : .chain
+    }
+
+    private static func handedDriverWheel(_ view: ChainingScrollView) {
+        driverWheels += 1
+        driverOwner = view
     }
 
     private func take(_ delta: CGFloat, scrolls: Bool, limit: CGFloat, at origin: CGFloat) -> Bool {
@@ -231,8 +281,17 @@ package final class ChainingScrollView: NSScrollView {
         return routing
     }
 
+    /// The phase a scroll track records for a move this scroller's wheel handler makes (`FrameHealth.trackScrolled`):
+    /// `d` momentum, `t` a finger's phased scroll, `-` a plain wheel or a phase's end. The clip's bounds change is
+    /// posted inside the handler, so it is set for that move alone and is `-` for any other (a layout's).
+    var trackPhase: Character = "-"
+
     package override func scrollWheel(with event: NSEvent) {
+        let moving: NSEvent.Phase = [.began, .changed]
+        trackPhase = !event.momentumPhase.intersection(moving).isEmpty ? "d" : !event.phase.intersection(moving).isEmpty ? "t" : "-"
+        defer { trackPhase = "-" }
         (superview as? NodeView)?.cancelElementScroll()
+        (superview as? NodeView)?.presenter?.personScrolls += 1 // a wheel's notch is no live scroll (Fragment.swift)
         // Precise deltas (a trackpad) are in points; a wheel's are in lines,
         // of the height AppKit scrolls a line by (10 points unless set; it
         // was 40 here, a browser's tick).
@@ -241,7 +300,8 @@ package final class ChainingScrollView: NSScrollView {
         var dy = precise ? event.scrollingDeltaY : event.deltaY * verticalLineScroll
         let phased = !(event.phase.isEmpty && event.momentumPhase.isEmpty)
         let extent = self.extent
-        var route = routing(dx: dx, dy: dy, phased: phased, in: extent)
+        let driver = event.cgEvent?.getIntegerValueField(.eventSourceUserData) == Self.driverMark
+        var route = routing(dx: dx, dy: dy, phased: phased, in: extent, driver: driver)
         if phased {
             let began = event.phase.contains(.began) && event.momentumPhase.isEmpty
             let over = event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled)
@@ -258,6 +318,7 @@ package final class ChainingScrollView: NSScrollView {
             if route == .appKit, !owned, Self.latch.chosen, let first = Self.unsentBegan, first !== event {
                 Self.unsentBegan = nil
                 collectionWillScroll?()
+                if driver { Self.handedDriverWheel(self) }
                 NSApp.postEvent(event, atStart: true)
                 super.scrollWheel(with: first)
                 return
@@ -269,6 +330,7 @@ package final class ChainingScrollView: NSScrollView {
             return
         case .appKit:
             collectionWillScroll?()
+            if driver { Self.handedDriverWheel(self) }
             super.scrollWheel(with: event)
         case .chain:
             nextResponder?.scrollWheel(with: event)
@@ -283,6 +345,17 @@ package final class ChainingScrollView: NSScrollView {
             contentView.scroll(to: target)
             reflectScrolledClipView(contentView)
         }
+    }
+}
+
+extension NodeView {
+    /// Kernel frames include the gutter; the document starts at the clip.
+    func frameInScrollDocument(_ frame: NSRect) -> NSRect {
+        guard let clip = superview?.superview as? NSClipView,
+              let scroll = clip.superview as? ChainingScrollView,
+              scroll.documentView === superview else { return frame }
+        let origin = scroll.kernelDocumentOrigin
+        return frame.offsetBy(dx: -origin.x, dy: -origin.y)
     }
 }
 

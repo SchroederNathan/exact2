@@ -3,20 +3,19 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, r
 import { tmpdir } from 'node:os';
 import { dirname, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
-import { Cdp } from '../../scripts/agent.mjs';
 import { boundedHttpBody, request, streamed } from './http-body.js';
 import { deferredFulfill, refusal } from './navigation.js';
-import { admitsNetwork, coversPath, createGrantSet, grantError, sameGrantDeclaration, scopedGrantSet } from './grant-admission.js';
+import { admittingGrant, admitsNetwork, coversPath, createGrantSet, grantError, sameGrantDeclaration, scopedGrantSet } from './grant-admission.js';
 import { createRequestExecutor, createSecretFacade, fetchWith, redirectOf } from '../web-js/admission.js';
-import { chromium } from '../../scripts/agent-launch.mjs';
+import { cdpBrowser, chromium } from '../../scripts/agent-launch.mjs';
 import { need } from '../../scripts/coverage.mjs';
-const { executable: chrome, unavailable } = chromium(), chromeTest = need('chrome', unavailable);
+const { unavailable } = chromium(), chromeTest = need('chrome', unavailable);
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 // The real `redirectOf` and `ownWithout`, for a stub `admission.js` written beside a module under test
-const realHelpers = `export { ownWithout, redirectOf } from ${JSON.stringify(pathToFileURL(resolve(ROOT, 'host/web-js/admission.js')).href)}; `;
+const realHelpers = `export { ownWithout, redirectOf, signalDeadline, within } from ${JSON.stringify(pathToFileURL(resolve(ROOT, 'host/web-js/admission.js')).href)}; `;
 const sets = new Map();
 const normalizers = new Map();
 function builtNormalizer(target, run = spawnSync) {
@@ -347,6 +346,11 @@ test('the TypeScript secret facade has native Store null, reservation, read and 
   expect(() => malformed.set('token', 'x')).toThrow('line 1');
 });
 
+test('the web refuses a locked secret and keeps an optional one plain (LLP 1133.010 D15)', async () => {
+  const backing = new Map([['key', 'older']]), store = createSecretFacade(backing, normalized('secret.keep token user-presence optional\nsecret.keep key user-presence\ndevice.local-auth purpose.lock'), () => Promise.resolve(null));
+  expect(() => store.set('key', 's')).toThrow(expect.objectContaining({ name: 'NotSupportedError' })); store.set('token', 'open'); await expect(store.protect('token')).rejects.toMatchObject({ name: 'NotSupportedError' }); expect([store.get('key'), store.has('key'), store.locked('key'), backing.get('key'), store.get('token'), store.has('token'), store.locked('token'), await store.unlock('token')]).toEqual([null, false, false, 'older', 'open', true, false, 'open']);
+});
+
 test('filesystem admission is component-based and refuses traversal', () => {
   const set = normalized('fs.read app:/data\nfs.write app:/data/out');
   expect(coversPath(set, 'fs.read', 'app:/data/note.txt')).toBe(true);
@@ -396,7 +400,7 @@ test('a chosen folder is the same storage for a TypeScript source and a Rust req
       // Review B6: writing the chosen folder itself, or a folder in it, is EISDIR, as on Hermes.
       code(fs.writeFile(doc, new Uint8Array([1]))), code(fs.appendFile(doc, new Uint8Array([1]))), code(fs.writeFile(`${doc}/sub`, new Uint8Array([1]))),
     ])).toEqual(['Unavailable ENOENT', 'Unavailable denied', 'Unavailable EISDIR', 'Unavailable ENOTDIR', 'Unavailable ENOTEMPTY',
-      'Unavailable failed', 'Unavailable failed', 'Unavailable failed', 'Unavailable denied', 'Unavailable EISDIR', 'Unavailable EISDIR', 'Unavailable EISDIR']);
+      'Unavailable failed', 'Unavailable failed', 'Unavailable ENOENT', 'Unavailable denied', 'Unavailable EISDIR', 'Unavailable EISDIR', 'Unavailable EISDIR']);
     // A Rust source's storage request: the same operation, its bytes as base64.
     expect(await globalThis.exact.documents.run('fs.readFile', { path: `${doc}/a.txt` }, null, read)).toEqual({ base64: btoa('A') });
     await expect(globalThis.exact.documents.run('fs.writeFile', { path: `${doc}/a.txt` }, new Uint8Array([1]), read)).rejects.toThrow(/^denied: fs.writeFile .*needs `fs.write doc:\/`/);
@@ -443,13 +447,13 @@ test('the production file command refuses a source outside the admitted fs.read 
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-files-admission-'));
   writeFileSync(resolve(dir, 'files.js'), readFileSync(resolve(ROOT, 'host/web-js/files.js'), 'utf8')
     .replace("from './rt.js'", "from './rt-stub.js'").replace("from './navigation.js'", "from './navigation-stub.js'"));
-  writeFileSync(resolve(dir, 'rt-stub.js'), `export const journal=[],clock={now:0,agent:true},inflight={n:0},Hosts={},OnHooks={},Views=new Map(),data={appId:'test.files'};export const nextTicket=()=>1,viewId=()=>1;\n`);
-  writeFileSync(resolve(dir, 'navigation-stub.js'), `export const reportPlace=()=> ['en','UTC','1'].join(String.fromCharCode(0));\n`);
+  writeFileSync(resolve(dir, 'rt-stub.js'), `export const journal=[],clock={now:0,agent:true},inflight={n:0},Hosts={},OnHooks={},Views=new Map(),data={appId:'test.files'};export const nextTicket=()=>1,viewId=()=>1,painted=()=>Promise.resolve();\n`);
+  writeFileSync(resolve(dir, 'navigation-stub.js'), `export { inertAncestor, liveById } from './navigation.js';\nexport const reportPlace=()=> ['en','UTC','1'].join(String.fromCharCode(0));\n`);
   cpSync(resolve(ROOT, 'host/web-js/pointer.js'), resolve(dir, 'pointer.js'));
-  writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(ROOT, 'host/web-js/admission.js'), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'"));
-  for (const name of ['grant-admission.js', 'faults.js', 'navigation.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
+  writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(ROOT, 'host/web-js/admission.js'), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'").replaceAll("'../web/address-space.js'", "'./address-space.js'"));
+  for (const name of ['grant-admission.js', 'address-space.js', 'faults.js', 'navigation.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
   const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document');
-  Object.defineProperty(globalThis, 'document', { configurable: true, value: { getElementById: () => ({ localName: 'button', isConnected: true, getAttribute: () => null, dispatchEvent() {} }) } });
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { getElementById: () => ({ localName: 'button', isConnected: true, getAttribute: () => null, dispatchEvent() {}, closest: () => null }), contains: () => true /* liveById: a live, attached element */ } });
   globalThis.exact = {};
   try {
     const admission = await import(pathToFileURL(resolve(dir, 'admission.js')).href);
@@ -471,6 +475,9 @@ test('the web matcher consumes the Rust grammar corpus', () => {
     const set = normalized(item.spec);
     expect(!grantError(set), item.spec).toBe(item.ok);
     for (const [url, admitted] of item.fetch ?? []) expect(admitsNetwork(set, url, 'fetch'), `${item.spec}: ${url}`).toBe(admitted);
+    for (const [url, admitted] of item.websocket ?? []) expect(admitsNetwork(set, url, 'websocket'), `${item.spec}: socket ${url}`).toBe(admitted);
+    if (item.spec.startsWith('net.websocket ') && item.spec.includes('://*.'))
+      for (const [url, admitted] of item.websocket ?? []) expect(admittingGrant(set, url, 'websocket'), `${item.spec}: socket line ${url}`).toBe(admitted ? item.spec : null);
     for (const [cap, path, admitted] of item.fs ?? []) expect(coversPath(set, cap, path), `${item.spec}: ${path}`).toBe(admitted);
     for (const [cap, path] of item.nativeFs ?? []) expect(coversPath(set, cap, path), `${item.spec}: inert ${path}`).toBe(false);
   }
@@ -551,7 +558,7 @@ test('a typescript.sources mount still builds after it moves', () => {
 chromeTest('a built TypeScript source refuses fetch and storage without grants', async () => {
   let destinationHits = 0;
   const destination = Bun.serve({ port: 0, fetch() { destinationHits++; return new Response('raw browser fetch', { headers: { 'access-control-allow-origin': '*' } }); } });
-  const dir = mkdtempSync(resolve(tmpdir(), 'exact ts fetch # ')), dist = resolve(dir, 'dist'), profile = resolve(dir, 'chrome');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact ts fetch # ')), dist = resolve(dir, 'dist');
   writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Grant probe', app: { id: 'test.grant-probe', name: 'Grant probe' }, host: { web: {} } }));
   writeFileSync(resolve(dir, 'app.contract'), `shape Result\n  value: string\ncomponent Probe\n  resource result = probe() as shape Result\n  view\n    text result.value testId="result"\n`);
   // The app dependency must be rewritten; copied host modules must retain browser
@@ -559,7 +566,7 @@ chromeTest('a built TypeScript source refuses fetch and storage without grants',
   writeFileSync(resolve(dir, 'fetch-request.ts'), `export async function attempt(_args:any,_store:any,storage:any){const results=[];try{await fetch(${JSON.stringify(destination.url.href)});results.push('raw browser fetch');}catch(error:any){results.push(error.name+':'+error.kind);}for(const call of [()=>storage.fs.readFile('app:/data/file'),()=>storage.sqlite.open('app:/data/test.db')]){try{await call();results.push('unexpected storage');}catch(error:any){results.push(error.kind+':'+error.code);}}return {value:results.join('|')};}\n`);
   writeFileSync(resolve(dir, 'app.ts'), `import type { Answer, Sources } from './app.contract.d.ts';\nimport { attempt } from './fetch-request.ts';\nexport const appId='test.grant-probe',grants='';\nconst sources: Sources = { probe: attempt };\nexport const answer: Answer = (source, args, store, storage, native) => sources[source](args as never, store, storage, native) as never;\n`);
   const built = spawnSync(process.execPath, ['host/web-js/build.mjs', 'grant-probe', '--out', dist, '--render', 'none'], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, EXACT_APP_DIR: dir } });
-  let page, child, cdp, exited;
+  let page, suite;
   try {
     expect(built.status, built.stderr || built.stdout).toBe(0);
     page = Bun.serve({ port: 0, async fetch(request) {
@@ -568,12 +575,8 @@ chromeTest('a built TypeScript source refuses fetch and storage without grants',
       if (!file.startsWith(dist + sep) || !existsSync(file)) return new Response('not found', { status: 404 });
       return new Response(Bun.file(file));
     } });
-    child = spawn(chrome, ['--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--no-first-run', '--disable-background-networking', `--user-data-dir=${profile}`, 'about:blank'], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
-    cdp = new Cdp(child.stdio[3], child.stdio[4]);
-    exited = new Promise(resolveExit => child.on('exit', () => { cdp.fail('browser closed'); resolveExit(); }));
-    const { targetInfos } = await cdp.send('Target.getTargets');
-    const target = targetInfos.find(info => info.type === 'page') ?? await cdp.send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
+    suite = await cdpBrowser();
+    const { cdp } = suite, { sessionId } = await suite.page();
     const call = (method, params = {}) => cdp.send(method, params, sessionId);
     await call('Page.enable');
     await call('Page.navigate', { url: page.url.href });
@@ -584,7 +587,7 @@ chromeTest('a built TypeScript source refuses fetch and storage without grants',
     expect(existsSync(resolve(dist, 'storage-sqlite.js'))).toBe(false);
     expect(destinationHits).toBe(0);
   } finally {
-    if (child?.pid) { try { if (process.platform === 'win32') child.kill(); else process.kill(-child.pid, 'SIGKILL'); } catch {} await exited; }
+    await suite?.close();
     page?.stop(true); destination.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
@@ -657,7 +660,8 @@ test('the JS target checks and takes the redirect mode once, as fetch is called'
     const { fetch: appFetch, answering } = await import(pathToFileURL(resolve(dir, 'ts-fetch.js')).href);
     const upload = await appFetch('https://x.test/up', { method: 'POST', exactBodyFrom: 'app:/data/p.jpg', redirect: 'sideways' }).catch(e => e);
     expect([upload instanceof TypeError, globalThis.redirectReads ?? 0]).toEqual([true, 0]);
-    answering.call = {};
+    // An answer being asked, in its turn (ts-data.js; a stream starts only then, 4322c85a1d).
+    answering.call = { turn: true };
     const refused = await appFetch('https://x.test/events', { exactStream: e => e, redirect: 'sideways' }).catch(e => e);
     expect([refused instanceof TypeError, answering.call.stream]).toEqual([true, undefined]);
     const options = { exactStream: e => e, redirect: 'manual' };
@@ -665,7 +669,7 @@ test('the JS target checks and takes the redirect mode once, as fetch is called'
     options.redirect = 'follow';
     expect(answering.call.stream.redirect).toBe('manual');
     // The caller's options stay as given, inherited ones too, and an accessor is read once
-    answering.call = {};
+    answering.call = { turn: true };
     let reads = 0;
     const inherited = Object.create({ method: 'POST', headers: { authorization: 'Bearer t' } }, {
       exactStream: { value: e => e, enumerable: true },
@@ -695,7 +699,7 @@ chromeTest('exactBodyFrom sends an app file from the page\'s store, a picked Fil
     received.push({ type: request.headers.get('content-type'), sha: new Bun.CryptoHasher('sha256').update(body).digest('hex'), length: body.length });
     return new Response('got ' + body.length, { headers: cors });
   } });
-  const dir = mkdtempSync(resolve(tmpdir(), 'exact-body-from-')), dist = resolve(dir, 'dist'), profile = resolve(dir, 'chrome');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-body-from-')), dist = resolve(dir, 'dist');
   const bytes = 'new Uint8Array(300000).map((_, i) => (Math.imul(i, 2654435761) >>> 13) & 255)';
   const expected = new Bun.CryptoHasher('sha256').update(new Uint8Array(300000).map((_, i) => (Math.imul(i, 2654435761) >>> 13) & 255)).digest('hex');
   writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Upload probe', app: { id: 'test.upload-probe', name: 'Upload probe' }, host: { web: {} } }));
@@ -722,7 +726,7 @@ const sources: Sources = { upload: async (_args, _store, storage) => {
 export const answer: Answer = (source, args, store, storage, native) => sources[source](args as never, store, storage, native) as never;
 `);
   const built = spawnSync(process.execPath, ['host/web-js/build.mjs', 'upload-probe', '--out', dist, '--render', 'none'], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, EXACT_APP_DIR: dir } });
-  let page, child, cdp, exited;
+  let page, suite;
   try {
     expect(built.status, built.stderr || built.stdout).toBe(0);
     page = Bun.serve({ port: 0, async fetch(request) {
@@ -731,12 +735,8 @@ export const answer: Answer = (source, args, store, storage, native) => sources[
       if (!file.startsWith(dist + sep) || !existsSync(file)) return new Response('not found', { status: 404 });
       return new Response(Bun.file(file));
     } });
-    child = spawn(chrome, ['--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--no-first-run', '--disable-background-networking', `--user-data-dir=${profile}`, 'about:blank'], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
-    cdp = new Cdp(child.stdio[3], child.stdio[4]);
-    exited = new Promise(resolveExit => child.on('exit', () => { cdp.fail('browser closed'); resolveExit(); }));
-    const { targetInfos } = await cdp.send('Target.getTargets');
-    const target = targetInfos.find(info => info.type === 'page') ?? await cdp.send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
+    suite = await cdpBrowser();
+    const { cdp } = suite, { sessionId } = await suite.page();
     const call = (method, params = {}) => cdp.send(method, params, sessionId);
     await call('Page.enable');
     const result = async () => (await call('Runtime.evaluate', { expression: `(async()=>{for(const end=performance.now()+20000;performance.now()<end;){await new Promise(r=>requestAnimationFrame(r));const value=document.querySelector('[data-testid="result"]')?.textContent;if(value)return value;}return document.body.innerText;})()`, returnByValue: true, awaitPromise: true })).result.value;
@@ -755,7 +755,7 @@ export const answer: Answer = (source, args, store, storage, native) => sources[
     expect(second.slice(0, 2)).toEqual(['typed 200 got 300000', 'picked 200 got 300000']);
     expect(received.slice(1)).toEqual([{ type: 'image/jpeg', sha: expected, length: 300000 }, { type: null, sha: expected, length: 300000 }]);
   } finally {
-    if (child?.pid) { try { if (process.platform === 'win32') child.kill(); else process.kill(-child.pid, 'SIGKILL'); } catch {} await exited; }
+    await suite?.close();
     page?.stop(true); destination.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
@@ -765,13 +765,13 @@ export const answer: Answer = (source, args, store, storage, native) => sources[
 // on the JS target, bound or literal, and again after the page reloads
 // (recipes F9, gallery F7): the web host's file store, as an object URL.
 chromeTest('an app:/data image shows from the page\'s store, after a reload too', async () => {
-  const dir = mkdtempSync(resolve(tmpdir(), 'exact-app-image-')), dist = resolve(dir, 'dist'), profile = resolve(dir, 'chrome');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-app-image-')), dist = resolve(dir, 'dist');
   const png = [137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,0,0,0,13,73,68,65,84,120,218,99,252,207,192,80,15,0,4,133,1,128,132,169,140,33,0,0,0,0,73,69,78,68,174,66,96,130];
   writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Image probe', app: { id: 'test.image-probe', name: 'Image probe' }, host: { web: {} } }));
   writeFileSync(resolve(dir, 'app.contract'), `shape Photo\n  path: string\n  how: string\ncomponent Probe\n  resource photo = photo() as shape Photo\n  view\n    column\n      text photo.how testId="how"\n      image photo.path width=4 height=4 testId="bound"\n      if photo.how != ""\n        image "app:/data/p.png" width=4 height=4 testId="literal"\n`);
   writeFileSync(resolve(dir, 'app.ts'), `import type { Answer, Sources } from './app.contract.d.ts';\nexport const appId = 'test.image-probe', grants = 'fs.read app:/data\\nfs.write app:/data';\nconst P = 'app:/data/p.png';\nconst sources: Sources = { photo: async (_args, _store, storage) => {\n  try { await storage!.fs.stat(P); return { path: P, how: 'found' }; } catch {}\n  await storage!.fs.atomicWriteFile(P, new Uint8Array([${png}]));\n  return { path: P, how: 'written' };\n} };\nexport const answer: Answer = (source, args, store, storage, native) => sources[source](args as never, store, storage, native) as never;\n`);
   const built = spawnSync(process.execPath, ['host/web-js/build.mjs', 'image-probe', '--out', dist, '--render', 'none'], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, EXACT_APP_DIR: dir } });
-  let page, child, cdp, exited;
+  let page, suite;
   try {
     expect(built.status, built.stderr || built.stdout).toBe(0);
     page = Bun.serve({ port: 0, async fetch(request) {
@@ -780,12 +780,8 @@ chromeTest('an app:/data image shows from the page\'s store, after a reload too'
       if (!file.startsWith(dist + sep) || !existsSync(file)) return new Response('not found', { status: 404 });
       return new Response(Bun.file(file));
     } });
-    child = spawn(chrome, ['--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--no-first-run', '--disable-background-networking', `--user-data-dir=${profile}`, 'about:blank'], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
-    cdp = new Cdp(child.stdio[3], child.stdio[4]);
-    exited = new Promise(resolveExit => child.on('exit', () => { cdp.fail('browser closed'); resolveExit(); }));
-    const { targetInfos } = await cdp.send('Target.getTargets');
-    const target = targetInfos.find(info => info.type === 'page') ?? await cdp.send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
+    suite = await cdpBrowser();
+    const { cdp } = suite, { sessionId } = await suite.page();
     const call = (method, params = {}) => cdp.send(method, params, sessionId);
     await call('Page.enable');
     // Each image's `src` (an object URL, never `app:`) once both have decoded, and what the source did.
@@ -795,7 +791,7 @@ chromeTest('an app:/data image shows from the page\'s store, after a reload too'
     await call('Page.reload');
     expect(await shown()).toEqual(['found', 'blob:', 'blob:', 1]);
   } finally {
-    if (child?.pid) { try { if (process.platform === 'win32') child.kill(); else process.kill(-child.pid, 'SIGKILL'); } catch {} await exited; }
+    await suite?.close();
     page?.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
@@ -833,20 +829,20 @@ test('rust-data decodes an ABI child scope before the production executor refuse
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-rust-data-'));
   const grants = 'net.fetch https://api.example\nnet.fetch https://outside.example\nsecret.keep token', set = normalized(grants);
   for (const name of ['rust-data.js', 'admission.js']) {
-    const source = readFileSync(resolve(ROOT, 'host/web-js', name), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'");
+    const source = readFileSync(resolve(ROOT, 'host/web-js', name), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'").replaceAll("'../web/address-space.js'", "'./address-space.js'");
     writeFileSync(resolve(dir, name), source);
   }
-  for (const name of ['http-body.js', 'grant-admission.js', 'faults.js', 'navigation.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
+  for (const name of ['http-body.js', 'grant-admission.js', 'address-space.js', 'faults.js', 'navigation.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
   writeFileSync(resolve(dir, 'admission-data.js'), `import {createGrantSet} from './admission.js';export const rustGrantSet=createGrantSet(${JSON.stringify(set)}),tsGrantSet=createGrantSet(${JSON.stringify(normalized(''))});\n`);
   const memory = new WebAssembly.Memory({ initial: 1 }), out = 32768;
   let output = new Uint8Array();
   const response = fill => {
     const bytes = [], u8 = value => bytes.push(value), u32 = value => bytes.push(value & 255, value >>> 8 & 255, value >>> 16 & 255, value >>> 24 & 255);
     const string = value => { const encoded = new TextEncoder().encode(value); u32(encoded.length); bytes.push(...encoded); };
-    u32(3); fill({ u8, u32, string }); output = Uint8Array.from(bytes); new Uint8Array(memory.buffer, out, output.length).set(output);
+    u32(4); fill({ u8, u32, string }); output = Uint8Array.from(bytes); new Uint8Array(memory.buffer, out, output.length).set(output);
   };
   const exports = {
-    memory, exact_logic_abi: () => 3, exact_logic_create: () => 1, exact_logic_alloc: () => 0, exact_logic_dealloc() {},
+    memory, exact_logic_abi: () => 4, exact_logic_create: () => 1, exact_logic_alloc: () => 0, exact_logic_dealloc() {},
     exact_logic_output: () => out, exact_logic_output_len: () => output.length,
     exact_logic_call(_session, pointer) {
       const code = new Uint8Array(memory.buffer)[pointer + 4];
@@ -884,12 +880,12 @@ test('ts-data installs the native Store facade and a later gpu-glue shader uses 
   writeFileSync(resolve(dir, 'ts-data.js'), readFileSync(resolve(ROOT, 'host/web-js/ts-data.js'), 'utf8')
     .replace('__APP_TS__', pathToFileURL(app).href).replace('__AUTH_IMPORT__', '').replace('__AUTH_INSTALL__', '')
     .replace("from './rt.js'", "from './rt-stub.js'"));
-  writeFileSync(resolve(dir, 'rt-stub.js'), `export const clock={agent:false,now:0},journal=[],Resources=[],inflight={n:0};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();\n`);
+  writeFileSync(resolve(dir, 'rt-stub.js'), `export const clock={agent:false,now:0},journal=[],Resources=[],inflight={n:0};export const drive=()=>{},Origin={now:()=>"app"};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();\n`);
   writeFileSync(resolve(dir, 'names.js'), `export const sourceTypes={read:[[],'s'],kept:[[],'s']};\n`);
-  writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(ROOT, 'host/web-js/admission.js'), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'"));
+  writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(ROOT, 'host/web-js/admission.js'), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'").replaceAll("'../web/address-space.js'", "'./address-space.js'"));
   writeFileSync(resolve(dir, 'admission-data.js'), `import {createGrantSet} from './admission.js';export const tsGrantSet=createGrantSet(${JSON.stringify(set)});\n`);
-  for (const name of ['grant-admission.js', 'faults.js', 'navigation.js', 'gpu-glue.js', 'gpu-assets.js', 'pace.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
-  cpSync(resolve(ROOT, 'host/web-js/ts-fetch.js'), resolve(dir, 'ts-fetch.js')); cpSync(resolve(ROOT, 'host/web-js/shape.js'), resolve(dir, 'shape.js'));
+  for (const name of ['grant-admission.js', 'address-space.js', 'faults.js', 'navigation.js', 'gpu-glue.js', 'gpu-assets.js', 'gpu-pads.js', 'gpu-tier.js', 'gpu-refusal.js', 'pace.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
+  cpSync(resolve(ROOT, 'host/web-js/ts-fetch.js'), resolve(dir, 'ts-fetch.js')); cpSync(resolve(ROOT, 'host/web-js/shape.js'), resolve(dir, 'shape.js')); cpSync(resolve(ROOT, 'host/web-js/uploads.js'), resolve(dir, 'uploads.js'));
   writeFileSync(resolve(dir, 'gpu.js'), `export default async()=>{};export const gpu_load=async()=>{},gpu_shader_names=()=> '["shader"]',gpu_shaders_clear=()=>{},gpu_shader=()=>true,gpu_unload=()=>{},gpu_child_view=()=>{};\n`);
   const descriptors = Object.fromEntries(['fetch', 'document', 'window', 'requestAnimationFrame', 'cancelAnimationFrame', 'devicePixelRatio'].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
   const shaderFetches = [], browserFetch = async input => { shaderFetches.push(String(input)); return new Response('shader'); };
@@ -901,6 +897,9 @@ test('ts-data installs the native Store facade and a later gpu-glue shader uses 
     cancelAnimationFrame: { configurable: true, value() {} }, devicePixelRatio: { configurable: true, value: 1 },
   });
   globalThis.exact = { devAssets: null, root: { dataset: {} }, views: new Map(), pendingSurfaces: [], generation: 0 };
+  // A browser with WebGPU: gpu-glue chooses its tier from the adapter before it loads (LLP 1139.003 D2, gpu-tier.js).
+  const gpuDescriptor = Object.getOwnPropertyDescriptor(globalThis.navigator, 'gpu');
+  Object.defineProperty(globalThis.navigator, 'gpu', { configurable: true, value: { requestAdapter: async () => ({ info: { vendor: 'apple', architecture: 'common-3' } }) } });
   try {
     const ts = await import(`${pathToFileURL(resolve(dir, 'ts-data.js')).href}?ts=${Date.now()}`), data = { q: [] };
     ts.install(data);
@@ -911,6 +910,7 @@ test('ts-data installs the native Store facade and a later gpu-glue shader uses 
     expect(shaderFetches.some(url => url.endsWith('/shaders/shader.wgsl'))).toBe(true);
     expect(globalThis.fetch).toBe(browserFetch);
   } finally {
+    if (gpuDescriptor) Object.defineProperty(globalThis.navigator, 'gpu', gpuDescriptor); else delete globalThis.navigator.gpu;
     for (const [name, descriptor] of Object.entries(descriptors)) {
       if (descriptor) Object.defineProperty(globalThis, name, descriptor); else delete globalThis[name];
     }
@@ -944,13 +944,13 @@ export function answer(name, args, store, storage) {
 `);
   writeFileSync(resolve(dir, 'ts-data.js'), readFileSync(resolve(ROOT, 'host/web-js/ts-data.js'), 'utf8')
     .replace('__APP_TS__', pathToFileURL(app).href).replace('__AUTH_IMPORT__', '').replace('__AUTH_INSTALL__', ''));
-  writeFileSync(resolve(dir, 'rt.js'), `export const clock={agent:false,now:0},journal=[],Resources=[],inflight={n:0};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();\n`);
+  writeFileSync(resolve(dir, 'rt.js'), `export const clock={agent:false,now:0},journal=[],Resources=[],inflight={n:0};export const drive=()=>{},Origin={now:()=>"app"};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();\n`); writeFileSync(resolve(dir, 'rt-link.js'), "import * as rt from './rt.js'; export { rt };\n"); // (and rt-link.js, ts-stream.js's way to them)
   const ledger = '{"days":["[",{"id":"s","transactions":["[",{"id":"s","amount":"n"}]}],"note":["?","s"]}';
   writeFileSync(resolve(dir, 'names.js'), `export const sourceTypes={ledger:[["s"],${ledger}],later:[[],${ledger}],read:[[],"s"],stream:[[],"s"]};\n`);
-  writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(ROOT, 'host/web-js/admission.js'), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'"));
+  writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(ROOT, 'host/web-js/admission.js'), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'").replaceAll("'../web/address-space.js'", "'./address-space.js'"));
   writeFileSync(resolve(dir, 'admission-data.js'), `import {createGrantSet} from './admission.js';export const tsGrantSet=createGrantSet(${JSON.stringify(normalized('fs.read app:/data'))});\n`);
-  for (const name of ['grant-admission.js', 'faults.js', 'navigation.js', 'storage-environment.js', 'http-body.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
-  for (const name of ['ts-fetch.js', 'ts-stream.js', 'ts-body-from.js', 'shape.js']) cpSync(resolve(ROOT, 'host/web-js', name), resolve(dir, name));
+  for (const name of ['grant-admission.js', 'address-space.js', 'faults.js', 'navigation.js', 'storage-environment.js', 'http-body.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
+  for (const name of ['ts-fetch.js', 'ts-stream.js', 'ts-body-from.js', 'shape.js', 'uploads.js']) cpSync(resolve(ROOT, 'host/web-js', name), resolve(dir, name));
   try {
     const ts = await import(`${pathToFileURL(resolve(dir, 'ts-data.js')).href}?shape=${Date.now()}`), data = { q: [] };
     ts.install(data);
@@ -964,9 +964,9 @@ export function answer(name, args, store, storage) {
     // What `JSON.stringify` leaves out is not there for Hermes either.
     expect(data.answer('ledger', ['dropped'], new Map()).v).toEqual([[['d', [['a', 1]]]], 'n']);
     await expect(data.answer('later', [], new Map()).promise).rejects.toThrow('`later` answered outside its shape: field `days`: field `transactions`: field `cents` is not in the shape');
-    // A storage refusal's code is Hermes's (kanban F28): a drive with no scratch store.
+    // A storage refusal's code is Hermes's (kanban F28): a drive with no scratch store reads an empty one.
     globalThis.location = { href: 'http://localhost/?agent' };
-    expect(await data.answer('read', [], new Map()).promise).toBe('Unavailable agent storage is unavailable in agent mode unless the drive names a scratch store (--storage <name>)');
+    expect(await data.answer('read', [], new Map()).promise).toBe('Unavailable ENOENT filesystem: no such file or directory: app:/data/x (a drive that names no scratch store reads an empty one; --storage <name> names one)');
     // A stream is the answer's, opened by the runtime, admitted as the wasm host admits it: a socket by
     // `net.websocket` (x2apps dash diary: refused as `net.fetch`). Outside an answer it says where to start one.
     const stream = data.answer('stream', [], new Map());
@@ -990,7 +990,7 @@ test('the web build retains every ambient diagnostic with its source location', 
       writeFileSync(resolve(dir, file), [
         "export const prefix = 'hello';",
         'export const a = () => Date.now();',
-        'export const b = () => globalThis.setTimeout(() => {}, 1);',
+        'export const b = () => globalThis.setInterval(() => {}, 1);',
         "export const c = () => Date['now']();",
         'export const d = () => Math[`random`]();',
         '',
@@ -999,7 +999,7 @@ test('the web build retains every ambient diagnostic with its source location', 
         cwd: ROOT, encoding: 'utf8', env: { ...process.env, EXACT_APP_DIR: dir, EXACT_WEB_DIST: resolve(dir, 'dist') },
       });
       expect(built.status, built.stderr).toBe(1);
-      for (const [line, api] of [[2, 'Date.now()'], [3, 'setTimeout()'], [4, 'Date.now()'], [5, 'Math.random()']]) {
+      for (const [line, api] of [[2, 'Date.now()'], [3, 'setInterval()'], [4, 'Date.now()'], [5, 'Math.random()']]) {
         expect(built.stderr, built.stderr).toContain(`${file}:${line}:24: ${api} is unavailable in data sources`);
       }
       expect(built.stderr).toContain('the web build (the JS target) failed');
@@ -1036,8 +1036,8 @@ test("the JS target refuses a data module's clock, randomness and timers as Herm
       'intl-format-alias': 'Intl.DateTimeFormat.format()', 'intl-format-alias-undefined': 'Intl.DateTimeFormat.format()',
       'intl-parts-alias': 'Intl.DateTimeFormat.formatToParts()', 'intl-parts-alias-undefined': 'Intl.DateTimeFormat.formatToParts()',
       'intl-format-getter': 'Intl.DateTimeFormat.format()', 'intl-format-computed': 'Intl.DateTimeFormat.format()',
-      'intl-parts-prototype': 'Intl.DateTimeFormat.formatToParts()', timeout: 'setTimeout()', interval: 'setInterval()',
-      'computed-timeout': 'setTimeout()', frame: 'requestAnimationFrame()', performance: 'performance.now()' };
+      'intl-parts-prototype': 'Intl.DateTimeFormat.formatToParts()', interval: 'setInterval()',
+      'computed-interval': 'setInterval()', frame: 'requestAnimationFrame()', performance: 'performance.now()' };
     for (const [form, api] of Object.entries(forms)) {
       const atInit = answer('atInit', [form]);
       expect(atInit.startsWith(api) && atInit.includes('as an argument'), `${form} at initialization: ${atInit}`).toBe(true);
@@ -1146,12 +1146,12 @@ export function answer(name, args, store, storage) {
 }`);
     writeFileSync(resolve(dir, 'ts-data.js'), readFileSync(resolve(ROOT, 'host/web-js/ts-data.js'), 'utf8')
       .replace('__APP_TS__', './source.js').replace('__AUTH_IMPORT__', '').replace('__AUTH_INSTALL__', ''));
-    writeFileSync(resolve(dir, 'rt.js'), 'export const clock={now:0},journal=[],Resources=[],inflight={n:0};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();');
+    writeFileSync(resolve(dir, 'rt.js'), 'export const clock={now:0},journal=[],Resources=[],inflight={n:0};export const drive=()=>{},Origin={now:()=>"app"};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();');
     writeFileSync(resolve(dir, 'names.js'), `export const sourceTypes=${JSON.stringify(Object.fromEntries([...methods, 'open', 'work', 'directories', 'document'].map(n => [n, [[], 's']])))};`);
-    writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(ROOT, 'host/web-js/admission.js'), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'"));
+    writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(ROOT, 'host/web-js/admission.js'), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'").replaceAll("'../web/address-space.js'", "'./address-space.js'"));
     writeFileSync(resolve(dir, 'admission-data.js'), `import {createGrantSet} from './admission.js';export const tsGrantSet=createGrantSet(${JSON.stringify(normalized(spec))});`);
-    for (const name of ['grant-admission.js', 'faults.js', 'navigation.js', 'http-body.js', 'storage-environment.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
-    cpSync(resolve(ROOT, 'host/web-js/ts-fetch.js'), resolve(dir, 'ts-fetch.js')); cpSync(resolve(ROOT, 'host/web-js/shape.js'), resolve(dir, 'shape.js'));
+    for (const name of ['grant-admission.js', 'address-space.js', 'faults.js', 'navigation.js', 'http-body.js', 'storage-environment.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
+    cpSync(resolve(ROOT, 'host/web-js/ts-fetch.js'), resolve(dir, 'ts-fetch.js')); cpSync(resolve(ROOT, 'host/web-js/shape.js'), resolve(dir, 'shape.js')); cpSync(resolve(ROOT, 'host/web-js/uploads.js'), resolve(dir, 'uploads.js'));
     // No storage adapters are installed: a grant refusal must not need them.
     try {
       const ts = await import(pathToFileURL(resolve(dir, 'ts-data.js')).href), data = { q: [] };
@@ -1175,7 +1175,7 @@ test('storage re-homes an answer\'s writes to the background before retiring it'
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-rehome-'));
   try {
     cpSync(resolve(ROOT, 'host/web/storage.js'), resolve(dir, 'storage.js'));
-    writeFileSync(resolve(dir, 'storage-environment.js'), "export const directories = {}; export const agentStorageRefusal = 'no store'; export const storageKey = () => 'k';");
+    writeFileSync(resolve(dir, 'storage-environment.js'), "export const directories = {}; export const agentStorageRefusal = 'no store'; export const agentReads = []; export const emptyRead = () => []; export const storageKey = () => 'k';");
     // Each write lands when the test says.
     writeFileSync(resolve(dir, 'storage-fs.js'), 'export const createFileSystem = () => ({ writeFile: () => new Promise(ok => globalThis.landWrite.push(ok)) });');
     globalThis.landWrite = [];
@@ -1227,13 +1227,14 @@ async function until(pred) { for (const end = realNow() + 10_000; !pred() && rea
 const stuck = async () => { for (let i = 0; i < 20; i++) await checkpoint(); return 'stuck'; }; // twenty turns: nothing outside is left to wait on
 let context = null;
 const backgroundOwner = {};
-self.__exact_host = op => {
+self.__exact_host = (op, name) => { if (op === 12 && name === 'listen') return ''; // the prelude's load-time ask (LLP 1133.005): no listener
   if (!context) throw new Error('host call outside an answer');
   if (op === 5) return;
   if (op === 13) return '1';
 };
 const storage = api.createStorage(self, { appId: 'test', grantSet: null }, () => context.owner, 'k');
 if (typeof api.bindAnswerStorage === 'function') api.bindAnswerStorage(self, storage, () => context.owner);
+eval(readFileSync(${JSON.stringify(resolve(ROOT, 'js/src/binary.js'))}, 'utf8'));
 eval(readFileSync(${JSON.stringify(resolve(ROOT, 'js/src/prelude.js'))}, 'utf8'));
 self.__exact_storage = storage.capability;
 self.__exact_install_storage();
@@ -1281,7 +1282,7 @@ try {
   postMessage('error: ' + (error && error.stack || error));
 }
 `);
-  writeFileSync(resolve(dir, 'storage-environment.js'), "export const directories = {}; export const agentStorageRefusal = 'no store'; export const storageKey = () => 'k';");
+  writeFileSync(resolve(dir, 'storage-environment.js'), "export const directories = {}; export const agentStorageRefusal = 'no store'; export const agentReads = []; export const emptyRead = () => []; export const storageKey = () => 'k';");
   writeFileSync(resolve(dir, 'storage-fs.js'), `export const createFileSystem = () => ({
   writeFile: () => new Promise(ok => globalThis.land.push(() => ok(''))),
   readFile: () => new Promise(ok => globalThis.land.push(() => ok('contents'))),
@@ -1322,13 +1323,14 @@ const stuck = async () => { for (let i = 0; i < 20; i++) await checkpoint(); ret
 self.land = [];
 self.writes = 0;
 let context = null;
-self.__exact_host = op => {
+self.__exact_host = (op, name) => { if (op === 12 && name === 'listen') return ''; // the prelude's load-time ask (LLP 1133.005): no listener
   if (!context) throw new Error('host call outside an answer');
   if (op === 5) return;
   if (op === 13) return '1';
 };
 const storage = api.createStorage(self, { appId: 'test', grantSet: null }, () => context.owner, 'k');
 if (typeof api.bindAnswerStorage === 'function') api.bindAnswerStorage(self, storage, () => context.owner);
+eval(readFileSync(${JSON.stringify(resolve(ROOT, 'js/src/binary.js'))}, 'utf8'));
 eval(readFileSync(${prelude}, 'utf8'));
 self.__exact_storage = storage.capability;
 self.__exact_install_storage();
@@ -1338,7 +1340,7 @@ const scratch = owner => ({ owner });
 ${body}
 })();
 `);
-  writeFileSync(resolve(dir, 'storage-environment.js'), "export const directories = {}; export const agentStorageRefusal = 'no store'; export const storageKey = () => 'k';");
+  writeFileSync(resolve(dir, 'storage-environment.js'), "export const directories = {}; export const agentStorageRefusal = 'no store'; export const agentReads = []; export const emptyRead = () => []; export const storageKey = () => 'k';");
   writeFileSync(resolve(dir, 'storage-fs.js'), `export const createFileSystem = () => ({
   writeFile: () => new Promise(ok => { globalThis.writes++; globalThis.land.push(() => ok('')); }),
   readFile: () => new Promise(ok => globalThis.land.push(() => ok('contents'))),
@@ -1489,9 +1491,9 @@ test('the web build\'s deadline covers a stalled body, and keeps the caller\'s o
     } finally { quick.stop(true); }
     const aborted = new AbortController(); aborted.abort();
     const own = await fetchWith(set, new Request(origin.url.href, { signal: aborted.signal }), { exactTimeout: 5000 }).catch(e => e);
-    // The caller's own abort is the native executor's `Aborted` (513450bda, LLP 1109 D3), not a lost connection.
-    expect([own.name, own.kind]).toEqual(['FetchError', 'Aborted']);
+    // The caller's own abort rejects with its signal's reason, as Fetch and native do, never a lost connection (LLP 1109 D3).
+    expect([own === aborted.signal.reason, own.name]).toEqual([true, 'AbortError']);
     const kept = await fetchWith(set, new Request(origin.url.href, { signal: aborted.signal }), { signal: undefined, exactTimeout: 5000 }).catch(e => e);
-    expect(kept.kind).toBe('Aborted');
+    expect(kept).toBe(aborted.signal.reason);
   } finally { origin.stop(true); }
 });

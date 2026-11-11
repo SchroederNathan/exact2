@@ -58,6 +58,7 @@ final class TextMetricsTests: XCTestCase {
             else { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
             appended.append(NSAttributedString(string: run.text, attributes: attrs))
         }
+        TextEngine.setBaseDirection(appended, direction: spec.direction)
         let actual = engine.attributed(spec)
         XCTAssertEqual(Array(actual.string.utf16), Array(appended.string.utf16))
         XCTAssertTrue(actual.isEqual(to: appended))
@@ -1205,7 +1206,7 @@ final class TextMetricsTests: XCTestCase {
                 // in f32, then C carries the resolved length, not the ratio.
                 var run = ExactTextRun()
                 run.text = bytes.baseAddress; run.len = bytes.count
-                run.font_size = 14.72; run.font_weight = 400; run.font_family = 1
+                run.font_size = 14.72; run.font_weight = 400; run.font_family = 1; run.font_stretch = 100
                 run.letter_spacing = 0.1
                 run.has_line_height = childHeight == nil ? 0 : 1
                 run.line_height = childHeight ?? 0
@@ -1331,7 +1332,7 @@ final class TextMetricsTests: XCTestCase {
             return bytes.withUnsafeBufferPointer { bytes in
                 var run = ExactTextRun()
                 run.text = bytes.baseAddress; run.len = bytes.count
-                run.font_size = 15; run.font_weight = 500
+                run.font_size = 15; run.font_weight = 500; run.font_stretch = 100
                 var strut = run; strut.text = nil; strut.len = 0
                 return withUnsafePointer(to: &run) { run in
                     var request = ExactMeasureRequest()

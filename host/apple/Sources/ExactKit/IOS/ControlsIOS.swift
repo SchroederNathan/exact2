@@ -11,7 +11,7 @@
 #if os(iOS) || os(tvOS)
 import UIKit
 
-/// The checklist mark: an SF Symbol circle at the body text's size, filled
+/// The checklist mark: an SF Symbol circle scaled with the body text, filled
 /// and checked when on (tvOS: a 16×16 rounded square). A radio is drawn on
 /// it, with its own symbols (`ExactRadio`, RadioIOS.swift). VoiceOver reads
 /// a checkbox as it reads UIKit's own toggles (`updateAccessibility`).
@@ -33,18 +33,22 @@ class ExactCheckbox: UIControl {
     #if os(tvOS)
     override var intrinsicContentSize: CGSize { CGSize(width: 16, height: 16) }
     #else
-    /// The mark's symbol at the reader's body size, Dynamic Type included;
-    /// on, its checkmark white over the accent.
+    /// The mark's side: UIKit's 22-point circle at the default text size,
+    /// scaled with the body style by `UIFontMetrics` to 44 at most, about
+    /// where UIKit's own list checkmark stops (48 by 43 at the largest
+    /// size). At the body font's `.large` symbol scale it had grown to 80
+    /// points there and outweighed its row (LLP 1116.019 D1).
+    var side: CGFloat {
+        min(44, ceil(UIFontMetrics(forTextStyle: .body).scaledValue(for: 22, compatibleWith: traitCollection)))
+    }
+    /// The mark's symbol, drawn fitted to `side`; on, its checkmark white
+    /// over the accent.
     func mark(on: Bool, tint: UIColor) -> UIImage? {
-        let font = UIFont.preferredFont(forTextStyle: .body, compatibleWith: traitCollection)
-        let size = UIImage.SymbolConfiguration(font: font, scale: .large)
+        let size = UIImage.SymbolConfiguration(pointSize: side)
         guard on else { return UIImage(systemName: "circle", withConfiguration: size)?.withTintColor(tint, renderingMode: .alwaysOriginal) }
         return UIImage(systemName: "checkmark.circle.fill", withConfiguration: size.applying(UIImage.SymbolConfiguration(paletteColors: [.white, tint])))
     }
-    override var intrinsicContentSize: CGSize {
-        let s = mark(on: false, tint: .label)?.size ?? CGSize(width: 22, height: 22)
-        return CGSize(width: ceil(s.width), height: ceil(s.height))
-    }
+    override var intrinsicContentSize: CGSize { CGSize(width: side, height: side) }
     /// A finger's target is 44 points each way at least (Apple's minimum),
     /// whatever the mark's size: the touch reaches past the mark's box,
     /// which stays the mark's for layout (LLP 1115.000 D13.2). Where two
@@ -105,7 +109,7 @@ class ExactCheckbox: UIControl {
         // smaller than the mark.
         let tint = isOn ? fill.withAlphaComponent(alpha) : (isEnabled ? UIColor.tertiaryLabel : .quaternaryLabel)
         guard let image = mark(on: isOn, tint: tint) else { return }
-        let scale = min(1, side / max(image.size.width, image.size.height))
+        let scale = min(side, self.side) / max(image.size.width, image.size.height)
         let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
         image.draw(in: CGRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2, width: size.width, height: size.height))
         #endif
@@ -135,11 +139,15 @@ final class ControlHost: NSObject {
     var spinners: [UInt32: UIActivityIndicatorView] = [:]
     /// Each determinate `progress`'s bar (LLP 1116 D8), beside them.
     var bars: [UInt32: UIProgressView] = [:]
-    /// Each native button's face as the runner last gave it. A face is the
-    /// control's viewless contents, which change only in a batch that says
-    /// so (`Batch.controls`), and its own props, which change only in a
-    /// batch that touches it: every other batch keeps it, and asks the
-    /// runner nothing.
+    /// Each native button's face as the runner last gave it: what its
+    /// control shows, and what `NodeView.face` tells every other reader (a
+    /// tab bar or navigation bar item, a menu row, an accessibility label).
+    /// A face is the button's viewless contents, which change only in a
+    /// batch that says so (`Batch.controls`), and its own props, which
+    /// change only in a batch that touches it: `Presenter.apply` drops it as
+    /// that batch or op arrives, and the next read asks the runner. Every
+    /// other batch keeps it, so a commit that changes no button waits on
+    /// the owner thread for none.
     private var faces: [UInt32: ButtonFace] = [:]
     func face(_ id: UInt32) -> ButtonFace {
         if let face = faces[id] { return face }
@@ -154,6 +162,17 @@ final class ControlHost: NSObject {
     private func control(for node: NodeView) -> UIControl {
         let kind = ControlKinds.kind(node.props)
         if let existing = controls[node.id], kinds[node.id] == kind { return existing }
+        // A row the pool reused brings its button back (`park`).
+        if kind == "button", controls[node.id] == nil,
+           let kept = node.subviews.lazy.compactMap({ $0 as? NativeButtonIOS }).first(where: { $0.owner === node }) {
+            kept.tag = Int(node.id)
+            controls[node.id] = kept
+            kinds[node.id] = kind
+            #if os(iOS)
+            presenter.menus.adoptNativeMenu(kept, of: node.id)
+            #endif
+            return kept
+        }
         controls.removeValue(forKey: node.id)?.removeFromSuperview()
         menus.removeValue(forKey: node.id)
         appliedRange.removeValue(forKey: node.id)
@@ -184,16 +203,97 @@ final class ControlHost: NSObject {
         return made
     }
 
-    /// Asks for the face of `id` again at the next sync.
-    func faceChanged(_ id: UInt32) { faces.removeValue(forKey: id) }
+    /// Whether a native button parks with its row (NodePool) rather than
+    /// going as a heavy leaf: drawn in its node, not glass, showing no menu,
+    /// and not under a touch. A `UIButton` holds no value, and its action
+    /// reaches whichever node owns it, so nothing of one row reaches the
+    /// next. A button leaving the window and a new one configured cost a
+    /// list's new row more than the rest of it. A pull-down keeps its menu,
+    /// built again for the next row (`MenuHost.adoptNativeMenu`). One not
+    /// made yet (in a closed popover, `unshown`) parks as its bare node,
+    /// the shape the next row's create ops give it (`NodePool.take`).
+    func parks(_ node: NodeView) -> Bool {
+        guard node.isNativeButton else { return false }
+        guard let b = controls[node.id] as? NativeButtonIOS else {
+            return controls[node.id] == nil && !node.subviews.contains { $0 is UIControl }
+        }
+        guard b.owner === node, b.superview === node, !b.isGlass, !b.isTracking, !b.isHighlighted else { return false }
+        #if os(iOS)
+        return b.menuAtRest
+        #else
+        return true
+        #endif
+    }
+    /// `id`'s node parks: its button stays in it, out of every map, until the
+    /// node's next id takes it back (`control(for:)`).
+    func park(_ id: UInt32) {
+        #if os(iOS)
+        presenter.menus.parkNativeMenu(id)
+        #endif
+        controls.removeValue(forKey: id)
+        reported.removeValue(forKey: id); faces.removeValue(forKey: id); kinds.removeValue(forKey: id)
+        menus.removeValue(forKey: id); lastRange.removeValue(forKey: id); appliedRange.removeValue(forKey: id)
+        picked.removeValue(forKey: id)
+    }
 
-    /// `contents`: a control's viewless contents may have changed (a batch
-    /// with `controls`, or a sync outside any batch); `touched`, the nodes
-    /// the batch changed.
-    func sync(contents: Bool = true, touched: [UInt32] = []) {
-        if contents { faces.removeAll() } else { for id in touched { faces.removeValue(forKey: id) } }
-        let owners = ControlKinds.indexed.flatMap { presenter.carrying($0) }.filter { $0.kind == "control" }
+    /// Whether a native button's control could not show: it is in a closed
+    /// `dialog` or popover (`MenuHost.inClosedBox`), which UIKit's menu and
+    /// alert present from its face, or in what a native bar stands for (a
+    /// lifted header, an adopted tablist: `NavigationHost.covers`), whose
+    /// items are made from faces too, while the host hides it: the cover
+    /// leaves after the box shows again. It gets one when that changes, as
+    /// a field in a closed box waits for it to show.
+    private func unshown(_ node: NodeView) -> Bool {
+        if presenter.menus.inClosedBox(node) { return true }
+        let covers = presenter.navigation.covers
+        guard covers.values.contains(.whole) else { return false }
+        var at: UIView? = node
+        while let view = at {
+            if let box = view as? NodeView, covers[box.id] == .whole, box.hiddenByHost { return true }
+            at = view.superview
+        }
+        return false
+    }
+
+    /// The native buttons the last sync left without a control (`unshown`).
+    private var waiting: Set<UInt32> = []
+    /// A closed box now shows in Exact's views (the agent's top layer, a
+    /// sheet, a context menu's preview): its buttons get their controls now,
+    /// whether or not a batch laid it out.
+    func syncShown() {
+        if waiting.contains(where: { presenter.views[$0].map { !unshown($0) } ?? false }) { sync(contents: false) }
+    }
+
+    /// Asks for the face of `id` again at its next read.
+    func faceChanged(_ id: UInt32) { faces.removeValue(forKey: id) }
+    /// Asks for every face again at its next read.
+    func facesChanged() { faces.removeAll() }
+
+    /// Configures again a control whose accent follows the tint
+    /// (`AccentColor`), which `sync` resolved by the tint its owner had then:
+    /// UIKit's default for one configured out of the window. Not while UIKit
+    /// dims the tint, which it shows unchanged after, nor for a control still
+    /// leaving after its owner went.
+    func tintChanged(_ owner: NodeView) {
+        guard owner.tintAdjustmentMode != .dimmed, presenter.views[owner.id] === owner,
+              owner.style["accent_color"]?.namesTint == true, let control = controls[owner.id] else { return }
+        configure(control, owner, on: nil)
+    }
+
+    /// `contents`: a sync outside any batch, which reads every face again;
+    /// a batch has already dropped the faces it changes (`Presenter.apply`).
+    /// `changed`, `touched`: after a batch, the views it touched with their
+    /// ancestors, and those whose props or style it changed or that it put
+    /// under another parent; a control nothing at or in changed, nor at or
+    /// above touched, stands as the last sync left it (`stands`).
+    func sync(contents: Bool = true, changed: Set<UInt32>? = nil, touched: Set<UInt32> = []) {
+        if contents { faces.removeAll() }
+        // A face read with no control (a tab's, a menu row's) goes with its view.
+        for id in faces.keys where controls[id] == nil && presenter.views[id] == nil { faces.removeValue(forKey: id) }
+        let all = ControlKinds.indexed.flatMap { presenter.carrying($0) }.filter { $0.kind == "control" }
+        let owners = all.filter { !($0.isNativeButton && unshown($0)) }
         let live = Set(owners.map(\.id))
+        waiting = Set(all.map(\.id)).subtracting(live)
         // A leaving control keeps drawing until its exit ends (LLP 1069.011 D9).
         let leaving = Set(presenter.leaving.values.flatMap { $0.members.map(\.id) })
         for id in Array(controls.keys) where !live.contains(id) && !leaving.contains(id) {
@@ -208,6 +308,7 @@ final class ControlHost: NSObject {
         }
         var sizes: [(UInt32, CGSize?)] = []
         for owner in owners {
+            if let changed, stands(owner, changed, touched) { continue }
             let native = owner.style["appearance"]?.string != "none"
             let control = control(for: owner)
             if !native {
@@ -218,45 +319,34 @@ final class ControlHost: NSObject {
             let mount = owner.controlMount
             if control.superview !== mount { mount.addSubview(control) }
             if control.isHidden != owner.cssVisibilityHidden { control.isHidden = owner.cssVisibilityHidden }
-            let on = owner.props["checked"].map { $0 == "true" }
-            let accent = owner.channels("accent_color").map { TextEngine.color($0) }
-            #if os(tvOS)
-            if let b = control as? NativeButtonIOS {
-                configureNative(b, owner, accent: accent)
-            } else if let c = control as? ExactCheckbox {
-                if let on { c.isOn = on }
-                assign(c, \.accent, accent)
-            } else {
-                configureValue(control, owner, accent: accent)
-            }
-            #else
-            if let b = control as? NativeButtonIOS {
-                configureNative(b, owner, accent: accent)
-            } else if let s = control as? UISwitch {
-                if let on, s.isOn != on { s.setOn(on, animated: s.window != nil) }
-                assign(s, \.onTintColor, accent)
-            } else if let c = control as? ExactCheckbox {
-                if let on { c.isOn = on }
-                assign(c, \.accent, accent)
-            } else {
-                configureValue(control, owner, accent: accent)
-            }
-            #endif
+            configure(control, owner, on: owner.props["checked"].map { $0 == "true" })
             if let c = control as? ExactCheckbox {
                 c.ariaUnavailable = owner.ariaUnavailable
             }
             if !(control is NativeButtonIOS) {
                 assign(control, \.isEnabled, !owner.disabled)
-                assign(control, \.accessibilityLabel, owner.props["accessibilityLabel"])
+                assign(control, \.accessibilityLabel, owner.authoredLabel)
                 assign(control, \.accessibilityIdentifier, owner.props["testId"])
             }
-            let natural = naturalSize(control, owner)
+            // A native button's box is its frame (below): its natural size is
+            // the kernel's, from the measurement, and asked here of none.
+            var natural = control is NativeButtonIOS ? .zero : naturalSize(control, owner)
             let box = control is NativeButtonIOS ? owner.bounds : owner.contentBox()
-            // A slider's track spans its box, as the web's does; a native
-            // button fills it, its chrome inside (LLP 1069.011 D6); the
-            // others keep their own size. A select aligns its closed value
-            // inside the box; unstyled controls stay centred.
-            if control is NativeButtonIOS {
+            #if os(iOS)
+            // A select its box holds narrower than its widest option wraps its
+            // title and grows taller, as a pop-up button does under Auto Layout,
+            // rather than running past its box (unit-converter at the largest
+            // text size, round 22). Its width stays the widest option's (D3).
+            if owner.props["type"] == "select", let button = control as? UIButton, box.width > 0, box.width < natural.width - 0.5 {
+                natural.height = max(natural.height, selectHeight(button, width: box.width))
+            }
+            let fillsSelect = owner.props["type"] == "select"
+            #else
+            let fillsSelect = false
+            #endif
+            if fillsSelect {
+                assign(control, \.frame, box)
+            } else if control is NativeButtonIOS {
                 // The box is the button's alignment rect, as its natural size is.
                 let frame = control.frame(forAlignmentRect: box)
                 if control.frame != frame { control.frame = frame }
@@ -268,8 +358,8 @@ final class ControlHost: NSObject {
                 #endif
                 var x = box.midX - width / 2
                 #if os(iOS)
-                if owner.props["type"] == "select" {
-                    switch selectAlignment(owner) {
+                if control is UIDatePicker {
+                    switch valueAlignment(owner) {
                     case .left: x = box.minX
                     case .right: x = box.maxX - width
                     default: break
@@ -296,14 +386,64 @@ final class ControlHost: NSObject {
         syncProgress()
     }
 
+    /// Configures `control` from its owner, its accent by the owner's tint
+    /// now; a nil `on` leaves a switch's or checkbox's checked state alone.
+    private func configure(_ control: UIControl, _ owner: NodeView, on: Bool?) {
+        let accent = owner.channels("accent_color").map { TextEngine.color($0) }
+        #if os(tvOS)
+        if let b = control as? NativeButtonIOS {
+            configureNative(b, owner, accent: accent)
+        } else if let c = control as? ExactCheckbox {
+            if let on { c.isOn = on }
+            assign(c, \.accent, accent)
+        } else {
+            configureValue(control, owner, accent: accent)
+        }
+        #else
+        if let b = control as? NativeButtonIOS {
+            configureNative(b, owner, accent: accent)
+        } else if let s = control as? UISwitch {
+            if let on, s.isOn != on { s.setOn(on, animated: s.window != nil) }
+            assign(s, \.onTintColor, accent)
+        } else if let c = control as? ExactCheckbox {
+            if let on { c.isOn = on }
+            assign(c, \.accent, accent)
+        } else {
+            configureValue(control, owner, accent: accent)
+        }
+        #endif
+    }
+
+    /// Whether a batch left `owner`'s control as it was: neither the owner
+    /// nor anything in it changed (each touched view's ancestors are in
+    /// `changed`; a button's face stands), nothing at or above it was
+    /// restyled or moved (an inherited disabled or a closing box), and it
+    /// is mounted where it was. A live list's tick then configures its
+    /// changed rows' controls, not every row's.
+    private func stands(_ owner: NodeView, _ changed: Set<UInt32>, _ touched: Set<UInt32>) -> Bool {
+        guard !changed.contains(owner.id), !touched.contains(owner.id), let control = controls[owner.id],
+              control.superview === owner.controlMount,
+              !(control is NativeButtonIOS) || faces[owner.id] != nil else { return false }
+        var at = presenter.accessibilityParent(of: owner)
+        while let view = at {
+            if let node = view as? NodeView, touched.contains(node.id) { return false }
+            at = presenter.accessibilityParent(of: view)
+        }
+        return true
+    }
+
     @objc private func changed(_ sender: UIControl) {
         let id = UInt32(sender.tag)
-        guard presenter.views[id] != nil else { return }
+        guard let node = presenter.views[id] else { return }
+        // Read first: the press's batch syncs a bound control back to `checked`.
         #if os(tvOS)
         let on = (sender as? ExactCheckbox)?.isOn ?? false
         #else
         let on = (sender as? UISwitch)?.isOn ?? (sender as? ExactCheckbox)?.isOn ?? false
         #endif
+        // A click on a checkbox is heard before its `input` and `change` (HTML
+        // dispatches `click`, then fires those as its activation behaviour).
+        if node.handlers.contains("press") { presenter.press(id) }
         presenter.checked(id, on)
         // The committed state is authoritative: an action that refused the
         // toggle snaps the control back (D4).
@@ -316,10 +456,12 @@ final class ControlHost: NSObject {
     }
 
     /// The agent's `tap` (LLP 1069.001 D9): the control's own activation.
-    func activate(_ node: NodeView) -> Bool? {
+    func activate(_ node: NodeView, before: (CGPoint?) -> Bool = { _ in true }) -> Bool? {
         // A native button takes the ordinary tap path (LLP 1069.011 D10).
         guard let control = controls[node.id], !(control is NativeButtonIOS) else { return nil }
         guard control.window != nil, control.isEnabled, !node.inert else { return false }
+        let point = control.convert(CGPoint(x: control.bounds.midX, y: control.bounds.midY), to: nil)
+        guard before(point), controls[node.id] === control, control.window != nil, control.isEnabled, !node.disabled, !node.inert else { return false }
         // A radio's tap, the host's own (x2apps survey #2).
         if control is ExactRadio { radioTapped(control); return true }
         #if os(tvOS)

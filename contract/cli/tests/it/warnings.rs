@@ -78,6 +78,9 @@ fn what_the_bar_places_or_the_compiler_cannot_see_is_not_warned() {
         "  row\n    box background-color=\"-exact-system-blue\"\n      text \"AL\"\n    text \"Ada\" role=\"heading\" aria-level=1\n    row\n      image \"symbol:sf/bell.slash\"\n      text \"Muted\"",
         // A pressable group around the heading is the title, tapped.
         "  button press=go\n    text \"Ada\" role=\"heading\" aria-level=1\n    text \"online\"",
+        // Readouts (LLP 1075.003 §9.15): a status of a dot and a text after
+        // the buttons, a status text before the heading.
+        "  text \"Saved\" role=\"status\"\n  text \"Log\" role=\"heading\"\n  button press=go\n    text \"Add\"\n  row role=\"status\" gap=6\n    view width=7 height=7 border-radius=3.5 background-color=\"-exact-system-blue\"\n    text \"Clock\" font-family=\"Menlo\" font-size=12",
         // `if`, `for` and a computed role are given the benefit.
         "  text \"List\" role=\"heading\" aria-level=1\n  text \"sub\"\n  if q != \"\"\n    text q\n  for x in [\"a\"] key=x\n    text x\n  text \"c\" role=(q == \"\" ? \"note\" : \"status\")",
         // Shown on no host, or over the page when opened.
@@ -123,6 +126,19 @@ fn a_header_with_no_heading_or_two_is_named_as_no_bar() {
         "column navigationKey=`${e.id}` navigationBar=\"none\"",
     );
     assert_eq!(warned(&said), []);
+    // Nor does a header that draws itself, as a site's does (`appearance="none"`, said or
+    // computed): iOS makes no bar of it, not even the system Back alone.
+    for attr in [
+        "appearance=\"none\"",
+        "appearance=(1 > 0 ? \"none\" : \"auto\")",
+    ] {
+        let drawn = none.replace(
+            "header display=\"flex\"",
+            &format!("header {attr} display=\"flex\""),
+        );
+        assert_ne!(drawn, none);
+        assert_eq!(warned(&drawn), [], "{attr}");
+    }
     let two = route("  text \"A\" role=\"heading\" aria-level=1\n  text \"B\" role=\"heading\" aria-level=2\n  image \"symbol:heart\"");
     assert_eq!(warned(&two), [(NO_BAR.to_string(), 11)]);
     let (_, warnings) = contract::compile_warned(&two);
@@ -303,10 +319,10 @@ fn a_tab_bar_of_one_tab_is_named_and_two_are_not() {
     assert_eq!(warned(&segments), []);
 }
 
-/// A stopwatch's actions over a mutation, each `send` on line 16.
+/// A stopwatch's actions over a mutation, each `send` on line 18.
 fn stopwatch(state: &str, send: &str) -> String {
     format!(
-        "shape Time\n  epochAtZero: number\nshape Ack\n  ok: bool\nfn later(t: number): number = t + 10\nfn mark(): number = performanceNow()\ncomponent App\n  resource time = exactTime() as shape Time\n  mutation wrote as shape Ack\n  state start = 0\n  state other = 0\n{state}  action begin\n    start = performanceNow()\n  action save\n    send wrote = keep({send})\n  view\n    button \"save\" press=save\n"
+        "shape Time\n  epochAtZero: number\n  anchorAt: number\n  anchorBeat: number\nshape Ack\n  ok: bool\nfn later(t: number): number = t + 10\nfn mark(): number = performanceNow()\ncomponent App\n  resource time = exactTime() as shape Time\n  mutation wrote as shape Ack\n  state start = 0\n  state other = 0\n{state}  action begin\n    start = performanceNow()\n  action save\n    send wrote = keep({send})\n  view\n    button \"save\" press=save\n"
     )
 }
 
@@ -324,10 +340,20 @@ fn a_launch_relative_time_sent_to_a_source_is_named_with_its_repair() {
         "`${start}`",
         "(other > 0 ? start : 0)",
         "max(start, 5)",
+        // Less a constant, a time is still a time.
+        "start - 1000",
+        "performanceNow() - 2 * 1000",
+        "start - max(500, 1000)",
+        // A reading less a span, the origin, or a never-set 0 is still a time.
+        "performanceNow() - (performanceNow() - start)",
+        "performanceNow() - time.epochAtZero",
+        "performanceNow() - other",
+        // The origin added on one branch only: the other is a launch's time.
+        "performanceNow() + (other > 0 ? time.epochAtZero : 0)",
     ] {
         assert_eq!(
             warned(&stopwatch("", send)),
-            [(PERSISTED.to_string(), 15)],
+            [(PERSISTED.to_string(), 17)],
             "{send}"
         );
     }
@@ -346,7 +372,7 @@ fn a_launch_relative_time_sent_to_a_source_is_named_with_its_repair() {
         "    send wrote = keep(t)",
         "    let t = performanceNow()\n    send wrote = keep(t)",
     );
-    assert_eq!(warned(&local), [(PERSISTED.to_string(), 16)]);
+    assert_eq!(warned(&local), [(PERSISTED.to_string(), 18)]);
 }
 
 #[test]
@@ -360,6 +386,10 @@ fn the_wall_clock_time_and_a_duration_are_not_named() {
         "other",
         "`${start}`.length",
         "(start > 5).toString()",
+        // A musical position from an anchor a source holds (euxy's beat):
+        // the time since the anchor, scaled and offset.
+        "time.anchorBeat + (performanceNow() - time.anchorAt) * 120 / 60000",
+        "max(0, time.anchorBeat + (performanceNow() - time.anchorAt) * 2 / 60000)",
     ] {
         assert_eq!(warned(&stopwatch("", send)), [], "{send}");
     }
@@ -373,6 +403,18 @@ fn a_launch_relative_time_in_a_persisted_state_is_named() {
     // stopwatch's start mark, kept by `persist` instead of a source.
     let src = "shape Time\n  epochAtZero: number\ncomponent App\n  resource time = exactTime() as shape Time\n  state start = 0 persist\n  state wall = 0 persist\n  state lap = 0 persist\n  action begin\n    lap = performanceNow() - start\n    start = performanceNow()\n    wall = time.epochAtZero + performanceNow()\n  view\n    button \"go\" press=begin\n";
     assert_eq!(warned(src), [(PERSISTED.to_string(), 5)]);
+    // A state kept as a reading less itself: from its initial 0 the first
+    // is a time, the next a span, and so on (a timestamp kept every other run).
+    let toggled = "component App\n  state mark = 0 persist\n  action tick\n    mark = performanceNow() - mark\n  view\n    button \"go\" press=tick\n";
+    assert_eq!(warned(toggled), [(PERSISTED.to_string(), 2)]);
+    // A state that is a launch's time in one action and the origin in
+    // another is sometimes a time: so is a number added to it.
+    let either = "shape Time\n  epochAtZero: number\nshape Ack\n  ok: bool\ncomponent App\n  resource time = exactTime() as shape Time\n  mutation wrote as shape Ack\n  state mark = 0\n  action a\n    mark = performanceNow()\n  action b\n    mark = time.epochAtZero\n  action save\n    send wrote = keep(mark + 1000)\n  view\n    button \"save\" press=save\n";
+    assert_eq!(warned(either), [(PERSISTED.to_string(), 14)]);
+    // A derive of the origin, read before the fixed point resolves it, is
+    // the origin: added to a reading it is the wall-clock time, kept as is.
+    let origin = "shape Time\n  epochAtZero: number\ncomponent App\n  resource time = exactTime() as shape Time\n  state at = 0 persist\n  derive origin = time.epochAtZero\n  action go\n    at = origin + performanceNow()\n  view\n    button \"go\" press=go\n";
+    assert_eq!(warned(origin), []);
 }
 
 const ONE_SCHEME: &str = "lower-colour-one-scheme";
@@ -550,6 +592,54 @@ fn a_field_the_copy_left_alone_is_not_named() {
     // `session.version` in the `send`: the same value either way.
     let src = "shape Ack\n  ok: bool\nshape Item\n  id: string\n  n: number\ncomponent App\n  mutation saved as shape Ack\n  state item = Item(id=\"x\", n=0)\n  state shown = \"\"\n  action go\n    item = Item(item, n=item.n + 1)\n    send saved = keep(item.id)\n    shown = `${item.n}`\n  view\n    button \"go\" press=go\n";
     assert_eq!(warned(src), [(REREAD.to_string(), 13)]);
+}
+
+const SEND_ASSIGNED: &str = "analyze-send-assigned";
+
+#[test]
+fn a_send_and_an_assignment_of_one_mutation_on_one_path_is_named_once_in_either_order() {
+    // LLP 1035.005.002 C1: no bake-off build wrote it; Weird Castle's
+    // logout (send, then `session = none`) means it. A warning, with what the
+    // runner does and the three intents' spellings.
+    let after = go("send saved = keep(count)\nsaved = none");
+    assert_eq!(warned(&after), [(SEND_ASSIGNED.to_string(), 11)]);
+    let (_, warnings) = contract::compile_warned(&after);
+    assert_eq!(
+        warnings[0].message,
+        "`go` both sends `saved` and assigns it on one path: it sends in `go` at line 10 and assigns in `go` at line 11. A send is asked when the action runs; once the writes land, a request still in flight for a mutation the action assigned is forgotten and its reply dropped, and `saved` keeps the assigned value (LLP 1016 D5), whichever line comes first. To clear an old result before a retry, keep the send and hide the result while `pending(saved)`; to sign out, forget the sign-in mutation here and send the logout through a mutation of its own; to dismiss an answer, assign alone"
+    );
+    // The reset written first drops the new request just the same.
+    let before = go("saved = none\nsend saved = keep(count)");
+    assert_eq!(warned(&before), [(SEND_ASSIGNED.to_string(), 11)]);
+    // Through a call, the calls are named; once a mutation an action.
+    let called = "shape Ack\n  ok: bool\ncomponent App\n  mutation saved as shape Ack\n  state count = 0\n  action clear\n    saved = none\n  action go\n    send saved = keep(count)\n    clear()\n    saved = none\n  view\n    button \"go\" press=go\n";
+    assert_eq!(warned(called), [(SEND_ASSIGNED.to_string(), 7)]);
+    assert!(
+        contract::compile_warned(called).1[0]
+            .message
+            .starts_with("`go` both sends `saved` and assigns it on one path: it sends in `go` at line 9 and assigns in `clear` (called at line 10)."),
+    );
+}
+
+#[test]
+fn exclusive_arms_and_a_queue_send_beside_an_assignment_are_not_named() {
+    for (case, body) in [
+        (
+            "arms",
+            "if mode == \"a\"\n  send saved = keep(count)\nelse\n  saved = none",
+        ),
+        (
+            "exclusive literals",
+            "if mode == \"a\"\n  send saved = keep(count)\nif mode == \"b\"\n  saved = none",
+        ),
+        ("the assignment alone", "saved = none"),
+    ] {
+        assert_eq!(warned(&go(body)), [], "{case}");
+    }
+    // A queue's assignment clears the displayed answer and drops no queued
+    // work (LLP 1092 D4): nothing to say.
+    let queued = "shape Ack\n  ok: bool\ncomponent App\n  mutation saved as shape Ack queue\n  state count = 0\n  action go\n    send saved = keep(count)\n    saved = none\n  view\n    button \"go\" press=go\n";
+    assert_eq!(warned(queued), []);
 }
 
 const UNLABELLED: &str = "lower-button-unlabelled";
@@ -775,14 +865,11 @@ fn symbols_answer_to_apple_names_and_aliases_and_the_plan_carries_the_role() {
         .unwrap_err();
         assert!(error.to_string().contains("not a role"), "{name}: {error}");
     }
-    // `sf/` stays distinct: Apple's name, opaque, and no warning.
+    // `sf/` stays distinct: Apple's name, opaque, no warning (a role's own: tamber_icons).
     let (plan, warnings) =
-        contract::compile_warned("component App\n  view\n    image \"symbol:sf/gearshape\"\n");
-    assert!(plan
-        .unwrap()
-        .strings
-        .iter()
-        .any(|s| s == "symbol:sf/gearshape"));
+        contract::compile_warned("component App\n  view\n    image \"symbol:sf/gearshape.2\"\n");
+    let strings = plan.unwrap().strings;
+    assert!(strings.iter().any(|s| s == "symbol:sf/gearshape.2"));
     assert!(warnings.is_empty(), "{warnings:?}");
 }
 
@@ -796,6 +883,7 @@ fn a_symbol_by_another_spelling_than_its_role_is_named_with_the_role() {
         [
             (SYMBOL_ALIAS.to_string(), 13),
             (SYMBOL_ALIAS.to_string(), 7),
+            (SYMBOL_ALIAS.to_string(), 8), // `sf/trash`: delete's Apple name (LLP 1121 D10)
             (SYMBOL_ALIAS.to_string(), 10)
         ]
     );
@@ -805,7 +893,7 @@ fn a_symbol_by_another_spelling_than_its_role_is_named_with_the_role() {
         "symbol `trash` is the role `delete`: write `symbol:delete`"
     );
     assert_eq!(
-        warnings[2].message,
+        warnings[3].message,
         "symbol `checkmark.circle.fill` is the role `select-fill`: write `symbol:select-fill`"
     );
 }
@@ -1031,7 +1119,7 @@ fn another_name_no_bar_or_a_sections_own_name_is_not_named() {
         // A section's own name: inside a `section`, or after a heading
         // always shown before it (expense-tracker's "Expenses" list under
         // "By category").
-        "list\n  section\n    header\n      text \"Notes\" role=\"heading\" aria-level=3\n    text \"a\"",
+        "list appearance=\"auto\"\n  section\n    header\n      text \"Notes\" role=\"heading\" aria-level=3\n    text \"a\"",
         "column\n  text \"By folder\" role=\"heading\" aria-level=2\ncolumn\n  text \"Notes\" role=\"heading\" aria-level=2",
         // Not shown with the bar: hidden, in a popover or another route.
         "text \"Notes\" role=\"heading\" display=\"none\"\ncolumn id=\"m\" popover=\"auto\"\n  text \"Notes\" role=\"heading\"",
@@ -1055,124 +1143,6 @@ fn another_name_no_bar_or_a_sections_own_name_is_not_named() {
         "          text \"first\"\n          header display=\"flex\"\n",
     );
     assert_eq!(warned(&late), [], "{late}");
-}
-
-const SCREEN: &str = "lower-screen-by-state";
-
-/// The line `needle` is on, from 1.
-fn line_of(src: &str, needle: &str) -> u32 {
-    let at = src
-        .find(needle)
-        .unwrap_or_else(|| panic!("{needle}\n{src}"));
-    src[..at].matches('\n').count() as u32 + 1
-}
-
-/// recipe-finder's round-7 page: its screens chosen in `choice`, inside one
-/// `scroll` under a bar laid out by hand, with no `header` (LLP 1116.005).
-fn finder(choice: &str) -> String {
-    let choice: String = choice.lines().map(|l| format!("        {l}\n")).collect();
-    format!(
-        "shape Meal\n  id: string\n  name: string\ncomponent App\n  state query = \"\"\n  state chosen = []\n  state shared = \"\"\n  state tab = \"all\"\n  state open2 = false\n  resource meals = searchMeals(query) as shape Meal[] else empty()\n  resource viewport = exactViewport() as shape Meal else empty()\n  derive showingDetail = chosen.length > 0\n  action edit(v: string)\n    query = v\n  action open(m: Meal)\n    chosen = [m]\n  action back\n    chosen = []\n  action share(m: Meal)\n    shared = m.name\n  action pick(t: string)\n    tab = t\n    chosen = []\n  action toggle\n    open2 = not open2\n  view\n    column height=\"100%\" display=\"flex\" flex-direction=\"column\"\n      row padding=16\n        text \"Recipe Finder\" font-weight=700\n      scroll flex=1 min-height=0\n{choice}"
-    )
-}
-
-/// The detail: Back, its heading deep in its layout, one more control.
-const DETAIL: &str = "  column gap=16\n    button press=back testId=\"back\"\n      text \"Back to recipes\"\n    row gap=16\n      column\n        text m.name role=\"heading\" aria-level=1\n    button press=share(m) testId=\"share\"\n      text \"Share\"\n";
-/// The list: its heading, a search field and rows that open the detail.
-const LIST: &str = "  column gap=16\n    text \"What sounds good today?\" role=\"heading\" aria-level=1\n    input value=query input=edit type=\"search\" aria-label=\"Search\"\n    for m in meals key=m.id\n      button press=open(m) testId=`meal-${m.id}`\n        text m.name\n";
-
-#[test]
-fn screens_swapped_by_state_without_routes_are_named_with_the_repair() {
-    // recipe-finder: Back left the app, a reload lost the recipe.
-    let when = format!(
-        "if showingDetail\n  for m in chosen key=m.id\n{}else\n{LIST}",
-        DETAIL
-            .replace("\n  ", "\n    ")
-            .replacen("  column", "    column", 1)
-    );
-    let src = finder(&when);
-    assert_eq!(
-        warned(&src),
-        [(SCREEN.to_string(), line_of(&src, "if showingDetail"))]
-    );
-    let (_, warnings) = contract::compile_warned(&src);
-    let m = &warnings[0].message;
-    assert!(
-        m.starts_with("this `if` swaps the page between screens by state")
-            && m.contains("the browser's Back leaves the app, a reload loses the place and no screen can be linked")
-            && m.contains("`routes` with a path for each, `push` to open one")
-            && m.contains("`contract vocab screen`"),
-        "{m}"
-    );
-    // The same screens through a `match` on the chosen option, and as a
-    // chain with no last `else`, after a loading arm (flashcards).
-    let matched = finder(&format!(
-        "match first(chosen)\n  case some(m)\n{}  case none\n{}",
-        DETAIL
-            .replace("\n  ", "\n    ")
-            .replacen("  column", "    column", 1),
-        LIST.replace("\n  ", "\n    ")
-            .replacen("  column", "    column", 1)
-    ));
-    assert_eq!(
-        warned(&matched),
-        [(SCREEN.to_string(), line_of(&matched, "match first"))]
-    );
-    let chain = finder(&format!("if pending(meals)\n  progress aria-label=\"Loading\"\nelse if chosen.length == 0\n{LIST}else if chosen.length > 0\n  for m in chosen key=m.id\n{}", DETAIL.replace("\n  ", "\n    ").replacen("  column", "    column", 1)));
-    assert_eq!(
-        warned(&chain),
-        [(SCREEN.to_string(), line_of(&chain, "if pending"))]
-    );
-    // event-rsvp's: a create form and an event's detail in one pane, the
-    // form's Cancel the press that leaves it.
-    let rsvp = "shape Event\n  id: string\n  title: string\ncomponent App\n  state selected = \"1\"\n  state creating = false\n  state title = \"\"\n  state answer = \"\"\n  resource events = loadEvents() as shape Event[] else empty()\n  action newEvent\n    creating = true\n  action back\n    selected = \"\"\n    creating = false\n  action editTitle(v: string)\n    title = v\n  action create\n    creating = false\n  action rsvp(r: string)\n    answer = r\n  view\n    main height=\"100%\" display=\"flex\" flex-direction=\"column\"\n      row padding=16\n        text \"gather\"\n        button press=newEvent testId=\"new-event\"\n          text \"Create event\"\n      scroll flex=1 min-height=0\n        column flex=1 min-width=0 gap=18 testId=\"detail-pane\"\n          if creating\n            column gap=22\n              column gap=8\n                text \"A new reason to get together.\" role=\"heading\" aria-level=2\n              input value=title input=editTitle aria-label=\"Event title\"\n              row gap=10\n                button press=create testId=\"create-save\"\n                  text \"Create event\"\n                button press=back testId=\"create-cancel\"\n                  text \"Cancel\"\n          else\n            for e in events.filter(x => x.id == selected) key=e.id\n              column gap=24\n                column gap=10\n                  text e.title role=\"heading\" aria-level=2\n                row role=\"radiogroup\" aria-label=\"Your RSVP\"\n                  button role=\"radio\" aria-checked=(answer == \"going\") press=rsvp(\"going\")\n                    text \"Going\"\n                  button role=\"radio\" aria-checked=(answer == \"maybe\") press=rsvp(\"maybe\")\n                    text \"Maybe\"\n";
-    assert_eq!(
-        warned(rsvp),
-        [(SCREEN.to_string(), line_of(rsvp, "if creating"))]
-    );
-}
-
-#[test]
-fn routes_tabs_loading_empty_disclosure_and_overlays_are_not_named() {
-    let detail = DETAIL
-        .replace("\n  ", "\n    ")
-        .replacen("  column", "    column", 1);
-    let swap = format!("if showingDetail\n  for m in chosen key=m.id\n{detail}else\n{LIST}");
-    // A router's screens are its routes.
-    let routed = finder(&swap).replacen("shape Meal", "routes nav\n  home \"/\"\nshape Meal", 1);
-    assert_eq!(warned(&routed), []);
-    for (case, choice) in [
-        // Tabs: a state a `tab` reads its selection from.
-        ("tabs", format!("row role=\"tablist\"\n  button role=\"tab\" aria-selected=(tab == \"all\") press=pick(\"all\")\n    text \"All\"\n  button role=\"tab\" aria-selected=(tab != \"all\") press=pick(\"saved\")\n    text \"Saved\"\nif tab == \"all\"\n{LIST}else\n{}", LIST.replace("What sounds good today?", "Saved"))),
-        // A loading or error view: keyed on a resource.
-        ("loading", format!("if pending(meals)\n  for m in meals key=m.id\n{detail}else\n{LIST}")),
-        ("responsive", format!("if viewport.name == \"wide\"\n{LIST}else\n{LIST}")),
-        // An empty state: one control.
-        ("empty", format!("if chosen.length == 0\n  column\n    text \"Nothing chosen yet\" role=\"heading\"\n    button press=edit(\"\")\n      text \"Search\"\nelse\n{LIST}")),
-        // Disclosure: an arm with no heading.
-        ("disclosure", format!("if open2\n{LIST}else\n  button press=toggle\n    text \"Show the recipes\"\n  button press=edit(\"\")\n    text \"Clear\"")),
-        // A swap no press inside it moves (the bar outside does).
-        ("unmoved", format!("if showingDetail\n  for m in chosen key=m.id\n{}else\n{}", detail.replace("press=back", "press=share(m)"), LIST.replace("press=open(m)", "press=share(m)"))),
-        // Inside a row, a dialog or a popover: theirs.
-        ("row", format!("for n in meals key=n.id\n  {}", swap.replace('\n', "\n  "))),
-        ("dialog", format!("dialog id=\"d\" closedby=\"any\"\n  {}", swap.replace('\n', "\n  "))),
-        ("popover", format!("column id=\"p\" popover=\"auto\"\n  {}", swap.replace('\n', "\n  "))),
-    ] {
-        let src = finder(&choice);
-        // The row case walks `chosen` in each meal's row: `lower-row-lookup`'s, not this one's.
-        let named: Vec<_> = warned(&src)
-            .into_iter()
-            .filter(|(id, _)| id != "lower-row-lookup")
-            .collect();
-        assert_eq!(named, [], "{case}\n{src}");
-    }
-    // A kept setting: a `persist` state.
-    let kept = finder(
-        &format!("if tab == \"all\"\n  for m in chosen key=m.id\n{detail}else\n{LIST}")
-            .replace("press=back", "press=pick(\"x\")"),
-    )
-    .replace("state tab = \"all\"", "state tab = \"all\" persist");
-    assert_eq!(warned(&kept), []);
 }
 
 const WIDTH_PADDING: &str = "lower-width-padding";
@@ -1324,7 +1294,7 @@ fn warned_circles(name: &str, body: &str) -> Vec<(String, u32, String)> {
     if let Err(e) = result {
         panic!("a warning never fails a build: {e:?}\n{src}");
     }
-    super::text_px_width::without_round_button_widths(warnings)
+    warnings
         .into_iter()
         .map(|w| (w.id.clone(), w.span.line, w.message))
         .collect()
@@ -1408,6 +1378,8 @@ const NESTED: &str = "lower-header-nested";
 #[test]
 fn a_header_a_box_below_its_route_is_named_with_the_repair() {
     let src = |root: &str, route: &str| {
+        // The root's `min-height=0` keeps its scroller scrolling (`lower-scroll-grows`).
+        let root = root.replacen("column flex=1", "column flex=1 min-height=0", 1);
         format!("routes nav\n  home \"/\"\ncomponent App\n  view\n    main navigationKey=`${{top(nav).id}}` width=\"100%\" height=\"100%\"\n      for e in stack(nav) key=e.id\n        column navigationKey=`${{e.id}}` position=\"absolute\" inset=0{route}\n          Home()\ncomponent Home\n  view\n    {root}\n      header\n        text \"Home\" role=\"heading\" aria-level=1\n      scroll flex=1\n        text \"body\"\n")
     };
     let nested = src("column flex=1", "");

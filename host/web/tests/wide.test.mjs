@@ -7,19 +7,16 @@
 // `navigationSplit` opts out or names the width; a sheet stays a sheet; a resize changes nothing else. At a
 // desktop width `check` advises (D1.3) on a tab bar left along the bottom and on a list that pushes unsplit.
 import { test, expect } from 'bun:test';
-import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { Cdp } from '../../../scripts/agent.mjs';
-import { chromium } from '../../../scripts/agent-launch.mjs';
+import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
 import { need } from '../../../scripts/coverage.mjs';
 import { readyPage } from './page.mjs';
 
 const WEB = resolve(new URL('..', import.meta.url).pathname);
-const { executable: chrome, unavailable } = chromium();
+const { unavailable } = chromium();
 const check = need('chrome', unavailable);
 
 const style = withLook(readFileSync(resolve(WEB, 'index.html'), 'utf8')).match(/<style>[\s\S]*?<\/style>/)[0];
@@ -67,13 +64,9 @@ async function inChrome(html, test, w = 1280) {
     res.writeHead(200, { 'content-type': 'text/javascript' }); res.end(readFileSync(req.url === '/check.js' ? resolve(WEB, '../web-js/check.js') : resolve(WEB, 'navigation.js')));
   });
   await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
-  const profile = mkdtempSync(resolve(tmpdir(), 'exact-wide-'));
-  const child = spawn(chrome, ['--headless=new', '--remote-debugging-pipe', '--window-size=1400,900', `--user-data-dir=${profile}`,
-    '--no-sandbox', '--no-first-run', '--disable-background-networking', 'about:blank'], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+  const suite = await cdpBrowser({ args: ['--window-size=1400,900'] }), { cdp } = suite;
   try {
-    const cdp = new Cdp(child.stdio[3], child.stdio[4]);
-    const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    const { sessionId } = await suite.page();
     const call = (method, params) => cdp.send(method, params, sessionId);
     const evaluate = async (expression) => {
       const reply = await call('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
@@ -93,9 +86,8 @@ async function inChrome(html, test, w = 1280) {
     await readyPage(cdp, sessionId, `http://127.0.0.1:${server.address().port}/`);
     await test(evaluate, size, click);
   } finally {
-    child.kill();
+    await suite.close();
     server.close();
-    rmSync(profile, { recursive: true, force: true });
   }
 }
 
@@ -109,6 +101,17 @@ check('a root tab bar left unsaid is a sidebar on a wide window and a bar on a p
   expect(await evaluate(`[document.getElementById('nav').hasAttribute('data-exact-sidebar'), box('bar')[0], box('bar')[2], box('bar')[1] + box('bar')[3], box('panels')[2]]`)).toEqual([false, 0, 390, 800, 390]);
   await size(1280);
   expect(await evaluate(`[document.getElementById('nav').hasAttribute('data-exact-sidebar'), box('bar')]`)).toEqual([true, [0, 0, 240, 800]]);
+}), 60000);
+
+check('segmented viewports keep root tabs below the full-width route and restore the continuous sidebar', () => inChrome(page(tabs(BAR)), async (evaluate) => {
+  expect(await evaluate(`[document.getElementById('nav').hasAttribute('data-exact-sidebar'), box('panels')[0]]`)).toEqual([true, 240]);
+  for (const [cols, rows] of [[2, 1], [1, 2]]) {
+    await evaluate(`import('./navigation.js').then(({ preferFold }) => { preferFold({ cols: ${cols}, rows: ${rows}, gap: 40 }); select(2); })`);
+    expect(await evaluate(`[document.getElementById('nav').hasAttribute('data-exact-sidebar'), box('panels')[0], box('panels')[2], box('bar')[0], box('bar')[2], box('bar')[1] + box('bar')[3], shown('r2')]`))
+      .toEqual([false, 0, 1280, 0, 1280, 800, true]);
+  }
+  await evaluate(`import('./navigation.js').then(({ preferFold }) => { preferFold(null); select(2); })`);
+  expect(await evaluate(`[document.getElementById('nav').hasAttribute('data-exact-sidebar'), box('panels')[0], shown('r2')]`)).toEqual([true, 240, true]);
 }), 60000);
 
 check('an arrangement the app wrote stays its own on a wide window', async () => {
@@ -132,19 +135,33 @@ check('appearance none keeps authored root tabs across selection and restores th
   expect(await evaluate(`document.getElementById('nav').hasAttribute('data-exact-sidebar')`)).toBe(false);
 }), 60000);
 
+check('a projection with nothing to change writes nothing', () => inChrome(page(tabs(BAR)), async (evaluate) => {
+  // What projections write, but for the selection and a style the test itself sets on the tab bar.
+  await evaluate(`window.writes = (change) => new Promise(done => { const seen = [], watch = new MutationObserver(records => seen.push(...records.filter(r => r.attributeName !== 'navigationkey' && !(r.target.id === 'bar' && r.attributeName === 'style')).map(r => (r.target.id || r.target.localName) + ' ' + r.attributeName))); watch.observe(document.getElementById('exact-root'), { attributes: true, subtree: true }); change(); setTimeout(() => { watch.disconnect(); done(seen); }); })`);
+  // A split showing the detail a row's press pushed, then a bound style that does not place the bar; then a sheet
+  // over it, the tab bar inert beneath.
+  await evaluate(`select('1'); { const row = document.getElementById('r1-bo'); row.addEventListener('click', () => push('2', '/people/bo'), {once:true}); row.click(); }`);
+  expect(await evaluate(`writes(() => { select(2); document.getElementById('bar').style.backgroundColor = 'red'; select(2); }).then(seen => [document.getElementById('nav').hasAttribute('data-exact-sidebar'), document.getElementById('r1-bo').hasAttribute('data-exact-split-row'), seen])`)).toEqual([true, true, []]);
+  await evaluate(`select(3)`);
+  expect(await evaluate(`writes(() => { select(3); select(3); }).then(seen => [document.getElementById('bar').inert, seen])`)).toEqual([true, []]);
+}), 60000);
+
 check('retained root tabs yield to changed authored placement and restore without losing selection', () => inChrome(page(tabs(BAR)), async (evaluate, size) => {
+  // Each change to what places the bar, then its undoing: by an inline style, a class or the bar's orientation.
+  await evaluate(`document.head.append(Object.assign(document.createElement('style'), { textContent: '#exact-root .placed { position: absolute !important; }' }))`);
+  const style = (id, property, value) => `document.getElementById('${id}').style.${property} = '${value}'`, bar = "document.getElementById('bar')";
   const samples = [];
-  for (const [id, property, changed, restored] of [
-    ['nav', 'display', 'block', 'flex'],
-    ['bar', 'position', 'absolute', 'relative'],
-    ['nav', 'flexDirection', 'row', 'column'],
-    ['bar', 'flexDirection', 'column', 'row'],
+  for (const change of [
+    [style('nav', 'display', 'block'), style('nav', 'display', 'flex')],
+    [style('bar', 'position', 'absolute'), style('bar', 'position', 'relative')],
+    [style('nav', 'flexDirection', 'row'), style('nav', 'flexDirection', 'column')],
+    [style('bar', 'flexDirection', 'column'), style('bar', 'flexDirection', 'row')],
+    [`${bar}.classList.add('placed')`, `${bar}.classList.remove('placed')`],
+    [`${bar}.setAttribute('aria-orientation', 'vertical')`, `${bar}.removeAttribute('aria-orientation')`],
   ]) {
-    for (const value of [changed, restored]) {
-      samples.push(await evaluate(`document.getElementById(${JSON.stringify(id)}).style[${JSON.stringify(property)}] = ${JSON.stringify(value)}; select(2); [document.getElementById('nav').hasAttribute('data-exact-sidebar'), shown('r2'), shown('t1')]`));
-    }
+    for (const step of change) samples.push(await evaluate(`${step}; select(2); [document.getElementById('nav').hasAttribute('data-exact-sidebar'), shown('r2'), shown('t1')]`));
   }
-  expect(samples).toEqual(Array.from({ length: 4 }, () => [[false, true, false], [true, true, false]]).flat());
+  expect(samples).toEqual(Array.from({ length: 6 }, () => [[false, true, false], [true, true, false]]).flat());
   await size(390);
   expect(await evaluate(`document.getElementById('nav').hasAttribute('data-exact-sidebar')`)).toBe(false);
   await size(1280);
@@ -158,23 +175,24 @@ check('a list whose rows push is beside its detail on a wide window, and pushes 
   const secondary = await evaluate(`getComputedStyle(document.getElementById('secondary')).color`);
   expect(secondary).not.toBe(await evaluate(`getComputedStyle(document.body).color`));
   expect(await evaluate(`[document.getElementById('r1').getAttribute('data-exact-split'), box('r1'), getComputedStyle(document.querySelector('#r1 img')).display, shown('r1'), placeholder('p1')]`))
-    .toEqual(['list', [240, 0, 320, 800], 'none', true, ['"No Selection"', 320, secondary]]);
+    .toEqual(['list', [240, 0, 320, 800], 'none', true, ['"Select an item"', 320, secondary]]);
   // A row's press pushes its detail: both show, the list live and the row marked; the detail has no Back.
   await evaluate(`{ const row = document.getElementById('r1-bo'); row.addEventListener('click', () => push('2', '/people/bo'), {once:true}); row.click(); }`);
   expect(await evaluate(`[shown('r1'), shown('r2'), box('r2'), document.getElementById('r2').getAttribute('data-exact-split'), document.getElementById('r1-bo').hasAttribute('data-exact-split-row'), back('r2'), off(), placeholder('p1')]`))
     .toEqual([true, true, [560, 0, 720, 800], 'detail', true, false, ['p2', 'r3'], null]);
   // A sheet stays a sheet over both, the list and the detail inert beneath it. In a wide window the look draws it as a
-  // card (LLP 1115.000 D4.8): 560 wide, as tall as its content, in the window's middle.
+  // card (LLP 1115.000 D4.8): 560 wide, a sheet's height (45rem), in the window's middle once it has slid up.
   await evaluate(`push('3', '/people/bo/edit')`);
-  const sheet = await evaluate(`box('r3')`);
-  expect([sheet[0], sheet[2], sheet[3] < 800, Math.abs(sheet[1] * 2 + sheet[3] - 800) <= 1]).toEqual([360, 560, true, true]);
+  const sheet = await evaluate(`document.getElementById('r3').getAnimations().forEach(a => a.finish()); box('r3')`);
+  expect([sheet[0], sheet[2], sheet[3], Math.abs(sheet[1] * 2 + sheet[3] - 800) <= 1]).toEqual([360, 560, 720, true]);
   expect(await evaluate(`[document.getElementById('r3').hasAttribute('data-exact-split'), shown('r1'), shown('r2'), document.getElementById('r1').hasAttribute('data-exact-covered'), off()]`))
     .toEqual([false, false, false, true, ['p2', 'r1', 'r2']]);
-  // A phone: the pushed stack, the list hidden and inert, the detail the whole width with Back; then wide again.
+  // A phone: the pushed stack, the list hidden and inert, the detail the whole width with Back, the row's disclosure
+  // still not drawn (the web draws none at any width); then wide again.
   await evaluate(`select('2')`);
   await size(390);
   expect(await evaluate(`[shown('r1'), shown('r2'), box('r2')[2], box('r2')[3] + box('bar')[3], document.getElementById('r1').hasAttribute('data-exact-split'), back('r2'), getComputedStyle(document.querySelector('#r1 img')).display, off()]`))
-    .toEqual([false, true, 390, 800, false, true, 'block', ['p2', 'r1', 'r3']]);
+    .toEqual([false, true, 390, 800, false, true, 'none', ['p2', 'r1', 'r3']]);
   // A phone's list, nothing chosen, is the whole width: no placeholder.
   await evaluate(`select('1')`);
   expect(await evaluate(`[shown('r1'), box('r1')[2], placeholder('p1')]`)).toEqual([true, 390, null]);
@@ -305,6 +323,19 @@ check('turning a split off clears its selected mark and stale row ownership cann
     // Keep an explicit split width, but revoke the old row's router-writing fact.
     await evaluate(`document.getElementById('r1').setAttribute('navigationSplit', '280'); document.getElementById('owned-row').setAttribute('data-exact-router-press', 'false'); select(3)`);
     expect(await evaluate(`[box('r1')[2], document.getElementById('owned-row').hasAttribute('data-exact-split-row'), back('r3')]`)).toEqual([280, false, true]);
+  });
+}, 60000);
+
+check('a detail no row pushed marks the row the app says is current', () => {
+  const body = `<div data-exact-list><button id="row-a" data-exact-on="press" data-exact-router-press="true">A${chevron}</button>
+    <button id="row-b" data-exact-on="press" data-exact-router-press="true" aria-current="page">B${chevron}</button></div>`;
+  return inChrome(page(ruleStack(body)), async evaluate => {
+    const marks = `[...document.querySelectorAll('[data-exact-split-row]')].map(e => e.id)`;
+    expect(await evaluate(`push(2, '/item/b'); ${marks}`)).toEqual(['row-b']);
+    // A row's press names its detail's row, whatever the app says is current.
+    expect(await evaluate(`{ const row = document.getElementById('row-a'); row.addEventListener('click', () => push(2, '/item/a', [[1, '/'], [2, '/item/a']]), {once:true}); row.click(); } ${marks}`)).toEqual(['row-a']);
+    // With no detail shown no row is marked.
+    expect(await evaluate(`select(1); ${marks}`)).toEqual([]);
   });
 }, 60000);
 

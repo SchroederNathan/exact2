@@ -8,6 +8,8 @@ mod fill;
 mod key_reads;
 #[path = "ownership_tests.rs"]
 mod ownership;
+#[path = "position_tests.rs"]
+mod position;
 #[path = "rekey_tests.rs"]
 mod rekey;
 #[path = "smooth_tests.rs"]
@@ -129,7 +131,7 @@ struct Harness {
     plan: Plan,
     slots: Vec<Value>,
     /// The plan's interned strings and site index, built once as a runner builds them
-    strings: &'static [Value],
+    strings: &'static crate::vm::Strings,
     sites: crate::instance::SiteIndex,
     tree: Tree,
     ids: Ids,
@@ -138,13 +140,9 @@ struct Harness {
 }
 fn env<'a>(plan: &'a Plan, slots: &'a [Value]) -> Env<'a> {
     // Test harnesses outlive every Env they build; leak one table per call.
-    env_with(
-        plan,
-        slots,
-        Box::leak(crate::vm::intern(plan).into_boxed_slice()),
-    )
+    env_with(plan, slots, Box::leak(Box::new(crate::vm::intern(plan))))
 }
-fn env_with<'a>(plan: &'a Plan, slots: &'a [Value], strings: &'a [Value]) -> Env<'a> {
+fn env_with<'a>(plan: &'a Plan, slots: &'a [Value], strings: &'a crate::vm::Strings) -> Env<'a> {
     Env {
         plan,
         strings,
@@ -188,7 +186,7 @@ impl Harness {
     fn try_from_parts(plan: Plan, slots: Vec<Value>) -> Result<Self, InstanceError> {
         let mut ids = Ids::default();
         let mut kernel = Kernel::with_monospace();
-        let strings: &'static [Value] = Box::leak(crate::vm::intern(&plan).into_boxed_slice());
+        let strings: &'static crate::vm::Strings = Box::leak(Box::new(crate::vm::intern(&plan)));
         let sites = crate::instance::SiteIndex::new(&plan);
         let mut u = Update::new(env_with(&plan, &slots, strings), &sites, &mut ids);
         let tree = Tree::create(&mut u)?;
@@ -286,7 +284,7 @@ impl Harness {
         let Child::Node(root) = &self.tree.children[0] else {
             panic!()
         };
-        root.collection.as_ref().unwrap()
+        root.collection().unwrap()
     }
 }
 #[test]
@@ -687,7 +685,7 @@ fn invalidated_zero_heights_do_not_hide_newly_nonempty_offwindow_rows() {
     let Child::Node(root) = &mut h.tree.children[0] else {
         panic!()
     };
-    let c = root.collection.as_mut().unwrap();
+    let c = root.collection_mut().unwrap();
     // Compact metadata after previously traversing a document of empty rows.
     for position in 0..c.index.len() {
         let key = c.index.key(position).unwrap().to_owned();
@@ -1380,4 +1378,55 @@ fn bounded_snapshots_equal_ordinary_and_refuse_before_owned_rows() {
         current
     );
     assert_ne!(current, ordinary);
+}
+
+/// The keyboard going down grows a transcript's port in two frames between
+/// reports (UIKit: its frame without, then with, the bottom safe area). The
+/// host clamped the port to the end of the first, which is short of the
+/// second's end; a reader at the end before the resize is still there.
+#[test]
+fn an_unreported_resize_the_reader_did_not_make_keeps_the_end() {
+    let mut h = Harness::new(100, false, true);
+    h.send(h.feedback(2880.0));
+    let mut hidden = h.feedback(2500.0);
+    hidden.port_main = 660.0;
+    h.send(hidden);
+    assert_eq!(h.snapshot().correction.unwrap().offset, 2540.0);
+    // A reader moving the port as it resizes (an interactive dismissal)
+    // chose where it is.
+    let mut h = Harness::new(100, false, true);
+    h.send(h.feedback(2880.0));
+    let mut dragged = h.feedback(2500.0);
+    dragged.port_main = 660.0;
+    h.send_filled(
+        dragged,
+        CollectionFill {
+            velocity: -400.0,
+            ..CollectionFill::default()
+        },
+    );
+    assert!(h.snapshot().correction.is_none());
+}
+
+#[test]
+fn measured_row_operations_count_scroll_and_whole_list_retirement() {
+    let mut h = Harness::new(3000, false, false);
+    assert!(
+        h.ids.work.sites.is_empty(),
+        "ordinary execution collects nothing"
+    );
+    h.ids.work.sites = vec![crate::perf::SiteWork::default(); h.plan.nodes.len()];
+    let site = h.ids.site(h.snapshot().view).unwrap().0 as usize;
+    h.send(h.feedback(16000.0));
+    let counts = h.ids.work.sites[site];
+    assert!(counts.row_constructed > 0 && counts.row_constructed < 100);
+    assert!(counts.row_retired > 0, "scrolled-out rows retire");
+    let mounted = h.snapshot().rows.len() as u64;
+    let mut u = Update::new(env_with(&h.plan, &h.slots, h.strings), &h.sites, &mut h.ids);
+    let children = std::mem::take(&mut h.tree.children);
+    super::super::destroy_all(&mut u, children);
+    assert_eq!(
+        h.ids.work.sites[site].row_retired,
+        counts.row_retired + mounted
+    );
 }

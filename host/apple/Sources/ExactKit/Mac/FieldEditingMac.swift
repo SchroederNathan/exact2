@@ -35,11 +35,33 @@ extension NodeView {
         styleFieldEditor(editor)
     }
     @objc package func controlTextDidEndEditing(_ obj: Notification) {
+        if Self.restartingEditing === self { return }
+        editingEnded()
+    }
+    /// The end of a field's editing: its `change` commits and it blurs.
+    private func editingEnded() {
         presenter?.collections.pinsChanged()
+        // Its editor still holds it here; a turn later it is the field's alone.
+        RunLoop.main.perform(inModes: [.common]) { [weak self] in self?.syncFieldSide() }
         showFieldFocus(false)
         presenter?.commitEdit(id, field?.stringValue ?? "", change: handlers.contains("change"))
         presenter?.blur(id)
     }
+    /// A write to a field that AppKit applies by ending the field editor's
+    /// editing and beginning it again
+    /// (`-[NSTextField setPlaceholderAttributedString:]` does, so the editor
+    /// shows the new placeholder). The field keeps the focus throughout, so
+    /// the app hears no blur and no `change` from it, as the web changes a
+    /// focused input's placeholder with neither. Editing that does not come
+    /// back ends as any does.
+    func keepingEditing(_ f: NSTextField, _ change: () -> Void) {
+        guard f.currentEditor() != nil, Self.restartingEditing == nil else { return change() }
+        Self.restartingEditing = self
+        change()
+        Self.restartingEditing = nil
+        if f.currentEditor() == nil { editingEnded() }
+    }
+    nonisolated(unsafe) private static weak var restartingEditing: NodeView?
     @objc package func controlTextDidChange(_ obj: Notification) {
         // What AppKit says of the app's own value going in is not typing.
         if writingValue { return }
@@ -50,7 +72,10 @@ extension NodeView {
             return
         }
         if !disabled { typedText(field?.stringValue ?? "") }
-        if let editor = field?.currentEditor() as? NSTextView { applyHeldValue(to: editor) }
+        if let editor = field?.currentEditor() as? NSTextView {
+            applyHeldValue(to: editor)
+            applyBaseDirection(to: editor) // an undo brings back the attributes of the text it restores
+        }
         if stepper != nil { updateNumberStepper() } // the stepper shows what the field holds (LLP 1116.007 D4)
     }
     /// The composition in `editor` is over, the app told of its text: what
@@ -93,8 +118,16 @@ extension NodeView {
         guard !writingValue, !disabled, props["emojiPicker"] != "true" else { return }
         if editor === textArea { editor.needsDisplay = true }
         typedText(editor.string)
-        // Cancelled: AppKit posts no change for it, so the held value lands here.
+        // Cancelled: AppKit posts no change for it, so the held value lands
+        // here, and faces that came while it was marked are drawn.
         applyHeldValue(to: editor)
+        if editor === textArea, !editor.hasMarkedText() { restyleMarkupProps() }
+        // And a `direction` that came while it was marked (LLP 1001 §1).
+        // The app heard its text first, and may have moved the focus: the editor is styled for its field now.
+        if !editor.hasMarkedText() {
+            if editor === textArea { applyBaseDirection(to: editor) }
+            else if let now = (editor as? FieldEditor)?.owner ?? (field?.currentEditor() === editor ? self : nil) { now.styleFieldEditor(editor) }
+        }
     }
     /// The ring Exact draws for a focused field (LLP 1104 D6): its border,
     /// painted by the box painter (`boxPlan`) two points wide in the focus
@@ -115,7 +148,7 @@ extension NodeView {
     /// AppKit's would be, in AppKit's colour at its own strength; where the
     /// node clips its box, inside the border.
     func showFieldFocus(_ on: Bool) {
-        let show = on && !disabled && !outlineNone && (!isNativeTextControl || textArea != nil)
+        let show = on && !disabled && !outlineNone && (!isNativeTextControl || textArea != nil || fieldGround != nil)
         let bordered = bordersItself
         // A textarea's scroll view covers the node's own border, so its ring
         // is a layer above the node's subviews instead.

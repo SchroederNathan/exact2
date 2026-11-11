@@ -149,7 +149,61 @@ async function reused(): Promise<Session> {
 
 async function parallel(): Promise<Session> {
   const [a, b] = await Promise.all([fetch("https://api.castle.xyz/a"), fetch("https://api.castle.xyz/b")]);
-  return {ok:true,username:"parallel",error:Array.from(new Uint8Array(await a.arrayBuffer())).join(",") + "/" + await b.text()};
+  // A fetched reply's clone reads the same bytes; its statusText is empty: the host gives none. Its headers, and its
+  // clone's, take no change, and its body reads once, as a fetched Response's do (Fetch's "immutable" guard, "consume
+  // body").
+  const said = (f: () => unknown): string => { try { f(); return "changed"; } catch (e) { return (e as Error).name; } };
+  const read = await b.text(), again = await b.text().then(() => "read again", (e: Error) => e.name);
+  return {ok:true,username:"parallel",error:[Array.from(new Uint8Array(await a.clone().arrayBuffer())).join(","), read, JSON.stringify(a.statusText),
+    said(() => a.headers.set("x-a", "b")), said(() => a.clone().headers.set("x-a", "b")), again, String(b.bodyUsed), said(() => b.clone())].join("/")};
+}
+
+// A fetch the app aborts from another answer (the abort runtime gap): its
+// controller kept by id; the aborted fetch rejects, and this answer goes on.
+const held = new Map<string, AbortController>();
+async function holding(id: string, method: string): Promise<Session> {
+  const controller = new AbortController();
+  // A call again replaces its last fetch: the source aborts it (the same key).
+  held.get(id)?.abort(new Error("replaced"));
+  held.set(id, controller);
+  try {
+    await fetch(`https://api.castle.xyz/held/${id}`, { method, body: method === "GET" ? undefined : id, signal: controller.signal });
+    return { ok: true, username: id, error: "fetched" };
+  } catch (e) {
+    // It rejects with its signal's reason, as Fetch does: that very value, or
+    // an AbortError for a bare abort().
+    if (e !== controller.signal.reason) return { ok: false, username: id, error: `not its reason: ${(e as Error).name}` };
+    if (e instanceof DOMException) return { ok: false, username: id, error: `aborted: ${e.name}` };
+    return { ok: false, username: id, error: `aborted: ${(e as Error).message}` };
+  }
+}
+function abortHeld(id: string, bare?: boolean): Session {
+  if (bare) held.get(id)?.abort();
+  else held.get(id)?.abort(new Error("by the app"));
+  return { ok: true, username: id, error: "aborting" };
+}
+// Aborted, it falls back to another fetch of its own: the abort, answered
+// after the first request's reply landed, must not reach the second.
+async function fallingBack(id: string): Promise<Session> {
+  const controller = new AbortController();
+  held.set(id, controller);
+  try {
+    await fetch(`https://api.castle.xyz/held/${id}`, { signal: controller.signal });
+    return { ok: true, username: id, error: "fetched" };
+  } catch {
+    const r = await fetch(`https://api.castle.xyz/fallback/${id}`);
+    return { ok: true, username: id, error: `fell back: ${await r.text()}` };
+  }
+}
+// Two fetches, the second aborted before its answer awaits it: withdrawn
+// unsent; the answer awaits the first.
+async function withdrawn(): Promise<Session> {
+  const controller = new AbortController();
+  const first = fetch("https://api.castle.xyz/first");
+  const second = fetch("https://api.castle.xyz/second", { signal: controller.signal });
+  controller.abort();
+  const why = await second.then(() => "sent", (e: Error) => e.name);
+  return { ok: true, username: await (await first).text(), error: why };
 }
 
 function answer(source: string, args: unknown[], store: Store): unknown {
@@ -166,11 +220,45 @@ function answer(source: string, args: unknown[], store: Store): unknown {
     case "item": case "thread": return item(text(args, 0));
     case "followup": return followup(text(args, 0));
     case "reused": return reused();
+    case "holding": return holding(text(args, 0), text(args, 1));
+    case "abortHeld": return abortHeld(text(args, 0));
+    case "abortBare": return abortHeld(text(args, 0), true);
+    case "withdrawn": return withdrawn();
+    case "fallingBack": return fallingBack(text(args, 0));
     case "saveQuietly": return saveQuietly(text(args, 0));
     // An answer that keeps coming (LLP 1016.000): each event, and the end.
     case "events": return fetch("https://api.castle.xyz/events?since=" + args[0], {
       exactStream: (e: { type: string; data: string; lastEventId: string; coalesced: number; message?: string }) =>
         e.type === "error" ? `ended: ${e.message}` : `${e.type} ${e.lastEventId}:${e.data}:${e.coalesced}:${store.get("castle.session") ?? "-"}`,
+    } as RequestInit);
+    // A long poll (LLP 1016.000 D8): each reply an event, its cursor the id.
+    case "changes": return fetch("https://api.castle.xyz/changes?since=" + args[0] + "&wait=25", {
+      exactStream: (e: { type: string; data: string; lastEventId: string; message?: string }) =>
+        e.type === "error" ? `ended: ${e.message}` : `${e.lastEventId}:${e.data}`,
+      exactLongPoll: { cursor: "since", from: "seq", ...(args[1] ? { sameCursor: args[1] } : {}) },
+    } as RequestInit);
+    // What a long poll refuses, each before anything is sent.
+    case "pollRefused": {
+      const poll: Record<string, unknown> = { cursor: "since", from: "seq" };
+      const map = (e: { type: string }) => e.type;
+      const asks: Record<string, [string, Record<string, unknown>]> = {
+        stream: ["https://api.castle.xyz/c", { exactLongPoll: poll }],
+        socket: ["wss://api.castle.xyz/c", { exactStream: map, exactLongPoll: poll }],
+        post: ["https://api.castle.xyz/c", { method: "POST", exactStream: map, exactLongPoll: poll }],
+        shape: ["https://api.castle.xyz/c", { exactStream: map, exactLongPoll: "since" }],
+        cursor: ["https://api.castle.xyz/c", { exactStream: map, exactLongPoll: { from: "seq" } }],
+        from: ["https://api.castle.xyz/c", { exactStream: map, exactLongPoll: { cursor: "since", from: "x".repeat(257) } }],
+        same: ["https://api.castle.xyz/c", { exactStream: map, exactLongPoll: { ...poll, sameCursor: "always" } }],
+      };
+      const [url, init] = asks[text(args, 0)];
+      return fetch(url, init as RequestInit).then(() => "sent", (e: Error) => e.message);
+    }
+    // A body that is not events is bytes (LLP 1016.000, the byte stream).
+    // LLP 1133.003 §9: the gate's stub decode is there under the agent only.
+    case "gate": return typeof (globalThis as { __exact_gate_decode?: unknown }).__exact_gate_decode;
+    case "bytes": return fetch("https://api.castle.xyz/screen.avcc", {
+      exactStream: (e: { type: string; data: ArrayBuffer | string; message?: string }) =>
+        e.type === "error" ? `ended: ${e.message}` : `${e.type}:${e.data instanceof ArrayBuffer ? new Uint8Array(e.data).join(",") : "text"}`,
     } as RequestInit);
     // A socket is the same answer with a `wss:` URL (LLP 1069.004 slice 3):
     // Jetstream's shape, the cursor a query parameter.
@@ -189,6 +277,22 @@ function answer(source: string, args: unknown[], store: Store): unknown {
         .then(r => r.text(), (e: { kind: string; message: string }) => { lastError = `${e.kind}: ${e.message}`; return "failed"; })
         .finally(() => { flushing = false; });
     case "flushing": return `${flushing} ${lastError}`;
+    // A read whose rejection, run with no store, reads the store (LLP 1146 D3).
+    case "peek":
+      return fetch("https://api.castle.xyz/peek").then(r => r.text(), () => {
+        try { return `kept ${store.get("castle.session")}`; } catch (e) { lastError = (e as Error).message; return "threw"; }
+      });
+    // Each store operation tried where there is no store, what each said kept for `flushing`.
+    case "peekAll":
+      return fetch("https://api.castle.xyz/peek").then(r => r.text(), async () => {
+        const s = store as unknown as Record<string, (...a: unknown[]) => unknown>;
+        const said: string[] = [];
+        for (const [op, ...a] of [["get", "castle.session"], ["has", "castle.session"], ["locked", "castle.session"], ["unlock", "castle.session"], ["protect", "castle.session"], ["unprotect", "castle.session"], ["set", "castle.session", "x"], ["forget", "castle.session"], ["keepKey", "castle.key", null], ["key", "castle.key"]]) {
+          try { await s[op](...a); said.push(`${op} answered`); } catch (e) { said.push((e as Error).message.split(". ")[0]); }
+        }
+        lastError = said.join(" | ");
+        return "threw";
+      });
     // A BufferSource body goes as its bytes (LLP 1069.002 D4): a view into
     // the middle of a buffer, the buffer itself, and a DataView, each once.
     case "upload": {
@@ -216,14 +320,25 @@ function answer(source: string, args: unknown[], store: Store): unknown {
       } else {
         const b = new Uint8Array([1, 2]).buffer as ArrayBuffer & { transfer?: () => ArrayBuffer };
         if (typeof b.transfer !== "function") return "unsupported";
+        const view = new Uint8Array(b);
         b.transfer();
-        init = { method: "POST", body: new Uint8Array(b) };
+        init = { method: "POST", body: view };
       }
       return fetch("https://api.castle.xyz/blob", init).then(r => r.text(), (e: Error) => `refused: ${e.message}`);
     }
+    // A HEAD's reply has no body (Fetch, "HTTP-network fetch"): it reads empty as often as asked, and is never used
+    case "head": return fetch("https://api.castle.xyz/blob", { method: "HEAD" })
+      .then(async r => [JSON.stringify(await r.text()), JSON.stringify(await r.text()), String(r.bodyUsed)].join("/"));
+    // Nor has a reply whose status has none (a 204's, a 205's, a 304's)
+    case "noBody": return fetch("https://api.castle.xyz/blob")
+      .then(async r => [r.status, JSON.stringify(await r.text()), JSON.stringify(await r.text()), String(r.bodyUsed)].join("/"));
     // A deadline for the whole exchange: a timeout rejects with its kind.
     case "timed": return fetch("https://api.castle.xyz/slow", { exactTimeout: args[0] } as RequestInit)
       .then(r => r.text(), (e: { kind: string; message: string }) => `failed: ${e.kind}: ${e.message}`);
+    // A reply the server may hold (LLP 1016.000 D9): marked on the request; beside a stream, or not a boolean, refused.
+    case "held": return fetch("https://api.castle.xyz/changes", (args[0] === "stream" || args[0] === "yes-stream"
+      ? { exactHeld: args[0] === "stream" ? true : "yes", exactStream: (event: unknown) => event }
+      : { exactHeld: args[0] === "true" ? true : args[0] === "false" ? false : args[0] }) as RequestInit).then(r => r.text(), (e: Error) => `refused: ${e.message}`);
     case "redirected": return fetch("https://api.castle.xyz/moved", {
       ...(args[0] === "" ? {} : { redirect: args[0] }),
     }).then(r => r.status + " " + (r.headers.get("location") ?? ""));

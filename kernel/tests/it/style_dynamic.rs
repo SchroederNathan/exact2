@@ -463,7 +463,10 @@ fn enum_rows_resolve_names_and_others_do_not() {
     for id in StyleId::ALL {
         let names = id.enum_names();
         // A keyword row (a bit set named by CSS keywords) lists its words too.
-        let keywords = id == StyleId::FontVariantNumeric;
+        let keywords = matches!(
+            id,
+            StyleId::FontVariantNumeric | StyleId::FontVariantLigatures
+        );
         assert_eq!(
             names.is_empty(),
             id.codec() != exact_kernel::StyleCodec::Enum && !keywords,
@@ -510,6 +513,43 @@ fn font_variant_numeric_is_a_keyword_bit_set() {
     );
     assert_eq!(exact_kernel::FontVariantNumeric::css(1), "tabular-nums");
     assert_eq!(exact_kernel::FontVariantNumeric::css(0), "normal");
+}
+
+#[test]
+fn font_variant_ligatures_is_a_keyword_bit_set() {
+    use exact_kernel::FontVariantLigatures as L;
+    let set = |v: &str| {
+        let mut p = StyleProps::default();
+        p.set_dynamic(StyleId::FontVariantLigatures, &StyleValue::Text(v.into()))
+            .map(|_| p.font_variant_ligatures)
+    };
+    assert_eq!(set("normal"), Ok(0));
+    assert_eq!(set("common-ligatures"), Ok(1));
+    assert_eq!(set("no-contextual"), Ok(0x80));
+    // `none` is every kind off: the four `no-` values.
+    assert_eq!(set("none"), Ok(0xaa));
+    assert_eq!(
+        set("no-common-ligatures no-discretionary-ligatures no-historical-ligatures no-contextual"),
+        Ok(0xaa)
+    );
+    assert_eq!(
+        set("discretionary-ligatures no-contextual"),
+        Ok(L::DiscretionaryLigatures.keyword_bits() | L::NoContextual.keyword_bits())
+    );
+    for refused in [
+        "none none",
+        "none common-ligatures",
+        "normal contextual",
+        "common-ligatures no-common-ligatures",
+        "contextual contextual",
+        "ligatures",
+        "",
+    ] {
+        assert!(set(refused).is_err(), "{refused:?}");
+    }
+    assert_eq!(L::css(0), "normal");
+    assert_eq!(L::css(0xaa), "none");
+    assert_eq!(L::css(0x81), "common-ligatures no-contextual");
 }
 
 #[test]
@@ -764,6 +804,7 @@ fn every_row_writes_its_own_field_and_no_other() {
         StyleValue::Text("y 30deg".into()),
         StyleValue::Text("blur(12px) saturate(1.14)".into()),
         StyleValue::Text("flip-block, flip-inline".into()),
+        StyleValue::Text("\"wght\" 650".into()),
     ];
     let mut unwritten = Vec::new();
     let base = StyleProps::default();

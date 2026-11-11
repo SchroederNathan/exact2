@@ -2,6 +2,10 @@ pub(crate) mod culling;
 mod draw;
 mod local;
 mod passes;
+pub(crate) use passes::Bound;
+mod prepass;
+pub(crate) mod probe;
+pub(crate) mod shadow_cache;
 use crate::buffers::{bytes, Buffer, Targets};
 use crate::pipeline::Pipelines;
 use crate::{
@@ -18,6 +22,7 @@ use std::ops::Range;
 pub(crate) const RETIRED_BUDGET: u64 = 64 * 1024 * 1024;
 
 pub(crate) struct Mesh {
+    pub(crate) outline: Option<crate::outline::Hull>,
     pub(crate) indices: Range<u32>,
     pub(crate) vertex_bytes: u64,
     pub(crate) asset: bool,
@@ -37,7 +42,7 @@ pub(crate) struct Mesh {
     pub(crate) boxed: bool,
 }
 
-/// Persistent GPU arenas, tick history and draw lists; model pipelines prepare on arrival.
+/// Persistent GPU arenas, tick history and draw lists; model pipelines compile on first use.
 /// Storage capacity is declared by `STORAGE_BINDINGS`; uses 4× MSAA HDR and WebGPU.
 pub struct RendererWithAssets<const ASSETS: bool> {
     pub(crate) device: wgpu::Device,
@@ -45,10 +50,14 @@ pub struct RendererWithAssets<const ASSETS: bool> {
     slot_capacity: u32,
     pub(crate) pipelines: Pipelines,
     pub(crate) models: crate::models::Models,
+    pub(crate) outlines: Option<crate::outline::Pipelines>,
     pub(crate) quads: crate::quads::Quads,
     model_batches: Vec<Option<crate::MaterialId>>,
+    pub(crate) model_poses_current: bool,
     pub(crate) slot_list: Vec<u32>,
     pub(crate) uniform: wgpu::Buffer,
+    pub(crate) viewmodel_uniform: wgpu::Buffer,
+    prepass_active: bool,
     transforms: [Buffer; 2],
     attachment_matrices: Buffer,
     attachment_words: Vec<f32>,
@@ -60,9 +69,11 @@ pub struct RendererWithAssets<const ASSETS: bool> {
     pub(crate) grids: u32,
     slots: Buffer,
     scene_binds: [wgpu::BindGroup; 2],
+    viewmodel_scene_binds: [wgpu::BindGroup; 2],
     /// The same scene group over the culled lists: binding 4 is a dynamic window.
     culled_binds: [wgpu::BindGroup; 2],
-    culled_key: (wgpu::Buffer, u64),
+    viewmodel_culled_binds: [wgpu::BindGroup; 2],
+    culled_key: ListsKey,
     /// The camera's occlusion culling (occlusion.rs), made on first use.
     occlusion: Option<crate::occlusion::Occlusion>,
     /// This frame draws last frame's camera lists as occluders.
@@ -80,15 +91,18 @@ pub struct RendererWithAssets<const ASSETS: bool> {
     pub(crate) local_plan: crate::local_shadows::Plan,
     pub(crate) local_culls: Vec<local::LocalCull>,
     /// Group 1 of forward passes; rebuilt when a shadow texture is replaced.
-    shadow_sample: wgpu::BindGroup,
+    pub(crate) shadow_sample: wgpu::BindGroup,
     shadow_sample_stale: bool,
     shadow_placeholder: wgpu::TextureView,
     shadow_comparison: wgpu::Sampler,
-    vertices: Buffer,
-    indices: Buffer,
+    /// Nearest, clamped to the edge: `textureGather` of four cascade texels.
+    shadow_gather: wgpu::Sampler,
+    pub(crate) vertices: Buffer,
+    pub(crate) indices: Buffer,
     pub(crate) meshes: Vec<Mesh>,
     pub(crate) mesh_uploads: u64,
     pub(crate) batches: Vec<Batch>,
+    batch_coverage: Vec<bool>,
     /// A drawn batch is in the viewmodel layer this frame.
     viewmodels: bool,
     /// Levels of detail: one per entity per frame.
@@ -98,21 +112,37 @@ pub struct RendererWithAssets<const ASSETS: bool> {
     // This frame's visible environment map is resident.
     pub(crate) sky_ready: bool,
     pub(crate) targets: Targets,
-    // A direct frame's attachments (`encode_hooked`), made at its target's size.
+    // A direct frame's attachments (`encode_hooked`), made at its target's size;
+    // a look frame that counts particles keeps its own, retained between passes.
     pub(crate) direct_targets: Option<crate::buffers::DirectTargets>,
-    // Frames may draw direct: on phones and tablets, whose tiling GPUs it is for.
-    // Elsewhere it would move MSAA edges (each sample is tonemapped before the
+    look_direct: Option<crate::buffers::DirectTargets>,
+    direct_retained: bool,
+    // Frames may draw direct: at one sample everywhere, where the picture is the
+    // tone pass's; at four on phones and tablets, whose tiling GPUs it is for.
+    // Elsewhere four would move MSAA edges (each sample is tonemapped before the
     // resolve), and pinned pixels with them, for little gain.
     pub(crate) allow_direct: bool,
+    // Frames drawn direct since construction (`Stats::direct_frames`).
+    pub(crate) direct_frames: u64,
     counts: Stats,
     shadows: Option<ShadowMaps>,
     bloom: Option<BloomTargets>,
     ssao: Option<crate::ssao::Ssao>,
+    pub(crate) water: crate::water::Passes,
+    water_effects: crate::WaterEffects,
     texture_creations: u64,
     hook_binding: Option<crate::hooks::FrameBinding>,
     custom_bindings: Option<crate::hooks::MaterialBindings>,
     hook_targets: Option<crate::hooks::HookTargets>,
     pub(crate) hook_metrics: Option<Box<crate::hooks::metrics::Metrics>>,
+    /// A look frame's instruments, armed for one encode (`probe.rs`).
+    pub(crate) probe: Option<probe::Probe>,
+    /// Records the probe has built: an unarmed frame builds none (tests).
+    pub(crate) probe_built: std::cell::Cell<u64>,
+    // The live frames' levels of detail, kept while a look frame selects its own.
+    look_levels: Option<Vec<(u32, Option<u8>)>>,
+    // The look frames' shadow-texel pipeline, its layout and its counter.
+    shadow_texels: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::Buffer)>,
 }
 
 // Use the uploaded affine records and the same presence test as transform.wgsl.
@@ -174,10 +204,27 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
     /// Compile effect pipelines for this output format and retain the device/queue.
     /// Draw targets must match this format; RGBA/BGRA unorm and sRGB are supported.
     /// Particle capacity prepares with emitters; asset arenas may compact retired spans.
-    /// Whether a frame that needs nothing of its HDR image after the opaque pass
-    /// draws tonemapped straight into the target: the default on Android and iOS.
+    /// Whether a frame that needs no HDR image draws tonemapped straight into the
+    /// target (README "Direct frames"): the default at one scene sample, and at
+    /// four on Android and iOS.
     pub fn set_direct(&mut self, allow: bool) {
         self.allow_direct = allow;
+    }
+
+    /// Which of a `Water` resource's effects frames draw (both by default):
+    /// a present-time choice that leaves the saved resource as it is.
+    pub fn set_water_effects(&mut self, effects: crate::WaterEffects) {
+        self.water_effects = effects;
+    }
+
+    /// Select diffuse-only lighting before preparing any models. Default: physical.
+    pub fn with_matte_models(mut self, matte: bool) -> Self {
+        assert!(
+            self.pipelines.models.is_none(),
+            "set model lighting before preparing models"
+        );
+        self.pipelines.matte_models = matte;
+        self
     }
 
     /// Cull the camera's draws by occlusion (occlusion.rs) on frames whose lists
@@ -187,9 +234,40 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
     }
 
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let pipelines = Pipelines::new(device, format);
+        Self::with_samples(device, queue, format, exact_game::SceneSamples::Four)
+    }
+    /// Construct a renderer with one or four scene samples per pixel.
+    pub fn with_samples(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        samples: exact_game::SceneSamples,
+    ) -> Self {
+        Self::configured(device, queue, format, samples, false)
+    }
+    /// Opt into an opaque depth prepass at 1×. Equal-depth colour fragments pass;
+    /// coplanar surfaces therefore follow draw order. Custom materials disable it.
+    pub fn configured(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        samples: exact_game::SceneSamples,
+        depth_prepass: bool,
+    ) -> Self {
+        let samples = samples.count();
+        assert!(
+            !depth_prepass || samples == 1,
+            "depth prepass requires one scene sample"
+        );
+        let pipelines = Pipelines::configured(device, format, samples, depth_prepass);
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("game frame"),
+            size: (frame::FLOATS * 4) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let viewmodel_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("game viewmodel frame"),
             size: (frame::FLOATS * 4) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -221,7 +299,8 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             wgpu::BufferUsages::STORAGE,
             "game attachment matrices",
         );
-        let environment = crate::ibl::EnvironmentLight::new(device, false);
+        let environment =
+            crate::ibl::EnvironmentLight::new(device, false, pipelines.cache.handle.as_ref());
         let lights = crate::lights::Lights::new(device);
         let retained_binds = scene_binds(
             device,
@@ -234,26 +313,59 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             &environment,
             &lights,
         );
-        let cull = crate::cull::Cull::new(device);
-        let culled_key = (cull.compacted.raw.clone(), cull.window);
+        let viewmodel_retained_binds = scene_binds(
+            device,
+            &pipelines.scene_layout,
+            &viewmodel_uniform,
+            &transforms,
+            &materials,
+            (&slots.raw, None),
+            &attachment_matrices,
+            &environment,
+            &lights,
+        );
+        let cull = crate::cull::Cull::new(device, pipelines.cache.handle.as_ref());
+        let culled_key = (cull.compacted.raw.clone(), cull.binding());
         let culled_binds = scene_binds(
             device,
             &pipelines.scene_layout,
             &uniform,
             &transforms,
             &materials,
-            (&cull.compacted.raw, Some(cull.window)),
+            (&cull.compacted.raw, cull.binding()),
             &attachment_matrices,
             &environment,
             &lights,
         );
-        let targets = Targets::new(device, (64, 64), &pipelines.tone_layout, &uniform);
+        let viewmodel_culled_binds = scene_binds(
+            device,
+            &pipelines.scene_layout,
+            &viewmodel_uniform,
+            &transforms,
+            &materials,
+            (&cull.compacted.raw, cull.binding()),
+            &attachment_matrices,
+            &environment,
+            &lights,
+        );
+        let targets = Targets::with_retention(
+            device,
+            (64, 64),
+            &pipelines.tone_layout,
+            &uniform,
+            false,
+            samples,
+        );
         let shadow_placeholder = crate::local_shadows::placeholder(device);
         let shadow_comparison = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("game shadow comparison"),
             compare: Some(wgpu::CompareFunction::LessEqual),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let shadow_gather = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("game shadow gather"),
             ..Default::default()
         });
         let shadow_sample = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -272,6 +384,10 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(&shadow_placeholder),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&shadow_gather),
+                },
             ],
         });
         let limits = device.limits();
@@ -282,14 +398,25 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             .min(u64::from(u32::MAX)) as u32;
         Self {
             models: crate::models::Models::default(),
-            quads: crate::quads::Quads::new::<ASSETS>(device, queue, &uniform),
+            quads: crate::quads::Quads::new::<ASSETS>(
+                device,
+                queue,
+                &uniform,
+                &viewmodel_uniform,
+                (samples, format),
+                pipelines.cache.handle.as_ref(),
+            ),
             model_batches: Vec::new(),
+            model_poses_current: false,
             slot_list: Vec::new(),
             device: device.clone(),
             queue: queue.clone(),
             slot_capacity,
             pipelines,
+            outlines: None,
             uniform,
+            viewmodel_uniform,
+            prepass_active: false,
             transforms,
             attachment_matrices,
             attachment_words: Vec::new(),
@@ -299,7 +426,9 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             grids: 0,
             slots,
             scene_binds: retained_binds,
+            viewmodel_scene_binds: viewmodel_retained_binds,
             culled_binds,
+            viewmodel_culled_binds,
             culled_key,
             occlusion: None,
             occluding: false,
@@ -316,26 +445,37 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             shadow_sample_stale: false,
             shadow_placeholder,
             shadow_comparison,
+            shadow_gather,
             vertices: Buffer::new(device, 1024, wgpu::BufferUsages::VERTEX, "game vertices"),
             indices: Buffer::new(device, 1024, wgpu::BufferUsages::INDEX, "game indices"),
             meshes: Vec::new(),
             mesh_uploads: 0,
             batches: Vec::new(),
+            batch_coverage: Vec::new(),
             viewmodels: false,
             levels: Default::default(),
             soft_retained: false,
             sky_ready: false,
             targets,
             direct_targets: None,
-            allow_direct: cfg!(any(target_os = "android", target_os = "ios")),
+            look_direct: None,
+            direct_retained: false,
+            allow_direct: samples == 1 || cfg!(any(target_os = "android", target_os = "ios")),
+            direct_frames: 0,
             shadows: None,
             bloom: None,
             ssao: None,
-            texture_creations: 4,
+            water: Default::default(),
+            water_effects: Default::default(),
+            texture_creations: if samples == 1 { 3 } else { 4 },
             hook_binding: None,
             custom_bindings: None,
             hook_targets: None,
             hook_metrics: None,
+            probe: None,
+            probe_built: Default::default(),
+            look_levels: None,
+            shadow_texels: None,
             counts: Stats {
                 draws: 1,
                 triangles: 1,
@@ -347,6 +487,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
     /// Swap history roles. The caller makes every live slot current before drawing.
     /// Feed retains matching target pages instead of copying the previous buffer.
     pub fn begin_tick(&mut self) {
+        self.model_poses_current = false;
         let previous = self.current;
         self.current = 1 - self.current;
         self.transforms[self.current].live = self.transforms[previous].live;
@@ -362,6 +503,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         if values.is_empty() {
             return Ok(());
         }
+        self.model_poses_current = false;
         self.check_capacity("transforms", end)?;
         self.ensure_slots(end);
         self.transforms[self.current].write(&self.queue, u64::from(first_slot) * 40, bytes(values));
@@ -395,6 +537,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         if end > self.transforms[1 - self.current].live / 40 {
             return self.write_transforms(first_slot, &crate::buffers::filled(floats, fill));
         }
+        self.model_poses_current = false;
         self.check_capacity("transforms", end)?;
         self.ensure_slots(end);
         self.transforms[self.current].write_with(
@@ -416,6 +559,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         if values.is_empty() {
             return Ok(());
         }
+        self.model_poses_current = false;
         self.check_capacity("transforms", end)?;
         self.ensure_slots(end);
         self.transforms[1 - self.current].write(
@@ -437,6 +581,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         if values.is_empty() {
             return Ok(());
         }
+        self.model_poses_current = false;
         self.check_capacity("transforms", end)?;
         self.ensure_slots(end);
         for buffer in &mut self.transforms {
@@ -594,6 +739,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 .unwrap_or(self.meshes.len()),
         );
         let mesh = Mesh {
+            outline: None,
             vertex_bytes: size_of_val(vertices) as u64,
             asset: false,
             indices: (index_start / 4) as u32..(index_end / 4) as u32,
@@ -701,6 +847,9 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                     target.live = target_start + bytes;
                 }
             }
+            if let Some(hull) = &mesh.outline {
+                hull.rebase(&self.queue, (v.live / size_of::<Vertex>() as u64) as u32);
+            }
             mesh.base_vertex = (v.live / size_of::<Vertex>() as u64) as i32;
             mesh.indices = (i.live / 4) as u32..((i.live + n) / 4) as u32;
             v.live += mesh.vertex_bytes;
@@ -787,18 +936,40 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             &self.environment,
             &self.lights,
         );
+        self.viewmodel_scene_binds = scene_binds(
+            &self.device,
+            &self.pipelines.scene_layout,
+            &self.viewmodel_uniform,
+            &self.transforms,
+            &self.materials,
+            (&self.slots.raw, None),
+            &self.attachment_matrices,
+            &self.environment,
+            &self.lights,
+        );
         self.rebind_culled();
         self.rebind_locals();
     }
     fn rebind_culled(&mut self) {
-        self.culled_key = (self.cull.compacted.raw.clone(), self.cull.window);
+        self.culled_key = (self.cull.compacted.raw.clone(), self.cull.binding());
         self.culled_binds = scene_binds(
             &self.device,
             &self.pipelines.scene_layout,
             &self.uniform,
             &self.transforms,
             &self.materials,
-            (&self.cull.compacted.raw, Some(self.cull.window)),
+            (&self.cull.compacted.raw, self.cull.binding()),
+            &self.attachment_matrices,
+            &self.environment,
+            &self.lights,
+        );
+        self.viewmodel_culled_binds = scene_binds(
+            &self.device,
+            &self.pipelines.scene_layout,
+            &self.viewmodel_uniform,
+            &self.transforms,
+            &self.materials,
+            (&self.cull.compacted.raw, self.cull.binding()),
             &self.attachment_matrices,
             &self.environment,
             &self.lights,
@@ -806,13 +977,18 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
     }
 }
 
+/// The culled lists a scene group binds: their buffer and binding size
+/// (`Cull::binding`).
+type ListsKey = (wgpu::Buffer, Option<u64>);
+
 fn record_end(first: u32, len: usize, stride: usize) -> u64 {
     assert!(len.is_multiple_of(stride), "incomplete slot record");
     u64::from(first) + (len / stride) as u64
 }
 
-// `slots` is the retained list (whole buffer, offset zero) or the culled lists
-// through a fixed window whose dynamic offset selects one view's group region.
+// `slots` is the retained list or the culled lists, whole at offset zero, or the
+// culled lists through a fixed window whose dynamic offset selects one view's
+// group region (`Cull::binding`).
 #[allow(clippy::too_many_arguments)]
 fn scene_binds(
     device: &wgpu::Device,
@@ -1011,7 +1187,7 @@ mod e10_tests {
         type Args = ();
         fn setup(w: &mut World, _: &()) {
             w.insert_resource(Environment {
-                background: Some([0.; 3]),
+                background: Some([0.; 3].into()),
                 fog: None,
                 ..Default::default()
             });

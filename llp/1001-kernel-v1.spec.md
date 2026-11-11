@@ -30,7 +30,7 @@ references remain unqualified. `position: fixed` is not a schema value. Percenta
 behavior: height for top/bottom, width for left/right, diverging from the
 [W3C draft's width rule](https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-rootmargin).
 Windows and Android inherit the Linux path without carrier qualification;
-terminal does not sample. The issue stays open. The margin is an observer option, not a CSS layout row.
+terminal does not sample. The margin is an observer option, not a CSS layout row.
 
 ## 1. One declaration authority (WS-B)
 
@@ -68,6 +68,12 @@ The schema metadata changes its digest, so producers and hosts re-bake together.
 >   `Kernel::set_root_font_size`; the table's 16 is what a host that sets none shows;
 > - `font-size` takes a text style (`-exact-title1`, …) that the kernel resolves
 >   against that root, and a `role="heading"` is lowered to one by its level;
+> - a text style carries its weight and its leading per platform (LLP 1115.000
+>   D12.2), where CSS's `font: -apple-system-*` keywords set one weight and a
+>   `normal` line height: the Mac's `headline` is bold and its styles carry the
+>   leading NSFont gives them (body 13/16), iOS's and the web's are the face's own.
+>   Named through `font` the style resets both, as the shorthand does; named by a
+>   bare `font-size` it fills only what nothing above says, where CSS fills nothing;
 > - `hr` is one solid edge in the separator role, not Chrome's two shades, and it is
 >   one hairline with no margin of its own (LLP 1115.000 D10.3): lowering writes it a
 >   top edge `-exact-hairline` thick and no margin, where Chrome's UA sheet gives it
@@ -103,9 +109,18 @@ The schema metadata changes its digest, so producers and hosts re-bake together.
 >   `min-width: 0`). A percentage-wide range shrinks below its 129 there too, which is
 >   CSS's own rule for a form control (Sizing 3 §5.2.2) and no deviation (LLP 1115.000
 >   D10.2);
+> - `font-weight` on a platform face draws the platform's named weight at each hundred
+>   (Charlie, 2026-10-24; LLP 1019 §13 D11): on Apple `600` is UIKit's and AppKit's
+>   semibold, San Francisco's `wght` 590, where Chrome and WebKit set the axis to 600,
+>   so its text is about 0.2% narrower than the browser's; a declared face keeps the
+>   number;
 > - an unset root background is the platform's, never a fixed white;
 > - a pushed route has the platform's Back whether or not one is authored;
-> - a custom pressable that declares no press feedback dims while held on iOS.
+> - a custom pressable that declares no press feedback dims while held on iOS;
+> - a state part's `:checked` (LLP 1121 D8) holds when the node's `checked`,
+>   `aria-checked` or `aria-selected` is true, or its `aria-pressed` is `"true"` (or
+>   true): one name for a toggle, a selected row and a pressed button, where CSS's
+>   `:checked` is an input's.
 >
 > And one layout deviation, recorded here because it holds on every host and not only
 > the terminal it was made for (LLP 1101 D3): `ch` and `lh` are a fixed 8 × 16 cell
@@ -118,6 +133,15 @@ The schema metadata changes its digest, so producers and hosts re-bake together.
 > raw `elementsFromPoint` filtered to ids omits it, while
 > `elementFromPoint()?.closest("[id]")` names it. This keeps the ruled first-entry
 > equality for the T3 Inspect overlay on every host.
+>
+> A viewport-segment deviation (2026-10-21; LLP 1078, "As built (the keyboard)"): on
+> iOS, under `interactive-widget="resizes-content"`, a keyboard that ends the viewport
+> inside a fold's band, or above it, leaves the fold in place: the lower segment's top
+> stays at the hinge, which tells a page the keyboard covers that segment, and segments
+> past the viewport's end are 0 tall. Chrome clips the band to the viewport, which moves
+> the lower segment's top to the viewport's end, and drops a fold the keyboard covers
+> whole until about a second after the keyboard goes; dropping it would switch a branch
+> that reads the count and take the focused field, and its keyboard, away.
 >
 > Where a later paragraph of this spec still states a presentation default as Chrome's
 > (`hr`'s shading, a bare `button` as `appearance: none`, `-exact-tint-color`
@@ -388,7 +412,12 @@ retain the existing editing session on a tap, including a button with gesture
 handlers and no press action. Messages uses it on bubbles and reaction badges
 that open Tapbacks: the panel does not exist yet at pointer down. Web prevents
 the pointer’s default focus change; iOS skips resigning the current responder.
-It neither focuses a field nor opens a keyboard. Messages also declares it on
+On iOS a button keeps the editing session without it, as a `UIButton` leaves the
+first responder alone: a press on a button (one that does not take the focus
+itself) commits what was typed as `change` and blurs nothing; a press on ground
+that presses nothing still ends the editing (LLP 1115, the keyboard is the
+platform's; ruled 2026-10-20). There `retainFocus` also keeps a pressed node
+that asks for focus from taking it. It neither focuses a field nor opens a keyboard. Messages also declares it on
 both Send controls: sending from a retained composer keeps its editing session.
 Other hosts currently ignore it.
 `focusGuide` (prop 241, string) accepts `"auto"` on a container. On tvOS,
@@ -469,13 +498,19 @@ not yet map the role to native presentation. A red colour or action label never
 implies the flag.
 
 `menuRemove` (263, string) carries root `-exact-menu-remove`: a literal list of
-the standard AppKit item ids in LLP 1021 §5.3. AppKit suppresses those items
+the standard AppKit item ids in LLP 1021 §5.3 and §5.3.1. AppKit suppresses those items
 and their menu equivalents; all other hosts ignore this non-CSS presentation
 hint. It changes no layout or window capability.
 
+`menuKeys` (292, string) carries root `-exact-menu-keys`: a literal list of
+`id=chord` pairs whose one id is `close-window` (LLP 1021 §5.3.3), each chord
+one `aria-keyshortcuts` chord with `Meta`, or `none`. AppKit gives File ▸
+Close Window the chord, or none; all other hosts ignore this non-CSS presentation hint.
+
 `menuPlacement` (261, string) is `-exact-menu` on a button (LLP 1021 §5.3,
-Charlie, 2026-10-12): a literal `app`, `file`, `edit`, `view`, `go`, `window`
-or `help`. AppKit adds the button to that menu even without a shortcut.
+Charlie, 2026-10-12; §5.3.1, 2026-10-22): a literal `about`, `app`, `file`,
+`edit`, `view`, `go`, `window`, `help` or `none`. AppKit adds the button to
+that menu even without a shortcut; `none` keeps its chord with no item.
 Declared deviation: HTML has no application menu; web, UIKit, Linux,
 Windows, Android and terminal hosts retain the ordinary button and ignore
 this hint. Dispatch and layout are unchanged.
@@ -554,6 +589,13 @@ with PR #47, with Charlie's rulings of 2026-09-27 where he made them; the
   or app-owned pressed state. Ruled 2026-09-27: it composes through CSS's
   `scale` property and never writes `transform`, and it is kept under reduced
   motion, as a native button's highlight is.
+- **`-exact-press-opacity`, `-exact-press-background-color`, `-exact-press-color`**,
+  bits 212 to 214 ([LLP 1061 D7](1061-press-feel-and-reduced-motion.rfc.md)), are
+  not CSS (Charlie, 2026-10-17). They are the author's pressed paint, which CSS
+  writes as an `:active` rule; Contract has no selectors, and `:active` also
+  matches the pressed node's ancestors where the press is the innermost
+  pressable's. The host shows them from the press state it tracks for
+  `-exact-press-scale`, on its timing, with no runner round trip.
 - **`-exact-layout-transition`**, bit 143 ([LLP 1063 D1, D6](1063-presence-and-layout-motion.rfc.md)),
   is not CSS. It moves the presentation after committed layout, sizing only
   the box's surface while content keeps its final geometry. The separate row
@@ -722,7 +764,11 @@ Declared deviations, and beside each what is CSS's own:
 **CSS grid's supported grammar follows Chrome's.** Track templates preserve
 named lines and `repeat()` (fixed, `auto-fill` and `auto-fit`) and accept px,
 percent, fr, auto, min/max-content, `fit-content()` and flexible `minmax()`
-maxima. Placement accepts numeric and named lines and spans. Keywords and units
+maxima. `rem`, and `calc()`, `min()`, `max()` and `clamp()` over px, `rem` and %, are lengths in
+ordinary tracks, `minmax()` and valid repetitions. The dimension parser and
+resolver supply their arithmetic, narrowing and zero floor; percentages use
+the grid's content box in that axis, with CSS's intrinsic-sizing treatment
+when the basis is indefinite. Placement accepts numeric and named lines and spans. Keywords and units
 are ASCII-case-insensitive; nested `repeat()` is refused as invalid CSS.
 All six rows are parsed as CSS tokens, so escapes and comments have their CSS
 meaning; canonical output uses the CSS serializer for identifiers and retains a
@@ -730,10 +776,12 @@ shorthand's trailing placement whenever omission would change that meaning.
 The following Chrome-valid forms are the complete declared grid grammar gaps:
 
 - `subgrid`; Taffy has no subgrid layout algorithm;
-- track lengths in units other than px, and calculated/custom/environment
-  track or placement values (`calc()`, `min()`, `max()`, `clamp()`, `var()`,
-  `env()`); Taffy's portable value has no browser unit context, cascade or
-  calculation resolver;
+- track lengths in units other than px; custom/environment track values
+  (`var()`, `env()`); and calculated/custom/environment placement values;
+  these grammars have no unit context or cascade;
+- calculated `fit-content()` limits; Taffy's compact limit stores only a
+  length or percentage. `grid-auto-columns` and `grid-auto-rows` have no
+  Contract rows yet;
 - CSS-wide keywords (`inherit`, `initial`, `unset`, `revert`, `revert-layer`)
   on all six rows, plus custom/environment values on `justify-items`; kernel
   style rows store specified values without a CSS cascade;
@@ -828,11 +876,17 @@ needs a field's width sets it
 `start` and `end` resolve against the paragraph's `direction` in
 `Paragraph::from_style`, so hosts see only left, center, right or justify; LLP
 1053). CSS `direction` orders flex rows and places blocks in the kernel, and
-`direction: rtl` is a paragraph's base direction on every host. Declared: under
-the initial `ltr`, the Apple and Linux engines still take a paragraph's base
-direction from its first strong character (as `unicode-bidi: plaintext`), so
-an `ltr` paragraph that opens with Hebrew or Arabic orders mixed text as an
-`rtl` one would. Its alignment is still `start` = left, and the web uses CSS.
+`direction` is a paragraph's base direction on every host, said either way,
+so no first strong character picks it: Apple text, the Markdown editor (LLP
+1045 D11) and Apple's plain text fields (an `input`, a `textarea` of either
+appearance, and a Markdown editor's text once its `markup` goes) as the web's
+fields take it, and a plain field's unsaid `text-align` is `start`, the right
+under `rtl` (`host/web/tests/field-direction.test.mjs`, `FieldDirection*Tests`).
+Declared: under the initial `ltr`, Linux's engine still takes a paragraph's
+base direction from its first strong character (as `unicode-bidi:
+plaintext`), so an `ltr` paragraph there that opens with Hebrew or Arabic
+orders mixed text as an `rtl` one would; its alignment is still `start` =
+left.
 The Linux text-flow walker cannot yet break an RTL run inside an LTR
 paragraph. Font matching stops at the nearest
 real declared face and never synthesizes weight or style, rather than CSS's initial
@@ -967,10 +1021,18 @@ the frame once more per backdrop node. The measured bounds are LLP 1053.000 §3.
   `regions`). A deviation, declared: a host that reports none (the web, Linux,
   Windows, Android, the terminal) resolves each to its safe-area inset, where a
   platform with margins would give more. `tests/regions.rs`.
+  Window Controls Overlay's title-bar area is a sixth: `env(titlebar-area-x|y|width|height)`
+  against the `Env`'s `titlebar_area`, `None` until a host reports one (the AppKit host
+  under `viewport-fit=cover`), so each is undefined and its fallback applies, as in a
+  browser tab. No compact kind holds it: a length that reads it is always a calculation
+  (wire kind 24, `env()` tags 36–39). `tests/titlebar.rs`.
 - **Comparisons** (2026-10-07; approved by Charlie 2026-10-06).
   Dimension rows accept `calc()`, `min()`, `max()` and `clamp()` over absolute
-  lengths, `ch`/`lh`, percentages, viewport units, safe-area insets and viewport
-  segments. Functions can nest; multiplication and division take a numeric
+  lengths, `ch`/`lh`, `rem`, percentages, viewport units, safe-area insets and viewport
+  segments. A `rem` resolves at layout against the root font size, which the
+  environment carries (`Env::root_font_size`); a new root size restyles every
+  node whose calculation or grid track holds one. `em` stays refused there: it
+  would need each element's font size at layout. Functions can nest; multiplication and division take a numeric
   factor or divisor. For example,
   `bottom="calc(clamp(15px, env(safe-area-inset-bottom), 60px) + 59px)"`.
   CSS orders the bounds as `clamp(MIN, VAL, MAX)`; MIN wins when it exceeds MAX.
@@ -1080,9 +1142,10 @@ no block lays out exactly as before. Refused: a block for a root, for an
 inline run, and beside a registered content region.
 
 `SetChildren` rejects: duplicate children, self-child, a root as a child, a cycle
-(child is an ancestor of the parent), children on a leaf type, a non-`Text`
-child under a `Text` (a text node's children are its inline runs; anything else
-would be a node the engine never lays out — `InlineRunNotText`), and a node
+(child is an ancestor of the parent), children on a leaf type, a child under a
+`Text` that is neither a `Text` nor an `Image` (a text node's children are its
+inline runs and the images in its text, LLP 1011.002; anything else would be a
+node the engine never lays out — `InlineRunNotText`), and a node
 more than `MAX_DEPTH` (128) levels below the top of its tree, inline runs
 included (`TooDeep`, 2026-09-23). Layout recurses once per level: release
 Taffy takes up to ~3.5 KiB of stack a level (flex; block 1.9, inline runs
@@ -1203,6 +1266,18 @@ widths for the issue's sentence: 16 px Arial at 180 px on the Mac
 (`balance_tests.rs`); the web JS target's conformance fixture carries it
 (`styles.contract`). A terminal entry refuses the row.
 
+**Font smoothing** (2026-10-28, [LLP 1019 D12](1019-fonts.rfc.md)).
+`-webkit-font-smoothing` (bit 222, inherited, `auto | antialiased`) is a paint
+row: a change neither measures nor lays out. AppKit draws an `antialiased`
+paragraph with Core Graphics font smoothing off (UIKit sets the same flag,
+expected to change nothing on iOS, as iOS Safari ignores the property); the
+web writes it with Firefox's `-moz-osx-font-smoothing`; Linux, Windows, a
+terminal and the widget and watch drivers admit it and draw as before.
+Declared: Apple reads it once per paragraph, so an inline run's own value
+gives way to its paragraph's, and text a platform view draws (a text field's,
+a native control's title) and a paragraph the content-region reader holds keep
+the platform's smoothing.
+
 **Book typography** (the reader diary, 2026-10-04). `text-align: justify`
 fills every line but a paragraph's last and one before a forced break, on
 every host; a line with no justification opportunity stays at the start, as
@@ -1218,6 +1293,15 @@ Declared: **Linux has no hyphenation dictionary**, so `auto` breaks there only
 at soft hyphens, logging it once; Apple hyphenates by the document's language,
 not an element's `lang`; text flowed around exclusions and a content region
 take no `text-indent` and no `auto` points.
+
+**iOS emergency word breaks** (QUEUE 62, 2026-10-22). In paragraphs
+without text-flow exclusions, a word too wide for its own line under
+`overflow-wrap: break-word` with `hyphens: manual` takes the last language
+hyphenation point that fits with its visible hyphen, as UILabel does. Ordinary word boundaries take precedence over these
+points, which add nothing to min-content and map back to the original source.
+Without a dictionary or a fitting syllable, the break is at a letter.
+`hyphens: none` and `overflow-wrap: anywhere` retain CSS's letter breaks.
+This is an iOS presentation deviation; other hosts retain their current rules.
 
 **Multi-column layout** (LLP 1093, stage 1 built 2026-10-04). Bits 180–190:
 `column_count` (`u16`, 0 is `auto`), `column_width`, `column_fill`,
@@ -1509,34 +1593,59 @@ authored per-glyph cascade needs a shaping API beyond cosmic-text's one
 
 CSS form and text vocabulary (app diaries kanban F11, ledger F1/F4,
 minesweeper F4, pomodoro F2): `rows` is HTML intrinsic line count and maxlength
-limits user UTF-16 edits, leaving authored values intact. Native interactive
-CSS resize handles are not implemented; Contract admits none and diagnoses
-other CSS values. user-select admits auto, none and text (2026-10-12, LLP
-1115.000 D11.6): the nearest authored value decides, and a control's label is
+limits user UTF-16 edits, leaving authored values intact. `resize`
+(2026-10-30) admits every CSS keyword. The browser draws its grip; the Mac
+and iOS draw Chrome's two strokes in a textarea's bottom end corner, and a
+drag hands the runner the border box the pointer reached
+(`Runner::resize_box`), which writes `width` and `height` in the box's
+`box-sizing`, as Chrome's inline style does: they replace an authored or
+`field-sizing: content` size until the plan rewrites the row, `min-*` and
+`max-*` still bound them, and nothing else does. `block` and `inline` are
+`vertical` and `horizontal`. Declared deviation: only a textarea has a grip
+on a native host, and tvOS (a read-only textarea), Linux, Windows, Android
+and the terminal draw none. user-select admits auto, none, text (2026-10-12, LLP
+1115.000 D11.6) and all (2026-10-20): the nearest authored value decides, and a control's label is
 not selectable unless text is said on it or inside the control. What is left
 is auto with nothing above it, the platform's: macOS resolves it as AppKit
 does (LLP 1115 D8: the chrome's label is not selectable, `article` and other
 content text is) and iOS as UIKit does (not selectable, a `UILabel`), so on
 iOS only text its author made selectable is, by UIKit's own text interaction
-over the paragraph's lines, one paragraph at a time. Declared deviation:
+over the paragraph's lines, one paragraph at a time. all is CSS UI 4's
+atomic selection on the web (the browser's own), macOS and iOS: a press in
+the element selects all of it, and a selection that takes part of it takes
+all of it, so a drag, a Shift-click or a Shift-arrow that reaches into it
+extends by the whole element; the outermost such element is the unit, an
+inline run's being its offsets in its paragraph. On macOS an element around
+paragraphs spans from its first paragraph's start to its last's end. On iOS
+a long press or a double tap in it selects it in place of a word, a tap
+selects nothing (a UITextView's), and an element around a paragraph is that
+paragraph (one selection is one paragraph). On the web, macOS and iOS an
+inline run that says all is selectable, alone, in text that is not. A
+scripted setSelectionRange is not widened. Declared deviation:
 Linux, Windows, Android and tvOS have no text selection executor, and text
-there is auto. all and contain are diagnosed at compile time
-(`lower-css-user-select`): no native presenter selects an element whole on one
-press or keeps a selection inside its element. Border shorthands reset and
+and all there are auto; the terminal's selection is the terminal's. contain
+is diagnosed at compile time (`lower-css-user-select`): no native presenter
+keeps a selection inside its element. Border shorthands reset and
 lower to existing side rows, including `inset`, `dotted` and `dashed` under
 §1's border semantics and raster deviation; other line styles are diagnosed.
 The one-to-four-value box shorthands (`padding`, `margin`, `inset`,
 `border-width`, `border-style`, `border-color`, `scroll-padding`,
-`scroll-margin`, `border-radius`) lower a literal, or each literal arm of a
+`scroll-margin`, `border-radius`), and the two-value `gap` (row, column),
+`overflow` and `overscroll-behavior` (x, y), lower a literal, or each literal arm of a
 choice, to its side rows, split at CSS white space (space, tab, LF, CR, FF)
 outside parentheses as CSS expands the shorthand
 (`exact_kernel::style::sides`); a literal `/` radius is refused by name. A
 computed value is bound whole to the four rows, and no host splits it: an
 overriding longhand, an `env()` substituted later and each row's grammar
-would make a run-time split differ from the browser's. So a computed value
-the compiler sees build a list (`` padding=`${pad}px 0` ``, a concatenation,
-a `fn` returning one) is refused (`lower-css-shorthand`), naming the
-longhands, each of which may be computed. A computed single value
+would make a run-time split differ from the browser's. A template is split
+at compile time at its own text's white space, as a literal is, when each
+interpolation is part of one value that also holds text, outside parentheses
+(`` padding=`${pad}px 0` ``: the top and bottom `${pad}px`, the sides `0`), and
+a literal one is one token; an interpolation holding white space reaches its
+row as a list, as a computed single value holding one does. Another computed
+value the compiler sees build a list (a concatenation, a `fn` returning one)
+is refused (`lower-css-shorthand`), naming the longhands, each of which may
+be computed. A computed single value
 (`padding=pad`) is every side's. A list that reaches a row anyway (state
 holding `"10px 5px"`) is refused by the row with a journal line on every
 host; the web's JS target refuses a list on a corner (two lengths, or a
@@ -1548,6 +1657,13 @@ underline/line-through to the existing line row; other color/style/thickness
 components are diagnosed. Linux draws its UA lines from font size and glyph
 advances; underline skip-ink:auto is not implemented and its driver log names
 that deviation once. Web and Apple use their text systems' decoration metrics.
+A box's lines cross its inline descendants' visible text in the box's colour,
+whatever the box's own visibility (CSS Text Decoration 3 §2.1); where boxes
+draw the same line, the nearest box's shows, as in Chrome. Native hosts place
+each glyph run's line by that run's font, not the decorating box's. Apple
+carries a text node's lines to its inline descendants only, not a block's to
+the paragraphs inside it. A terminal cell, and an Apple widget snapshot's text, draw
+a box's lines in the text's own colour.
 
 CSS flex shorthand admits grow/shrink factors and any admitted dimension basis,
 with the factors adjacent as CSS requires. Intrinsic flex-basis keywords

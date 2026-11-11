@@ -33,6 +33,8 @@ mod host_opcodes;
 pub mod kv;
 #[cfg(feature = "bindings")]
 pub mod pool;
+#[cfg(unix)]
+pub mod process;
 pub mod secrets;
 pub mod stdlib;
 #[cfg(feature = "bindings")]
@@ -41,3 +43,11 @@ pub mod transport;
 
 #[cfg(feature = "bindings")]
 mod sqlite_abi;
+
+/// `faccessat`'s flag that checks the effective IDs. Bionic refuses every flag
+/// (`EINVAL`), and an Android process never runs with an effective ID other
+/// than its real one, so there it is none.
+#[cfg(all(unix, not(target_os = "android")))]
+pub(crate) const AT_EACCESS: libc::c_int = libc::AT_EACCESS;
+#[cfg(target_os = "android")]
+pub(crate) const AT_EACCESS: libc::c_int = 0;

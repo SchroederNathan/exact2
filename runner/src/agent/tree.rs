@@ -99,9 +99,21 @@ fn tree_rows<D: DataSource>(
         s.push(']');
         if runner.inactive(node.id) {
             s.push_str(",\"inactive\":true");
+            // LLP 1153 D8: `hidden` where no host shows the route (every
+            // inactive one but a page a sheet covers), so an agent reading
+            // the tree sees which screen shows.
+            if crate::head::hidden_route(kernel, node.id) {
+                s.push_str(",\"hidden\":true");
+            }
         }
         if runner.unopened_tabs().contains(&node.id) {
             s.push_str(",\"unopened\":true");
+        }
+        // A status item is placed in the menu bar or tray, not the window,
+        // where the target has one (LLP 1133.025 D4); `tap` reaches it the
+        // same. Elsewhere the button is an ordinary button.
+        if runner.places_status_items() && crate::desktop::presents(node.props, "status") {
+            s.push_str(",\"presented\":\"status\"");
         }
         s.push_str(",\"children\":");
         ids(&node.children(), &mut s);

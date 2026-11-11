@@ -99,9 +99,24 @@ internal class Player(private val fonts: Map<Int, Font>) {
     /** Device pixels the stream's matrices are moved by (a backdrop's node is placed at its bounds). */
     private var shiftX = 0f
     private var shiftY = 0f
-    /** The matrix the last op 1 set (slots and groups draw under their own and restore it). */
+    /** The stream's Canvas matrix, including clip and opacity restores. */
     private val current = Matrix()
+    private val savedMatrices = ArrayList<Matrix>()
+    private var matrixDepth = 0
+    private fun saveMatrix() {
+        if (matrixDepth == savedMatrices.size) savedMatrices.add(Matrix())
+        savedMatrices[matrixDepth++].set(current)
+    }
+    private fun restoreMatrix() { current.set(savedMatrices[--matrixDepth]) }
     private val backdropBounds = RectF()
+
+    /** [anim] over [bounds]: drawn at the origin, under a translation, with bounds of its size alone. Android 10's
+     * `AnimatedImageDrawable` drew a strip of its frames, or nothing, at bounds away from the origin. */
+    private fun drawAnimated(c: Canvas, anim: android.graphics.drawable.Drawable) {
+        c.save(); c.translate(bounds.left.toFloat(), bounds.top.toFloat())
+        anim.setBounds(0, 0, bounds.width(), bounds.height()); anim.draw(c)
+        c.restore()
+    }
 
     /**
      * A material's backdrop (op 27 at [at]): what this replay drew from [from] up to it, again, into a node at the
@@ -110,6 +125,8 @@ internal class Player(private val fonts: Map<Int, Font>) {
      */
     /** Op 27 (one blur) or 42 (ordered functions: kind 0 blur, 1 saturation), over what [b] drew from [from] to [at]. */
     private fun backdrop(c: Canvas, b: IntBuffer, from: Int, at: Int) {
+        // No backdrop filter before RenderEffect (Android 12): what is behind shows unfiltered.
+        if (android.os.Build.VERSION.SDK_INT < 31) return
         val ordered = b.get(at) == 42
         val count = if (ordered) b.get(at + 1) else 1
         readRRect(b, if (ordered) at + 2 + 2 * count else at + 2)
@@ -664,6 +681,9 @@ internal class Player(private val fonts: Map<Int, Font>) {
     fun replay(canvas: Canvas, b: IntBuffer, from: Int, n: Int) {
         tint = 1f; tintEnd = -1
         val base = canvas.save()
+        val matrixBase = matrixDepth
+        // Each recording starts locally; stream matrices supply the device coordinates.
+        current.reset(); canvas.setMatrix(current)
         var c: Canvas = canvas
         var outer: Canvas? = null
         var node: android.graphics.RenderNode? = null
@@ -717,6 +737,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
                     fill.shader = null; shader = null
                 }
                 4 -> {
+                    saveMatrix()
                     c.save()
                     if (readRRect(b, i + 1)) c.clipRect(rect) else {
                         path.rewind(); path.addRoundRect(rect, radii, Path.Direction.CW); c.clipPath(path)
@@ -724,12 +745,18 @@ internal class Player(private val fonts: Map<Int, Font>) {
                     i += 13
                 }
                 5 -> {
+                    saveMatrix()
                     c.save()
                     i = readPath(b, i + 2, b.get(i + 1) == 1)
                     c.clipPath(path)
                 }
-                6 -> { if (i == tintEnd) { tint = 1f; tintEnd = -1 }; c.restore(); i += 1 }
+                6 -> {
+                    if (i == tintEnd) { tint = 1f; tintEnd = -1 }
+                    c.restore(); restoreMatrix(); i += 1
+                }
                 7 -> {
+                    // saveLayer bounds use the current Canvas space, including earlier restores.
+                    saveMatrix()
                     val alpha = f(b, i + 1)
                     val end = layerEnd(b, i + 2, n)
                     if (end > 0 && singleFill(b, i + 2, end)) {
@@ -744,7 +771,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
                     rect.set(f(b, i + 2), f(b, i + 3), f(b, i + 2) + f(b, i + 4), f(b, i + 3) + f(b, i + 5))
                     val anim = animated(b.get(i + 1))
                     if (anim != null) {
-                        rect.round(bounds); anim.bounds = bounds; anim.draw(c)
+                        rect.round(bounds); drawAnimated(c, anim)
                     } else image(b.get(i + 1))?.let { bmp -> c.drawBitmap(bmp, null, rect, imagePaint) }
                     i += 6
                 }
@@ -762,7 +789,8 @@ internal class Player(private val fonts: Map<Int, Font>) {
                         for (g in 0 until count) {
                             glyphIds[g] = b.get(at); positions[2 * g] = f(b, at + 1); positions[2 * g + 1] = f(b, at + 2); at += 3
                         }
-                        c.drawGlyphs(glyphIds, 0, positions, 0, count, font, glyphPaint)
+                        if (android.os.Build.VERSION.SDK_INT >= 31) c.drawGlyphs(glyphIds, 0, positions, 0, count, font, glyphPaint)
+                        else LegacyGlyphs.draw(c, glyphIds, positions, count, font, glyphPaint)
                     }
                     i += 6 + 3 * count
                 }
@@ -779,7 +807,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
                         c.save()
                         path.rewind(); path.addRoundRect(rect, radii, Path.Direction.CW); c.clipPath(path)
                         dstRect.set(f(b, i + 2), f(b, i + 3), f(b, i + 2) + f(b, i + 4), f(b, i + 3) + f(b, i + 5))
-                        dstRect.round(bounds); anim.bounds = bounds; anim.draw(c)
+                        dstRect.round(bounds); drawAnimated(c, anim)
                         c.restore()
                     } else image(b.get(i + 1))?.let { bmp ->
                         // Drawn under a clip, not as a BitmapShader's fill: a shader keeps its bitmap's pixels (for a
@@ -861,13 +889,16 @@ internal class Player(private val fonts: Map<Int, Font>) {
                     node = g
                     grouped = b.get(i + 1)
                     outer = c
+                    saveMatrix()
                     c = g.beginRecording()
+                    current.reset(); c.setMatrix(current)
                     i += 2
                 }
                 21 -> {
                     node?.let { g ->
                         g.endRecording()
                         c = outer!!
+                        restoreMatrix()
                         c.save(); matrix.setTranslate(-shiftX, -shiftY); c.setMatrix(matrix); c.drawRenderNode(holder?.invoke(grouped) ?: g); c.restore()
                     }
                     node = null
@@ -877,6 +908,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
             }
         }
         canvas.restoreToCount(base)
+        matrixDepth = matrixBase
     }
 }
 

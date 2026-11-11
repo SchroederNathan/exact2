@@ -87,7 +87,9 @@ pub fn typescript_exporting(plan: &Plan, exports: Option<&[String]>) -> Result<S
         .flat_map(|action| exact_runner::vm::instructions(plan.code(action.body)))
         .flatten()
         .filter(|instruction| instruction.op == Opcode::Send)
-        .map(|instruction| quoted(plan.str(StrId(instruction.args[1] as u32))))
+        .map(|instruction| plan.str(StrId(instruction.args[1] as u32)))
+        .filter(|source| plan.module_named(source).is_none())
+        .map(quoted)
         .collect();
     writeln!(
         out,
@@ -102,7 +104,9 @@ pub fn typescript_exporting(plan: &Plan, exports: Option<&[String]>) -> Result<S
     out.push_str("\nexport interface SourceMap {\n");
     for row in &plan.sources {
         let name = plan.str(row.name);
-        if exact_plan::runner_owned_source(name) {
+        // The runner's own sources and a native module's names are not the
+        // data module's to answer (LLP 1133.002 D13).
+        if exact_plan::runner_owned_source(name) || plan.module_named(name).is_some() {
             continue;
         }
         write!(out, "  {}: {{ args: [", quoted(name)).unwrap();
@@ -128,9 +132,21 @@ pub fn typescript_exporting(plan: &Plan, exports: Option<&[String]>) -> Result<S
           * `type Recipe = Result<'recipe'>` (a list's element: `Result<'recipes'>[number]`). */\n\
          export type Result<S extends Source> = SourceMap[S]['result'];\n\
          export interface Store {\n\
+           /** The value kept under `name`; throws `InvalidAccessError` for a locked presence secret, read with `unlock` (LLP 1133.010). */\n\
            get(name: string): string | null;\n\
+           /** Throws `NotSupportedError` when the name would be kept locked and this device keeps no locked secret. */\n\
            set(name: string, value: string): void;\n\
            forget(name: string): void;\n\
+           /** A value is kept under `name`, locked or not. */\n\
+           has(name: string): boolean;\n\
+           /** `name` is kept under its presence policy, or awaits the move to it. */\n\
+           locked(name: string): boolean;\n\
+           /** The value: after the person's check when `name` is locked, at once when not; `null` when nothing is kept. Rejects with `code` `USER_CANCEL`, `AUTHENTICATION_FAILED`, `LOCKOUT`, `NOT_AVAILABLE`, `PERMISSION_DENIED` or `NotSupportedError`. */\n\
+           unlock(name: string, options?: { reason?: string }): Promise<string | null>;\n\
+           /** Lock an `optional` presence name for good; rejects `NotSupportedError` where no locked secret can be kept. */\n\
+           protect(name: string): Promise<void>;\n\
+           /** After the person's check, unlock an `optional` presence name for good. */\n\
+           unprotect(name: string, options?: { reason?: string }): Promise<void>;\n\
            /** Keep a P-256 pair under the `secret.keep <name>` grant (LLP 1069.005 D1b). */\n\
            keepKey(name: string, pair: CryptoKeyPair): Promise<void>;\n\
            /** The pair kept under `name`, its private key non-extractable. */\n\
@@ -145,9 +161,19 @@ pub fn typescript_exporting(plan: &Plan, exports: Option<&[String]>) -> Result<S
          export interface NativeModule { readonly available: boolean; call(request: Record<string, unknown>): Record<string, unknown>; later(request: Record<string, unknown>): Promise<Record<string, unknown>>; watch(topic: string): void }\n\
          /** A resource-owned WebSocket, for TypeScript on the web JS target and native hosts (LLP 1016.000 D7). Methods are synchronous-mutation-only; refresh or disposal invalidates it. */\n\
          export interface StreamSocket { readonly readyState: number; readonly bufferedAmount: number; send(data: string | ArrayBuffer | ArrayBufferView): void; close(code?: number, reason?: string): void }\n\
-         export interface StreamEvent { readonly type: string; readonly data: string | ArrayBuffer; readonly lastEventId: string; readonly coalesced: number; readonly kind?: string; readonly message?: string; readonly status?: number; readonly code?: number; readonly reason?: string; readonly wasClean?: boolean }\n\
+         /** A local listener's connection (LLP 1133.005 D1): `send` writes a line and a `\\n` (a line with a `\\n` throws `SyntaxError`); `end()` closes it once what was sent is written. `readyState` is 1 while open, 3 after its `end`. The same rules as `StreamSocket`'s, by connection: its listener's mapper sends on the connection it is handed. */\n\
+         export interface ListenConnection { readonly readyState: number; send(line: string): void; end(): void }\n\
+         /** A local listener's event: `listening` (`address`, `port`: 0 for `unix:`), then each `connection`, `message` (one line, without its terminator) and `end` (`reason` `peer`, `app`, `timeout` or `overflow`), by connection `id`; `error` ends it (`kind` `Refused`, `AddressInUse`, `Unsupported` or `Network`). */\n\
+         export type ListenEvent = { readonly type: \"listening\"; readonly address: string; readonly port: number } | { readonly type: \"connection\"; readonly id: number } | { readonly type: \"message\"; readonly id: number; readonly data: string } | { readonly type: \"end\"; readonly id: number; readonly reason: \"peer\" | \"app\" | \"timeout\" | \"overflow\" } | { readonly type: \"error\"; readonly kind: string; readonly message: string };\n\
          declare global {\n\
-           interface RequestInit { exactStream?: (event: StreamEvent, socket?: StreamSocket) => unknown; exactIndependentHttp?: { maxResponseBytes: number }; /** A deadline for the whole exchange, 1 to 3600000 ms: the request is cancelled and the fetch rejects with a FetchError whose `kind` is \"Timeout\". Not with `exactStream`. */ exactTimeout?: number; /** The body is this app file (`app:/…`), read by the host when it sends the request, under `fs.read`, at most 64 MiB; its bytes never enter JavaScript. Not with `body`, nor on a GET or HEAD; no Content-Type is added. */ exactBodyFrom?: string }\n\
+           /** A local listener (LLP 1133.005), a resource's answer as `fetch(url, {exactStream})` is: listening while the resource holds it, on `unix:<absolute path>` under a `net.listen` grant. Defined on desktop hosts only: test `\"exactListen\" in globalThis`. A mutation that calls it throws `InvalidStateError`. */\n\
+           function exactListen<T>(address: string, options: { exactStream: (event: ListenEvent, connection?: ListenConnection) => T; /** Newest wins: take the address over from a live listener. */ takeover?: boolean; /** ms, 1 to 600000: a connection whose first line has not arrived ends `timeout`. */ firstLineTimeout?: number; /** 1 to 1048576, 65536 by default. */ maxLineBytes?: number; /** 1 to 64, 16 by default. */ maxConnections?: number }): Promise<T>;\n\
+         }\n\
+         export interface StreamEvent { readonly type: string; readonly data: string | ArrayBuffer; readonly lastEventId: string; readonly coalesced: number; readonly kind?: string; readonly message?: string; readonly status?: number; readonly code?: number; readonly reason?: string; readonly wasClean?: boolean; /** An upload's `progress`: the body's bytes sent so far, of `total`. */ readonly loaded?: number; readonly total?: number; readonly lengthComputable?: boolean }\n\
+         declare global {\n\
+           interface RequestInit { exactStream?: (event: StreamEvent, socket?: StreamSocket) => unknown; exactIndependentHttp?: { maxResponseBytes: number }; /** A deadline for the whole exchange, 1 to 3600000 ms: the request is cancelled and the fetch rejects with a FetchError whose `kind` is \"Timeout\". Not with `exactStream`, but for an upload (`exactUploadProgress`). */ exactTimeout?: number; /** The body is this app file (`app:/…`), read by the host when it sends the request, under `fs.read`, at most 64 MiB; its bytes never enter JavaScript. Not with `body`, nor on a GET or HEAD; no Content-Type is added. */ exactBodyFrom?: string; /** A 2xx reply's body is written to this app file (`app:/…`) by the host as it arrives, under `fs.write`, at most `exactIndependentHttp.maxResponseBytes` or 1 GiB; its bytes never enter JavaScript. The file appears whole or not at all, and the response's `exactBodyTo` names the bytes written. A reply that is not 2xx leaves the file untouched and is read as usual. Not with `exactStream`, nor on a HEAD. */ exactBodyTo?: string; /** The server may hold the reply until something changes (a long poll): no clock waits on it (a jump, `clock settle`, `clock data`), and each reply that leaves it out names it. Its answer must be safe to supersede. Not with `exactStream`. */ exactHeld?: boolean; /** With `exactStream`, an upload: as its body (`body` or `exactBodyFrom`) goes out the mapper gets `progress` events (`loaded` of `total` bytes sent), then `load` with the reply's `status` and `data`, whatever the status, which ends it. It is in flight until that reply, for `pending` and every clock. Not on a GET or HEAD, a WebSocket or a long poll; it follows its redirects. */ exactUploadProgress?: boolean; /** With `exactStream`, a long poll: the host asks again and again, one GET at a time, each JSON reply an event whose `lastEventId` is its cursor (the reply's field `from`, `a` or `a.b`), asked with next in the query parameter `cursor`; a heartbeat (204, 304, an empty body, or by default the same cursor) is asked again with no event; the network, 408, 429, 502, 503 or 504 after `Retry-After` or a backoff of 1 s doubling to 30 s. */ exactLongPoll?: { cursor: string; from: string; sameCursor?: \"heartbeat\" | \"event\" } }\n\
+           /** `{path, bytes}` when `exactBodyTo` wrote the body to its file (its `text()` and `arrayBuffer()` are then empty); absent or `null` otherwise. */\n\
+           interface Response { readonly exactBodyTo?: { readonly path: string; readonly bytes: number } | null }\n\
            /** An answer that keeps coming: `exactStream` maps each event, and the end, to the answer. */\n\
            function fetch<T>(input: string | URL, init: RequestInit & { exactStream: (event: StreamEvent, socket?: StreamSocket) => T }): Promise<T>;\n\
          }\n\
@@ -170,39 +196,55 @@ pub fn design_exports(contract: &std::path::Path) -> Option<Vec<String>> {
     Some(design.exports?.into_iter().map(|e| e.value).collect())
 }
 
-/// @ref LLP 1121 D12 — the design's colour tokens as a string-literal
-/// union, so a data module returning a token's name is checked
-/// (`ColorToken`): those its `exports` lists, else every one the plan keeps;
-/// none without a design. A synthetic token (an expression
-/// a row writes) is no name a module returns.
+/// @ref LLP 1121 D12 — the design's tokens as a string-literal union per
+/// kind, so a data module returning a token's name is checked
+/// (`ColorToken`, and since stage 6 G `LengthToken`, `NumberToken`,
+/// `TypeToken`, `FamilyToken`, `BoxShadowToken`, `TextShadowToken`): those
+/// its `exports` lists, else every one the plan keeps; none without a
+/// design. A synthetic token (an expression a row writes) is no name a
+/// module returns.
 fn tokens(plan: &Plan, exports: Option<&[String]>, out: &mut String) {
-    let mut names: Vec<&str> = Vec::new();
-    for row in &plan.theme {
-        let role = Some(plan.str(row.role)).filter(|r| !r.is_empty());
-        // A role override by the role's spelling, as a row writes it and the
-        // generators name it (`CanvasText`, `-exact-secondary-label`).
-        let name = role.unwrap_or(plan.str(row.name));
-        let exported = exports.is_none_or(|lines| {
-            lines
-                .iter()
-                .any(|line| exact_tamber::exports_names(line, name, role))
-        });
-        if exported && !name.contains('(') && !names.contains(&name) {
-            names.push(name);
+    const KINDS: [(u8, &str, &str); 7] = [
+        (0, "ColorToken", "A colour token"),
+        (1, "LengthToken", "A length token"),
+        (2, "NumberToken", "A number token"),
+        (3, "BoxShadowToken", "A `box-shadow` token"),
+        (4, "TextShadowToken", "A `text-shadow` token"),
+        (5, "TypeToken", "A type token"),
+        (6, "FamilyToken", "A family token"),
+    ];
+    for (kind, union, what) in KINDS {
+        let mut names: Vec<&str> = Vec::new();
+        for row in plan.theme.iter().filter(|r| r.kind == kind) {
+            let role = Some(plan.str(row.role)).filter(|r| !r.is_empty());
+            // A role override by the role's spelling, as a row writes it and
+            // the generators name it (`CanvasText`, `-exact-secondary-label`).
+            let name = role.unwrap_or(plan.str(row.name));
+            // A component's param is every binding's (D15), as `tamber gen` names it
+            // (stage 7 D, over A's leaving it out: a data module may return one).
+            let exported = name.starts_with(contract_lower::params::PREFIX)
+                || exports.is_none_or(|lines| {
+                    lines
+                        .iter()
+                        .any(|line| exact_tamber::exports_names(line, name, role))
+                });
+            if exported && !name.contains('(') && !names.contains(&name) {
+                names.push(name);
+            }
         }
+        if names.is_empty() {
+            continue;
+        }
+        let quoted: Vec<String> = names
+            .iter()
+            .map(|n| serde_json::to_string(n).expect("a string is JSON"))
+            .collect();
+        let _ = writeln!(
+            out,
+            "/** {what} of the app's design, by its name (LLP 1121 D12). */\nexport type {union} = {};",
+            quoted.join(" | ")
+        );
     }
-    if names.is_empty() {
-        return;
-    }
-    let quoted: Vec<String> = names
-        .iter()
-        .map(|n| serde_json::to_string(n).expect("a string is JSON"))
-        .collect();
-    let _ = writeln!(
-        out,
-        "/** A colour token of the app's design, by its name (LLP 1121 D12). */\nexport type ColorToken = {};",
-        quoted.join(" | ")
-    );
 }
 
 /// The file's top (LLP 1116.006 D7): what `app.ts` writes, one line each, so a builder reads
@@ -212,7 +254,10 @@ fn summary(plan: &Plan, out: &mut String) {
     let sources: Vec<_> = plan
         .sources
         .iter()
-        .filter(|row| !exact_plan::runner_owned_source(plan.str(row.name)))
+        .filter(|row| {
+            let name = plan.str(row.name);
+            !exact_plan::runner_owned_source(name) && plan.module_named(name).is_none()
+        })
         .collect();
     if sources.is_empty() {
         return;

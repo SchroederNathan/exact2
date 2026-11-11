@@ -1,7 +1,9 @@
 import type { Answer, Sources, Result } from './app.contract.d.ts';
+import { watchPosition } from '@exact/geolocation';
+import { acknowledge, consume, unfinishedPurchases } from '@exact/purchases';
 
 export const appId = 'com.exact.weatherlight';
-export const grants = 'net.fetch https://api.open-meteo.com\nnet.fetch https://geocoding-api.open-meteo.com';
+export const grants = 'net.fetch https://api.open-meteo.com\nnet.fetch https://geocoding-api.open-meteo.com\ndevice.geolocation-approximate locationPurpose\nfs.read app:/data\nfs.write app:/data';
 type Forecast = Result<'forecast'>;
 type Hour = Forecast['current'];
 type Outlook = Result<'outlook'>;
@@ -72,20 +74,22 @@ async function json(url: string): Promise<Json> {
 }
 // Open-Meteo returns ISO wall times in the requested city's timezone. Keep
 // those strings intact: converting through the device timezone shifts the day.
-async function forecast(lat: number, lon: number): Promise<Forecast> {
-  const key = `${lat},${lon}`;
+async function forecast(lat: number, lon: number, plus = false): Promise<Forecast> {
+  // Weatherlight+ looks sixteen days ahead (LLP 1133.015 §10).
+  const span = plus ? 16 : 7;
+  const key = `${lat},${lon},${span}`;
   try {
     if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat)>90 || Math.abs(lon)>180) throw new Error('Invalid location');
     const common = 'temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,wind_speed_10m';
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&timezone=auto&forecast_days=7&current=${common}&hourly=${common},precipitation_probability&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max`;
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&timezone=auto&forecast_days=${span}&current=${common}&hourly=${common},precipitation_probability&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max`;
     const data = await json(url), c = object(data.current), h = object(data.hourly), d = object(data.daily);
     const currentTime = string(c.time);
     const all = times(h).map((time,i): Hour => ({id:time,time,temp:numeric(at(h,'temperature_2m',i)),feels:numeric(at(h,'apparent_temperature',i)),humidity:numeric(at(h,'relative_humidity_2m',i)),cloud:numeric(at(h,'cloud_cover',i)),rain:numeric(at(h,'precipitation',i)),chance:numeric(at(h,'precipitation_probability',i)),wind:numeric(at(h,'wind_speed_10m',i)),code:numeric(at(h,'weather_code',i)),day:numeric(at(h,'is_day',i)),hour:hourOf(time)}));
     const thisHour = all.find(hour=>hour.time.slice(0,13)===currentTime.slice(0,13));
     if (!thisHour) throw new Error('Current hour missing');
     const current: Hour = {id:'now',time:currentTime,temp:numeric(c.temperature_2m),feels:numeric(c.apparent_temperature),humidity:numeric(c.relative_humidity_2m),cloud:numeric(c.cloud_cover),rain:numeric(c.precipitation),chance:thisHour.chance,wind:numeric(c.wind_speed_10m),code:numeric(c.weather_code),day:numeric(c.is_day),hour:hourOf(currentTime)};
-    const days = times(d).slice(0,7).map((id,i)=>({id,low:numeric(at(d,'temperature_2m_min',i)),high:numeric(at(d,'temperature_2m_max',i)),code:numeric(at(d,'weather_code',i)),chance:numeric(at(d,'precipitation_probability_max',i)),sunrise:string(at(d,'sunrise',i)),sunset:string(at(d,'sunset',i)),uv:numeric(at(d,'uv_index_max',i))}));
-    if(days.length!==7) throw new Error('Incomplete weekly forecast');
+    const days = times(d).slice(0,span).map((id,i)=>({id,low:numeric(at(d,'temperature_2m_min',i)),high:numeric(at(d,'temperature_2m_max',i)),code:numeric(at(d,'weather_code',i)),chance:numeric(at(d,'precipitation_probability_max',i)),sunrise:string(at(d,'sunrise',i)),sunset:string(at(d,'sunset',i)),uv:numeric(at(d,'uv_index_max',i))}));
+    if(days.length!==span) throw new Error('Incomplete daily forecast');
     const result: Forecast = {lat,lon,ready:true,stale:false,message:'',updated:currentTime.replace('T',' · '),current,hours:all.filter(hour=>hour.time>currentTime).slice(0,24),days};
     if(result.hours.length!==24) throw new Error('Incomplete hourly forecast');
     // Bounded, location-specific cache: a failed refresh may keep that city's
@@ -98,12 +102,13 @@ async function forecast(lat: number, lon: number): Promise<Forecast> {
     return {...(previous || empty),lat,lon,stale:!!previous,message:previous ? 'Could not refresh. Showing this city’s last available forecast.' : 'The forecast couldn’t be reached. Check your connection and try again.'};
   }
 }
-function outlook(f: Forecast, units: string, selected: string, lat: number, lon: number): Outlook {
+function outlook(f: Forecast, units: string, selected: string, lat: number, lon: number, following: boolean): Outlook {
   const temp = (n:number) => `${Math.round(units==='F' ? n*9/5+32 : n)}°`;
   const blank: Outlook = {ready:false,temp:'—°',condition:'',feels:'—',wind:'—',humidity:'—',chance:'—',range:'',sunrise:'—',sunset:'—',uv:'—',summary:'',selectedLabel:'RIGHT NOW',cloud:30,rain:0,day:1,hour:12,speed:5,
     hours:Array.from({length:24},(_,i)=>({id:`waiting-${i}`,label:'—',temp:'—°',icon:'—',chance:'—'})),
     days:Array.from({length:7},(_,i)=>({id:`waiting-${i}`,label:i===0?'Today':'—',condition:'Forecast unavailable',icon:'—',chance:'—',low:'—°',high:'—°',left:'0%',span:'0%'}))};
-  if(!f.ready || f.lat!==lat || f.lon!==lon || !f.days.length) return blank;
+  // Following, the forecast is wherever the person is; else only the chosen city's.
+  if(!f.ready || (!following && (f.lat!==lat || f.lon!==lon)) || !f.days.length) return blank;
   const h = f.hours.find(hour=>hour.id===selected) || f.current;
   const day = f.days.find(d=>d.id===h.time.slice(0,10)) || f.days[0];
   const min = Math.min(...f.days.map(d=>d.low)), max = Math.max(...f.days.map(d=>d.high)), spread = Math.max(1,max-min);
@@ -126,9 +131,74 @@ async function places(query: string): Promise<Result<'places'>> {
     return {items,message:items.length ? 'Choose a place to see its forecast.' : 'No places found. Try another city or postal code.'};
   } catch {return {items:[],message:'City search couldn’t connect. Try again, or choose a city below.'};}
 }
+// Following: the forecast where the person is, approximately, asked again when
+// they move five kilometres (LLP 1133.002 §7). Without a position, the last one.
+async function here(lat: number, lon: number, plus: boolean): Promise<Forecast> {
+  try {
+    const p = await watchPosition({ maximumAge: 600000, apple: { desiredAccuracy: 'threeKilometers', distanceFilter: 5000 }, android: { quality: 'lowPower', minUpdateDistanceMeters: 5000 } });
+    return forecast(p.coords.latitude, p.coords.longitude, plus);
+  } catch {
+    return forecast(lat, lon, plus);
+  }
+}
+// Weatherlight+'s delivery loop (LLP 1133.015 D5): the one place a purchase
+// is delivered and finished, however it arrived. A subscription has nothing
+// to credit and is acknowledged; a tip is counted once by its token, in the
+// same write as the count, then consumed. A finish that fails leaves the row
+// in the queue, and the next answer runs the loop again.
+const TIPS = 'app:/data/tips.json', VISITS = 'app:/data/visits.json', VERSION = '1';
+type Tips = { tips: number; tokens: string[] };
+async function readJson<T>(storage: Parameters<Answer>[3], path: string, empty: T): Promise<T> {
+  try { return { ...empty, ...JSON.parse(new TextDecoder().decode(await storage.fs.readFile(path))) }; } catch { return empty; }
+}
+async function writeJson(storage: Parameters<Answer>[3], path: string, value: unknown): Promise<void> {
+  await storage.fs.atomicWriteFile(path, new TextEncoder().encode(JSON.stringify(value)));
+}
+async function deliverPurchases(storage: Parameters<Answer>[3]): Promise<Result<'tips'>> {
+  const kept = await readJson<Tips>(storage, TIPS, { tips: 0, tokens: [] });
+  for (const p of await unfinishedPurchases()) {
+    if (p.purchaseState !== 'purchased') continue;
+    try {
+      if (p.itemId === 'tip.small') {
+        if (!kept.tokens.includes(p.purchaseToken)) {
+          kept.tips += 1;
+          kept.tokens.push(p.purchaseToken);
+          await writeJson(storage, TIPS, kept);
+        }
+        await consume({ purchaseToken: p.purchaseToken });
+      } else {
+        await acknowledge({ purchaseToken: p.purchaseToken });
+      }
+    } catch {
+      // Not finished: the store keeps it in the queue.
+    }
+  }
+  return { tips: kept.tips };
+}
+// The days the person opened Weatherlight, by the date at launch, for the
+// rating prompt: asked on the fifth, once per version.
+type Visits = { days: number[]; asked: string };
+async function visits(storage: Parameters<Answer>[3], epoch: number): Promise<Result<'visits'>> {
+  const kept = await readJson<Visits>(storage, VISITS, { days: [], asked: '' });
+  const day = Math.floor(epoch / 86400000);
+  if (epoch > 0 && !kept.days.includes(day)) {
+    kept.days = [...kept.days, day].slice(-30);
+    await writeJson(storage, VISITS, kept);
+  }
+  return { days: kept.days.length, ask: kept.days.length >= 5 && kept.asked !== VERSION };
+}
+async function reviewAsked(storage: Parameters<Answer>[3]): Promise<Result<'visits'>> {
+  const kept = await readJson<Visits>(storage, VISITS, { days: [], asked: '' });
+  await writeJson(storage, VISITS, { ...kept, asked: VERSION });
+  return { days: kept.days.length, ask: false };
+}
 const sources: Sources = {
-  forecast: ([lat,lon,revision]) => revision === 0 ? {...empty,lat,lon} : forecast(lat,lon),
-  outlook: ([f,units,selected,lat,lon]) => outlook(f,units,selected,lat,lon),
+  forecast: ([lat,lon,revision,following,plus]) => revision === 0 ? {...empty,lat,lon} : following ? here(lat,lon,plus) : forecast(lat,lon,plus),
+  outlook: ([f,units,selected,lat,lon,following]) => outlook(f,units,selected,lat,lon,following),
   places: ([query]) => places(query),
+  tips: (_, _store, storage) => readJson<Tips>(storage, TIPS, { tips: 0, tokens: [] }).then(t => ({ tips: t.tips })),
+  visits: ([epoch], _store, storage) => visits(storage, epoch),
+  deliverPurchases: (_, _store, storage) => deliverPurchases(storage),
+  reviewAsked: (_, _store, storage) => reviewAsked(storage),
 };
 export const answer: Answer = (source,args,store,storage) => sources[source](args,store,storage);

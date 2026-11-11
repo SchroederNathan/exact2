@@ -3,6 +3,7 @@ package dev.exact.canvas
 import android.app.Activity
 import android.content.Context
 import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
@@ -56,6 +57,12 @@ open class ExactActivity : Activity() {
     protected open fun drive(scroll: (Float) -> Unit): Drive? = null
     private var driver: Drive? = null
     private lateinit var view: ExactView
+    /** The process's gamepads ([Pads]): every key and motion event is offered to them first. */
+    private val pads: Pads get() = Pads.attach(this)
+
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean = pads.key(event) || super.dispatchKeyEvent(event)
+    override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean =
+        pads.motion(event) || super.dispatchGenericMotionEvent(event)
 
     override fun onCreate(state: Bundle?) {
         // An activity made again in a process whose host runs (LLP 1115.001 D15.1: a configuration change this
@@ -75,11 +82,13 @@ open class ExactActivity : Activity() {
         hatchReader?.activity = this
         // The starting window goes the moment the first frame is drawn, not after its exit fade (splashfade=1: the
         // platform's fade, to compare): the first frame is what shows.
-        if (intent.getStringExtra("splashfade") != "1") splashScreen.setOnExitAnimationListener { it.remove() }
+        if (Build.VERSION.SDK_INT >= 31 && intent.getStringExtra("splashfade") != "1") Splash.quick(this)
         if (!again) environment()
         edgeToEdge()
         // exact2's thread, made before the assets are checked: it loads exact2's library meanwhile.
         owner()
+        // The modules' implementations the APK carries answer their names (LLP 1133.001 D5).
+        Extensions.bind(this)
         installAssets(File(storage, "app"))
         // What the host asks of the platform (LLP 1115.001 D5), acted on here, on the main thread.
         requests = Requests(this).also { it.back = { goes -> takeBack(goes) } }
@@ -97,6 +106,23 @@ open class ExactActivity : Activity() {
         }
         setContentView(root)
         accessibility.addAccessibilityStateChangeListener(accessWatch)
+        // A launch with a URL (a shortcut, a link) into a process whose host runs goes where the URL says; one the
+        // system restores (a saved state) keeps where it was. The first launch's is the host's launch location
+        // ([environment]).
+        if (again && state == null) received(intent)
+    }
+
+    /** A URL or a share given to the running activity: its location, as a link's (LLP 1133.023 D15 item 3), or the
+     * share's (LLP 1133.024 D5; `singleTask` brings this task forward for it). */
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        received(intent)
+    }
+
+    private fun received(intent: android.content.Intent) {
+        if (Shares.isShare(intent)) Shares.request(this, intent)?.let { Exact.share(it) }
+        else intent.data?.let { Exact.open(it.toString()) }
     }
 
     /** Whether an accessibility service is on (LLP 1115.001 D13). The reader answers one through its root
@@ -158,13 +184,37 @@ open class ExactActivity : Activity() {
      * only while the host says Back has somewhere to go in the app ([Requests.back]): at the first screen there is
      * none, so Back is the system's own, which leaves the app with its own animation. A Back that arrives and the
      * app does not take (it had somewhere to go a moment ago) finishes the activity, as it always did. */
-    private val backCallback = android.window.OnBackInvokedCallback { if (Exact.back()) view.invalidate() else finish() }
+    private val backCallback by lazy { Back(this) }
     private var takesBack = false
     private fun takeBack(on: Boolean) {
         if (on == takesBack) return
         takesBack = on
-        if (on) onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, backCallback)
-        else onBackInvokedDispatcher.unregisterOnBackInvokedCallback(backCallback)
+        if (Build.VERSION.SDK_INT >= 33) backCallback.take(on)
+    }
+    private fun back() { if (Exact.back()) view.invalidate() else finish() }
+
+    /** Before Android 13 Back arrives here, and the app's routes take it while they have somewhere to go. */
+    @Deprecated("Android 13's OnBackInvokedDispatcher takes Back from then on ([Back]).")
+    override fun onBackPressed() {
+        if (Build.VERSION.SDK_INT < 33 && takesBack) back() else @Suppress("DEPRECATION") super.onBackPressed()
+    }
+
+    /** [takeBack]'s callback from Android 13, in a class of its own: an older release never resolves its types. */
+    @android.annotation.TargetApi(33)
+    private class Back(activity: ExactActivity) {
+        private val dispatcher = activity.onBackInvokedDispatcher
+        private val callback = android.window.OnBackInvokedCallback { activity.back() }
+        fun take(on: Boolean) {
+            if (on) dispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
+            else dispatcher.unregisterOnBackInvokedCallback(callback)
+        }
+    }
+
+    /** The starting window goes the moment the first frame is drawn (Android 12's SplashScreen), in an object of its
+     * own: an older release never resolves its types. */
+    @android.annotation.TargetApi(31)
+    private object Splash {
+        fun quick(activity: Activity) = activity.splashScreen.setOnExitAnimationListener { it.remove() }
     }
 
     /** Where exact2 keeps the app's files, and the APK's assets are copied: the app's own files directory, which
@@ -206,10 +256,10 @@ open class ExactActivity : Activity() {
         val colors = Palette.read(this).also { toldColors = it }
         // The window as it is now, with the system's raw insets (D3.3): told before the host boots too, so the page is
         // laid out where it will be shown. The view's own size is never told: the presenter places the page.
-        val metrics = windowManager.currentWindowMetrics
-        val size = metrics.bounds.width() to metrics.bounds.height()
-        val density = resources.displayMetrics.density
-        val edges = edges(root.rootWindowInsets ?: metrics.windowInsets)
+        val size = windowSize()
+        val density = Device.scale(this)
+        val insets = root.rootWindowInsets ?: if (Build.VERSION.SDK_INT >= 30) windowManager.currentWindowMetrics.windowInsets else null
+        val edges = insets?.let { edges(it) } ?: IntArray(16)
         toldWindow = Triple(size, density, edges.toList())
         // asyncboot=0: boot when the view is laid out, on the main thread, to compare. Otherwise now, on a thread that
         // also loads the library: exact2 loads, boots and paints its first frame while Android sets the activity up,
@@ -238,8 +288,9 @@ open class ExactActivity : Activity() {
                 ready = true
                 // `start=N` for an app whose rows have one pitch: scrolled there before the driver starts.
                 val start = intent.getStringExtra("start")?.toIntOrNull() ?: 0
-                if (start > 0 && startPitchDp > 0f) view.scrollBy(start * startPitchDp * resources.displayMetrics.density)
+                if (start > 0 && startPitchDp > 0f) view.scrollBy(start * startPitchDp * Device.scale(this))
                 driver?.contentReady()
+                Extensions.firstFrame()
             }
         }
         view.booting = booting
@@ -251,7 +302,7 @@ open class ExactActivity : Activity() {
         Exact.answered = { view.onPublished() }
         Exact.turned = { view.turned() }
         if (input) view.keys = Keys(view)
-        val elements = Natives(this, File(storage, "app"), modules, video)
+        val elements = Natives(this, File(storage, "app"), Extensions.withViews(modules), video)
         natives = elements
         elements.hatched = { node, context -> hatchReader?.made(node, context) }
         view.natives = elements
@@ -293,17 +344,19 @@ open class ExactActivity : Activity() {
 
     /** The app is edge to edge (LLP 1115.001 D3.4): the window reaches under transparent system bars and into the
      * display's cutout, and the software keyboard is an inset the host is told, not a pan of the window. Android 15
-     * does most of this to every app that targets it; the calls make it so from Android 12 on. */
+     * does most of this to every app that targets it; the calls make it so from Android 11 on, [Legacy] before. */
     @Suppress("DEPRECATION")
     private fun edgeToEdge() {
-        window.setDecorFitsSystemWindows(false)
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false)
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            }
+        } else Legacy.edgeToEdge(window)
         window.statusBarColor = Color.TRANSPARENT
         window.navigationBarColor = Color.TRANSPARENT
         window.isStatusBarContrastEnforced = false
         window.isNavigationBarContrastEnforced = false
-        window.attributes = window.attributes.apply {
-            layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-        }
         window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
     }
 
@@ -311,6 +364,7 @@ open class ExactActivity : Activity() {
      * bars, the display cutout, the software keyboard and the system's gestures, in pixels. */
     private fun edges(insets: android.view.WindowInsets): IntArray {
         val out = IntArray(16)
+        if (Build.VERSION.SDK_INT < 30) { Legacy.edges(root.rootWindowInsets ?: insets, out); return out }
         val kinds = intArrayOf(
             android.view.WindowInsets.Type.systemBars(), android.view.WindowInsets.Type.displayCutout(),
             android.view.WindowInsets.Type.ime(), android.view.WindowInsets.Type.systemGestures(),
@@ -322,6 +376,11 @@ open class ExactActivity : Activity() {
         return out
     }
 
+    /** The window's size, in pixels. */
+    private fun windowSize(): Pair<Int, Int> =
+        if (Build.VERSION.SDK_INT >= 30) windowManager.currentWindowMetrics.bounds.let { it.width() to it.height() }
+        else Legacy.windowSize(this)
+
     /** The window's size, density and insets as the host was last told them. */
     private var toldWindow: Triple<Pair<Int, Int>, Float, List<Int>>? = null
 
@@ -329,9 +388,8 @@ open class ExactActivity : Activity() {
      * told (LLP 1115.001 D3.3). The host answers with where the page is ([chrome]). */
     private fun window(insets: android.view.WindowInsets) {
         if (!reads()) return
-        val size = if (root.width > 0 && root.height > 0) root.width to root.height
-            else windowManager.currentWindowMetrics.bounds.let { it.width() to it.height() }
-        val density = resources.displayMetrics.density
+        val size = if (root.width > 0 && root.height > 0) root.width to root.height else windowSize()
+        val density = Device.scale(this)
         val edges = edges(insets)
         val now = Triple(size, density, edges.toList())
         if (now == toldWindow) return
@@ -353,6 +411,7 @@ open class ExactActivity : Activity() {
             }
         }
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(c[4]))
+        if (Build.VERSION.SDK_INT < 30) { Legacy.lightBars(window, c[5] == 0); return }
         val light = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
             android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
         window.insetsController?.setSystemBarsAppearance(if (c[5] != 0) 0 else light, light)
@@ -410,19 +469,47 @@ open class ExactActivity : Activity() {
         // What changed while the activity was stopped and is no configuration change.
         configure()
         view.running(true)
+        Exact.hidden(false)
     }
 
     override fun onStop() {
         stopped = true
+        Exact.hidden(true)
+        if (reads()) pads.background()
         view.running(false, reads())
+        // Behind the hide, the pads' release and the stop of the turns (none queued after it), what they and anything
+        // since the pause committed is on disk before Android may kill it.
+        if (!Exact.drainStore()) android.util.Log.w("exact", "the store's writes did not finish before the stop")
         contentResolver.unregisterContentObserver(settings)
         super.onStop()
     }
 
-    /** In front again: a share sheet that was up and chose nothing was dismissed ([Requests.resumed]). */
+    /** In front again: a share sheet that was up and chose nothing was dismissed ([Requests.resumed]); an extension
+     * reads again what the person may have changed in Settings ([Extensions.resumed]). */
     override fun onResume() {
         super.onResume()
         requests.resumed()
+        Extensions.resumed()
+    }
+
+    override fun onPause() {
+        // Everything committed before the pause is on disk (exact2 writes the store on a thread of its own).
+        if (!Exact.drainStore()) android.util.Log.w("exact", "the store's writes did not finish before the pause")
+        Extensions.paused()
+        super.onPause()
+    }
+
+    /** A permission an extension asked for ([ExtensionContext.requestPermissions], LLP 1133.002 D9). */
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        Extensions.permissionsResult(requestCode)
+    }
+
+    /** An activity an extension started for its result ([ExtensionContext.startActivityForResult], LLP 1133.018 D13
+     * item 2). */
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        Extensions.activityResult(requestCode, resultCode, data)
     }
 
     override fun onDestroy() {
@@ -455,6 +542,15 @@ open class ExactActivity : Activity() {
 
     /** The launch extras that reach exact2 as its environment, written before its library loads. */
     private fun environment() {
+        android.system.Os.setenv("XDG_CACHE_HOME", cacheDir.absolutePath, true)
+        // Rust's `temp_dir` is TMPDIR, else /data/local/tmp, which an app cannot write. API 29 sets none, and a
+        // drive with no scratch store keeps its `app:/` files under it (`exact_linux::picker`).
+        android.system.Os.setenv("TMPDIR", cacheDir.absolutePath, false)
+        // The launching intent's URL is the launch location (LLP 1133.023 D15 item 3): the activity is exported, so
+        // any app may start it with one, which reaches only what the navigation root routes, as a link does.
+        intent.data?.takeUnless { Shares.isShare(intent) }?.let { android.system.Os.setenv("EXACT_LAUNCH_URL", it.toString(), true) }
+        // A share that starts the app is its launch location, claimed before the boot (LLP 1133.024 D5).
+        Shares.request(this, intent)?.let { android.system.Os.setenv("EXACT_SHARE", it, true) }
         // rows=0: no kept rows, every frame walks every row (exact2's EXACT_ROWS), to compare.
         if (intent.getStringExtra("rows") == "0") android.system.Os.setenv("EXACT_ROWS", "0", true)
         // imgvp=N: keep N viewports of decoded pictures (exact2's EXACT_IMAGE_VIEWPORTS; 12 by default).
@@ -495,7 +591,8 @@ open class ExactActivity : Activity() {
         intent.getStringExtra("kinds")?.let { android.system.Os.setenv("BENCH_KINDS", it, true) }
     }
 
-    /** The APK's `app/` assets (the plan names `assets/…` under it), copied once per install: exact2 reads files. */
+    /** The APK's `app/` assets (the plan names `assets/…` under it, a GPU module's shaders `shaders/`), copied once
+     * per install, replacing the last install's: exact2 reads files. */
     private fun installAssets(to: File) {
         val stamp = packageManager.getPackageInfo(packageName, 0).lastUpdateTime.toString()
         val done = File(to, ".done")
@@ -510,6 +607,9 @@ open class ExactActivity : Activity() {
             dir.mkdirs()
             for (n in names) copy("$from/$n", File(dir, n))
         }
+        // A new install's tree replaces the old, an empty one included: a file the APK no longer has (a shader a
+        // module no longer names, which the host would register and the module refuse) does not linger.
+        to.deleteRecursively()
         if (assets.list("app").isNullOrEmpty()) return
         copy("app", to)
         done.writeText(stamp)

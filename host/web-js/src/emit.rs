@@ -11,19 +11,34 @@
 
 use crate::code::{self, Scope, Uses};
 use crate::style;
-use exact_kernel::{NodeType, PropId, StyleId};
-use exact_plan::{BindingKind, EventKind, Plan, RegionKind, Value};
+use exact_kernel::{NodeType, PropId};
+use exact_plan::{BindingKind, EventKind, NodesId, Plan, RegionKind, Value};
 use exact_web::host::template::Parts;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
+#[path = "answers.rs"]
+mod answers;
+#[path = "list_options.rs"]
+mod list_options;
+#[path = "lower.rs"]
+pub(crate) mod lower;
 #[path = "motion.rs"]
 mod motion;
+#[path = "named_records.rs"]
+mod named_records;
 #[path = "regions.rs"]
 mod regions;
 #[path = "rows.rs"]
 mod rows;
+#[path = "said.rs"]
+mod said;
+#[path = "sides.rs"]
+mod sides;
 #[path = "timers.rs"]
 mod timers;
+#[path = "trapped.rs"]
+mod trapped;
 #[path = "type_descriptors.rs"]
 mod type_descriptors;
 use regions::root_slot;
@@ -141,10 +156,17 @@ pub fn value_js(v: &Value) -> String {
 struct Em<'a> {
     plan: &'a Plan,
     sites: &'a Sites,
+    /// What its rows and arms ask of the whole plan, each answered once.
+    answers: answers::Answers<'a>,
     parts: Vec<Option<Parts>>,
     uses: Uses,
     out: String,
     classes: Vec<String>,
+    /// Each distinct set of state looks (LLP 1121 D8), `data-exact-looks` index plus one.
+    looks: Vec<Vec<(u8, String)>>,
+    /// Where each class and each set of looks is in `classes` and `looks`.
+    class_at: HashMap<String, usize>,
+    looks_at: HashMap<Vec<(u8, String)>, usize>,
 
     paint: bool,
     warnings: Vec<String>,
@@ -161,15 +183,10 @@ struct Em<'a> {
     /// Whether an image draws a symbol (`symbols.js`), and whether a
     /// binding names one (its roles are then the plan's strings).
     symbols: (bool, bool),
-    /// Each height drag handle's owner (`heightDragFor`, resolved as the
-    /// kernel resolves it), by node.
-    heights: std::collections::BTreeMap<u32, u32>,
-    /// Each transform drag handle's target and clip, by node.
-    transforms: std::collections::BTreeMap<u32, (u32, u32)>,
-    /// Each Arrange grip's list (`reorderFor`), by node.
-    reorders: std::collections::BTreeMap<u32, u32>,
-    /// The `@keyframes` that animate `scale` (a pressed node plays their
-    /// `-exact-press` copies).
+    /// Possible height and transform owners whose motion values must be observed.
+    heights: std::collections::BTreeSet<u32>,
+    transforms: std::collections::BTreeSet<u32>,
+    /// The `@keyframes` that animate `scale` (a pressed node plays their `-exact-press` copies).
     press_keyframes: Vec<String>,
     /// Whether a dynamic row can reference an element (`url(#…)`): nodes
     /// with an `id` then name it (`data-exact-id`, rt.js `Sr`).
@@ -193,11 +210,12 @@ const HOST_FACTS: &[&str] = &[
     "exactSurface",
     "exactTransport",
     "exactMIDI",
+    "exactActivities",
 ];
 
 pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, String> {
     // A development build makes every token a property (LLP 1121 stage 4).
-    let _every = crate::modes::every(dev_reload);
+    let _every = crate::modes::every_for(plan, dev_reload);
     // And every overridden role its sheet's property (stage 5).
     let _live = exact_kernel::style::roles::live_properties(dev_reload);
     // @ref LLP 1095 D4 — the roles the theme replaces, as the runner sets them.
@@ -224,10 +242,14 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
     let mut em = Em {
         plan,
         sites: &sites,
+        answers: answers::Answers::new(plan),
         parts,
         uses: Uses::default(),
         out: String::new(),
         classes: Vec::new(),
+        looks: Vec::new(),
+        class_at: HashMap::new(),
+        looks_at: HashMap::new(),
         paint,
         warnings,
         row_actions: Default::default(),
@@ -241,16 +263,14 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         symbols: (false, false),
         heights: Default::default(),
         transforms: Default::default(),
-        reorders: Default::default(),
         press_keyframes: rows::press_keyframes(plan),
         refs: rows::can_refer(plan),
         site_attrs,
         dev_reload,
         panels: exact_runner::instance::tabs::panel_sites(plan),
     };
-    em.heights = em.height_targets();
-    em.transforms = em.transform_targets();
-    em.reorders = em.reorder_lists();
+    em.heights = em.drag_targets(PropId::HeightDragFor);
+    em.transforms = em.drag_targets(PropId::TransformDragFor);
     let top = Scope::default();
     let action = Scope {
         action: true,
@@ -368,8 +388,11 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
             }
         );
     }
-    // The reserved sources facts.js answers, their declared fields filled by name.
+    // The reserved sources facts.js, midi.js and transport.js answer, their declared fields filled by name:
+    // installed before any resource, since the boot's settlement asks them (the runner answers them itself).
     let facts = crate::facts::reserved(plan, &mut body)?;
+    let midi = timers::midi(&mut em, &mut body)?;
+    let transport = timers::transport(&mut em, &mut body)?;
     for (i, r) in plan.resources.iter().enumerate() {
         let mut args = Vec::new();
         for a in r.args.iter() {
@@ -420,12 +443,17 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         } else {
             kept.to_string()
         };
+        // Its last `context` arguments are its `with` context (LLP 1027.005
+        // D6), which identify no upload it asks (uploads.js, LLP 1016.000 D10).
+        let args = match r.context {
+            0 => format!("()=>[{}]", args.join(",")),
+            n => format!("Object.assign(()=>[{}],{{context:{n}}})", args.join(",")),
+        };
         let _ = write!(
             body,
-            "const r_{i}={res}({},{},()=>[{}],{initial},{initial_args},{},{placeholder}{carry});",
+            "const r_{i}={res}({},{},{args},{initial},{initial_args},{},{placeholder}{carry});",
             serde_json::to_string(plan.str(r.name)).unwrap(),
             serde_json::to_string(plan.str(r.source)).unwrap(),
-            args.join(","),
             serde_json::to_string(&type_code(plan, r.ty)).unwrap()
         );
         // The runner's own resource shows its facts, never a write (overlay.js)
@@ -525,27 +553,14 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
     if let Some(m) = &modes {
         body.push_str(&m.js(plan, &em.classes));
     }
-    // Symbols (symbols.js): a bound source picks its role from the plan's
-    // strings that name one, `symbol:`-prefixed or not.
+    // Symbols (symbols.js): a bound source picks its role, or an icon token
+    // (LLP 1121 D10), from the plan's own table.
     if em.symbols.0 {
-        let mut roles = Vec::new();
-        if em.symbols.1 {
-            for s in &plan.strings {
-                let role = s.strip_prefix("symbol:").unwrap_or(s);
-                if let Some((_, path, filled)) = exact_kernel::generated::symbol(role) {
-                    let entry = format!(
-                        "{}:[{},{}]",
-                        serde_json::to_string(role).unwrap(),
-                        serde_json::to_string(path).unwrap(),
-                        filled as u8
-                    );
-                    if !roles.contains(&entry) {
-                        roles.push(entry);
-                    }
-                }
-            }
-        }
-        let _ = write!(body, "$symbols({{{}}});", roles.join(","));
+        let _ = write!(
+            body,
+            "$symbols({});",
+            crate::symbols::table(plan, em.symbols.1)
+        );
     }
     if paint {
         let painting = em.uses.rt("usePaint");
@@ -562,6 +577,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
     if [
         "x_frame",
         "x_measure",
+        "x_rangeFrame",
         "x_elementFromPoint",
         "x_elementsFromPoint",
     ]
@@ -617,8 +633,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         let _ = write!(body, "{queues}($state);");
     }
     timers::timers(&mut em, &mut body)?;
-    let midi = timers::midi(&mut em, &mut body)?;
-    let transport = timers::sequences(&mut em, &mut body)?;
+    timers::sequences(&mut em, &mut body)?;
     let viewport = em.parts[sites.root as usize].as_ref().and_then(|p| {
         let fit = p.props.get("viewportFit");
         let widget = p.props.get("interactiveWidget");
@@ -718,14 +733,24 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         })
         .collect();
     let names_js = format!(
-        "{names_js}export const sourceTypes={{{}}};export const pages=[{}];\n",
+        "{names_js}export const sourceTypes={{{}}};export const pages=[{}];export const viewportMedia={};export const activation={};\n",
         source_types.join(","),
-        pages.join(",")
+        pages.join(","),
+        crate::facts::viewport_media(plan),
+        crate::facts::activation(plan)
     );
     let imports: Vec<String> = em.uses.names.iter().cloned().collect();
     let budget: Vec<String> = em.uses.budget.iter().cloned().collect();
+    // What many sites share, built once (LLP 1071 §7, generated code at
+    // scale): after `sources`, which build.mjs reads as the first match.
+    let consts: String = em
+        .uses
+        .consts
+        .iter()
+        .map(|(n, v)| format!("const {n}={v};\n"))
+        .collect();
     let js = format!(
-        "// Generated by exact-web-js from the app's plan. Do not edit.\nimport{{{}}}from\"./rt.js\";{}{}{}{}\nexport const sources={{{}}};export const wait={};export default function(){{{body}return $state}}\n",
+        "// Generated by exact-web-js from the app's plan. Do not edit.\nimport{{{}}}from\"./rt.js\";{}{}{}{}\nexport const sources={{{}}};export const wait={};{consts}export default function(){{{body}return $state}}\n",
         imports.join(","),
         if budget.is_empty() {
             String::new()
@@ -765,12 +790,16 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
     };
     let mut css = fonts.css.clone();
     // @ref LLP 1095 D4 — the theme's reach into the host's own sheet.
-    css.push_str(&exact_kernel::style::roles::theme_css());
+    css.push_str(&(exact_kernel::style::roles::theme_css() + &crate::base_scale::css(plan)));
     css.push_str("#exact-root#exact-root{");
     for (i, c) in em.classes.iter().enumerate() {
         let _ = write!(css, ".c{}{{{c}}}", i + 1);
     }
     css.push('}');
+    for (i, looks) in em.looks.iter().enumerate() {
+        let at = format!("[data-exact-looks=\"{}\"]", i + 1);
+        css.push_str(&exact_web::host::template::look_rules(&at, looks));
+    }
     // The classes that set a scheme read the theme's text on it.
     css.push_str(&exact_kernel::style::roles::scheme_classes(&em.classes));
     css.push_str(&modes.as_ref().map_or(String::new(), |m| m.css(plan)));
@@ -871,10 +900,12 @@ fn zero(plan: &Plan, ty: exact_plan::TypesId) -> String {
 
 impl Em<'_> {
     fn class(&mut self, css: &str) -> usize {
-        match self.classes.iter().position(|c| c == css) {
-            Some(i) => i,
+        match self.class_at.get(css) {
+            Some(i) => *i,
             None => {
                 self.classes.push(css.to_string());
+                self.class_at
+                    .insert(css.to_string(), self.classes.len() - 1);
                 self.classes.len() - 1
             }
         }
@@ -892,7 +923,7 @@ impl Em<'_> {
 
     fn node(&mut self, i: u32, parent: &str, scope: &Scope) -> Result<(), String> {
         let plan = self.plan;
-        let row = &plan.nodes[i as usize];
+        let row = &plan.node(NodesId(i));
         let node_type = NodeType::from_wire(row.node_type).ok_or("unknown node type")?;
 
         if node_type == NodeType::Head {
@@ -907,7 +938,7 @@ impl Em<'_> {
                         serde_json::to_string(text.text()).unwrap()
                     )),
                     _ => {
-                        let f = self.f(b.expr, scope)?;
+                        let f = self.bound(i, parent, &b, scope)?;
                         fields.push(format!(
                             "{}:{f}",
                             serde_json::to_string(prop.name()).unwrap()
@@ -946,6 +977,9 @@ impl Em<'_> {
             self.symbols.1 |= bound;
         }
         let (mut attrs, content, extra) = rows::attributes(element, &parts.props);
+        if element == "img" && exact_runner::rows::repeated(plan, exact_plan::NodesId(i)) {
+            attrs.push(("loading".into(), "lazy".into()));
+        }
         let mut css = parts.css.clone();
         css.push_str(&extra);
         // @ref LLP 1063 — `-exact-layout-transition` and `-exact-exit-animation` are custom
@@ -958,6 +992,10 @@ impl Em<'_> {
         // tablist and a menu theirs (LLP 1115.000 D4.5).
         if presence.contains("--exact-press:")
             || presence.contains("--exact-press-haptic:")
+            || presence.contains("--exact-press-opacity:")
+            || presence.contains("--exact-press-opacity-to:")
+            || presence.contains("--exact-press-background-color:")
+            || presence.contains("--exact-press-color:")
             || attrs.iter().any(|a| {
                 a.0 == "data-button-style"
                     || (a.0 == "role" && ["radiogroup", "tablist", "menu"].contains(&a.1.as_str()))
@@ -974,6 +1012,19 @@ impl Em<'_> {
         }
         if element == "a" {
             attrs.push(("data-view".into(), String::new()));
+        }
+        // Its state looks, by the rules the sheet carries for their set.
+        if !parts.looks.is_empty() {
+            let at = match self.looks_at.get(&parts.looks) {
+                Some(at) => *at,
+                None => {
+                    self.looks.push(parts.looks.clone());
+                    self.looks_at
+                        .insert(parts.looks.clone(), self.looks.len() - 1);
+                    self.looks.len() - 1
+                }
+            };
+            attrs.push(("data-exact-looks".into(), (at + 1).to_string()));
         }
         if let Some(id) = self.exact_id(i) {
             attrs.push(("data-exact-id".into(), id));
@@ -1157,8 +1208,15 @@ impl Em<'_> {
             self.markdown = true;
         }
         self.editor(i, element, &e)?;
+        let (lowers, mut seen) = (
+            self.lower_candidate(i, &parts, element, !kinds.is_empty(), markdown),
+            Vec::new(),
+        );
         for (k, b) in row.bindings.iter().enumerate() {
             let b = plan.binding(b);
+            if self.named_record(i, &b, &e, scope)? {
+                continue;
+            }
             // tvOS's focus guide has no DOM property, whether literal or bound.
             if b.kind == BindingKind::Prop && b.id == PropId::FocusGuide as u16 {
                 continue;
@@ -1180,11 +1238,11 @@ impl Em<'_> {
                 continue;
             }
             let f = self
-                .f(b.expr, scope)
+                .bound(i, &e, &b, scope)
                 .map_err(|x| format!("node {i}: {x}"))?;
             let at = self.out.len();
-            let (raw, f) = (f.clone(), self.counted(i, k, f));
-            self.paint_binding(node_type, b, &e, &f);
+            let f = self.counted(i, k, f);
+            self.paint_binding(node_type, &b, &e, &f);
             match b.kind {
                 BindingKind::Prop if markdown && b.id == PropId::Text as u16 => {
                     self.markdown(&e, &f)
@@ -1196,13 +1254,13 @@ impl Em<'_> {
                     // The plan stores editable; HTML exposes the inverse, readonly.
                     // `glassGroup`'s reserved `-1` is `auto` (LLP 1053.000.000.000 D3).
                     let f = if prop == PropId::Editable {
-                        format!("()=>!({f})()")
+                        format!("()=>{{const v=({f})();return v==null?v:!v}}")
                     } else if prop == PropId::GlassGroup {
                         format!("()=>{{const v=({f})();return v===-1?\"auto\":v}}")
-                    } else if prop == PropId::Wakelock {
-                        // The value as computed, which wakelock.js journals
-                        // as the runner does when it is neither word.
-                        format!("()=>{{const v=({f})();{e}.$wake=v;return v}}")
+                    } else if matches!(prop, PropId::Wakelock | PropId::Orientationlock) {
+                        // The value as computed, which wakelock.js and orientationlock.js journal.
+                        let k = ["wake", "orient"][usize::from(prop == PropId::Orientationlock)];
+                        format!("()=>{{const v=({f})();{e}.${k}=v;return v}}")
                     } else {
                         f.clone()
                     };
@@ -1217,31 +1275,43 @@ impl Em<'_> {
                         let _ = write!(self.out, "{}({e});", self.uses.rt("cp"));
                     }
                 }
-                BindingKind::Style => self.style_row(i, b, &parts, &e, &f)?,
+                BindingKind::Style => self.style_row(i, &b, &parts, &e, &f, scope)?,
             }
-            // The row item's fields it reads (LLP 1071.000 D3).
-            if let Some(m) = crate::reads::field_mask(&raw).filter(|_| self.out.len() > at) {
+            let raw = (lowers && b.kind == BindingKind::Style).then(|| self.out[at..].to_string());
+            // Include dependencies added by lowering, such as a text row's shorthand.
+            if let Some(m) = crate::reads::field_mask(&self.out[at..]) {
                 let (fm, stmt) = (self.uses.rt("fm"), self.out.split_off(at));
                 let _ = write!(self.out, "{fm}({m},()=>{{{stmt}}});");
             }
+            let end = self.out.len();
+            seen.extend(raw.map(|raw| lower::Seen { b, f, raw, at, end }));
+        }
+        if !seen.is_empty() {
+            self.lower(&e, &class, &parts, scope, seen)?;
         }
         self.motion_node(i, &e, scope)?;
         self.height_owner(i, &e, scope)?;
-        if let Some(l) = self.reorders.get(&i) {
+        if self.reorder_handle(i) {
             self.motion = true;
             let on = self.uses.rt("onReorder");
-            let _ = write!(self.out, "{on}({e},e{l});");
-        } else if self.computed_reorder(i) {
-            // A computed `reorderFor` (a board's `cards-${col.id}`, LLP 1094
-            // D1) names its list at run time, as the runner's binding does.
-            self.motion = true;
-            let on = self.uses.rt("onReorder");
-            let _ = write!(self.out, "{on}({e},null);");
+            let _ = write!(self.out, "{on}({e});");
         }
         self.wrap_flow(i, &e, scope)?;
         let mut edges = ["0".to_string(), "0".to_string()];
         for h in row.handlers.iter() {
             let h = plan.handler(h);
+            if let Some((name, types)) = crate::events::declared(plan, h) {
+                let (on, ve) = (self.uses.rt("on"), self.uses.rt("viewEvent"));
+                let message = self.uses.rt("onMessage");
+                let name = serde_json::to_string(&name).unwrap_or_default();
+                let types = types.join(",");
+                let a = h.action.0;
+                let _ = write!(
+                    self.out,
+                    "{on}({e},\"message\",{ve}({name},[{types}],a_{a}),{message});"
+                );
+                continue;
+            }
             let mut args = Vec::new();
             for a in h.args.iter() {
                 let f = code::expression(plan, plan.code(plan.arg(a).expr), scope, &mut self.uses)?;
@@ -1278,6 +1348,9 @@ impl Em<'_> {
                 | EventKind::Midimessage
                 | EventKind::Wheel
                 | EventKind::Drop
+                | EventKind::Dragenter
+                | EventKind::Dragleave
+                | EventKind::Atompress // LLP 1045.000 D7: the Markdown editor's and reader's.
                 | EventKind::Play
                 | EventKind::Playing
                 | EventKind::Pause
@@ -1294,6 +1367,10 @@ impl Em<'_> {
                 | EventKind::Volumechange
                 // @ref LLP 1042 — through `media.js`, a bool payload.
                 | EventKind::Fullscreenchange
+                // @ref LLP 1042 §9 — an image's, which picture-in-picture.js dispatches on it.
+                | EventKind::Enterpictureinpicture
+                | EventKind::Leavepictureinpicture
+                | EventKind::Pictureinpictureerror
                 // @ref LLP 1098 D6 — the media session's, through `media.js`.
                 | EventKind::Seekbackward
                 | EventKind::Seekforward
@@ -1310,6 +1387,13 @@ impl Em<'_> {
                 | EventKind::Scrollend
                 | EventKind::Resize
                 | EventKind::Intersect
+                | EventKind::Currententrychange
+                | EventKind::Navigatesuccess
+                | EventKind::Navigateerror
+                | EventKind::Newwindow // @ref LLP 1020.002 D5, D7: nothing fires them,
+                | EventKind::Download // the browser opening its own and downloading,
+                | EventKind::Capture // and the runtime refusing a capture (`onFrameCapture`)
+                | EventKind::Userpromptopened // @ref LLP 1020.002 D9: the browser's own dialogs
                 | EventKind::Select => {}
                 // The motion piece's: the swipe's holds, a pan's velocity.
                 EventKind::Swiperight
@@ -1345,15 +1429,10 @@ impl Em<'_> {
             let piece = crate::events::piece(h.event);
             if let Some(piece) = piece {
                 let f = self.uses.rt(piece);
-                let owner = match (h.event, self.heights.get(&i), self.transforms.get(&i)) {
-                    (EventKind::Heightrelease, Some(t), _) => format!(",e{t}"),
-                    (EventKind::Transformrelease, _, Some((t, c))) => format!(",e{t},e{c}"),
-                    _ => String::new(),
-                };
-                let _ = write!(self.out, "{f}({e},{handler}{owner});");
+                let _ = write!(self.out, "{f}({e},{handler});");
                 continue;
             }
-            if h.event == EventKind::Navigate {
+            if h.event == EventKind::Navigate && node_type != NodeType::WebView {
                 let nav = self.uses.rt("navigateTo");
                 let _ = write!(self.out, "{nav}({handler});");
                 continue;
@@ -1392,82 +1471,11 @@ impl Em<'_> {
         } else {
             self.children(self.sites.of_node(i), &e, scope)?;
         }
+        self.live_time(i, element, &e, scope)?;
         if panel {
             self.out.push_str("});");
         }
         Ok(())
-    }
-
-    /// What the runner reads when a virtualized list is created
-    /// (`Collection::create`), evaluated there: its axis, its literal sizes,
-    /// its row estimate, `scrollFollowEnd` (read again at each update),
-    /// `scroll-start`, `scroll-restoration`, its edges' handlers, and its plan site.
-    fn list_options(
-        &mut self,
-        i: u32,
-        scope: &Scope,
-        edges: &[String; 2],
-    ) -> Result<String, String> {
-        let plan = self.plan;
-        let (mut ph, mut pw) = (Vec::new(), Vec::new());
-        let (mut x, mut est, mut follow, mut manual) = (
-            "!1".to_string(),
-            "void 0".to_string(),
-            "0".to_string(),
-            "!1".to_string(),
-        );
-        let mut init = "void 0".to_string();
-        let mut at_end = "!1".to_string();
-        for b in plan.nodes[i as usize]
-            .bindings
-            .iter()
-            .map(|b| plan.binding(b))
-        {
-            let value = match style::literal(plan, plan.code(b.expr)) {
-                Some(v) => value_js(&v),
-                None => code::expression(plan, plan.code(b.expr), scope, &mut self.uses)
-                    .map_err(|x| format!("node {i}: {x}"))?,
-            };
-            match b.kind {
-                BindingKind::Style
-                    if b.id == StyleId::Height as u16 || b.id == StyleId::MaxHeight as u16 =>
-                {
-                    ph.push(value)
-                }
-                BindingKind::Style
-                    if b.id == StyleId::Width as u16 || b.id == StyleId::MaxWidth as u16 =>
-                {
-                    pw.push(value)
-                }
-                BindingKind::Style if b.id == StyleId::Display as u16 => {
-                    x = format!("({value})===\"flex\"")
-                }
-                BindingKind::Prop
-                    if b.id == PropId::EstimatedItemHeight as u16
-                        || b.id == PropId::EstimatedItemWidth as u16 =>
-                {
-                    est = value
-                }
-                BindingKind::Prop if b.id == PropId::ScrollFollowEnd as u16 => {
-                    follow = format!("()=>{value}")
-                }
-                BindingKind::Prop if b.id == PropId::InitialItemCount as u16 => init = value,
-                BindingKind::Prop if b.id == PropId::ScrollStart as u16 => {
-                    at_end = format!("({value})===\"end\"")
-                }
-                BindingKind::Prop if b.id == PropId::ScrollRestoration as u16 => {
-                    manual = format!("({value})===\"manual\"")
-                }
-                _ => {}
-            }
-        }
-        Ok(format!(
-            "{{x:{x},ph:[{}],pw:[{}],est:{est},init:{init},atEnd:{at_end},follow:{follow},manual:{manual},start:{},end:{},site:\"{i}\"}}",
-            ph.join(","),
-            pw.join(","),
-            edges[0],
-            edges[1]
-        ))
     }
 }
 

@@ -101,6 +101,7 @@ fn selected_config(dir: &Path, baked: &[u8], client: Client) -> Config {
         dev_plan: None,
         dev_url: None,
         dev_identity: None,
+        dev_said: None,
         card: String::new(),
         vnc: None,
         compat: UPDATE_COMPAT.into(),
@@ -110,6 +111,10 @@ fn selected_config(dir: &Path, baked: &[u8], client: Client) -> Config {
         module: Ok(None),
         updates: None,
         hatches: None,
+        packages: Vec::new(),
+        clock_started: None,
+        #[cfg(target_os = "macos")]
+        painted_boot: None,
     };
     config.use_updates(Box::new(Updates::from_client(client).unwrap()), baked);
     config
@@ -163,6 +168,7 @@ fn a_fetched_plan_refused_at_boot_falls_back_to_baked() {
         dev_plan: None,
         dev_url: None,
         dev_identity: None,
+        dev_said: None,
         card: String::new(),
         vnc: None,
         compat: r#"{"id":"fixture00000000","inputs":{"store":{"L":"0"}}}"#.into(),
@@ -172,6 +178,10 @@ fn a_fetched_plan_refused_at_boot_falls_back_to_baked() {
         module: Ok(None),
         updates: None,
         hatches: None,
+        packages: Vec::new(),
+        clock_started: None,
+        #[cfg(target_os = "macos")]
+        painted_boot: None,
     };
     let size = config.size;
     let (presenter, error) = boot_presenter::<Named>(&mut config, size).unwrap();
@@ -233,6 +243,7 @@ fn a_partial_initial_dev_plan_falls_back_without_counting_the_store() {
         dev_plan: Some(PathBuf::from("app.plan")),
         dev_url: None,
         dev_identity: None,
+        dev_said: None,
         card: String::new(),
         vnc: None,
         compat: compat.into(),
@@ -242,6 +253,10 @@ fn a_partial_initial_dev_plan_falls_back_without_counting_the_store() {
         module: Ok(None),
         updates: None,
         hatches: None,
+        packages: Vec::new(),
+        clock_started: None,
+        #[cfg(target_os = "macos")]
+        painted_boot: None,
     };
     config.use_updates(Box::new(updates), &baked);
     assert_eq!(&*config.plan, b"EXPL");
@@ -606,7 +621,9 @@ fn a_refused_initial_layout_releases_no_network_requests() {
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
-    static ORIGIN: OnceLock<(String, String)> = OnceLock::new();
+    // (origin, grants, the app's request's own path: the listener counts only requests to it, since a
+    // stranger on this machine can reach a reused ephemeral port; QUEUE's stray request, 2026-09-09.)
+    static ORIGIN: OnceLock<(String, String, String)> = OnceLock::new();
     struct Seed;
     impl DataSource for Seed {
         fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
@@ -629,8 +646,9 @@ fn a_refused_initial_layout_releases_no_network_requests() {
                 &[Value::Number(1.0)],
                 "only the accepted delivery facts may reach the data source"
             );
+            let (origin, _, path) = ORIGIN.get().unwrap();
             Ok(Answer::Later(Request::post_json(
-                &ORIGIN.get().unwrap().0,
+                &format!("{origin}{path}"),
                 "{}",
             )))
         }
@@ -644,22 +662,54 @@ fn a_refused_initial_layout_releases_no_network_requests() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
+    let path = format!("/refused-layout-{}", std::process::id());
     ORIGIN
-        .set((origin.clone(), format!("net.fetch {origin}\n")))
+        .set((
+            origin.clone(),
+            format!("net.fetch {origin}\n"),
+            path.clone(),
+        ))
         .unwrap();
     let requests = Arc::new(AtomicUsize::new(0));
+    // Anything else that came, by its request line and peer: said if the count is wrong.
+    let strangers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let stopped = Arc::new(AtomicBool::new(false));
     let worker = {
         let requests = requests.clone();
+        let strangers = strangers.clone();
         let stopped = stopped.clone();
         std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    // (macOS hands an accepted socket the listener's nonblocking mode: a read
+                    // before the request's bytes are in would find none.)
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();
-                    let _ = stream.read(&mut [0; 4096]);
-                    requests.fetch_add(1, Ordering::SeqCst);
+                    // (Its request line whole: one read may hold part of it. A second at most,
+                    // and 16 KiB: a peer that never ends its line keeps the worker no longer.)
+                    let (mut got, mut chunk) = (Vec::new(), [0; 4096]);
+                    let end = std::time::Instant::now() + Duration::from_secs(1);
+                    while !got.windows(2).any(|w| w == b"\r\n")
+                        && got.len() < 16 * 1024
+                        && std::time::Instant::now() < end
+                    {
+                        match stream.read(&mut chunk) {
+                            Ok(n) if n > 0 => got.extend_from_slice(&chunk[..n]),
+                            _ => break,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&got);
+                    let line = text.lines().next().unwrap_or("").to_string();
+                    if line.starts_with(&format!("POST {path} ")) {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        strangers
+                            .lock()
+                            .unwrap()
+                            .push(format!("{line:?} from {:?}", stream.peer_addr()));
+                    }
                     let _ = stream.write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
                     );
@@ -720,7 +770,12 @@ fn a_refused_initial_layout_releases_no_network_requests() {
             {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!(requests.load(Ordering::SeqCst), expected, "{label}");
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                expected,
+                "{label} (others that came: {:?})",
+                strangers.lock().unwrap()
+            );
             drop(presenter);
         }
     });

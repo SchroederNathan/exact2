@@ -87,12 +87,30 @@ impl<D: DataSource> Host<D> {
     /// platform's lock while any session's batch last said `true`. A new host
     /// (a boot, a committed plan) says it at its first batch.
     pub(super) fn wakelock_moved(&mut self) -> Option<bool> {
-        let held = !exact_runner::wakelock::holders(self.runner.kernel()).is_empty();
-        if self.wakelock_told == Some(held) {
-            return None;
-        }
-        self.wakelock_told = Some(held);
-        Some(held)
+        let held = !exact_runner::wakelock::holders(&self.runner).is_empty();
+        moved(&mut self.holds_told.wakelock, held)
+    }
+
+    /// The session's orientation lock when it changed since a batch last
+    /// said it (LLP 1133.029 D3): the lock's JSON, or `{"types":0}` when
+    /// none is held, a conflict among the types included, which the runner
+    /// journals. A new host says it at its first batch.
+    pub(super) fn orientation_moved(&mut self) -> Option<String> {
+        let lock = match self.runner.orientation_session() {
+            exact_runner::orientation::Session::Held(lock) => lock.json(),
+            _ => "{\"types\":0}".to_owned(),
+        };
+        moved(&mut self.holds_told.orientation, lock)
+    }
+
+    /// Whether the app must finish work an answer started (`Runner::must_finish`),
+    /// when that changed since a batch last said it: on iOS and tvOS the
+    /// session holds a background task while it must. The batch that says
+    /// `false` comes after the store the last reply's turn wrote is
+    /// persisted. A new host says it at its first batch.
+    pub(super) fn finish_moved(&mut self) -> Option<bool> {
+        let must = self.runner.must_finish();
+        moved(&mut self.holds_told.finish, must)
     }
 
     /// Take the presenter's resolutions; when anything resolves differently,
@@ -180,6 +198,26 @@ pub(crate) fn emit_roles(batch: &mut Batch) {
     batch.roles(&entries);
 }
 
+/// What a batch last said of each hold, so a batch says one only when it moves.
+#[derive(Default)]
+pub(super) struct Told {
+    wakelock: Option<bool>,
+    orientation: Option<String>,
+    finish: Option<bool>,
+}
+
+fn moved<T: PartialEq + Clone>(told: &mut Option<T>, now: T) -> Option<T> {
+    if told.as_ref() == Some(&now) {
+        return None;
+    }
+    *told = Some(now.clone());
+    Some(now)
+}
+
 #[cfg(test)]
 #[path = "colors_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "finish_tests.rs"]
+mod finish_tests;

@@ -3,7 +3,9 @@
 //! date now is `epochAtZero + performanceNow()`. Beside it, where the viewer is: their
 //! locale and IANA time zone, so a source formats a date the way the device
 //! would (`new Intl.DateTimeFormat(time.locale, { timeZone: time.timeZone })`)
-//! without reading either from ambient state.
+//! without reading either from ambient state. `formatLocale` is the regional
+//! format where the platform keeps one apart from the language (macOS and
+//! iOS's Region, POSIX `LC_TIME`): what the device's own formatters use.
 //! @ref LLP 1027.000.000 (Draft; the Bluesky client is its consumer)
 
 use exact_plan::Value;
@@ -15,6 +17,7 @@ pub const FIELDS: &[&str] = &[
     "epochAtZero",
     "utcOffset",
     "locale",
+    "formatLocale",
     "resolvedLocale",
     "timeZone",
     "seed",
@@ -51,6 +54,17 @@ pub struct Launch {
     pub time: Option<WallTime>,
     /// Where the viewer is (`set_place`'s fact, its seed included).
     pub place: Option<Place>,
+    /// Where a live clock reads as the boot starts. A fresh runner's clock
+    /// starts there, not at zero, so what its boot arms (`after(ms)`) is
+    /// due `ms` from now however long the host ran before it (the timers
+    /// RFC, D1). `None`: a seek clock's boot, at zero.
+    pub clock: Option<f64>,
+    /// A cold share's tokens and what each has so far (LLP 1133.024 D3), set
+    /// with the boot's other facts so the first frame is the share's route.
+    pub shared: Vec<(String, crate::share_in::SharedFiles)>,
+    /// The claims that cold share drew from, so a later share this launch
+    /// draws its tokens and file names past them.
+    pub claims: Option<crate::share_in::Claims>,
 }
 
 impl Launch {
@@ -58,6 +72,9 @@ impl Launch {
     pub const NONE: Launch = Launch {
         time: None,
         place: None,
+        clock: None,
+        shared: Vec::new(),
+        claims: None,
     };
 }
 
@@ -67,7 +84,13 @@ impl Launch {
 /// with the real one, not with zero until the host's first `set_time`.
 /// `None`, or a fact that does not validate, boots on zero as before.
 pub fn launching<T>(time: Option<WallTime>, boot: impl FnOnce() -> T) -> T {
-    launching_with(Launch { time, place: None }, boot)
+    launching_with(
+        Launch {
+            time,
+            ..Launch::NONE
+        },
+        boot,
+    )
 }
 
 /// Boot under what the host knows at launch ([`Launch`]): a fact that does
@@ -85,6 +108,11 @@ pub fn launching_with<T>(launch: Launch, boot: impl FnOnce() -> T) -> T {
     let launch = Launch {
         time: launch.time.filter(|t| t.validate().is_ok()),
         place: launch.place.filter(|p| p.validate().is_ok()),
+        clock: launch
+            .clock
+            .filter(|t| (0.0..=crate::MAX_CLOCK_MS).contains(t)),
+        shared: launch.shared,
+        claims: launch.claims,
     };
     let _restore = Restore(Some(LAUNCH.with(|l| l.replace(launch))));
     boot()
@@ -96,8 +124,8 @@ pub fn launching_with<T>(launch: Launch, boot: impl FnOnce() -> T) -> T {
 pub fn without_launch_time<T>(boot: impl FnOnce() -> T) -> T {
     launching_with(
         Launch {
-            time: None,
             place: launch_place(),
+            ..Launch::NONE
         },
         boot,
     )
@@ -106,6 +134,22 @@ pub fn without_launch_time<T>(boot: impl FnOnce() -> T) -> T {
 /// The date a boot under [`launching`] reads first.
 pub(crate) fn launch_time() -> WallTime {
     LAUNCH.with(|l| l.borrow().time).unwrap_or_default()
+}
+
+/// Where a fresh runner's clock starts: the live clock's reading a boot under
+/// [`launching_with`] was told, else zero.
+pub(crate) fn launch_clock() -> f64 {
+    LAUNCH.with(|l| l.borrow().clock).unwrap_or(0.0)
+}
+
+/// A cold share's tokens, when a boot under [`launching_with`] was told.
+pub(crate) fn launch_shared() -> Vec<(String, crate::share_in::SharedFiles)> {
+    LAUNCH.with(|l| l.borrow().shared.clone())
+}
+
+/// The claims a cold share drew from, when a boot under [`launching_with`] was told.
+pub(crate) fn launch_claims() -> Option<crate::share_in::Claims> {
+    LAUNCH.with(|l| l.borrow().claims.clone())
 }
 
 /// Where the viewer is, when a boot under [`launching_with`] was told.
@@ -150,6 +194,12 @@ pub struct Place {
     /// source mixes with the date and a counter for ids (LLP 1027.000's
     /// seed, supplied). Zero until the host says.
     pub seed: f64,
+    /// BCP 47, the regional format the platform's own date and number
+    /// formatters use (macOS and iOS's `Locale.current` with the hour cycle
+    /// the user forces as `-u-hc-`, Electron's `app.getSystemLocale()`,
+    /// Java's `Locale.Category.FORMAT`). Empty where the host keeps none
+    /// apart from `locale`, which `formatLocale` answers then.
+    pub format_locale: String,
 }
 
 impl Default for Place {
@@ -158,14 +208,15 @@ impl Default for Place {
             locale: "en-US".into(),
             time_zone: "UTC".into(),
             seed: 0.0,
+            format_locale: String::new(),
         }
     }
 }
 
 impl Place {
     /// The place a host tells before a boot, as `set_place`'s input:
-    /// `locale NUL timeZone NUL seed`, the seed required; `None` unless it
-    /// validates.
+    /// `locale NUL timeZone NUL seed`, the seed required, then optionally
+    /// `NUL formatLocale`; `None` unless it validates.
     pub fn launched(text: &str) -> Option<Place> {
         let mut fields = text.split('\0');
         let (locale, time_zone) = (fields.next()?, fields.next()?);
@@ -174,6 +225,7 @@ impl Place {
             locale: locale.into(),
             time_zone: time_zone.into(),
             seed,
+            format_locale: fields.next().unwrap_or("").into(),
         };
         place.validate().is_ok().then_some(place)
     }
@@ -188,6 +240,7 @@ impl Place {
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || extra.contains(&c))
         };
         if fine(&self.locale, &[])
+            && (self.format_locale.is_empty() || fine(&self.format_locale, &[]))
             && fine(&self.time_zone, &['/', '_', '+'])
             && self.seed.is_finite()
             && self.seed >= 0.0
@@ -204,6 +257,11 @@ impl Place {
     pub fn field(&self, name: &str) -> Option<Value> {
         match name {
             "locale" => Some(Value::str(&self.locale)),
+            "formatLocale" => Some(Value::str(if self.format_locale.is_empty() {
+                &self.locale
+            } else {
+                &self.format_locale
+            })),
             "timeZone" => Some(Value::str(&self.time_zone)),
             "seed" => Some(Value::Number(self.seed)),
             _ => None,

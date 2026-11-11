@@ -189,6 +189,25 @@ final class NavigationRulesTests: XCTestCase {
         XCTAssertFalse(NavigationRules.dispatchesBack(shownKey: "", rootKey: "compose", sourceKey: "compose", modalActive: true))
     }
 
+    /// UIKit's finished pop decides: the app follows it when its top is among the routes UIKit took
+    /// away, however the source's node or the root's key fared during the swipe.
+    func testTheAppFollowsAPopUIKitFinished() {
+        // A swipe from Updates back to Settings: the app still names Updates
+        XCTAssertTrue(NavigationRules.appIsBehind(poppedKeys: ["updates"], uikitTop: "settings", shownKeys: ["settings", "updates"], rootKey: "updates"))
+        // UIKit's long-press Back menu took two routes away
+        XCTAssertTrue(NavigationRules.appIsBehind(poppedKeys: ["updates", "log"], uikitTop: "settings", shownKeys: ["settings", "updates", "log"], rootKey: "log"))
+        // The app selected Updates again during a pop from Log to Settings: the pop took it
+        XCTAssertTrue(NavigationRules.appIsBehind(poppedKeys: ["updates", "log"], uikitTop: "settings", shownKeys: ["settings", "updates"], rootKey: "updates"))
+        // Nothing popped is the app's top: nothing popped, or the app already went back
+        XCTAssertFalse(NavigationRules.appIsBehind(poppedKeys: [], uikitTop: "updates", shownKeys: ["settings", "updates"], rootKey: "updates"))
+        XCTAssertFalse(NavigationRules.appIsBehind(poppedKeys: ["updates"], uikitTop: "settings", shownKeys: ["settings"], rootKey: "settings"))
+        // A route the app pushed during the pop was never on UIKit's stack
+        XCTAssertFalse(NavigationRules.appIsBehind(poppedKeys: ["thread"], uikitTop: "inbox", shownKeys: ["inbox", "thread", "compose"], rootKey: "compose"))
+        // UIKit's top is above the app's top in the app's stack, or not in it
+        XCTAssertFalse(NavigationRules.appIsBehind(poppedKeys: ["updates"], uikitTop: "log", shownKeys: ["settings", "updates", "log"], rootKey: "updates"))
+        XCTAssertFalse(NavigationRules.appIsBehind(poppedKeys: ["updates"], uikitTop: "specs", shownKeys: ["settings", "updates"], rootKey: "updates"))
+    }
+
     /// D2's exception: the app replaced the swiped screen in place while the
     /// finger was down (capture giving way to what it wrote). The gesture
     /// applies to the replacement, so it is not pushed back in.
@@ -214,7 +233,7 @@ final class NavigationRulesTests: XCTestCase {
             C(id: 3, html: "close", press: true, disabled: false),
         ]
         let resolve = { (target: String?) -> UInt32? in
-            NavigationRules.backControl(named: target, among: controls, id: \.id, htmlID: \.html, pressable: \.press, disabled: \.disabled, inActiveRoute: \.active)?.id
+            NavigationBack.control(named: target, among: controls, id: \.id, htmlID: \.html, pressable: \.press, disabled: \.disabled, inActiveRoute: \.active)?.id
         }
         XCTAssertEqual(resolve("back"), 12)
         XCTAssertEqual(resolve("close"), 3)
@@ -222,25 +241,37 @@ final class NavigationRulesTests: XCTestCase {
         XCTAssertNil(resolve(nil))
         // All disabled: nothing may begin.
         let disabled = [C(id: 1, html: "back", press: true, disabled: true)]
-        XCTAssertNil(NavigationRules.backControl(named: "back", among: disabled, id: \.id, htmlID: \.html, pressable: \.press, disabled: \.disabled, inActiveRoute: \.active))
+        XCTAssertNil(NavigationBack.control(named: "back", among: disabled, id: \.id, htmlID: \.html, pressable: \.press, disabled: \.disabled, inActiveRoute: \.active))
         let inactive = controls.filter { !$0.active }
-        XCTAssertNil(NavigationRules.backControl(named: "back", among: inactive, id: \.id, htmlID: \.html, pressable: \.press, disabled: \.disabled, inActiveRoute: \.active))
+        XCTAssertNil(NavigationBack.control(named: "back", among: inactive, id: \.id, htmlID: \.html, pressable: \.press, disabled: \.disabled, inActiveRoute: \.active))
+        // A control in no route (a header the screens share) serves the active route that has none of its own;
+        // one in another route never does, and the route's own comes first.
+        struct S { let id: UInt32; let html: String?; let press: Bool; let disabled: Bool; let active: Bool; let routed: Bool }
+        let shared = [S(id: 2, html: "back", press: true, disabled: false, active: false, routed: false),
+                      S(id: 5, html: "back", press: true, disabled: false, active: false, routed: true)]
+        let resolveShared = { (controls: [S]) -> UInt32? in
+            NavigationBack.control(named: "back", among: controls, id: \.id, htmlID: \.html, pressable: \.press, disabled: \.disabled, inActiveRoute: \.active, inAnyRoute: \.routed)?.id
+        }
+        XCTAssertEqual(resolveShared(shared), 2)
+        XCTAssertNil(resolveShared(shared.filter { $0.id == 5 }), "another route's control is that route's")
+        XCTAssertEqual(resolveShared(shared + [S(id: 8, html: "back", press: true, disabled: false, active: true, routed: true)]), 8, "the route's own first")
+        XCTAssertNil(resolveShared([S(id: 2, html: "back", press: true, disabled: true, active: false, routed: false)]), "a disabled shared control refuses")
     }
 
     /// LLP 1115 D5: the authored control when it resolves; refused while a
     /// declared one does not; else, given a visit beneath, the root's
     /// `navigate` with its location, or the runner's own back.
     func testBackIsAlwaysThereUnlessTheAuthorSaysOtherwise() {
-        typealias B = NavigationRules.Back
+        typealias B = NavigationBack.Way
         var asked = 0
         let beneath = { () -> String? in asked += 1; return "/" }
-        XCTAssertEqual(NavigationRules.back(control: 7, declared: true, hearsNavigate: true, beneath: beneath), B.press(7))
-        XCTAssertNil(NavigationRules.back(control: nil, declared: true, hearsNavigate: true, beneath: beneath), "a disabled control refuses")
+        XCTAssertEqual(NavigationBack.way(control: 7, declared: true, hearsNavigate: true, beneath: beneath), B.press(7))
+        XCTAssertNil(NavigationBack.way(control: nil, declared: true, hearsNavigate: true, beneath: beneath), "a disabled control refuses")
         XCTAssertEqual(asked, 0, "the runner is asked only when there is no control")
-        XCTAssertEqual(NavigationRules.back(control: nil, declared: false, hearsNavigate: true, beneath: beneath), B.navigate("/"))
-        XCTAssertEqual(NavigationRules.back(control: nil, declared: false, hearsNavigate: false, beneath: beneath), B.pop, "no navigate handler: the runner's own back")
-        XCTAssertNil(NavigationRules.back(control: nil, declared: true, hearsNavigate: false, beneath: beneath), "a disabled control still refuses")
-        XCTAssertNil(NavigationRules.back(control: nil, declared: false, hearsNavigate: true, beneath: { nil }), "a stack's root")
+        XCTAssertEqual(NavigationBack.way(control: nil, declared: false, hearsNavigate: true, beneath: beneath), B.navigate("/"))
+        XCTAssertEqual(NavigationBack.way(control: nil, declared: false, hearsNavigate: false, beneath: beneath), B.pop, "no navigate handler: the runner's own back")
+        XCTAssertNil(NavigationBack.way(control: nil, declared: true, hearsNavigate: false, beneath: beneath), "a disabled control still refuses")
+        XCTAssertNil(NavigationBack.way(control: nil, declared: false, hearsNavigate: true, beneath: { nil }), "a stack's root")
     }
 
     /// LLP 1115.000 D5.2, D5.3: a route's bar is its own. Its header when
@@ -299,23 +330,6 @@ final class NavigationRulesTests: XCTestCase {
         XCTAssertTrue(NavigationRules.modalRefusesDismissal(closedby: "none"))
         XCTAssertFalse(NavigationRules.modalRefusesDismissal(closedby: "closerequest"))
         XCTAssertFalse(NavigationRules.modalRefusesDismissal(closedby: nil))
-    }
-
-    /// D5: a session answers a keyboard only for its own editor, or while it
-    /// still holds an inset it applied.
-    func testAKeyboardConcernsOnlyTheSessionThatOwnsIt() {
-        XCTAssertTrue(NavigationRules.keyboardConcerns(editing: true, holdsInset: false))
-        XCTAssertTrue(NavigationRules.keyboardConcerns(editing: false, holdsInset: true))
-        XCTAssertFalse(NavigationRules.keyboardConcerns(editing: false, holdsInset: false))
-    }
-
-    /// D5: the viewport freeze is for an initially interactive pop, never a
-    /// sheet — the Messages defect of 2026-09-09.
-    func testTheViewportFreezeIsForAnInteractivePopOnly() {
-        XCTAssertTrue(NavigationRules.freezesViewport(modalActive: false, changing: true, initiallyInteractive: true))
-        XCTAssertFalse(NavigationRules.freezesViewport(modalActive: true, changing: true, initiallyInteractive: true))
-        XCTAssertFalse(NavigationRules.freezesViewport(modalActive: false, changing: false, initiallyInteractive: true))
-        XCTAssertFalse(NavigationRules.freezesViewport(modalActive: false, changing: true, initiallyInteractive: false))
     }
 
     /// D3: a focus that cannot be delivered has a named reason, in a fixed
@@ -765,7 +779,7 @@ final class MacShortcutTests: XCTestCase {
         let shown = { go.items.filter { !$0.isHidden } }
         XCTAssertEqual(shown().map(\.title), ["Back", "Home"])
         XCTAssertTrue(shown()[0].target is ShortcutHost)
-        XCTAssertEqual(go.items.filter { $0.target is GoMenuTarget }.map(\.keyEquivalent), [""])
+        XCTAssertEqual(go.items.filter { $0.target is GoMenuTarget }.map(\.keyEquivalent), ["", "]"], "Forward keeps ⌘], which nothing claims")
         XCTAssertEqual(shown()[1].state, .on)
         XCTAssertFalse(file.items.contains { $0.keyEquivalent == "," || $0.keyEquivalent == "[" })
         XCTAssertNotNil(app.items.first { $0.action == #selector(NSApplication.hideOtherApplications(_:)) })
@@ -811,7 +825,9 @@ final class MacShortcutTests: XCTestCase {
         XCTAssertEqual(menu("Edit").items.filter { $0.title == "Undo" }.map(\.isHidden), [true])
         XCTAssertEqual(shown("Edit").map(\.title), ["Undo Move", "Redo", "Cut", "Copy", "Paste", "Paste and Match Style", "Delete", "Select All", "Duplicate",
                                                 "Find", "Spelling and Grammar", "Substitutions", "Transformations", "Speech"])
-        XCTAssertEqual(shown("View").first?.title, "Zoom In")
+        // ⌘= stands in for the host's Zoom In, in its place (LLP 1021 §5.3.1).
+        XCTAssertEqual(shown("View").prefix(3).map(\.title), ["Actual Size", "Zoom In", "Zoom Out"])
+        XCTAssertTrue(shown("View")[1].target is ShortcutHost)
         XCTAssertEqual(shown("File").map(\.title).prefix(2), ["Close Board", "Export"])
         let close = menu("File").items.first { $0.title == "Close Window" }!
         XCTAssertEqual(close.keyEquivalent, "", "⌘W is the app's Close Board, once")
@@ -909,7 +925,8 @@ final class MacShortcutTests: XCTestCase {
 
     /// LLP 1115.000 D7.8: a release build has no Develop menu, and so takes
     /// none of its chords (Reload ⌘R, Open Project… ⌘O, App Info… ⌘D, Save
-    /// Trace ⌥⌘T); a development build's bar is as it was.
+    /// Trace ⌥⌘T); a development build's bar is as it was, with the
+    /// frame-health commands, which take none.
     func testOnlyADevelopmentBuildsBarHasDevelopAndItsChords() {
         let presenter = Presenter()
         let window = window(presenter)
@@ -927,9 +944,10 @@ final class MacShortcutTests: XCTestCase {
         let development = DevMenu.makeMenu(shortcuts: presenter.shortcuts, documents: false, develop: true)
         XCTAssertEqual(titles(development), ["File", "Edit", "View", "Go", "Window", "Develop", "Help"])
         let develop = development.items.first { $0.submenu?.title == "Develop" }!.submenu!
-        XCTAssertEqual(develop.items.map(\.title), ["Reload", "Open Project…", "App Info…", "Save Trace"])
-        XCTAssertEqual(develop.items.map(\.keyEquivalent), ["r", "o", "d", "t"])
-        XCTAssertEqual(develop.items.map(\.keyEquivalentModifierMask), [.command, .command, .command, [.command, .option]])
+        // The frame-health commands (#1141) take no chord.
+        XCTAssertEqual(develop.items.map(\.title), ["Reload", "Open Project…", "App Info…", "Show Frame Health", "Save Trace"])
+        XCTAssertEqual(develop.items.map(\.keyEquivalent), ["r", "o", "d", "", "t"])
+        XCTAssertEqual(develop.items.filter { !$0.keyEquivalent.isEmpty }.map(\.keyEquivalentModifierMask), [.command, .command, .command, [.command, .option]])
         // Which build is which: production trust, or `build.mjs`'s stamp of a
         // production or distributed build (`exact release`); an unstamped
         // host, as this test's, is a development one. The environment

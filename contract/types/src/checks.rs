@@ -9,7 +9,35 @@ use contract_syntax::{
 use std::collections::{BTreeMap, BTreeSet};
 
 mod midi;
+mod permission;
 mod sounds;
+
+/// Whether a roster parameter admits `t`. The roster table spells three
+/// parameters `any`; each is held to the values its runner entry reads, so a
+/// call that would fail at runtime (`isEmpty(5)`) is refused here instead.
+/// (`length` is `lists::infer_length`'s.)
+pub(super) fn roster_accepts(f: exact_plan::Stdlib, spec: &str, t: &Ty) -> bool {
+    use exact_plan::Stdlib;
+    match (f, spec) {
+        (Stdlib::IsEmpty, "any") => matches!(t, Ty::String | Ty::Enum(_) | Ty::List(_)),
+        (Stdlib::ToString, "any") => matches!(t, Ty::Number | Ty::String | Ty::Enum(_) | Ty::Bool),
+        (Stdlib::First | Stdlib::At, "any") => matches!(t, Ty::List(_)),
+        _ => t.matches_roster(spec),
+    }
+}
+
+/// A roster parameter as a refusal spells it.
+pub(super) fn roster_spelling(f: exact_plan::Stdlib, spec: &str) -> &str {
+    use exact_plan::Stdlib;
+    match (f, spec) {
+        (Stdlib::Length | Stdlib::IsEmpty, "any") => "string | list",
+        (Stdlib::ToString, "any") => "number | string | bool",
+        (Stdlib::First | Stdlib::At, "any") => "list",
+        // The ISO 4217 codes `"currency"` takes (LLP 1116 D8), too many to spell here.
+        (Stdlib::FormatNumber, code) if code.starts_with("\"USD\"") => "\"USD\" | \"EUR\" | …",
+        _ => spec,
+    }
+}
 
 /// Reject recursive functions without revisiting completed subgraphs.
 pub(super) fn check_function_cycles(file: &File) -> Result<(), TypeError> {
@@ -404,6 +432,11 @@ pub(super) fn infer_owned_state_initializers(
         let t = Ty::Option(Box::new(ct.mutations[i].clone()));
         settled.push((m.name.clone(), Ref::Mutation(i as u32), t));
     }
+    // One scope for every initializer, its second frame grown as each state
+    // settles: copying the names for each state is quadratic in a large root.
+    let mut base = Scope::default();
+    base.push(settled);
+    base.push(names);
     for (i, state) in c.states.iter().enumerate() {
         let regions = match owners.get(i).copied().unwrap_or(Owner::Root) {
             Owner::Root => None,
@@ -412,7 +445,10 @@ pub(super) fn infer_owned_state_initializers(
                 let Some(owner_scope) = scopes.get(&(tag, arm)) else {
                     if !complete {
                         // Its region was skipped: the view check says why.
-                        names.push((state.name.clone(), Ref::Slot(i as u32), ct.slots[i].clone()));
+                        base.push_name_at(
+                            1,
+                            (state.name.clone(), Ref::Slot(i as u32), ct.slots[i].clone()),
+                        );
                         continue;
                     }
                     return err(
@@ -432,16 +468,17 @@ pub(super) fn infer_owned_state_initializers(
             }
         };
         if let Some(regions) = regions {
-            let mut scope = Scope::default();
-            scope.push(settled.clone());
-            scope.push(names.clone());
+            let mut scope = base.clone();
             scope.frames.extend(regions);
             if let Some(e) = super::component::initializer_scope(c, i, &scope, &types.shapes) {
                 return Err(e);
             }
             ct.slots[i] = infer(&state.expr, &scope, &types.shapes)?;
         }
-        names.push((state.name.clone(), Ref::Slot(i as u32), ct.slots[i].clone()));
+        base.push_name_at(
+            1,
+            (state.name.clone(), Ref::Slot(i as u32), ct.slots[i].clone()),
+        );
     }
     Ok(())
 }
@@ -703,81 +740,6 @@ fn share_files(value: &Expr, t: &Ty) -> Result<(), TypeError> {
     Ok(())
 }
 
-/// `showNotification(title=, body=, tag=, showTrigger=, navigate=)`: the Notification
-/// API's title and options by name, named only, `title` required; strings,
-/// and `showTrigger` a number (when to show it, in epoch milliseconds: the
-/// Notification Triggers draft's `TimestampTrigger`). `closeNotification(tag)`:
-/// one string. Whether the grants name `device.notifications` is the host's
-/// to refuse, as `fetch`'s grants are.
-fn notification_args(
-    name: &str,
-    args: &[Expr],
-    scope: &Scope,
-    shapes: &Shapes,
-    span: Span,
-) -> Result<(), TypeError> {
-    const USAGE: &str = "`showNotification(title=…, body=…, tag=…, showTrigger=…, navigate=…)`";
-    if name == "closeNotification" {
-        let one = matches!(args, [tag] if !matches!(tag, Expr::NamedArg(..)));
-        if !one || Ty::String.unify(&infer(&args[0], scope, shapes)?).is_none() {
-            return err(
-                "type-notification-argument",
-                "`closeNotification` takes the tag it closes: `closeNotification(\"reminder-1\")`",
-                span,
-            );
-        }
-        return Ok(());
-    }
-    let mut seen = BTreeSet::new();
-    for arg in args {
-        let Expr::NamedArg(arg_name, value, at) = arg else {
-            return err(
-                "type-notification-argument",
-                format!("`showNotification` takes named arguments: {USAGE}"),
-                arg.span(),
-            );
-        };
-        let want = match arg_name.as_str() {
-            "title" | "body" | "tag" | "navigate" => Ty::String,
-            "showTrigger" => Ty::Number,
-            other => {
-                return err(
-                    "type-notification-argument",
-                    format!("`showNotification` has no argument `{other}`; it takes title=, body=, tag=, showTrigger= and navigate="),
-                    *at,
-                )
-            }
-        };
-        if !seen.insert(arg_name.as_str()) {
-            return err(
-                "type-notification-argument",
-                format!("`{arg_name}=` is given twice"),
-                *at,
-            );
-        }
-        let t = infer(value, scope, shapes)?;
-        if want.unify(&t).is_none() {
-            let what = match want {
-                Ty::Number => "a number: epoch milliseconds",
-                _ => "a string",
-            };
-            return err(
-                "type-notification-argument",
-                format!("`{arg_name}=` is {what}, not `{t}`"),
-                value.span(),
-            );
-        }
-    }
-    if !seen.contains("title") {
-        return err(
-            "type-notification-argument",
-            format!("`showNotification` needs `title=`: {USAGE}"),
-            span,
-        );
-    }
-    Ok(())
-}
-
 /// `scrollIntoView("list-id", key, block=, inline=, behavior=, row=)` (LLP
 /// 1070.000 §1): a virtualized list's `id` as a literal, a row key, and the
 /// web's `ScrollIntoViewOptions` by name with literal values; `row=` names an
@@ -915,12 +877,18 @@ pub(super) fn check_command(
             Some(owner) if owner != component => format!(
                 "`{name}` is an action of `{owner}`, not in `{component}`'s scope; pass it as an `action` prop or `provide` it"
             ),
+            None if matches!(name, "showNotification" | "closeNotification" | "setAppBadge" | "clearAppBadge") => format!(
+                "`{name}` is `@exact/notifications`' (LLP 1133.004): `exact add notifications`, then `use {name} from \"@exact/notifications\"` (`closeNotification` takes `tag=`)"
+            ),
             _ => format!(
                 "`{name}` is not a host command; the hosts answer {}",
                 HOST_COMMANDS.join(", ")
             ),
         };
         return err("type-unknown-command", message, span);
+    }
+    if super::frame_commands::is(name) {
+        return super::frame_commands::command_args(name, args, scope, shapes, span);
     }
     if name == "relaunch" && !args.is_empty() {
         return err("type-relaunch", "`relaunch()` takes no arguments", span);
@@ -955,8 +923,8 @@ pub(super) fn check_command(
     if name == "saveFile" {
         return save_file_args(args, scope, shapes, span);
     }
-    if name == "showNotification" || name == "closeNotification" {
-        return notification_args(name, args, scope, shapes, span);
+    if name == "requestPermission" {
+        return permission::args(args, scope, shapes, span);
     }
     if name.starts_with("show") && name.ends_with("Picker") && name != "showPicker" {
         return picker_args(name, args, scope, shapes, span);
@@ -985,7 +953,14 @@ pub(super) fn check_command(
         }
         return Ok(());
     }
-    if name == "fastSeek" || name == "load" {
+    if [
+        "fastSeek",
+        "load",
+        "requestPictureInPicture",
+        "exitPictureInPicture",
+    ]
+    .contains(&name)
+    {
         return super::media::command_args(name, args, scope, shapes, span);
     }
     if name == "removeAllRanges" && !args.is_empty() {
@@ -1021,7 +996,7 @@ pub(super) fn check_command(
         }
         return Ok(());
     }
-    if matches!(name, "playSound" | "playSounds" | "stopSounds") {
+    if matches!(name, "playSound" | "playSounds" | "stopSounds" | "haptic") {
         return sounds::args(name, args, scope, shapes, span);
     }
     if matches!(name, "requestMIDIAccess" | "sendMIDI") {
@@ -1029,12 +1004,12 @@ pub(super) fn check_command(
     }
     if name == "postMessage" {
         // The web's argument order, `postMessage(message, target)`: the target
-        // is a surface's literal name, checked against the app's canvases.
+        // is a surface name or the id of an iframe.
         const USAGE: &str = "`postMessage(text, \"world\")`";
         let [text, surface] = args else {
             return err(
                 "type-post-message",
-                format!("{USAGE}: the message, then a surface's literal name"),
+                format!("{USAGE}: the message, then a canvas surface name or iframe id"),
                 span,
             );
         };
@@ -1045,10 +1020,10 @@ pub(super) fn check_command(
                 text.span(),
             );
         }
-        if !matches!(surface, Expr::Str(..)) {
+        if !infer(surface, scope, shapes)?.is_string() {
             return err(
                 "type-post-message",
-                format!("the surface is named literally, as in `surface=world()`: {USAGE}"),
+                format!("the target is a string naming a canvas surface or iframe id: {USAGE}"),
                 surface.span(),
             );
         }
@@ -1297,7 +1272,60 @@ fn check_attr(a: &Attr, scope: &Scope, shapes: &Shapes) -> Result<(), TypeError>
     if a.name == "glassGroup" {
         return glass_group_value(&a.value, scope, shapes).map(|_| ());
     }
+    if super::component::handler_attr(&a.name) {
+        if let Some(checked) = handler_action(&a.name, &a.value, scope, shapes) {
+            return checked;
+        }
+    }
     infer(&a.value, scope, shapes).map(|_| ())
+}
+
+/// A handler's value where `infer` would read it as something else. A
+/// handler names an action of its own component or an action prop, as
+/// lowering binds it (and analyze's `check_handler` holds it to): a call
+/// is the action's even where an app `fn` shares the name, which a call in
+/// an expression reaches first; a name that is only a `fn`, or another
+/// component's action, is refused as a handler's, not typed as the fn or
+/// left to the roster's refusal. `None` leaves the value to `infer`.
+fn handler_action(
+    attr: &str,
+    value: &Expr,
+    scope: &Scope,
+    shapes: &Shapes,
+) -> Option<Result<(), TypeError>> {
+    let (name, args, span) = match value {
+        Expr::Ident(n, span) => (n, &[][..], *span),
+        Expr::Call(n, args, span) => (n, args.as_slice(), *span),
+        _ => return None,
+    };
+    match scope.lookup(name) {
+        Some((Ref::Action(_) | Ref::Prop(_), Ty::Action(params))) => {
+            // A call with any count of arguments, `pick()` too: `infer`
+            // would type it as the fn.
+            if matches!(value, Expr::Call(..)) && shapes.fns.contains_key(name) {
+                let checked =
+                    super::component::action_call(name, params, args, span, scope, shapes);
+                return Some(checked.map(|_| ()));
+            }
+            None
+        }
+        Some(_) => None,
+        None => {
+            let names =
+                format!("`{attr}=` names an action of its own component or an `action` prop");
+            let message = match shapes.actions.get(name) {
+                Some(owner) => format!(
+                    "`{name}` is an action of `{owner}`, not in `{}`'s scope: {names}; pass it as one (`{name}: action` under `props`, `{name}={name}` at the use) or `provide` it",
+                    scope.component()
+                ),
+                None if shapes.fns.contains_key(name) => {
+                    format!("`{name}` is a `fn`, not an action: {names}")
+                }
+                None => return None,
+            };
+            Some(err("type-handler-action", message, span))
+        }
+    }
 }
 
 /// `glassGroup`'s value: a number, the literal `"auto"` (typed as the number

@@ -1,4 +1,6 @@
 mod args;
+mod input;
+mod look;
 mod render;
 mod textures;
 
@@ -6,7 +8,7 @@ use crate::{
     perf::{Perf, Stamp},
     Feed,
 };
-use exact_game::{Clock, Game, Sim, World};
+use exact_game::{Clock, Data, Game, Sim, World};
 use exact_gpu::{
     wgpu, AssetError, Frame, InputEvent, Lifecycle, Restore, Surface, SurfaceError, Value,
 };
@@ -44,10 +46,11 @@ impl Executor for () {}
 use crate::renderer::RETIRED_BUDGET;
 
 /// One simulation and its lazily created GPU renderer, for an exact canvas.
-/// Model pipelines prepare during delivery; primitive pipelines prepare at first render.
+/// Model assets upload during delivery; pipeline variants compile when first drawn.
 pub struct WorldSurface<G: Game, P: Executor = (), const ASSETS: bool = false, H: crate::Hooks = ()>
 {
     sim: Option<Sim<G>>,
+    development_edits: bool,
     pending_restore: Option<(Vec<u8>, Restore)>,
     placed: crate::placed::Placements,
     refusal: Option<SurfaceError>,
@@ -57,7 +60,6 @@ pub struct WorldSurface<G: Game, P: Executor = (), const ASSETS: bool = false, H
     hook_poses: crate::hooks::Poses,
     gpu_timing: Option<crate::hooks::gpu_timing::GpuTiming>,
     /// What the last `render` encoded, for timing once the module submits it.
-    // The timestamp pairs the last encoded frame wrote, until it is submitted.
     encoded: Option<u64>,
     render: Option<(crate::renderer::RendererWithAssets<ASSETS>, Feed)>,
     format: Option<wgpu::TextureFormat>,
@@ -70,6 +72,8 @@ pub struct WorldSurface<G: Game, P: Executor = (), const ASSETS: bool = false, H
     trace: Option<crate::trace::Trace>,
     error: Option<SurfaceError>,
     dirty: bool,
+    output_opaque: bool,
+    frame_ready: bool,
     assets_dirty: bool,
     asset_check: Option<(exact_game::WorldId, u64, u64)>,
     reported: bool,
@@ -78,45 +82,16 @@ pub struct WorldSurface<G: Game, P: Executor = (), const ASSETS: bool = false, H
     audio_requested: bool,
     hidden: bool,
     interrupted: bool,
-}
-impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Default
-    for WorldSurface<G, P, ASSETS, H>
-{
-    fn default() -> Self {
-        Self {
-            sim: None,
-            pending_restore: None,
-            placed: Default::default(),
-            refusal: None,
-            presentation: P::default(),
-            hooks: H::default(),
-            hook_clock: Default::default(),
-            hook_poses: Default::default(),
-            gpu_timing: None,
-            encoded: None,
-            render: None,
-            format: None,
-            payloads: Default::default(),
-            device: false,
-            device_assets_invalidated: false,
-            storage_limit: 0,
-            perf: Perf::default(),
-            ready_work: None,
-            trace: None,
-            error: None,
-            dirty: true,
-            assets_dirty: false,
-            asset_check: None,
-            reported: false,
-            generation: 0,
-            seekable: true,
-            audio_requested: false,
-            hidden: false,
-            interrupted: false,
-        }
-    }
+    look: look::Look<ASSETS>,
+    rung: Option<crate::quality::Rung>,
 }
 impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, P, ASSETS, H> {
+    /// Bake-owned development capability; production modules refuse live edits.
+    #[doc(hidden)]
+    pub fn development_edits(mut self, allowed: bool) -> Self {
+        self.development_edits = allowed;
+        self
+    }
     fn check_primitive_assets(&mut self) -> Result<(), SurfaceError> {
         if ASSETS {
             return Ok(());
@@ -187,6 +162,7 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
         self.error = None;
         self.reported = false;
         self.perf = Perf::default();
+        self.gpu_timing = None;
         Ok(())
     }
     fn finish_restore(&mut self) {
@@ -262,14 +238,6 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
             self.ready_reasons().join("; ")
         ))
     }
-    /// Read the simulation after a successful bind.
-    pub fn sim(&self) -> Option<&Sim<G>> {
-        self.sim.as_ref()
-    }
-    /// Read presentation diagnostics owned by this canvas's render hooks.
-    pub fn render_hooks(&self) -> &H {
-        &self.hooks
-    }
 }
 #[allow(clippy::too_many_arguments)]
 fn observer<'a, const ASSETS: bool>(
@@ -319,12 +287,22 @@ fn observer<'a, const ASSETS: bool>(
                 }
             }
         }
+        // Even the last observer can run on an advance-only frame.
+        if left < 2 {
+            render::retain_primes(render, placed, true);
+        }
         start = (measure && left > 0 && left <= 240).then(Stamp::now);
     }
 }
 impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
     for WorldSurface<G, P, ASSETS, H>
 {
+    fn render_scale(&self) -> f32 {
+        self.raster_scale()
+    }
+    fn retier(&mut self) -> bool {
+        self.retier_rung()
+    }
     fn clock(&mut self, seekable: bool) {
         self.seekable = seekable;
         self.presentation.clock(seekable);
@@ -386,6 +364,9 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             requests: self.payloads.request(requests),
         }
     }
+    fn accepts_asset_update(&self, name: &str) -> bool {
+        !G::TABLES.is_empty() && name == exact_game::asset::TABLE_ASSET
+    }
     fn asset(&mut self, file: &str, bytes: Result<&[u8], AssetError>) {
         if ASSETS || exact_game::asset::delivers_without_models::<G>() {
             let name = if ASSETS {
@@ -397,12 +378,16 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             if let Some(sim) = &mut self.sim {
                 match bytes {
                     Ok(bytes) => {
-                        let accepted = sim
-                            .deliver_asset(
-                                name,
-                                exact_game::asset::Content::decode::<ASSETS>(name, bytes),
-                            )
-                            .is_ok();
+                        let result = sim.deliver_asset(
+                            name,
+                            exact_game::asset::Content::decode::<ASSETS>(name, bytes),
+                        );
+                        let accepted = result.is_ok();
+                        if name == exact_game::asset::TABLE_ASSET {
+                            if let Err(error) = result {
+                                self.refusal = Some(SurfaceError(error));
+                            }
+                        }
                         if ASSETS && accepted && name.ends_with(".model") {
                             if let Some((_, model)) =
                                 sim.presentation_models().find(|(n, _)| *n == name)
@@ -456,7 +441,14 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             self.hooks.device_lost();
             self.ready_work = None;
             self.render = Some((
-                crate::renderer::RendererWithAssets::<ASSETS>::new(device, queue, format),
+                crate::renderer::RendererWithAssets::<ASSETS>::configured(
+                    device,
+                    queue,
+                    format,
+                    crate::quality::samples(self.rung, G::SAMPLES),
+                    G::DEPTH_PREPASS,
+                )
+                .with_matte_models(G::MATTE_MODELS),
                 {
                     let mut feed = Feed::default();
                     feed.share_attachment_diagnostics(self.placed.attachments.diagnostics.clone());
@@ -596,6 +588,9 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
     ) -> bool {
         self.render_frame(frame, device, queue, encoder, target, format)
     }
+    fn frame_ready(&self) -> bool {
+        self.frame_ready
+    }
     fn submitted(&mut self) {
         self.frame_submitted();
     }
@@ -628,15 +623,20 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
     fn placement(&self, index: usize) -> Option<exact_gpu::Placement> {
         self.placed.placement(index)
     }
+    fn srgb_target(&self) -> bool {
+        matches!(G::SAMPLES, exact_game::SceneSamples::One)
+    }
     fn high_dynamic_range(&self) -> bool {
         G::HIGH_DYNAMIC_RANGE
+    }
+    fn opaque(&self) -> bool {
+        self.output_opaque
     }
     fn wants_input(&self) -> bool {
         true
     }
     fn input(&mut self, event: &InputEvent) {
         self.reported = false;
-        use exact_game::{InputEvent as E, PointerPhase as P};
         use exact_gpu::PointerPhase as Q;
         let Some(sim) = &mut self.sim else {
             return;
@@ -646,78 +646,11 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             InputEvent::Key { down: true, .. }
                 | InputEvent::Pointer { phase: Q::Down, .. }
                 | InputEvent::Control { phase: Q::Down, .. }
-        ) {
+        ) || matches!(event, InputEvent::Pad { buttons, .. } if buttons.iter().any(|b| *b >= 0.5))
+        {
             self.presentation.unlock();
         }
-        let e = match event {
-            InputEvent::Key {
-                code, down, at_ms, ..
-            } => E::Key {
-                code: code.clone(),
-                down: *down,
-                at_ms: *at_ms,
-            },
-            InputEvent::Pointer {
-                id,
-                phase,
-                x,
-                y,
-                dx,
-                dy,
-                kind,
-                buttons,
-                at_ms,
-            } => E::Pointer {
-                id: u64::from(*id),
-                phase: match phase {
-                    Q::Down => P::Down,
-                    Q::Move => P::Move,
-                    Q::Up => P::Up,
-                    Q::Cancel => P::Cancel,
-                },
-                x: *x,
-                y: *y,
-                dx: *dx,
-                dy: *dy,
-                // A finger's contact is its phase, not a mouse button.
-                buttons: if *kind == exact_gpu::PointerKind::Touch {
-                    0
-                } else {
-                    *buttons
-                },
-                at_ms: *at_ms,
-            },
-            InputEvent::Control {
-                name,
-                id,
-                phase,
-                x,
-                y,
-                at_ms,
-            } => E::Control {
-                name: name.clone(),
-                id: u64::from(*id),
-                phase: match phase {
-                    Q::Down => P::Down,
-                    Q::Move => P::Move,
-                    Q::Up => P::Up,
-                    Q::Cancel => P::Cancel,
-                },
-                x: *x,
-                y: *y,
-                at_ms: *at_ms,
-            },
-            InputEvent::Wheel { dx, dy, at_ms, .. } => E::Wheel {
-                dx: *dx,
-                dy: *dy,
-                at_ms: *at_ms,
-            },
-            InputEvent::Blur { at_ms } => E::Blur { at_ms: *at_ms },
-            InputEvent::Message { text, at_ms } => E::Message {
-                text: text.clone(),
-                at_ms: *at_ms,
-            },
-        };
+        let e = input::engine_event(event);
         if let Err(error) = sim.validate_input(&e) {
             self.refusal = Some(SurfaceError(error));
             return;
@@ -737,6 +670,9 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
     }
     fn agent(&mut self, request: &str) -> Option<String> {
         self.reported = false;
+        if let Some(reply) = self.look(request) {
+            return Some(reply);
+        }
         let sim = self.sim.as_mut()?;
         match crate::trace::request(request) {
             Ok(Some(crate::trace::Request::Arm { entity, frames })) => {
@@ -785,6 +721,7 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             ),
             P::inspect,
         );
+        self.look.tell_into(request, &mut reply);
         if H::ENABLED {
             #[derive(Default, exact_game::Data)]
             struct Operation {
@@ -825,12 +762,13 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
         // its own Data decoder to distinguish state from tree/error/entity replies.
         let state = world_state(&reply);
         if state {
-            #[derive(Default, exact_game::Data)]
-            struct PerfRequest {
-                perf_reset: bool,
-                perf: bool,
-            }
-            if let Ok(r) = exact_game::json::from_str::<PerfRequest>(request) {
+            let span_since = crate::perf::PerfRequest::parse(request)
+                .ok()
+                .and_then(|r| r.span_since);
+            if let Ok(r) = crate::perf::PerfRequest::parse(request) {
+                if r.perf || r.perf_reset {
+                    sim.measure_spans(crate::perf::clock_ms, r.perf_reset);
+                }
                 if r.perf_reset {
                     self.perf.reset();
                     if let Some(timing) = &mut self.gpu_timing {
@@ -855,7 +793,17 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             } else {
                 ",\"device\":false"
             });
+            let scale = G::render_scale(sim.args());
+            crate::quality::row(self.rung, G::SAMPLES, scale, &mut reply);
             self.perf.append(&mut reply);
+            reply.pop();
+            reply.push_str(",\"tickSpans\":");
+            reply.push_str(&sim.spans_json(span_since));
+            reply.push('}');
+            let trace_events = crate::perf::PerfRequest::parse(request)
+                .ok()
+                .filter(|q| q.trace_export)
+                .map(|_| sim.trace_events_json());
             let work = self
                 .render
                 .as_ref()
@@ -875,7 +823,17 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             } else {
                 String::new()
             };
-            reply.push_str(&format!(",\"ready\":{ready},\"readyReasons\":{},\"gpu\":{{\"storageBindings\":{},\"requiredStorageBindings\":{},\"beforeReady\":{},\"afterReady\":{}{textures},\"bufferScope\":\"model instances, skin and quad buffers; excludes vertex/index, primitive pages and slots\"}}",
+            // Whether forward shading runs in half precision (SHADER_F16).
+            let half = self
+                .render
+                .as_ref()
+                .map_or_else(|| "null".into(), |(r, _)| r.pipelines.half.to_string());
+            // Whether culled draws start at their region (INDIRECT_FIRST_INSTANCE).
+            let first_instance = self
+                .render
+                .as_ref()
+                .map_or_else(|| "null".into(), |(r, _)| r.cull.first_instance.to_string());
+            reply.push_str(&format!(",\"ready\":{ready},\"readyReasons\":{},\"gpu\":{{\"shaderF16\":{half},\"firstInstance\":{first_instance},\"storageBindings\":{},\"requiredStorageBindings\":{},\"beforeReady\":{},\"afterReady\":{}{textures},\"bufferScope\":\"model instances, skin and quad buffers; excludes vertex/index, primitive pages and slots\"}}",
                 exact_game::json::to_string(&reasons).unwrap(), self.storage_limit, if ASSETS { crate::STORAGE_BINDINGS } else { crate::SCENE_STORAGE_BINDINGS },
                 self.ready_work.unwrap_or(work).json(),
                 self.ready_work.map_or_else(Default::default, |before| work.since(before)).json()));
@@ -891,6 +849,9 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
                     timing.poll(&renderer.device, &renderer.queue);
                 }
                 timing.append(&mut reply);
+            }
+            if let Some(events) = trace_events {
+                render::append_trace(&mut reply, events, self.gpu_timing.as_ref());
             }
             reply.push_str("}}");
         }
@@ -931,15 +892,6 @@ fn world_state(reply: &str) -> bool {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "surface_tests.rs"]
 mod tests;
-#[cfg(test)]
-impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, P, ASSETS, H> {
-    pub(crate) fn renderer_for_test(
-        &mut self,
-    ) -> Option<&mut crate::renderer::RendererWithAssets<ASSETS>> {
-        self.render.as_mut().map(|(renderer, _)| renderer)
-    }
-}
-
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
@@ -1066,7 +1018,7 @@ mod residency_tests {
         s.device_ready(wgpu::Features::empty());
         s.bind(&[], None).unwrap();
         let model = model();
-        let bytes = exact_game::bin::to_vec(&model);
+        let bytes = exact_game::asset::encode_model(&model);
         let tex = include_bytes!("../../bake/tests/fixtures/crate/0-srgb-straight.tex");
         s.assets();
         s.asset("hero.model", Ok(&bytes));
@@ -1121,7 +1073,7 @@ mod residency_tests {
         let mut model = model();
         let texture = include_bytes!("../../bake/tests/fixtures/crate/0-srgb-straight.tex");
         s.assets();
-        s.asset("hero.model", Ok(&exact_game::bin::to_vec(&model)));
+        s.asset("hero.model", Ok(&exact_game::asset::encode_model(&model)));
         s.asset(&model.textures[0], Ok(texture));
         let (before, _) = exact_gpu::fixture::render(&gpu, &mut s, &frame()).unwrap();
         assert!(!s.render.as_ref().unwrap().0.models.records.is_empty());
@@ -1145,7 +1097,7 @@ mod residency_tests {
             "retired geometry leaked before redelivery"
         );
         model.materials[0].base_color = [1., 0., 0., 1.];
-        s.asset("hero.model", Ok(&exact_game::bin::to_vec(&model)));
+        s.asset("hero.model", Ok(&exact_game::asset::encode_model(&model)));
         exact_gpu::fixture::render(&gpu, &mut s, &frame()).unwrap();
         assert!(
             s.render.as_ref().unwrap().0.models.records.is_empty(),
@@ -1177,7 +1129,7 @@ mod residency_tests {
         model.meshes[0].positions.resize(80_000 * 3, 0.);
         model.meshes[0].normals.resize(80_000 * 3, 0.);
         model.meshes[0].uvs.resize(80_000 * 2, 0.);
-        let bytes = exact_game::bin::to_vec(&model);
+        let bytes = exact_game::asset::encode_model(&model);
         let tex = include_bytes!("../../bake/tests/fixtures/crate/0-srgb-straight.tex");
         s.assets();
         s.asset("hero.model", Ok(&bytes));
@@ -1223,7 +1175,7 @@ mod residency_tests {
         ));
         s.assets();
         s.asset("hero.model", Ok(&bytes));
-        s.asset("peer.model", Ok(&exact_game::bin::to_vec(&peer)));
+        s.asset("peer.model", Ok(&exact_game::asset::encode_model(&peer)));
         let live = s
             .sim
             .as_ref()
@@ -1297,7 +1249,7 @@ mod residency_tests {
                 .get_mut::<exact_game::Mesh>("hero")
                 .unwrap() = exact_game::Mesh::asset(&name);
             s.assets();
-            s.asset(&name, Ok(&exact_game::bin::to_vec(&model)));
+            s.asset(&name, Ok(&exact_game::asset::encode_model(&model)));
             s.asset(&model.textures[0], Ok(&bytes));
             s.prepare_assets(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
             let live = s
@@ -1362,7 +1314,9 @@ mod residency_tests {
         surface.bind(&[], None).unwrap();
         surface.asset(
             "fox.model",
-            Ok(&exact_game::bin::to_vec(&crate::test_model::skinned_model())),
+            Ok(&exact_game::asset::encode_model(
+                &crate::test_model::skinned_model(),
+            )),
         );
         surface.asset(
             "fox/0-srgb-straight.tex",
@@ -1382,6 +1336,14 @@ mod residency_tests {
             headroom: 1.0,
         };
         exact_gpu::fixture::render(&gpu, &mut surface, &frame).unwrap();
+        surface
+            .render
+            .as_ref()
+            .unwrap()
+            .0
+            .pipelines
+            .wait_specializations();
+        let ready_work = surface.render.as_ref().unwrap().0.residency_work();
         let before = surface.render.as_ref().unwrap().0.residency_work().json();
         let saved = surface.carry().unwrap().unwrap();
         for mode in [Restore::Open, Restore::Carry] {
@@ -1403,7 +1365,7 @@ mod residency_tests {
         surface.restore(&saved, Restore::Carry).unwrap();
         exact_gpu::fixture::render(&gpu, &mut surface, &frame).unwrap();
         let work = surface.render.as_ref().unwrap().0.residency_work();
-        let delta = work.since(surface.ready_work.unwrap());
+        let delta = work.since(ready_work);
         assert_eq!(delta.texture_uploads, 1);
         assert_eq!(delta.mesh_uploads, 0);
         assert_eq!(delta.pipeline_creations, 0);
@@ -1446,7 +1408,7 @@ mod residency_tests {
             .collect();
         for _ in 0..3 {
             model.meshes[0].positions[0] += 0.01;
-            surface.asset("fox.model", Ok(&exact_game::bin::to_vec(&model)));
+            surface.asset("fox.model", Ok(&exact_game::asset::encode_model(&model)));
             exact_gpu::fixture::render(&gpu, &mut surface, &frame).unwrap();
             let renderer = &surface.render.as_ref().unwrap().0;
             assert_eq!(

@@ -29,6 +29,12 @@ impl<D: DataSource> Runner<D> {
         let resource = self.plan.str(row.name).to_string();
         // Delivery is the runner's own (LLP 1030 D7): the data seam never
         // sees it, and a data crate could not answer it if it did.
+        if source == "exactActivities" {
+            return self
+                .activities_answer(i)
+                .map(Answer::Now)
+                .map_err(|error| RunnerError::Data { resource, error });
+        }
         if source == crate::delivery::SOURCE {
             return self
                 .delivery_answer(i)
@@ -75,14 +81,27 @@ impl<D: DataSource> Runner<D> {
                 .map(Answer::Now)
                 .map_err(|error| RunnerError::Data { resource, error });
         }
+        // A native module's source is the module's, never the app data's
+        // (LLP 1133.002 D13).
+        if self.plan.module_named(&source).is_some() {
+            return self.module_answer(i, &source, args);
+        }
         // @ref LLP 1038 D5 / §8 — distinguish asked sources from compiled boot values.
         self.log(lines::query(&resource, &source));
-        if self.live {
+        self.count_ask(i);
+        if self.live.admitted {
             self.count_churn(i, args, &resource);
         }
+        self.snapshot_sockets();
+        self.store.set_clock_ms(self.now_ms);
         let answer =
             self.data
                 .answer_for(super::Target::Resource(i), &mut self.store, &source, args);
+        let answer = self.refuse_locked(answer);
+        // What its turn sent on its module's sockets (LLP 1016.000 D7, the
+        // amendment of 2026-10-18), whatever it answered.
+        self.stage_answer(super::Target::Resource(i));
+        self.hear_aborted();
         for line in self.data.take_logs() {
             self.log(line);
         }
@@ -91,6 +110,7 @@ impl<D: DataSource> Runner<D> {
 
     /// Say once, in a development build, that resource `i` is asked again
     /// and again, its arguments new each time: [`CHURN_ASKS`] in a second.
+    /// An alert, so it reaches the platform's log (LLP 1146 D4).
     fn count_churn(&mut self, i: usize, args: &[Value], resource: &str) {
         let (now, answering) = (self.now_ms, self.churn.answering);
         let row = self
@@ -119,7 +139,7 @@ impl<D: DataSource> Runner<D> {
         if row.2 < CHURN_ASKS || std::mem::replace(&mut row.3, true) {
             return;
         }
-        self.log(format!(
+        self.alert(format!(
             "`{resource}` was asked {CHURN_ASKS} times in a second, its arguments new each time (argument {} last): an argument that moves on every answer, such as a clock read in a derive (`performanceNow()`), asks again without end. Give it a value that changes only when the answer should, such as a timer's tick",
             k + 1
         ));
@@ -212,5 +232,31 @@ mod tests {
             r.query(0, &[Value::Number(f64::from(n) + 1.)]).unwrap();
         }
         assert!(said(&r).is_empty());
+    }
+
+    // LLP 1146 D3 and D4: while measuring, `perf` counts each resource's asks,
+    // and the churn line is an alert the host writes to its platform's log.
+    #[test]
+    fn asks_are_counted_for_perf_and_churn_is_an_alert_while_measuring() {
+        let mut r = runner();
+        r.measure(true, false);
+        r.admit_live(None);
+        r.churn.answering = true;
+        for n in 0..=CHURN_ASKS {
+            r.query(0, &[Value::Number(f64::from(n) + 1.)]).unwrap();
+        }
+        let reply = crate::perf::reply(&r, "{\"op\":\"perf\"}");
+        assert!(
+            reply.contains(&format!(
+                "\"resources\":[{{\"name\":\"r\",\"asked\":{}}}]",
+                CHURN_ASKS + 1
+            )),
+            "{reply}"
+        );
+        let alerts = r.take_alerts();
+        assert!(
+            alerts.iter().any(|l| l.contains("times in a second")),
+            "{alerts:?}"
+        );
     }
 }

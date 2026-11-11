@@ -1,6 +1,6 @@
 //! System Back, in order (LLP 1115.001 D6; LLP 1115 D5, "Back is always
 //! there"): the route's part of it, which is the rule the iOS host follows
-//! (`NavigationRules.back`), over the same runner.
+//! (`NavigationBack.way`), over the same runner.
 //!
 //! From the navigation root's selected route, Back goes to the first of:
 //!
@@ -20,7 +20,8 @@
 //!
 //! Who asks: Android's system Back (`canvas/keys.rs`), and on a desktop
 //! (LLP 1115.000 D5.4) a mouse's back button and the keys a desktop goes
-//! Back by ([`Presenter::back_key`]), whose default action it is.
+//! Back by ([`Presenter::back_key`]), whose default action it is. A mouse's
+//! forward button goes Forward ([`Presenter::system_forward`], D5.5).
 //!
 //! Before the route come the soft keyboard, which Android closes itself, and
 //! the top layer: an open menu or alert closes first (D6 step 2, D10;
@@ -49,7 +50,7 @@ impl<D: DataSource> Presenter<D> {
     /// The navigation root that shows: the first node in tree order that
     /// carries `navigationBack` (lowering gives the first root with a
     /// `navigationKey` one, empty where the author named no control).
-    fn navigation_root(&self) -> Option<ViewId> {
+    pub(super) fn navigation_root(&self) -> Option<ViewId> {
         let kernel = self.host.kernel();
         if !kernel.has_prop(PropId::NavigationBack) {
             return None;
@@ -142,15 +143,24 @@ impl<D: DataSource> Presenter<D> {
             || name == "ArrowLeft" && held.alt && !(held.shift || held.ctrl || held.meta)
     }
 
+    /// The same for Forward (LLP 1115.000 D5.5): Alt+Right, or a keyboard's
+    /// Forward key (`BrowserForward`, evdev's `KEY_FORWARD`).
+    pub(crate) fn forward_key(&self, name: &str) -> bool {
+        let held = self.modifiers();
+        name == "BrowserForward"
+            || name == "ArrowRight" && held.alt && !(held.shift || held.ctrl || held.meta)
+    }
+
     /// A Back key's keydown, after the page's shortcuts: Back is its default
-    /// action, as a browser's Alt+Left is. The `key` handlers at the focus
+    /// action, as a browser's Alt+Left is, and a Forward key's is Forward. The `key` handlers at the focus
     /// and above hear it first, and one that prevents it keeps the key (an
     /// editor's own Alt+Left); a field's caret never takes it. A held key's
     /// repeats go back no further. With nowhere to go back to nothing
     /// happens: a desktop app is not left by its Back key.
     pub(crate) fn back_key_down(&mut self, name: &str, code: &str, repeat: bool, now_ms: f64) {
         let kernel = self.host.kernel();
-        let hears = self.focus.is_some_and(|id| {
+        // With nothing focused the root's handlers hear it (`key_event`).
+        let hears = self.focus.is_none_or(|id| {
             self.display.allows(kernel, id)
                 && kernel
                     .node(id)
@@ -165,7 +175,9 @@ impl<D: DataSource> Presenter<D> {
                 return;
             }
         }
-        if !repeat {
+        if !repeat && self.forward_key(name) {
+            self.system_forward(now_ms);
+        } else if !repeat {
             self.system_back(now_ms);
         }
     }
@@ -173,22 +185,41 @@ impl<D: DataSource> Presenter<D> {
     /// Whether system Back would be taken now: what a shell's back callback
     /// is enabled by, so that Back with nowhere to go leaves the app with
     /// the system's own animation (D6).
-    pub fn back_goes(&self) -> bool {
-        self.top_open() || self.back().is_some()
+    pub fn back_goes(&mut self) -> bool {
+        self.surface_takes_back() || self.back().is_some() || self.remote_back_target().is_some()
+    }
+
+    /// Whether an open surface of the top layer hears Back: not a manual
+    /// popover, whose page keeps Back (HTML: it has no close watcher).
+    fn surface_takes_back(&self) -> bool {
+        self.shape_surface_open() || self.alert_takes_back()
     }
 
     /// The agent's `back` (LLP 1116.006 D4): system Back, as a desktop's
-    /// Back key takes it. `None` with nowhere to go back to; `Some(Err)`
-    /// for a route whose Back control refuses it (journaled, as a key's is).
-    pub(crate) fn agent_back(&mut self, now_ms: f64) -> Option<Result<(), String>> {
-        let refused = matches!(self.back()?, Back::Refused);
-        self.system_back(now_ms);
-        Some(match refused {
-            true => {
-                Err("the route's navigationBack control is disabled or has no press handler".into())
-            }
-            false => Ok(()),
-        })
+    /// Back key takes it, answered with what it went to: `dialog` while a
+    /// surface of the top layer is open (the web driver's word), else
+    /// `route`, and why, when the surface stayed open or the route's Back
+    /// control refused it (journaled, as a key's is). `None` with nowhere
+    /// to go back to.
+    pub(crate) fn agent_back(&mut self, now_ms: f64) -> Option<serde_json::Value> {
+        let (what, refused) = if self.surface_takes_back() {
+            self.system_back(now_ms);
+            ("dialog", self.surface_takes_back().then_some("the surface stayed open: its closedby is \"none\", it is a manual popover, or a `cancel` handler prevented the close"))
+        } else {
+            let refused = matches!(self.back()?, Back::Refused);
+            self.system_back(now_ms);
+            (
+                "route",
+                refused.then_some(
+                    "the route's navigationBack control is disabled or has no press handler",
+                ),
+            )
+        };
+        let mut answer = serde_json::json!({ "back": what, "delivery": "platform" });
+        if let Some(why) = refused {
+            answer["refused"] = why.into();
+        }
+        Some(answer)
     }
 
     /// System Back at `now_ms`: whether the app took it. `false` is the
@@ -200,7 +231,8 @@ impl<D: DataSource> Presenter<D> {
             return true;
         }
         let Some(back) = self.back() else {
-            return false;
+            // A TV's remote has no Escape key: its Back is one (LLP 1115.001.003 D3).
+            return self.remote_back(now_ms);
         };
         let error = match back {
             Back::Press(control) => {
@@ -219,6 +251,38 @@ impl<D: DataSource> Presenter<D> {
                 "system Back refused: the route's navigationBack control is disabled or has no press handler"
                     .into(),
             ),
+        };
+        if let Some(error) = error {
+            self.host.log(error);
+        }
+        true
+    }
+
+    /// The platform's Forward (LLP 1115.000 D5.5): to the location Back
+    /// left on the selected stack ([`Runner::location_ahead`]), delivered
+    /// as the web host delivers a browser's Forward (LLP 1038 D7): to the
+    /// navigation root's `navigate`, else by the runner's own `go`. Whether
+    /// it went: not with nothing ahead, nor while a surface of the top
+    /// layer is open, which Forward does not close.
+    pub fn system_forward(&mut self, now_ms: f64) -> bool {
+        if self.surface_takes_back() {
+            return false;
+        }
+        let Some(location) = self.host.runner().location_ahead() else {
+            return false;
+        };
+        let Some(root) = self.navigation_root() else {
+            return false;
+        };
+        let error = match (self.host.runner().handlers_of(root)).contains(&EventKind::Navigate) {
+            true => self
+                .host
+                .dispatch_at(root, Event::Navigate(location), now_ms)
+                .or(self.after_commit()),
+            false => match self.host.host_go(&location, now_ms) {
+                Ok(_) => self.after_commit(),
+                Err(error) => Some(error),
+            },
         };
         if let Some(error) = error {
             self.host.log(error);

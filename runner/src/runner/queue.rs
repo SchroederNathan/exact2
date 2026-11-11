@@ -8,6 +8,7 @@
 //! `next_due` is not: like `then_due` it is cleared before its commit, and
 //! armed only by the scan ([`Runner::arm_next`]) after a commit concludes.
 
+use super::modules::CallOrigin;
 use super::*;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -22,6 +23,10 @@ pub const QUEUE_BOUND: usize = 64;
 pub(super) struct Waiting {
     source: String,
     args: Vec<Value>,
+    /// The origin of the commit that sent it, which its `next` runs under.
+    origin: CallOrigin,
+    /// The invocation that commit was part of (LLP 1133.023 D7); 0 for none.
+    id: u64,
 }
 
 /// The state a refused `next` saw. A standing commit that changes a slot,
@@ -119,9 +124,12 @@ impl<D: DataSource> Runner<D> {
                 mutation: self.plan.str(self.plan.mutations[m].name).to_string(),
             });
         }
+        let (origin, id) = (self.call_origin(), self.invocation_id());
         self.queues.waiting[m].push_back(Waiting {
             source: source.to_string(),
             args: args.to_vec(),
+            origin,
+            id,
         });
         self.pending_mut[m] = true;
         Ok(())
@@ -201,7 +209,11 @@ impl<D: DataSource> Runner<D> {
         let name = self.plan.str(self.plan.mutations[m].name).to_string();
         let was_poisoned = self.poisoned;
         let checkpoint = self.checkpoint(false);
-        let (result, refusal) = match self.next_inner(m, &name) {
+        let (origin, id) = self.queues.waiting[m]
+            .front()
+            .map_or((CallOrigin::App, 0), |w| (w.origin, w.id));
+        let next = self.as_invocation(origin, id, |r| r.next_inner(m, &name));
+        let (result, refusal) = match next {
             Ok(receipt) => (Ok(receipt), None),
             Err((e, why)) => (Err(e), Some(why)),
         };
@@ -298,6 +310,29 @@ impl<D: DataSource> Runner<D> {
         self.update().map_err(other)
     }
 
+    /// Whether a send of invocation `id` waits its turn.
+    pub(super) fn queued_of(&self, id: u64) -> bool {
+        id != 0 && (self.queues.waiting.iter()).any(|w| w.iter().any(|s| s.id == id))
+    }
+
+    /// Drop the waiting sends of invocation `id`, one journal line per
+    /// mutation.
+    pub(super) fn drop_queued_of(&mut self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        for m in 0..self.queues.waiting.len() {
+            let before = self.queues.waiting[m].len();
+            self.queues.waiting[m].retain(|s| s.id != id);
+            let n = before - self.queues.waiting[m].len();
+            if n > 0 {
+                let name = self.plan.str(self.plan.mutations[m].name).to_string();
+                self.log(super::lines::forgot_waiting(n, &name));
+            }
+        }
+        self.sync_pending_flags();
+    }
+
     /// Drop every waiting send — poison, or a reload that does not carry
     /// them (D4). They were never asked: no ticket, no source call, one
     /// journal line per mutation.
@@ -333,6 +368,8 @@ impl<D: DataSource> Runner<D> {
 
 /// What asking a send gave: an answer now for the mutation's slot, or a
 /// request for the host.
+// (most sends that reach the host are requests: boxing one would cost each an allocation)
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Asked {
     Now(usize, Value),
     Later(Request),
@@ -351,15 +388,27 @@ impl<D: DataSource> Runner<D> {
         let ty = self.plan.mutations[m].ty;
         let name = |plan: &Plan| plan.str(plan.mutations[m].name).to_string();
         self.snapshot_sockets();
+        self.store.set_clock_ms(self.now_ms);
         self.mutation_requests += 1;
-        let answer = self
-            .data
-            .answer_for(Target::Mutation(m), &mut self.store, source, args);
+        let answer = if Self::activity_send(source) {
+            self.activity_request(source, args)
+        } else if self.plan.module_named(source).is_some() {
+            // A native module's send (LLP 1133.002 D13): the runner's substitute.
+            self.module_send(m, source, args)
+        } else {
+            let answer = self
+                .data
+                .answer_for(Target::Mutation(m), &mut self.store, source, args);
+            self.refuse_locked(answer)
+        };
         // What its source staged on sockets goes out only with an answer
-        // now that conforms (LLP 1016.000 D7).
+        // now that conforms (LLP 1016.000 D7); what the turns after its
+        // source sent goes whatever it answers (the amendment of 2026-10-18).
+        self.stage_answer(Target::Mutation(m));
         let staged = self.store.take_sockets();
         // A mutation's console lines, including a refusal, reach the agent's
         // logs whether the answer comes now or the send waited its turn.
+        self.hear_aborted();
         for line in self.data.take_logs() {
             self.log(line);
         }
@@ -369,7 +418,7 @@ impl<D: DataSource> Runner<D> {
                 message: why.clone(),
                 reason: reason.clone(),
             });
-            self.log(super::lines::send_failed_now(&name(&self.plan), why));
+            self.alert(super::lines::send_failed_now(&name(&self.plan), why));
             self.end_write(m, None);
             return Ok(Asked::Failed);
         }
@@ -383,7 +432,7 @@ impl<D: DataSource> Runner<D> {
                     return Err(self.shape(name(&self.plan), &v, ty));
                 }
                 if let Err(why) = self.stage_sockets(m, staged) {
-                    self.log(super::lines::send_failed_now(&name(&self.plan), &why));
+                    self.alert(super::lines::send_failed_now(&name(&self.plan), &why));
                     self.end_write(m, None);
                     return Ok(Asked::Failed);
                 }
@@ -393,7 +442,7 @@ impl<D: DataSource> Runner<D> {
             }
             Answer::Later(_) if !staged.is_empty() => {
                 let why = "a socket mutation must answer synchronously";
-                self.log(super::lines::send_failed_now(&name(&self.plan), why));
+                self.alert(super::lines::send_failed_now(&name(&self.plan), why));
                 self.end_write(m, None);
                 Ok(Asked::Failed)
             }

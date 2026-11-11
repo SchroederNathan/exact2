@@ -97,16 +97,17 @@ struct ReorderScroller {
     }
     private var range: (now: CGFloat, low: CGFloat, high: CGFloat) {
         let insets = scroll.adjustedContentInset
-        if vertical {
-            let low = -insets.top
-            return (scroll.contentOffset.y, low, max(low, scroll.contentSize.height + insets.bottom - scroll.bounds.height))
-        }
-        let low = -insets.left
-        return (scroll.contentOffset.x, low, max(low, scroll.contentSize.width + insets.right - scroll.bounds.width))
+        let low = PixelGrid.offset(CGPoint(x: -insets.left, y: -insets.top), in: scroll)
+        let high = PixelGrid.offset(CGPoint(x: scroll.contentSize.width + insets.right - scroll.bounds.width,
+                                            y: scroll.contentSize.height + insets.bottom - scroll.bounds.height), in: scroll)
+        return vertical ? (scroll.contentOffset.y, low.y, high.y) : (scroll.contentOffset.x, low.x, high.x)
     }
     func canScroll(toward direction: Double) -> Bool {
         let r = range
-        return direction < 0 ? r.now > r.low : direction > 0 ? r.now < r.high : false
+        // (at an edge within a hundredth of a pixel: UIKit's read-back of the
+        // last pixel is a ULP off the grid's; PixelGrid.same, Astra's audit)
+        if direction < 0 { return r.now > r.low && !PixelGrid.same(r.now, r.low, in: scroll) }
+        return direction > 0 ? r.now < r.high && !PixelGrid.same(r.now, r.high, in: scroll) : false
     }
     func scroll(by delta: Double) -> Bool {
         let r = range
@@ -114,14 +115,17 @@ struct ReorderScroller {
         guard next != r.now, delta.isFinite else { return false }
         var offset = scroll.contentOffset
         if vertical { offset.y = next } else { offset.x = next }
-        scroll.setContentOffset(offset, animated: false)
-        return true
+        scroll.setContentOffset(PixelGrid.offset(offset, in: scroll), animated: false)
+        return (vertical ? scroll.contentOffset.y : scroll.contentOffset.x) != r.now
     }
 }
 
 extension NodeView {
     /// Where focus goes after a keyboard or custom-action move (D9).
-    func focusAfterReorder() { UIAccessibility.post(notification: .layoutChanged, argument: self) }
+    func focusAfterReorder() {
+        _ = becomeFirstResponder()
+        UIAccessibility.post(notification: .layoutChanged, argument: self)
+    }
 
     /// A grouped grip's drag (D6): the ghost's session, not Arrange's.
     package func reorderGroupDragged(_ gesture: UIGestureRecognizer, point: CGPoint) -> Bool {

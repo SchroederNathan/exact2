@@ -54,6 +54,8 @@ pub struct Bridge<D: DataSource> {
 mod clock;
 mod midi;
 mod mode;
+mod presence;
+mod requests;
 
 #[cfg(test)]
 mod refusal_tests;
@@ -222,18 +224,6 @@ impl<D: DataSource> Bridge<D> {
         self.emit(batch)
     }
 
-    /// Whether the current runner still holds a request ticket (LLP 1016 D5).
-    pub fn request_active(&self, ticket: f64) -> u32 {
-        u32::from(
-            ticket.is_finite()
-                && ticket >= 0.0
-                && self
-                    .host
-                    .as_ref()
-                    .is_some_and(|host| host.runner().holds(ticket as u64)),
-        )
-    }
-
     /// The input concatenates plan, pairing receipt, and browser environment id.
     /// The JS loader prepares that private environment before this synchronous swap.
     /// Requests in flight refuse it unless `let_go` (the dev loop's, LLP 1007 §6):
@@ -292,7 +282,7 @@ impl<D: DataSource> Bridge<D> {
             preferences: self.preferences,
             fold: self.fold,
         };
-        let (checkpoint, launch_facts) = (self.checkpoint.take(), self.launch_facts.clone());
+        let (checkpoint, launch_facts) = (self.checkpoint.take(), self.launch());
         let booted = exact_runner::time::launching_with(launch_facts, || match checkpoint {
             Some((digest, page)) => Host::boot_checkpoint_linked(
                 self.links,
@@ -339,7 +329,7 @@ impl<D: DataSource> Bridge<D> {
             preferences: self.preferences,
             fold: self.fold,
         };
-        let booted = exact_runner::time::launching_with(self.launch_facts.clone(), || {
+        let booted = exact_runner::time::launching_with(self.launch(), || {
             Host::boot_linked(
                 self.links,
                 &plan,
@@ -505,7 +495,7 @@ impl<D: DataSource> Bridge<D> {
     /// Dispatch an event at `now_ms` (the page's clock); `kind` is 0 = press,
     /// 1 = change, 2 = hover in, 3 = hover out, 4 = focus, 5 = blur, 6 = key,
     /// 7 = submit, 8 = load, 9 = message (the payload — a change's text, a
-    /// key's chord with its code and repeat (`KeyboardEvent::parse`), or a
+    /// key's chord with its code, repeat and isComposing (`KeyboardEvent::parse`), or a
     /// guest message — is the input buffer's first `len` bytes, UTF-8).
     /// Kind 43 is `keyup`; 44 is `keycapture`, with the keydown payload (#140).
     /// Kind 45 is `intersect`, `0|1,ratio` (LLP 1005).
@@ -543,8 +533,9 @@ impl<D: DataSource> Bridge<D> {
             // wheel, drop and resize, and a text field's input, change and
             // select with its selection, replacement input (48), a key's down (6), up (43) and capture (44)
             // with its code and repeat, and focusin (46) and focusout (47) with
-            // their targets, toggle (50) and scrollend (51) (`Event::of_host_kind`).
-            6 | 10 | 13 | 19 | 20 | 21 | 28..=48 | 50..=54 => {
+            // their targets, toggle (50), scrollend (51), a file drag's enter
+            // and leave (55, 56), a paste with files (57), an iframe's record (58), an atom's press (59) (`Event::of_host_kind`).
+            6 | 10 | 13 | 19 | 20 | 21 | 28..=48 | 50..=59 => {
                 match Event::of_host_kind(kind, &payload) {
                     Ok(event) => event,
                     Err(error) => return self.refuse(error),
@@ -604,29 +595,6 @@ impl<D: DataSource> Bridge<D> {
         };
         let out = match self.host.as_mut() {
             Some(h) => h.dispatch_at(view, event, now_ms),
-            None => "{\"ops\":[],\"timers\":false,\"error\":\"not booted\"}".to_string(),
-        };
-        self.emit(out)
-    }
-
-    /// A request's outcome from the page (LLP 1016 D2): the input buffer
-    /// holds `hlen` bytes of header lines, then `blen` bytes of body.
-    pub fn fulfill(
-        &mut self,
-        ticket: f64,
-        kind: u32,
-        status: u32,
-        hlen: usize,
-        blen: usize,
-        now_ms: f64,
-    ) -> u32 {
-        let n = self.input.len();
-        let hlen = hlen.min(n);
-        let blen = blen.min(n - hlen);
-        let headers = String::from_utf8_lossy(&self.input[..hlen]).into_owned();
-        let body = self.input[hlen..hlen + blen].to_vec();
-        let out = match self.host.as_mut() {
-            Some(h) => h.fulfill_at(ticket as u64, kind, status, &headers, body, now_ms),
             None => "{\"ops\":[],\"timers\":false,\"error\":\"not booted\"}".to_string(),
         };
         self.emit(out)
@@ -772,7 +740,7 @@ impl<D: DataSource> Bridge<D> {
 
     /// The locale and time zone, as `locale NUL timeZone` in the input buffer.
     pub fn set_place(&mut self, len: usize) -> u32 {
-        // `locale NUL timeZone`, then `NUL seed` at launch.
+        // `locale NUL timeZone`, then `NUL seed` and `NUL formatLocale`.
         let text = std::str::from_utf8(&self.input[..len.min(self.input.len())]).unwrap_or("");
         let mut fields = text.split('\0');
         let (Some(locale), Some(zone)) = (fields.next(), fields.next()) else {
@@ -782,7 +750,7 @@ impl<D: DataSource> Bridge<D> {
         let (locale, zone) = (locale.to_owned(), zone.to_owned());
         let out = self.host.as_mut().map_or_else(
             || exact_runner::agent::error("not booted"),
-            |h| h.set_place(&locale, &zone, seed),
+            |h| h.set_place(&locale, &zone, seed, fields.next()),
         );
         self.emit(out)
     }
@@ -949,23 +917,6 @@ impl<D: DataSource> Bridge<D> {
         self.emit(out)
     }
 
-    /// Move the clock: `mode` 0 fires every timer due (the wall clock), 1
-    /// stops after a timer that sends (the agent's jump), 2 lands only the
-    /// `then`s already armed, the clock unmoved (an agent's input's end).
-    pub fn advance(&mut self, now_ms: f64, mode: u32) -> u32 {
-        let out = match self.host.as_mut() {
-            // The `then`s an agent's input settled (Runner::land_then).
-            Some(h) if mode == 2 => {
-                let a = h.runner_mut().land_then();
-                h.advanced(a)
-            }
-            Some(h) if mode == 1 => h.advance_until_request(now_ms),
-            Some(h) => h.advance(now_ms),
-            None => "{\"ops\":[],\"timers\":false,\"error\":\"not booted\"}".to_string(),
-        };
-        self.emit(out)
-    }
-
     /// A presented frame (LLP 1073 D5).
     pub fn frame(&mut self, now_ms: f64) -> u32 {
         let out = match self.host.as_mut() {
@@ -1126,6 +1077,12 @@ macro_rules! host {
             EXACT_BRIDGE.with(|b| b.borrow_mut().build_locations($plan))
         }
 
+        /// The page's report of the colours it draws Exact's colour roles in (colors.rs).
+        #[no_mangle]
+        pub extern "C" fn exact_report_colors(len: u32) {
+            EXACT_BRIDGE.with(|b| $crate::colors::report(&b.borrow().launch_input(0, len as usize)))
+        }
+
         /// Boot; returns the first batch's length.
         #[no_mangle]
         pub extern "C" fn exact_boot(width: f64, height: f64, launch_len: u32, preferences: u32) -> u32 {
@@ -1192,6 +1149,12 @@ macro_rules! host {
         #[no_mangle]
         pub extern "C" fn exact_fonts() -> u32 {
             EXACT_BRIDGE.with(|b| b.borrow_mut().fonts())
+        }
+
+        /// Whether the booted plan needs the presence module (`presence::needed`): 1 or 0.
+        #[no_mangle]
+        pub extern "C" fn exact_presence() -> u32 {
+            EXACT_BRIDGE.with(|b| b.borrow().presence())
         }
 
         /// Dispatch an event; returns the batch's length.
@@ -1281,6 +1244,12 @@ macro_rules! host {
         #[no_mangle]
         pub extern "C" fn exact_set_display_scale(scale: f64) -> u32 {
             EXACT_BRIDGE.with(|b| b.borrow_mut().set_display_scale(scale))
+        }
+
+        /// The aborts a realm heard between batches.
+        #[no_mangle]
+        pub extern "C" fn exact_collect_aborts() -> u32 {
+            EXACT_BRIDGE.with(|b| b.borrow_mut().collect_aborts())
         }
 
         /// A topic the page module announced, in the input buffer.

@@ -1,6 +1,8 @@
 //! `storage.fs.compressImage` in real Chrome (LLP 1069.002 A1.3, A1.7): the
 //! web host's `storage-fs.js` over `storage-image.js`, in the page and in a
-//! module worker, and a Rust source's request through `storage-request.js`.
+//! module worker, and a Rust source's request through `storage-request.js`;
+//! and `transformImage` and `compressImage`'s edit there (LLP 1133.019 §11's
+//! image conformance), with Firefox and WebKit where installed.
 use std::path::Path;
 use std::process::Command;
 
@@ -11,15 +13,6 @@ const GRANTS: [&str; 2] = [
 
 #[test]
 fn chrome_compresses_an_image_upright_within_budget_and_refuses_by_name() {
-    let chrome = std::env::var("CHROME")
-        .unwrap_or_else(|_| "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
-    if !Path::new(&chrome).exists() {
-        missing(
-            "chrome",
-            "compressImage browser check unavailable: set CHROME",
-        );
-        return;
-    }
     let sets = GRANTS
         .iter()
         .map(|spec| {
@@ -34,7 +27,6 @@ fn chrome_compresses_an_image_upright_within_budget_and_refuses_by_name() {
         .collect::<serde_json::Map<_, _>>();
     let result = Command::new(std::env::var_os("BUN").unwrap_or_else(|| "bun".into()))
         .args(["--input-type=module", "-e", PROBE])
-        .env("CHROME", chrome)
         .env(
             "EXACT_GRANT_SETS",
             serde_json::Value::Object(sets).to_string(),
@@ -42,6 +34,14 @@ fn chrome_compresses_an_image_upright_within_budget_and_refuses_by_name() {
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
         .output()
         .unwrap();
+    if let Some(why) = String::from_utf8_lossy(&result.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("missing chrome: "))
+        .map(str::to_owned)
+    {
+        missing("chrome", &why);
+        return;
+    }
     let stdout = String::from_utf8_lossy(&result.stdout);
     assert!(
         result.status.success(),
@@ -151,7 +151,24 @@ fn check(engine: &str, report: &serde_json::Value) {
             "{engine} {realm}: {}",
             r["clear"]
         );
+        assert_eq!(
+            r["png"],
+            serde_json::json!({"type": "image/png", "size": [8, 8], "left": 0, "right": 255}),
+            "{engine} {realm}: a PNG lost its alpha"
+        );
+        assert_eq!(r["badType"], "TypeError", "{engine} {realm}");
+        transformed(engine, realm, &r["transform"]);
     }
+    // A Rust source's transform: D14's options beside the paths, its record back.
+    assert_eq!(
+        report["rustTransform"],
+        serde_json::json!({"path":"app:/data/rust-turned.jpg","type":"image/jpeg","width":64,"height":48,
+            "colorSpace":"srgb","hdr":false,"metadata":"none","sized":true}),
+        "{engine}: {report}"
+    );
+    assert_eq!(report["rustPng"], "image/png", "{engine}: {report}");
+    // A null `type` is absent, as the native request reads it.
+    assert_eq!(report["rustNull"], "image/jpeg", "{engine}: {report}");
     assert_eq!(
         report["rust"],
         serde_json::json!({"path":"app:/data/rust.jpg","type":"image/jpeg","width":24,"height":32,"sized":true}),
@@ -170,8 +187,79 @@ fn check(engine: &str, report: &serde_json::Value) {
     );
 }
 
+/// LLP 1133.019 §11's image conformance on the canvas codec.
+fn transformed(engine: &str, realm: &str, t: &serde_json::Value) {
+    let rgb = |v: &serde_json::Value| -> Vec<u64> {
+        v.as_array().unwrap()[..3]
+            .iter()
+            .map(|c| c.as_u64().unwrap())
+            .collect()
+    };
+    let blue = |v: &serde_json::Value| {
+        let c = rgb(v);
+        c[2] > 200 && c[0] < 60 && c[1] < 60
+    };
+    let red = |v: &serde_json::Value| {
+        let c = rgb(v);
+        c[0] > 200 && c[1] < 60 && c[2] < 60
+    };
+    // A `to` without an extension gains the type's; a canvas keeps nothing,
+    // and says so whatever was asked.
+    assert_eq!(
+        t["turned"]["record"],
+        serde_json::json!({"path":"app:/data/turned.jpg","type":"image/jpeg","size":t["turned"]["record"]["size"],
+            "width":64,"height":48,"colorSpace":"srgb","hdr":false,"metadata":"none"}),
+        "{engine} {realm}: {t}"
+    );
+    assert!(
+        blue(&t["turned"]["top"]) && red(&t["turned"]["bottom"]),
+        "{engine} {realm}: rotate 90 puts blue on top: {t}"
+    );
+    assert_eq!(t["turned"]["exif"], false, "{engine} {realm}: {t}");
+    assert!(
+        red(&t["flipped"]["left"]) && blue(&t["flipped"]["right"]),
+        "{engine} {realm}: flip puts blue on the right: {t}"
+    );
+    assert_eq!(
+        t["cropped"]["size"],
+        serde_json::json!([24, 64]),
+        "{engine} {realm}"
+    );
+    assert!(
+        t["cropped"]["corners"].as_array().unwrap().iter().all(blue),
+        "{engine} {realm}: the crop is all blue: {t}"
+    );
+    assert_eq!(
+        t["free"]["size"],
+        serde_json::json!([74, 80]),
+        "{engine} {realm}: {t}"
+    );
+    assert_eq!(
+        t["free"]["png"], 0,
+        "{engine} {realm}: a free turn's PNG corner is clear: {t}"
+    );
+    assert!(
+        rgb(&t["free"]["jpeg"]).iter().all(|&c| c > 245),
+        "{engine} {realm}: a free turn's JPEG corner is white: {t}"
+    );
+    assert_eq!(
+        t["compressed"]["size"],
+        serde_json::json!([64, 24]),
+        "{engine} {realm}: {t}"
+    );
+    assert!(blue(&t["compressed"]["topLeft"]), "{engine} {realm}: {t}");
+    assert_eq!(
+        t["codes"],
+        serde_json::json!(["outside", "unsupported", "TypeError", "denied", "outside"]),
+        "{engine} {realm}: {t}"
+    );
+}
+
 const PROBE: &str = r#"
 import { Cdp } from './scripts/agent.mjs';
+import { chromium } from './scripts/agent-launch.mjs';
+const { executable: browserExecutable, unavailable: browserMissing } = chromium();
+if (browserMissing) { console.log(`missing chrome: ${browserMissing}`); process.exit(0); }
 import { webHostFiles } from './scripts/app.mjs';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -190,7 +278,7 @@ const server = createServer((req, res) => {
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const origin = `http://127.0.0.1:${server.address().port}`;
 const profile = mkdtempSync(resolve(tmpdir(), 'exact-compress-browser-'));
-const child = spawn(process.env.CHROME, ['--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--no-first-run', '--disable-background-networking', `--user-data-dir=${profile}`, 'about:blank'], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+const child = spawn(browserExecutable, ['--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--no-first-run', '--disable-background-networking', `--user-data-dir=${profile}`, 'about:blank'], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
 const cdp = new Cdp(child.stdio[3], child.stdio[4]);
 const exited = new Promise(r => child.on('exit', () => { cdp.fail('browser closed'); r(); }));
 // The same checks in the page and in a module worker: `realm` runs them
@@ -276,6 +364,46 @@ const checks = async (origin, sets, app) => {
   const white = new OffscreenCanvas(8, 8).getContext('2d');
   white.drawImage(await createImageBitmap(new Blob([await fs.readFile('app:/tmp/clear.jpg')], { type: 'image/jpeg' })), 0, 0);
   report.clear = [...white.getImageData(0, 0, 1, 1).data].slice(0, 3);
+  // `type: "image/png"` (A1.11): clear on the left half, red on the right, kept.
+  const half = new OffscreenCanvas(16, 16), halfContext = half.getContext('2d');
+  halfContext.fillStyle = '#f00'; halfContext.fillRect(8, 0, 8, 16);
+  await fs.writeFile('app:/tmp/half.png', await (await half.convertToBlob({ type: 'image/png' })).arrayBuffer());
+  const png = await fs.compressImage('app:/tmp/half.png', 'app:/tmp/half-out.png', { maxDimension: 8, maxBytes: 100000, type: 'image/png' });
+  const alpha = new OffscreenCanvas(8, 8).getContext('2d');
+  alpha.drawImage(await createImageBitmap(new Blob([await fs.readFile('app:/tmp/half-out.png')], { type: 'image/png' })), 0, 0);
+  report.png = { type: png.type, size: [png.width, png.height], left: alpha.getImageData(0, 0, 1, 1).data[3], right: alpha.getImageData(7, 0, 1, 1).data[3] };
+  report.badType = await code(fs.compressImage('app:/tmp/half.png', 'app:/tmp/x.webp', { maxDimension: 8, maxBytes: 100, type: 'image/webp' }));
+  // `transformImage` and `compressImage`'s edit (LLP 1133.019 §11): the
+  // fixture upright is 48×64, blue on the left.
+  const at = async (path, type, points) => {
+    const b = await createImageBitmap(new Blob([await fs.readFile(path)], { type }));
+    const c = new OffscreenCanvas(b.width, b.height).getContext('2d');
+    c.drawImage(b, 0, 0);
+    return { size: [b.width, b.height], points: points.map(([x, y]) => [...c.getImageData(x, y, 1, 1).data]) };
+  };
+  const t = report.transform = {};
+  const turned = await fs.transformImage('app:/tmp/in.jpg', 'app:/data/turned', { rotate: 90, metadata: 'keep' });
+  const [top, bottom] = (await at(turned.path, 'image/jpeg', [[32, 2], [32, 45]])).points;
+  const turnedTags = tags(await fs.readFile(turned.path));
+  t.turned = { record: turned, top, bottom, exif: Boolean(turnedTags[0x8825] || turnedTags[0x9003]) };
+  const flipped = await fs.transformImage('app:/tmp/in.jpg', 'app:/data/flipped.jpg', { flip: 'horizontal' });
+  const [left, right] = (await at(flipped.path, 'image/jpeg', [[2, 32], [45, 32]])).points;
+  t.flipped = { left, right };
+  const cropped = await fs.transformImage('app:/tmp/in.jpg', 'app:/data/cropped.jpg', { crop: { x: 0, y: 0, width: 24, height: 64 } });
+  t.cropped = { size: [cropped.width, cropped.height], corners: (await at(cropped.path, 'image/jpeg', [[1, 1], [22, 1], [1, 62], [22, 62]])).points };
+  // 48 cos 30 + 64 sin 30 = 73.6, 48 sin 30 + 64 cos 30 = 79.4.
+  const free = await fs.transformImage('app:/tmp/in.jpg', 'app:/data/free', { rotate: 30, type: 'image/png' });
+  const freeJpeg = await fs.transformImage('app:/tmp/in.jpg', 'app:/data/free.jpg', { rotate: 30 });
+  t.free = { size: [free.width, free.height], png: (await at(free.path, 'image/png', [[0, 0]])).points[0][3], jpeg: (await at(freeJpeg.path, 'image/jpeg', [[0, 0]])).points[0] };
+  const compressed = await fs.compressImage('app:/tmp/in.jpg', 'app:/data/compressed.jpg', { maxDimension: 100, maxBytes: 2_000_000, rotate: 90, crop: { x: 0, y: 0, width: 64, height: 24 } });
+  t.compressed = { size: [compressed.width, compressed.height], topLeft: (await at(compressed.path, 'image/jpeg', [[2, 2]])).points[0] };
+  t.codes = [
+    await code(fs.transformImage('app:/tmp/in.jpg', 'app:/data/x.jpg', { crop: { x: 100, y: 0, width: 4, height: 4 } })),
+    await code(fs.transformImage('app:/tmp/in.jpg', 'app:/data/x.img', { type: 'image/x-unknown' })),
+    await code(fs.transformImage('app:/tmp/in.jpg', 'app:/data/x.jpg', { flip: 'both' })),
+    await code(fs.transformImage('app:/tmp/in.jpg', 'app:/cache/x.jpg')),
+    await code(fs.compressImage('app:/tmp/in.jpg', 'app:/data/x.jpg', { maxDimension: 10, maxBytes: 10000, crop: { x: 0, y: 100, width: 4, height: 4 } })),
+  ];
   fs.dispose();
   return report;
 };
@@ -303,9 +431,14 @@ const expression = `(async () => {
     const ask = (destination, scope) => requests.run(JSON.stringify({ version: 1, op: 'fs.compressImage', args: { path: 'app:/tmp/in.jpg', destination, maxDimension: 32, maxBytes: 2000000 } }), scope);
     const rust = decode(await ask('app:/data/rust.jpg'));
     const rustDenied = decode(await ask('app:/data/denied.jpg', createGrantSet(sets[keys[1]])));
+    const rustPng = decode(await requests.run(JSON.stringify({ version: 1, op: 'fs.compressImage', args: { path: 'app:/tmp/in.jpg', destination: 'app:/data/rust.png', maxDimension: 32, maxBytes: 2000000, type: 'image/png' } })));
+    const rustNull = decode(await requests.run(JSON.stringify({ version: 1, op: 'fs.compressImage', args: { path: 'app:/tmp/in.jpg', destination: 'app:/data/rust-null.jpg', maxDimension: 32, maxBytes: 2000000, type: null } })));
     const rustDoc = decode(await requests.run(JSON.stringify({ version: 1, op: 'fs.compressImage', args: { path: 'doc:/1/in.jpg', destination: 'app:/data/x.jpg', maxDimension: 32, maxBytes: 2000000 } })));
+    const turned = decode(await requests.run(JSON.stringify({ version: 1, op: 'fs.transformImage', args: { path: 'app:/tmp/in.jpg', destination: 'app:/data/rust-turned', rotate: 90 } })));
+    const { size, ...rustTransform } = turned;
     requests.dispose();
-    return JSON.stringify({ page, worker: reply.ok, rust: rust.error ? rust : { path: rust.path, type: rust.type, width: rust.width, height: rust.height, sized: rust.size > 0 }, rustDenied: rustDenied.error, rustDoc: rustDoc.error });
+    return JSON.stringify({ page, worker: reply.ok, rust: rust.error ? rust : { path: rust.path, type: rust.type, width: rust.width, height: rust.height, sized: rust.size > 0 }, rustDenied: rustDenied.error, rustDoc: rustDoc.error, rustPng: rustPng.error ?? rustPng.type, rustNull: rustNull.error ?? rustNull.type,
+      rustTransform: turned.error ? turned : { ...rustTransform, sized: size > 0 } });
   })()`;
 const reports = {};
 try {
@@ -325,7 +458,7 @@ try {
   rmSync(profile, { recursive: true, force: true });
 }
 // Firefox and WebKit, through Playwright as conform.mjs and the agent's
-// carriers launch them, when they are installed (bunx playwright@1.63.0
+// carriers launch them, when they are installed (bunx playwright@1.64.1
 // install firefox webkit); else said, not failed.
 try {
   const playwright = await import('playwright-core');

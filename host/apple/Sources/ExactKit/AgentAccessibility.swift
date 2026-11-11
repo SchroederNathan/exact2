@@ -67,16 +67,9 @@ extension Agent {
     private func axRoots(_ view: ExactView) -> [AnyObject] {
         var roots: [AnyObject] = [view]
         #if os(iOS) || os(tvOS)
-        // A presentation mounts its navigation beside the viewport (ModalIOS)
-        for mount in presenter.modals.mountRoots {
-            var v: UIView = mount
-            while let s = v.superview, !(s is UIWindow) { v = s }
-            if v !== view, !view.isDescendant(of: v), !v.isDescendant(of: view),
-               !roots.contains(where: { $0 === v }) { roots.append(v) }
-        }
-        // A `dialog` in its sheet is outside both (DialogSheetIOS.swift).
-        roots += presenter.menus.sheets.roots
+        roots = presenter.accessibilitySurfaces
         #else
+        if presenter.navigation.split.active { roots = [presenter.navigation.split.agentRoot] }
         // A dialog's sheet, the sheets on it, and the popovers AppKit shows (LLP 1115.002 D7).
         for sheet in presenter.sheets(on: view.window) { if case .owned(let content) = presenter.axSheet(sheet) { roots.append(content) } }
         roots += presenter.menus.windowed.map(\.content)
@@ -99,6 +92,10 @@ extension Presenter {
         var modalView: AnyObject?
         var modalDepth = -1
         var limits: [[String: Any]] = []
+        #if os(iOS) || os(tvOS)
+        var nativeTabBar: UIView?
+        var nativeTabBarExcluded = false
+        #endif
         var remaining: Int { budget - visited }
     }
     /// The elements' own budget (D7), under the reply's 256 KB.
@@ -134,12 +131,30 @@ extension Presenter {
     /// The elements under `roots`, the platform's facts each (D2, D7);
     /// `foreign` names another session's surface, where the walk stops;
     /// `modalRoot` is a presentation the platform makes modal (an AppKit sheet);
-    /// `scope` keeps the elements joined to those ids, with the chain above.
+    /// `scope` keeps the elements joined to those ids and the ones no node
+    /// owns below them, with the chain above.
     func axElements(roots: [AnyObject], limit: Int = 500, excluded: Bool = false, scope: Set<UInt32>? = nil, modalRoot: AnyObject? = nil,
                     limits: [[String: Any]] = [], foreign: @escaping (AnyObject) -> Bool = { _ in false }) -> [String: Any] {
         // A scroll view's indicators and other unexposed views cost visits too.
         var w = AxWalk(limit: limit, budget: 5 * limit + 64, excluded: excluded, foreign: foreign, modalRoot: modalRoot, limits: limits)
+        #if os(iOS) || os(tvOS)
+        w.nativeTabBar = navigation.tabController.flatMap { tabs -> UIView? in
+            guard let owner = tabs.viewIfLoaded,
+                  roots.contains(where: { ($0 as? UIView).map { owner.isDescendant(of: $0) } ?? false }),
+                  let bar = tabs.projectedTabBar, bar.window != nil,
+                  sequence(first: bar, next: { $0.superview }).allSatisfy({ view in
+                      !view.isHidden && view.alpha != 0 && !view.accessibilityElementsHidden && (view === bar || !view.isAccessibilityElement)
+                  }) else { return nil }
+            return bar
+        }
+        #endif
         for root in roots where !w.stopped { visit(root, parent: nil, depth: 0, exclusion: [], into: &w) }
+        #if os(iOS) || os(tvOS)
+        // Report an unverified native projection when the walk excludes the controller's bar
+        if !w.stopped, let bar = w.nativeTabBar, w.nativeTabBarExcluded || !w.seen.contains(ObjectIdentifier(bar)) {
+            w.limits.append(["root": "tab-bar", "reason": "the native tab bar is excluded by the view walk; its accessibility projection cannot be verified"])
+        }
+        #endif
         #if os(macOS)
         if let modal = w.modalView as? NodeView {
             let popovers = menus.presented(within: modal)
@@ -154,7 +169,7 @@ extension Presenter {
         #if os(iOS) || os(tvOS)
         markModalLeaks(&w)
         let platform = "iOS \(UIDevice.current.systemVersion)", source = "uikit", order = "containment"
-        var known = ["alpha", "reading-order"]
+        var known = ["reading-order"]
         #else
         let platform = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)", source = "appkit", order = "navigation"
         var known: [String] = []
@@ -176,7 +191,14 @@ extension Presenter {
         if !parts.isEmpty { coverage["parts"] = parts }
         var ancestors: [[String: Any]] = []
         if let scope {
-            let kept = w.elements.indices.filter { k in (w.elements[k]["id"] as? UInt32).map(scope.contains) ?? false }
+            // An element no node owns goes with the element it is under.
+            var inScope = Set<Int>()
+            let kept = w.elements.indices.filter { k in
+                let joined = (w.elements[k]["id"] as? UInt32).map(scope.contains)
+                    ?? (w.elements[k]["parent"] as? Int).map(inScope.contains) ?? false
+                if joined { inScope.insert(k) }
+                return joined
+            }
             if let first = kept.first {
                 var p = w.elements[first]["parent"] as? Int
                 while let k = p { ancestors.insert(["i": k, "id": w.elements[k]["id"] ?? NSNull(), "role": w.elements[k]["role"] ?? "", "name": w.elements[k]["name"] ?? ""], at: 0); p = w.elements[k]["parent"] as? Int }
@@ -184,7 +206,7 @@ extension Presenter {
             elements = kept.map { w.elements[$0] }
         }
         // The states this runtime can observe (D6): UIKit's expanded status needs iOS 18.
-        var observes = ["checked", "disabled"]
+        var observes = ["checked", "pressed", "disabled"]
         #if os(iOS) || os(tvOS)
         if #available(iOS 18, *) { observes.append("expanded") }
         #else
@@ -212,6 +234,10 @@ extension Presenter {
         if let v = obj as? UIView {
             if v.isHidden { exclusion.append("hidden") }
             if v.accessibilityElementsHidden { exclusion.append("elementsHidden") }
+            let geometry = v.bounds.isEmpty ? "emptyBounds" : v.convert(v.bounds, to: nil).isEmpty ? "emptyFrame" : nil
+            if let geometry, !exclusion.contains(geometry) { exclusion.append(geometry) }
+            if v.alpha == 0, !exclusion.contains("transparent") { exclusion.append("transparent") }
+            if v === w.nativeTabBar, !exclusion.isEmpty { w.nativeTabBarExcluded = true }
         }
         if !exclusion.isEmpty && !w.excluded { return }
         let o = obj as! NSObject
@@ -240,6 +266,7 @@ extension Presenter {
         for child in kids {
             if w.stopped { break }
             let hidden = modal != nil && child !== modal
+            if hidden, let sibling = child as? UIView, w.nativeTabBar?.isDescendant(of: sibling) == true { w.nativeTabBar = nil }
             if hidden && !w.excluded { continue }
             visit(child, parent: here, depth: depth + 1, exclusion: hidden ? exclusion + ["modalSibling"] : exclusion, into: &w)
         }
@@ -438,15 +465,15 @@ extension Presenter {
             : names.contains("link") ? "link" : names.contains("header") ? "heading" : names.contains("searchField") ? "searchbox"
             : names.contains("button") ? "button" : names.contains("image") ? "image" : names.contains("adjustable") ? "adjustable"
             : names.contains("tabBar") ? "tablist" : names.contains("staticText") ? "text" : "unknown")
-        // UIKit's toggle (LLP 1115.000 D13.3, D14.4): the `toggleButton`
-        // trait, or a `UISwitch`, and its value, "1" on and "0" off. It is
-        // UIKit's one form for a checkbox, a switch and a pressed button
-        // alike, so which of them it is here is what its author wrote: the
-        // role or control kind of the view it joins. A toggle whose value is
-        // not UIKit's reports no `checked`, which the comparison names.
-        if forced == nil, names.contains("toggleButton") || Self.isSwitch(obj), let role = id.flatMap({ views[$0] }).flatMap(Self.toggleRole) {
+        // UIKit uses the same toggle trait for checkboxes, switches and pressed buttons.
+        // The joined view or native class identifies the role; the platform's value supplies its state.
+        if forced == nil, names.contains("toggleButton") || Self.isSwitch(obj),
+           let role = id.flatMap({ views[$0] }).flatMap(Self.toggleRole)
+                ?? (Self.isSwitch(obj) ? "switch" : obj is ExactCheckbox ? "checkbox" : names.contains("button") ? "button" : nil) {
             e["role"] = role
-            if value == "1" || value == "0" { states["checked"] = value == "1" }
+            let state = role == "button" ? "pressed" : "checked"
+            if value == "2" { states[state] = "mixed" }
+            else if value == "1" || value == "0" { states[state] = value == "1" }
         }
         // UIKit has no radio trait: the drawn radio (x2apps survey #2) says
         // what it is by its class, its state by `selected`.
@@ -466,7 +493,7 @@ extension Presenter {
             let vp = viewport
             if let window = vp.window {
                 let r = vp.convert(frame, from: window.screen.coordinateSpace)
-                e["frame"] = ["x": round2(r.minX - vp.contentOffset.x), "y": round2(r.minY - vp.contentOffset.y), "w": round2(r.width), "h": round2(r.height), "source": "element"]
+                e["frame"] = ["x": round2(r.minX - vp.pageOrigin.x), "y": round2(r.minY - vp.pageOrigin.y), "w": round2(r.width), "h": round2(r.height), "source": "element"]
             }
         }
         #else
@@ -502,7 +529,11 @@ extension Presenter {
         if r == "AXHeading", let level = f.value as? Int { states["level"] = level }
         // A spinning indicator is AppKit's busy one (LLP 1069.001, amended 2026-10-07).
         if r == "AXBusyIndicator" { states["busy"] = true }
-        if r == "AXCheckBox" || r == "AXRadioButton", let on = f.value as? Int { states["checked"] = on == 1 }
+        if r == "AXCheckBox" || r == "AXRadioButton", let on = f.value as? Int {
+            let toggle = r == "AXCheckBox" && f.subrole == "AXToggle"
+            if toggle { e["role"] = "button" }
+            states[toggle ? "pressed" : "checked"] = on == 2 ? "mixed" as Any : on == 1
+        }
         e["interactive"] = ["AXButton", "AXLink", "AXTextField", "AXTextArea", "AXCheckBox", "AXRadioButton", "AXSlider", "AXPopUpButton", "AXMenuItem", "AXComboBox"].contains(r)
         native["role"] = r
         if let subrole = f.subrole { native["subrole"] = subrole }
@@ -543,6 +574,7 @@ extension Presenter {
         if let e = obj as? NSAccessibilityElement, let n = e.accessibilityParent() as? NodeView { return (n.id, "owner") }
         // A control's cell is the control's (its accessibility is the cell's).
         let host = (obj as? NSCell)?.controlView ?? (obj as? NSView)
+        if obj is NSCell, let owned = host as? AgentOwned, let id = owned.agentViewId { return (id, "owner") }
         if let n = host as? NodeView, obj is NSCell { return (n.id, "owner") }
         var v = obj is NSCell ? host : host?.superview
         let control = host is NSControl
@@ -577,7 +609,10 @@ extension Presenter {
             if view == nil, let e = obj as? UIAccessibilityElement { view = e.accessibilityContainer as? UIView }
             // A container holding the modal view is around it, not beside it.
             guard let view, !modal.isDescendant(of: view) else { continue }
-            w.elements[k]["outsideModal"] = !(view === modal || view.isDescendant(of: modal))
+            // A lifted subtree can be beside the modal's card while still authored inside it.
+            let inside = surface(containing: view)?.kind == .popover
+                && sequence(first: view, next: { self.listenerParent(of: $0) }).contains { $0 === modal }
+            w.elements[k]["outsideModal"] = !(view === modal || view.isDescendant(of: modal) || inside)
         }
     }
     #endif

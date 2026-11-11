@@ -1,12 +1,12 @@
 // Storage completions belong to an answer checkpoint, not an arbitrary browser
 // microtask. @ref LLP 1027 D10: host work returns through the data seam.
-import { agentStorageRefusal, directories, storageKey } from './storage-environment.js';
+import { agentReads, agentStorageRefusal, directories, emptyRead, storageKey } from './storage-environment.js';
 let fileFactory, sqliteFactory, toldAgent = false;
 
-export function createStorage(win, admitted, scope, key = storageKey(admitted.appId)) {
+export function createStorage(win, admitted, scope, key = storageKey(admitted.appId), timers = undefined) {
   // Once storage has been used, a replacement reserves its owner before the
   // old realm is disposed, retaining the shared SQLite worker across reloads.
-  let fs = key && fileFactory?.(key, admitted.grantSet);
+  let fs = key && fileFactory?.(key, admitted.grantSet, timers);
   let sqlite = key && sqliteFactory?.(key, admitted.grantSet);
   let fsLoading, sqliteLoading;
   const queues = new Map(), waiters = new Map(), retired = new WeakSet();
@@ -53,7 +53,7 @@ export function createStorage(win, admitted, scope, key = storageKey(admitted.ap
   const fileSystem = () => fs ? Promise.resolve(fs) : fsLoading ??= import('./storage-fs.js').then(({ createFileSystem }) => {
     fileFactory = createFileSystem;
     if (disposed) throw unavailable();
-    return fs = createFileSystem(key, admitted.grantSet);
+    return fs = createFileSystem(key, admitted.grantSet, timers);
   });
   const databaseSystem = () => sqlite ? Promise.resolve(sqlite) : sqliteLoading ??= import('./storage-sqlite.js').then(({ createSqlite }) => {
     sqliteFactory = createSqlite;
@@ -84,30 +84,34 @@ export function createStorage(win, admitted, scope, key = storageKey(admitted.ap
       );
     });
   }
-  function enqueue(invoke, convert = clone, discard = () => {}, keyed = true) {
+  function enqueue(invoke, convert = clone, discard = () => {}, keyed = true, op = '') {
     const reservedCell = claim();
     const drop = () => { if (reservedCell) untrack(reservedCell); };
     if (disposed) { drop(); return win.Promise.reject(unavailable()); }
-    if (keyed && key == null) {
-      drop();
-      // Said once, as on every host (trivia F7): the page's console reaches the driver's logs.
-      if (!toldAgent) { toldAgent = true; console.warn(`storage refused (agent): ${agentStorageRefusal}`); }
-      return win.Promise.reject(error({message:agentStorageRefusal, code:'agent'}));
-    }
     const cell = reservedCell || track(scope());
     const active = () => { if (disposed || retired.has(cell.owner)) throw unavailable(); };
     return new win.Promise((resolve, reject) => {
       const ready = completion(cell);
       const fail = () => reject(unavailable());
-      Promise.resolve().then(() => { active(); return invoke(active); }).then(
+      Promise.resolve().then(() => {
+        active();
+        if (keyed && key == null) { tellAgent(); throw error({message:agentStorageRefusal, code:'agent'}); }
+        return invoke(active);
+      }).then(
         value => ready(() => { try { resolve(convert(value)); } catch(e) { discard(value); reject(error(e)); } }, () => discard(value), fail),
         e => ready(() => reject(error(e)), () => {}, fail),
       );
     });
   }
+  // Cloning stays synchronous, but its failure belongs to the reserved
+  // cell's checkpoint, even when another answer's turn issued the call.
+  const failed = e => enqueue(() => { throw e; }, undefined, undefined, false);
+  // The first refused read or write is said once, as on every host (trivia F7): the page's console reaches the driver's logs.
+  function tellAgent() { if (!toldAgent) { toldAgent = true; console.warn(`storage refused (agent): ${agentStorageRefusal}`); } }
   function method(raw, name, args, convert, discard) {
-    const captured = structuredClone(args);
-    return enqueue(() => raw[name](...captured), convert, discard);
+    let captured;
+    try { captured = structuredClone(args); } catch (e) { return failed(e); }
+    return enqueue(() => raw[name](...captured), convert, discard, true, name);
   }
   const closeDiscarded = raw => { void raw.close().catch(() => {}); };
   const statement = raw => Object.freeze({
@@ -129,26 +133,40 @@ export function createStorage(win, admitted, scope, key = storageKey(admitted.ap
   let documents;
   const documentFiles = () => documents ??= (typeof window === 'undefined'
     ? Promise.reject(error({message:'storage: the documents the person chose live in the page; a worker-placed module cannot reach them (placement main reaches them)', code:'unsupported'}))
-    : import('./documents-glue.js').then(() => globalThis.exact.documents.files(admitted.grantSet)));
+    : import('./documents-glue.js').then(() => globalThis.exact.documents.keeping(admitted.appId, admitted.grantSet)).then(() => globalThis.exact.documents.files(admitted.grantSet)));
   const files = {directories};
   for (const method of ['readFile','writeFile','atomicWriteFile','appendFile','readdir','mkdir','rm','stat','rename','copyFile','realpath']) {
     files[method] = (...args) => {
       // Snapshot input bytes before the caller can mutate its buffers.
-      const captured = structuredClone(args);
+      let captured;
+      try { captured = structuredClone(args); } catch (e) { return failed(e); }
+      // A document copied into an app file needs both (documents-glue.js `copyFile`).
+      if (method === 'copyFile' && typeof captured[0] === 'string' && captured[0].startsWith('doc:/') && typeof captured[1] === 'string' && captured[1].startsWith('app:/'))
+        return enqueue(async active => { await documentFiles(); const backend = await fileSystem(); active(); return globalThis.exact.documents.copyFile(captured[0], captured[1], admitted.grantSet, backend); }, clone, () => {}, true, method);
       if (captured.slice(0, 2).some(p => typeof p === 'string' && p.startsWith('doc:/')))
         return enqueue(async active => { const backend = await documentFiles(); active(); return backend[method](...captured); }, clone, () => {}, false);
-      return enqueue(async active => { const backend = await fileSystem(); active(); return backend[method](...captured); });
+      // A refused read answers as an empty store would, in its answer's turn (storage-environment.js `emptyRead`).
+      if (key == null && agentReads.includes(method)) return enqueue(() => { tellAgent(); return emptyRead(method, captured[0]); }, clone, () => {}, false);
+      return enqueue(async active => { const backend = await fileSystem(); active(); return backend[method](...captured); }, clone, () => {}, true, method);
     };
   }
-  // The prelude hands `compressImage` its options as two numbers (LLP
-  // 1069.002 A1); app files only, so never the documents' backend.
-  files.compressImage = (from, to, maxDimension, maxBytes) =>
-    enqueue(async active => { const backend = await fileSystem(); active(); return backend.compressImage(from, to, {maxDimension, maxBytes}); });
+  // What the app keeps across launches (LLP 1069.010.000 D5): the page's
+  // kept handles, which the prelude asks here rather than at the host door.
+  files.recentDocuments = () => enqueue(async active => { await documentFiles(); active(); return globalThis.exact.documents.recent(admitted.grantSet); }, clone, () => {}, false);
+  files.forgetDocument = path => enqueue(async active => { await documentFiles(); active(); return globalThis.exact.documents.forget(String(path), admitted.grantSet); }, clone, () => {}, false);
+  // The prelude hands `compressImage` its options as two numbers, the media
+  // type and its edit's JSON (LLP 1069.002 A1, A1.11; LLP 1133.019 D15), and
+  // `transformImage` its options' JSON (D14); app files only, so never the
+  // documents' backend.
+  files.compressImage = (from, to, maxDimension, maxBytes, type, edit) =>
+    enqueue(async active => { const backend = await fileSystem(); active(); return backend.compressImage(from, to, {...(edit ? JSON.parse(edit) : {}), maxDimension, maxBytes, type}); }, clone, () => {}, true, 'compressImage');
+  files.transformImage = (from, to, options) =>
+    enqueue(async active => { const backend = await fileSystem(); active(); return backend.transformImage(from, to, JSON.parse(options)); }, clone, () => {}, true, 'transformImage');
   return {
     reserve, abandon,
     capability: Object.freeze({fs:Object.freeze(files),sqlite:Object.freeze({open:path => enqueue(async active => {
       const backend = await databaseSystem(); active(); return backend.open(path);
-    }, database, closeDiscarded)}),work}),
+    }, database, closeDiscarded, true, 'open')}),work}),
     async deliver(owner) {
       await this.ready(owner);
       this.deliverNow(owner);

@@ -15,17 +15,19 @@ typealias SymbolConfig = NSImage.SymbolConfiguration
 #endif
 
 extension NodeView {
-    /// The symbol's own tint, or `nil` to follow the platform's
-    /// (LLP 1095 stage 2): with no row its own for a symbol nobody tinted
-    /// (`unsaidSymbolTint`), and for one that names the accent the accent,
-    /// which the platform keeps dynamic (iOS inherits the hierarchy's
-    /// `tintColor`, a window or app tint included; macOS has the nearest
-    /// authored accent, else `controlAccentColor`), so neither is resolved
-    /// to channels here.
-    var symbolTint: PlatformColor? {
-        guard let row = style["tint_color"] else { return nil }
-        if case .object(let o) = row, o["sys"]?.string == "@tint" { return nil }
-        return channels("tint_color").map(TextEngine.color)
+    /// A page symbol takes its presented computed color (LLP 1081 stage 2).
+    var symbolInk: PlatformColor? {
+        #if os(macOS)
+        return channels("text_color").map(TextEngine.color) ?? .textColor
+        #else
+        return channels("text_color").map(TextEngine.color) ?? .label
+        #endif
+    }
+    /// The ink it is drawn in: its computed colour, or as a list cell's
+    /// image (iOS's custom grouped row) its tint, which the sheet sets, as
+    /// UIKit tints a cell's image (`GroupedListIOS.swift`'s standard cell).
+    var drawnSymbolInk: PlatformColor? {
+        drawsListSymbol ? channels("tint_color").map(TextEngine.color) ?? inheritedTint : symbolInk
     }
     /// Whether a colour row is the platform's accent (`AccentColor`, iOS's
     /// inherited `tintColor`) rather than a colour of its own. An unset
@@ -35,65 +37,86 @@ extension NodeView {
         guard case .object(let o) = row else { return false }
         return o["sys"]?.string?.hasPrefix("@tint") == true
     }
-    /// The accent a `nil` `symbolTint` follows, for an API that needs a colour.
+    /// The platform tint used by a native control’s symbol.
     var inheritedTint: PlatformColor {
         #if os(iOS) || os(tvOS)
-        return tintColor
+        return inheritedInk
         #else
         return viewTint ?? .controlAccentColor
         #endif
     }
 
-    /// What the symbol's look reads from its style, for the image's key: a
-    /// change makes it again. Its colours are resolved into the
-    /// configuration, so every trait they resolve by is here too, and the
-    /// system colours' generation (LLP 1095 D5).
-    var symbolLookKey: String {
-        [style["symbol_rendering"]?.string ?? "", (style["symbol_palette"] ?? .null).key,
-         "\(number("symbol_value", -1))", (style["tint_color"] ?? .null).key, "\(drawsDark)",
-         "\(drawsHighContrast ?? SystemColor.highContrast)", "\(drawsElevated)", "\(SystemColor.generation)", bakedTintKey].joined(separator: "|")
+    /// Whether it is drawn as a list cell's image (iOS's custom grouped row).
+    var drawsListSymbol: Bool {
+        #if os(iOS) || os(tvOS)
+        listSymbol
+        #else
+        false
+        #endif
     }
-    /// The inherited tint, when the look bakes it into the image: a
-    /// hierarchical glyph without its own tint or tinted by it (`Highlight`
-    /// too), or a palette naming it.
-    private var bakedTintKey: String {
-        let mode = style["symbol_rendering"]?.string
-        let bakes = (mode == "hierarchical" && (symbolTint == nil || style["tint_color"]?.namesTint == true))
-            || (mode == "palette" && style["symbol_palette"]?.namesTint == true)
-        guard bakes, let tint = viewTint else { return "" }
-        return (SystemColor.channels("@tint", dark: drawsDark, tintColor: tint, fallback: nil) ?? []).map { "\($0)" }.joined(separator: ",")
+    /// Only shape changes replace a symbol; paint is a view configuration.
+    var symbolLookKey: String {
+        [style["symbol_rendering"]?.string ?? "", "\(number("symbol_value", -1))", "\(drawsListSymbol)"].joined(separator: "|")
     }
 
-    /// What a symbol nobody tinted draws in: the role table's `symbol` row,
-    /// the initial `-exact-tint-color` (LLP 1115.000 D3.9). On iOS the view's
-    /// tint, as UIKit draws a template image. On the Mac
-    /// `secondaryLabelColor`, as AppKit draws one in an `NSImageView`
-    /// (measured on macOS 27.0.1: black at 50% in a light window, white at
-    /// 55% in a dark one), and not the accent, which is a control's own
-    /// image's; a tint that names the accent still follows it
-    /// (`inheritedTint`). `PlatformDefaultsMacTests` holds the Mac's to the
-    /// table's column.
-    var unsaidSymbolTint: PlatformColor {
-        #if os(macOS)
-        if style["tint_color"] == nil { return .secondaryLabelColor }
+    #if os(iOS) || os(tvOS)
+    /// The point size whose large scale UIKit's list cell draws its image at
+    /// at each accessibility text size: a star measured on iOS 27.0 under the
+    /// system's text size (ink 30.33, 35, 34.33, 40.33 and 45.33 points wide,
+    /// 23.67 at the default's 17), about 0.76 of the checkmark accessory's
+    /// growth, stepping back at AX3 as it does.
+    static let listSymbolPoints: [UIContentSizeCategory: CGFloat] = [
+        .accessibilityMedium: 21.78, .accessibilityLarge: 25.14, .accessibilityExtraLarge: 24.66,
+        .accessibilityExtraExtraLarge: 28.97, .accessibilityExtraExtraExtraLarge: 32.56,
+    ]
+    #endif
+    /// Shape belongs to the cached image; paint can change without replacing it.
+    func symbolShape(_ base: SymbolConfig) -> SymbolConfig {
+        #if os(iOS) || os(tvOS)
+        // At an accessibility size UIKit draws a list cell's image smaller
+        // than the text's large scale (`listSymbolPoints`).
+        guard drawsListSymbol else { return base }
+        let sized = Self.listSymbolPoints[traitCollection.preferredContentSizeCategory].map { base.applying(SymbolConfig(pointSize: $0)) } ?? base
+        return sized.applying(SymbolConfig(scale: .large))
+        #else
+        return base
         #endif
-        return inheritedTint
     }
 
     /// The symbol's configuration: its size and weight, then its rendering
     /// mode (D10) — hierarchical in the tint, a palette, or multicolor.
-    func symbolConfiguration(_ base: SymbolConfig) -> SymbolConfig {
-        let tint = symbolTint ?? unsaidSymbolTint
+    /// `face`: as a native control's face draws it, without the page's ink.
+    func symbolConfiguration(_ base: SymbolConfig, face: Bool = false) -> SymbolConfig {
+        #if os(iOS) || os(tvOS)
+        // Take a face's colours undimmed: UIKit keeps the image a control is given as made (TintDimmingIOS.swift)
+        let tint = face ? undimmedInheritedTint : drawnSymbolInk ?? inheritedTint
+        #else
+        let tint = (face ? nil : drawnSymbolInk) ?? inheritedTint
+        #endif
+        let base = symbolShape(base)
         switch style["symbol_rendering"]?.string {
         case "hierarchical": return base.applying(SymbolConfig(hierarchicalColor: tint))
         case "multicolor": return base.applying(SymbolConfig.preferringMulticolor())
         case "palette":
             let colors = (style["symbol_palette"]?.array ?? []).compactMap { c -> PlatformColor? in
-                c.channels(dark: drawsDark, contrast: drawsHighContrast, elevated: drawsElevated, tint: ownTint(for: c)).map(TextEngine.color)
+                #if os(iOS) || os(tvOS)
+                if face { return c.channels(dark: drawsDark, contrast: drawsHighContrast, elevated: drawsElevated, tint: undimmedTint(for: c)).map(TextEngine.color) }
+                return c.channels(dark: drawsDark, contrast: drawsHighContrast, elevated: drawsElevated, tint: ownTint(for: c, key: "symbol_palette"))
+                    .map { TextEngine.color(dimmedWithTint($0, key: "symbol_palette")) }
+                #else
+                return c.channels(dark: drawsDark, contrast: drawsHighContrast, elevated: drawsElevated, tint: ownTint(for: c)).map(TextEngine.color)
+                #endif
             }
             return colors.isEmpty ? base : base.applying(SymbolConfig(paletteColors: colors))
         default: return base
         }
+    }
+
+    /// A native control configures its own image in the control tint.
+    var faceImage: SymbolImage? {
+        guard props["symbolPath"] == nil, let name = props["symbolName"], !name.isEmpty else { return image }
+        let points = number("font_size", PageFacts.defaultRootFontSize), weight = number("font_weight", 400)
+        return points > 0 ? symbolImage(name, symbolConfiguration(SymbolMeasure.configuration(points: points, weight: weight), face: true)) : nil
     }
 
     /// A symbol by name in that configuration, at its variable value (D11)

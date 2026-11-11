@@ -27,6 +27,37 @@
 pub mod asm;
 pub mod builder;
 pub mod bytes;
+mod entry;
+pub mod pool;
+pub use entry::entry_identifier;
+/// ActivityKit's ordered placement identities (LLP 1126.001 WP8).
+pub const ACTIVITY_PLACEMENTS: [&str; 8] = [
+    "lockScreen",
+    "compactLeading",
+    "compactTrailing",
+    "minimal",
+    "expanded.leading",
+    "expanded.trailing",
+    "expanded.center",
+    "expanded.bottom",
+];
+/// `haptic(kind)`'s kinds, a sequence step's too (LLP 1077 D14): the
+/// presses `-exact-press-haptic` takes (`PressHaptic` in the kernel's schema),
+/// `impact` (`impact-medium`'s), and the outcomes, which an action plays and a
+/// press does not, since at touch-down nothing has succeeded yet.
+pub const HAPTIC_KINDS: [&str; 10] = [
+    "selection",
+    "impact",
+    "impact-light",
+    "impact-medium",
+    "impact-heavy",
+    "impact-soft",
+    "impact-rigid",
+    "success",
+    "warning",
+    "error",
+];
+
 pub mod shared;
 pub mod strings;
 pub mod value;
@@ -44,6 +75,98 @@ pub use value::Value;
 /// Interned string index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StrId(pub u32);
+
+/// An `icons` row's `path` (LLP 1121 stage 14 C2, round 2): an interned
+/// string on the wire, as any `str` field (format.json and its digest are
+/// unchanged), but no [`StrId`], so `plan.str()` and the string pool don't
+/// take it. An even-odd icon's path starts `evenodd:`, which only
+/// `exact_kernel::Icon` strips; its one method (below) is the one way
+/// out, called by `exact_runner::icon_of` alone (a guard test holds that).
+///
+/// Every way a row's path could be read as a string fails to compile (C2
+/// round 2's bypasses). A sibling field reads as written:
+///
+/// ```
+/// fn read(plan: &exact_plan::Plan) {
+///     let rows = &plan.icons;
+///     for glyph in rows {
+///         let _ = plan.str(glyph.sf);
+///     }
+/// }
+/// ```
+///
+/// Through a binding the table hands out:
+///
+/// ```compile_fail
+/// fn read(plan: &exact_plan::Plan) {
+///     let rows = &plan.icons;
+///     for glyph in rows {
+///         let _ = plan.str(glyph.path);
+///     }
+/// }
+/// ```
+///
+/// Parenthesised:
+///
+/// ```compile_fail
+/// fn read(plan: &exact_plan::Plan, row: &exact_plan::IconsRow) {
+///     let _ = plan.str((row).path);
+/// }
+/// ```
+///
+/// Destructured, its id taken out:
+///
+/// ```compile_fail
+/// fn read(plan: &exact_plan::Plan, row: &exact_plan::IconsRow) {
+///     let exact_plan::IconsRow { path, .. } = row.clone();
+///     let _ = plan.strings.get(path.0 as usize);
+/// }
+/// ```
+///
+/// Nor by printing it:
+///
+/// ```
+/// let mut b = exact_plan::builder::PlanBuilder::new(0, 0);
+/// b.icon("icon.a", "", "0 0 24 24", "M0 0h1Z", "icons/a.svg");
+/// let plan = b.finish().unwrap();
+/// assert_eq!(format!("{:?}", plan.icons[0].path), "IconPathId(..)");
+/// ```
+///
+/// Nor hashed or ordered (no `Hash`, `Ord`: they would hand its index to a
+/// hasher or a comparison; C2, the last gaps):
+///
+/// ```compile_fail
+/// use std::hash::{Hash, Hasher};
+/// fn index(row: &exact_plan::IconsRow) -> u64 {
+///     let mut h = std::collections::hash_map::DefaultHasher::new();
+///     row.path.hash(&mut h);
+///     h.finish()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn order(a: &exact_plan::IconsRow, b: &exact_plan::IconsRow) -> bool {
+///     a.path < b.path
+/// }
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct IconPathId(pub(crate) u32);
+
+/// Its index stays inside: a debug print shows none (C2 round 3).
+impl std::fmt::Debug for IconPathId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IconPathId(..)")
+    }
+}
+
+impl IconPathId {
+    /// The path's string id, for `exact_runner::icon_of` to hand
+    /// `exact_kernel::Icon::of_row`, the one reader of the marker. Call it
+    /// nowhere else.
+    pub fn raw_for_icon(self) -> StrId {
+        StrId(self.0)
+    }
+}
 
 /// A bytecode range in the code pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -72,6 +195,8 @@ pub enum PlanError {
         available: usize,
     },
     BadMagic,
+    /// A running host received a snapshot, or the snapshot reader received another entry.
+    WrongEntry,
     UnsupportedVersion(u32),
     FormatDigestMismatch {
         expected: u64,
@@ -109,6 +234,11 @@ pub enum PlanError {
     ArmOwner {
         arm: u32,
     },
+    /// A timer carries invalid wait or tolerance options (LLP 1147).
+    TimerWait {
+        /// The invalid timer row.
+        timer: u32,
+    },
     /// A timer with a zero interval would never make progress.
     ZeroInterval {
         timer: u32,
@@ -127,16 +257,21 @@ pub enum PlanError {
         mutation: u32,
         slot: u32,
     },
-    /// A static face weight is outside CSS Fonts' 1–1000 domain.
+    /// A face's weight range leaves CSS Fonts' 1–1000 domain or runs
+    /// backwards.
     FaceWeight {
         face: u32,
         weight: u16,
+    },
+    /// A face's stretch range is empty or runs backwards.
+    FaceStretch {
+        face: u32,
     },
     /// A face source is not a portable local relative path.
     FaceSource {
         face: u32,
     },
-    /// A family repeats one static `(weight, italic)` coordinate.
+    /// A family repeats one `(weight range, stretch range, italic)` face.
     DuplicateFace {
         family: u32,
         face: u32,
@@ -221,6 +356,42 @@ impl Plan {
     /// progress. Called by the generated `validate`, so every loaded or built
     /// plan has passed it.
     pub fn validate_semantics(&self) -> Result<(), PlanError> {
+        let activity = !self.activity_slots.is_empty();
+        if self.snapshot_entry.is_empty() {
+            if self.snapshot_refresh.is_some() || activity {
+                return Err(PlanError::WrongEntry);
+            }
+        } else if self.snapshot_refresh.is_some() == activity {
+            return Err(PlanError::WrongEntry);
+        }
+        if activity {
+            if self.activity_slots.len() != ACTIVITY_PLACEMENTS.len() {
+                return Err(PlanError::WrongEntry);
+            }
+            let roots: Vec<_> = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.parent == Some(NodesId(0)) && n.arm.is_none())
+                .map(|(i, _)| i as u32)
+                .collect();
+            for (i, slot) in self.activity_slots.iter().enumerate() {
+                if self.str(slot.name) != ACTIVITY_PLACEMENTS[i]
+                    || roots.get(i) != Some(&slot.root.0)
+                {
+                    return Err(PlanError::WrongEntry);
+                }
+            }
+            if roots.len() != ACTIVITY_PLACEMENTS.len()
+                || !self.slots.iter().any(|s| {
+                    self.str(s.name) == "snapshot_state"
+                        && s.owner.is_none()
+                        && self.type_(s.ty).kind == TypeKind::Record
+                })
+            {
+                return Err(PlanError::WrongEntry);
+            }
+        }
         // @ref LLP 1038 D2 — declaration order and the one root router slot.
         let mut notfound = false;
         for (i, route) in self.routes.iter().enumerate() {
@@ -376,6 +547,13 @@ impl Plan {
             }
         }
         for (i, t) in self.timers.iter().enumerate() {
+            if (t.tolerance_ms != 0 && (t.wait != 0 || t.frame))
+                || t.wait > 4
+                || (t.wait != 0 && t.frame)
+                || (t.max_ms != 0 && t.wait < 3)
+            {
+                return Err(PlanError::TimerWait { timer: i as u32 });
+            }
             if t.frame && (t.interval_ms != 0 || t.once) {
                 return Err(PlanError::FrameTimer { timer: i as u32 });
             }
@@ -390,11 +568,16 @@ impl Plan {
             if !is_portable_asset_path(self.str(face.source)) {
                 return Err(PlanError::FaceSource { face: i as u32 });
             }
-            if !(1..=1000).contains(&face.weight) {
+            if !(1..=1000).contains(&face.weight)
+                || !(face.weight..=1000).contains(&face.weight_max)
+            {
                 return Err(PlanError::FaceWeight {
                     face: i as u32,
                     weight: face.weight,
                 });
+            }
+            if face.stretch_min == 0 || face.stretch_max < face.stretch_min {
+                return Err(PlanError::FaceStretch { face: i as u32 });
             }
         }
         for (i, family) in self.families.iter().enumerate() {
@@ -402,7 +585,13 @@ impl Plan {
             let mut coordinates = Vec::new();
             for face_id in family.faces.iter() {
                 let face = self.face(face_id);
-                let coordinate = (face.weight, face.italic);
+                let coordinate = (
+                    face.weight,
+                    face.weight_max,
+                    face.stretch_min,
+                    face.stretch_max,
+                    face.italic,
+                );
                 if coordinates.contains(&coordinate) {
                     return Err(PlanError::DuplicateFace {
                         family: i as u32,
@@ -453,6 +642,28 @@ impl Plan {
         {
             return Err(PlanError::GenericStacks);
         }
+        // @ref LLP 1121 D8 — looks by node, then state, one a state a node
+        // (hosts binary-search by node).
+        if let Some(i) = self
+            .looks
+            .windows(2)
+            .position(|pair| (pair[0].node.0, pair[0].state) >= (pair[1].node.0, pair[1].state))
+        {
+            return Err(PlanError::BadReference {
+                table: "looks",
+                row: i as u32 + 1,
+                field: "node",
+            });
+        }
+        // A look is `:hover` (1) or `:focus-visible` (2): `:active` (0) lowers
+        // to the press paint (LLP 1121 D8 as amended 2026-10-18).
+        if let Some(i) = self.looks.iter().position(|l| !(1..=2).contains(&l.state)) {
+            return Err(PlanError::BadReference {
+                table: "looks",
+                row: i as u32,
+                field: "state",
+            });
+        }
         self.validate_texts()?;
         self.validate_site_depth()?;
         self.validate_acyclic_types()
@@ -466,7 +677,10 @@ impl Plan {
         let mut depth = vec![0u32; first_region + self.regions.len()];
         let up = |site: usize| -> Option<usize> {
             let (parent, arm) = match site.checked_sub(first_region) {
-                None => (self.nodes[site].parent, self.nodes[site].arm),
+                None => {
+                    let node = self.node(NodesId(site as u32));
+                    (node.parent, node.arm)
+                }
                 Some(r) => (self.regions[r].parent, self.regions[r].arm),
             };
             match (parent, arm) {
@@ -740,6 +954,10 @@ pub const RUNNER_OWNED_SOURCES: &[&str] = &[
     "exactTime",
     "exactTransport",
     "exactMIDI",
+    "exactActivities",
+    "startActivity",
+    "updateActivity",
+    "endActivity",
 ];
 
 /// Whether the runner answers `name` ([`RUNNER_OWNED_SOURCES`]).
@@ -760,17 +978,60 @@ impl Plan {
     /// Declare a hatch word and the platforms that handle it, after
     /// lowering: the row comes from `app.json`, not from Contract.
     pub fn add_hatch(&mut self, word: &str, platforms: u16) {
-        let id = match self.strings.iter().position(|s| s == word) {
+        let word = self.intern(word);
+        self.hatches.push(HatchesRow { word, platforms });
+    }
+
+    /// Declare a package's view, after lowering: the row comes from the
+    /// package's `exact.json`, not from Contract (LLP 1133.001 D1).
+    pub fn add_view(&mut self, tag: &str, extension: &str, displayed: bool, binds: &[&str]) {
+        let row = ViewsRow {
+            tag: self.intern(tag),
+            extension: self.intern(extension),
+            displayed,
+            binds: self.intern(&binds.join(" ")),
+        };
+        self.views.push(row);
+    }
+
+    /// Replace module row `i`'s declared substitute, after lowering: the
+    /// bake adds what `app.json` says the platform would show (LLP 1133.023
+    /// §10).
+    pub fn set_module_substitute(&mut self, i: usize, json: &str) {
+        let id = self.intern(json);
+        self.modules[i].substitute = id;
+    }
+
+    /// Set tool row `i`'s face, the manifest's `intents` face for it as a
+    /// JSON object (LLP 1133.023 D8), after lowering.
+    pub fn set_tool_face(&mut self, i: usize, json: &str) {
+        let id = self.intern(json);
+        self.tools[i].face = id;
+    }
+
+    /// The package view row of `tag`, if a package serves it.
+    pub fn view_named(&self, tag: &str) -> Option<&ViewsRow> {
+        self.views.iter().find(|v| self.str(v.tag) == tag)
+    }
+
+    fn intern(&mut self, text: &str) -> StrId {
+        let found = self.strings.iter().position(|s| s == text);
+        match found {
             Some(i) => StrId(i as u32),
             None => {
-                self.strings.push(word.to_string());
-                StrId(self.strings.len() as u32 - 1)
+                let id = StrId(self.strings.len() as u32);
+                self.strings.push(text);
+                id
             }
-        };
-        self.hatches.push(HatchesRow {
-            word: id,
-            platforms,
-        });
+        }
+    }
+
+    /// The native module row of source `name`, when a module answers it
+    /// rather than the app's data (LLP 1133.002 D13).
+    pub fn module_named(&self, name: &str) -> Option<&ModulesRow> {
+        self.modules
+            .iter()
+            .find(|m| self.str(self.sources[m.source.0 as usize].name) == name)
     }
 
     /// Whether `platform`'s module handles `word`, as the plan says it: true

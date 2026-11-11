@@ -8,10 +8,11 @@
 //! DOM's `MouseEvent`s (studio diary R3, R19).
 //!
 //! The wire is one UTF-8 line every host writes the same way:
-//! `offsetX,offsetY,buttons,pressure,pointerType,pointerId,clientX,clientY`
+//! `offsetX,offsetY,button,buttons,pressure,pointerType,pointerId,clientX,clientY`
 //! (the viewport point last, LLP 1094 D11); a wheel's is
 //! `offsetX,offsetY,deltaX,deltaY,deltaMode`; a drop's is `offsetX,offsetY`
-//! and then one `doc:` handle per line. Each may end in the modifiers held.
+//! and then one `doc:` handle per line; a press's is `clientX,clientY`, or
+//! nothing where there was no pointer. Each may end in the modifiers held.
 
 use super::Event;
 use exact_plan::Value;
@@ -24,8 +25,14 @@ pub struct PointerEvent {
     pub offset_x: f64,
     /// From the top of the node's content box, CSS px.
     pub offset_y: f64,
+    /// The button whose press or release this is, DOM's numbering (UI
+    /// Events `MouseEvent.button`): 0 primary (or a touch, or a pen's
+    /// contact), 1 auxiliary, 2 secondary, 3 back, 4 forward; -1 on a move,
+    /// where no button changed (Pointer Events §4.1.1.2).
+    pub button: f64,
     /// DOM's bit set: 1 primary (or a touch, or a pen in contact), 2
-    /// secondary, 4 auxiliary. 0 on `pointerup` and on a hover move.
+    /// secondary, 4 auxiliary, 8 back, 16 forward. 0 on `pointerup` and on
+    /// a hover move.
     pub buttons: f64,
     /// 0 to 1: a pen's or a pressed touch's force where the platform
     /// measures one, else DOM's defaults, 0.5 while pressed and 0 while not.
@@ -45,7 +52,7 @@ pub struct PointerEvent {
 }
 
 impl PointerEvent {
-    /// Decode the wire line — eight fields, then optionally the modifiers
+    /// Decode the wire line — nine fields, then optionally the modifiers
     /// held as a chord prefix (`Shift+Meta`, [`KeyModifiers::held`]);
     /// `None` for a malformed one, a non-finite number, a pressure outside
     /// 0 to 1, another pointer type or a modifier DOM does not name.
@@ -56,7 +63,8 @@ impl PointerEvent {
                 .ok()
                 .filter(|v| v.is_finite())
         };
-        let (offset_x, offset_y, buttons, pressure) = (number()?, number()?, number()?, number()?);
+        let (offset_x, offset_y, button, buttons, pressure) =
+            (number()?, number()?, number()?, number()?, number()?);
         let pointer_type = parts.next()?;
         let pointer_id = exact_num::parse_f64(parts.next()?).ok()?;
         let mut number = || {
@@ -68,12 +76,14 @@ impl PointerEvent {
         let held = super::KeyModifiers::held(parts.next().unwrap_or(""))?;
         let valid = parts.next().is_none()
             && (0.0..=1.0).contains(&pressure)
+            && button >= -1.0
             && buttons >= 0.0
             && pointer_id.is_finite()
             && matches!(pointer_type, "mouse" | "pen" | "touch");
         valid.then(|| PointerEvent {
             offset_x,
             offset_y,
+            button,
             buttons,
             pressure,
             pointer_type: pointer_type.into(),
@@ -89,6 +99,7 @@ impl PointerEvent {
         Value::record(vec![
             Value::Number(self.offset_x),
             Value::Number(self.offset_y),
+            Value::Number(self.button),
             Value::Number(self.buttons),
             Value::Number(self.pressure),
             Value::str(&self.pointer_type),
@@ -99,6 +110,53 @@ impl PointerEvent {
             Value::Bool(self.held.ctrl),
             Value::Bool(self.held.alt),
             Value::Bool(self.held.meta),
+        ])
+    }
+}
+
+/// A press's `MouseEvent`, what a `press` action may take: where the pointer
+/// was and the modifier keys held (gallery F20). A press from the keyboard or
+/// an assistive technology is at 0, 0, as the `click` Chrome dispatches for
+/// one is, which is how a page tells it from a pointer's (LLP 1021 D2).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MouseEvent {
+    /// From the viewport's left, CSS px, as a `PointerEvent`'s.
+    pub client_x: f64,
+    /// From the viewport's top, CSS px.
+    pub client_y: f64,
+    /// The modifier keys held.
+    pub held: super::KeyModifiers,
+}
+
+impl MouseEvent {
+    /// Decode the wire line: the modifiers alone (no point), or the point
+    /// and then optionally the modifiers; `None` for a malformed one, a
+    /// non-finite number or a modifier DOM does not name.
+    pub fn parse(payload: &str) -> Option<MouseEvent> {
+        if !payload.contains(',') {
+            let held = super::KeyModifiers::held(payload)?;
+            return Some(MouseEvent {
+                held,
+                ..MouseEvent::default()
+            });
+        }
+        let ([client_x, client_y], held) = numbers(payload)?;
+        Some(MouseEvent {
+            client_x,
+            client_y,
+            held,
+        })
+    }
+
+    /// The `MouseEvent` record, its fields in the compiler's order.
+    pub fn value(&self) -> Value {
+        Value::record(vec![
+            Value::Bool(self.held.shift),
+            Value::Bool(self.held.ctrl),
+            Value::Bool(self.held.alt),
+            Value::Bool(self.held.meta),
+            Value::Number(self.client_x),
+            Value::Number(self.client_y),
         ])
     }
 }
@@ -198,6 +256,18 @@ impl DropEvent {
         })
     }
 
+    /// A file drag's `dragenter` or `dragleave`: the point line alone, no
+    /// files (the DOM's are protected until the drop).
+    pub fn parse_point(payload: &str) -> Option<DropEvent> {
+        let ([offset_x, offset_y], held) = numbers(payload)?;
+        Some(DropEvent {
+            offset_x,
+            offset_y,
+            files: Vec::new(),
+            held,
+        })
+    }
+
     /// The `DragEvent` record, its fields in the compiler's order.
     pub fn value(&self) -> Value {
         Value::record(vec![
@@ -242,35 +312,38 @@ mod tests {
 
     #[test]
     fn the_wire_line_decodes_and_refuses_what_dom_never_sends() {
-        let p = PointerEvent::parse("12.5,-3,1,0.25,pen,7,40,50.5").unwrap();
+        let p = PointerEvent::parse("12.5,-3,0,1,0.25,pen,7,40,50.5").unwrap();
         assert_eq!(
-            (p.offset_x, p.offset_y, p.buttons, p.pressure),
-            (12.5, -3.0, 1.0, 0.25)
+            (p.offset_x, p.offset_y, p.button, p.buttons, p.pressure),
+            (12.5, -3.0, 0.0, 1.0, 0.25)
         );
         assert_eq!((p.pointer_type.as_str(), p.pointer_id), ("pen", 7.0));
         assert_eq!((p.client_x, p.client_y), (40.0, 50.5));
         for bad in [
             "",
-            "1,2,1,0.5,mouse",
-            // The six-field line: every writer is in the repo, and there is
-            // no compatibility parse (LLP 1094 D11).
-            "1,2,1,0.5,mouse,1",
-            "1,2,1,0.5,mouse,1,Shift",
-            "1,2,1,1.5,mouse,1,0,0",
-            "1,NaN,1,0.5,mouse,1,0,0",
-            "1,2,1,0.5,mouse,1,0,Infinity",
-            "1,2,1,0.5,stylus,1,0,0",
-            "1,2,1,0.5,mouse,1,0,0,Hyper",
-            "1,2,1,0.5,mouse,1,0,0,Shift,9",
+            "1,2,0,1,0.5,mouse",
+            // The lines before `button` and before the viewport point: every
+            // writer is in the repo, and there is no compatibility parse
+            // (LLP 1094 D11).
+            "1,2,1,0.5,mouse,1,0,0",
+            "1,2,0,1,0.5,mouse,1",
+            "1,2,0,1,0.5,mouse,1,Shift",
+            "1,2,0,1,1.5,mouse,1,0,0",
+            "1,NaN,0,1,0.5,mouse,1,0,0",
+            "1,2,-2,1,0.5,mouse,1,0,0",
+            "1,2,0,1,0.5,mouse,1,0,Infinity",
+            "1,2,0,1,0.5,stylus,1,0,0",
+            "1,2,0,1,0.5,mouse,1,0,0,Hyper",
+            "1,2,0,1,0.5,mouse,1,0,0,Shift,9",
         ] {
             assert!(PointerEvent::parse(bad).is_none(), "{bad}");
         }
-        let held = PointerEvent::parse("1,2,1,0.5,mouse,1,3,4,Shift+Meta")
+        let held = PointerEvent::parse("1,2,0,1,0.5,mouse,1,3,4,Shift+Meta")
             .unwrap()
             .held;
         assert!(held.shift && held.meta && !held.ctrl && !held.alt);
         assert!(matches!(
-            Event::pointer_payload(31, "0,0,0,0,mouse,1,0,0"),
+            Event::pointer_payload(31, "0,0,-1,0,0,mouse,1,0,0"),
             Some(Event::Pointermove(_))
         ));
         assert!(matches!(
@@ -278,8 +351,8 @@ mod tests {
             Some(Event::Contextmenu)
         ));
         assert!(matches!(
-            Event::contextmenu_payload("40,8,2,0.5,mouse,1,48,16,Control"),
-            Some(Event::ContextmenuAt(p)) if p.offset_x == 40.0 && p.held.ctrl
+            Event::contextmenu_payload("40,8,2,2,0.5,mouse,1,48,16,Control"),
+            Some(Event::ContextmenuAt(p)) if p.offset_x == 40.0 && p.button == 2.0 && p.held.ctrl
         ));
         assert!(Event::contextmenu_payload("x").is_none());
     }
@@ -298,5 +371,69 @@ mod tests {
         for bad in ["5,6", "5,6\n/tmp/a.board", "x\ndoc:/1/a"] {
             assert!(DropEvent::parse(bad).is_none(), "{bad}");
         }
+        // A drag's enter or leave is the point alone.
+        let enter = DropEvent::parse_point("1.5,2,Meta").unwrap();
+        assert!(enter.files.is_empty() && enter.held.meta && enter.offset_x == 1.5);
+        for bad in ["", "1", "1,2\ndoc:/1/a", "NaN,0"] {
+            assert!(DropEvent::parse_point(bad).is_none(), "{bad}");
+        }
+    }
+}
+
+/// A press on an inline atom of a Markdown text or field (LLP 1045.000 D7):
+/// its kind, source, destination and source range, and the modifiers held.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AtomEvent {
+    /// The declaring `atom`'s name.
+    pub kind: String,
+    /// The atom's whole source text, the faces' key.
+    pub source: String,
+    /// A link atom's destination as written; empty for a prefix token.
+    pub href: String,
+    /// Its source range, UTF-16.
+    pub start: f64,
+    /// One past its last code unit.
+    pub end: f64,
+    /// The modifier keys held.
+    pub held: super::KeyModifiers,
+}
+
+impl AtomEvent {
+    /// Decode ABI kind 59: `start,end,modifiers`, then the kind, the
+    /// destination and the source a line each, the source verbatim. `None`
+    /// for a malformed line, a range that is not whole and ordered, or a
+    /// range whose length is not the source's.
+    pub fn parse(payload: &str) -> Option<AtomEvent> {
+        let mut lines = payload.splitn(4, '\n');
+        let ([start, end], held) = numbers(lines.next()?)?;
+        let (kind, href, source) = (lines.next()?, lines.next()?, lines.next()?);
+        let whole = |n: f64| n >= 0.0 && n.fract() == 0.0;
+        let fits = whole(start)
+            && whole(end)
+            && start < end
+            && (end - start) as usize == source.encode_utf16().count();
+        (fits && !kind.is_empty()).then(|| AtomEvent {
+            kind: kind.into(),
+            source: source.into(),
+            href: href.into(),
+            start,
+            end,
+            held,
+        })
+    }
+
+    /// The `AtomEvent` record, its fields in the compiler's order.
+    pub fn value(&self) -> Value {
+        Value::record(vec![
+            Value::str(&self.kind),
+            Value::str(&self.source),
+            Value::str(&self.href),
+            Value::Number(self.start),
+            Value::Number(self.end),
+            Value::Bool(self.held.shift),
+            Value::Bool(self.held.ctrl),
+            Value::Bool(self.held.alt),
+            Value::Bool(self.held.meta),
+        ])
     }
 }

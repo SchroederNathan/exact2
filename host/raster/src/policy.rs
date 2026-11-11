@@ -150,6 +150,11 @@ struct SessionState {
     evicted: u64,
 }
 impl SessionState {
+    /// The entries that hold a place in the queue ([`PENDING_JOBS`]): queued,
+    /// decoding (a cancelled decode still running counts: its slot and
+    /// reservation are held), ready and not yet taken. A delivered picture
+    /// is cache and a failed decode its views' answer; neither drains by
+    /// itself, so neither may refuse a new request.
     fn pending(&self) -> usize {
         self.entries
             .values()
@@ -159,7 +164,7 @@ impl SessionState {
                     Phase::Ready {
                         delivery: false,
                         ..
-                    }
+                    } | Phase::Failed(_)
                 )
             })
             .count()
@@ -422,7 +427,7 @@ impl Gate {
     /// arrives as [`RasterSession::wake`], looks for it at once rather than at
     /// the timeout.
     pub fn wait_work(&self, timeout: Duration) -> Option<DecodePermit> {
-        self.wait_work_since(self.wake_sequence(), timeout)
+        self.wait_work_since(self.wake_sequence(), Some(timeout))
     }
     /// The wakes so far, for [`Gate::wait_work_since`].
     pub fn wake_sequence(&self) -> u64 {
@@ -431,8 +436,13 @@ impl Gate {
     /// [`Gate::wait_work`] counting wakes from `observed`, a
     /// [`Gate::wake_sequence`] read before the worker looked for work the
     /// gate does not hold (a source's header): one that came while it looked
-    /// returns at once instead of at the timeout.
-    pub fn wait_work_since(&self, observed: u64, timeout: Duration) -> Option<DecodePermit> {
+    /// returns at once instead of sleeping through it. `None` waits without
+    /// a timeout; work outside the gate must call [`RasterSession::wake`].
+    pub fn wait_work_since(
+        &self,
+        observed: u64,
+        timeout: Option<Duration>,
+    ) -> Option<DecodePermit> {
         if let Some(permit) = self.next_decode() {
             return Some(permit);
         }
@@ -446,7 +456,10 @@ impl Gate {
         let wake = &self.inner.wake;
         wake.waiters
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (sequence, _) = wake.changed.wait_timeout(sequence, timeout).unwrap();
+        let sequence = match timeout {
+            Some(timeout) => wake.changed.wait_timeout(sequence, timeout).unwrap().0,
+            None => wake.changed.wait(sequence).unwrap(),
+        };
         wake.waiters
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         drop(sequence);
@@ -554,9 +567,7 @@ impl RasterSession {
                 entry.requests.len() == 1
                     && matches!(
                         entry.phase,
-                        Phase::Queued { .. }
-                            | Phase::Failed(_)
-                            | Phase::Ready { delivery: true, .. }
+                        Phase::Queued { .. } | Phase::Ready { delivery: true, .. }
                     )
             });
             if session.pending() - usize::from(removable) >= PENDING_JOBS {

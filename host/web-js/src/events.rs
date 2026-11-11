@@ -2,7 +2,24 @@
 //! (`piece`, called with the element and the handler) and the event
 //! families `on` takes (`binder`), each imported only where a plan binds it.
 
-use exact_plan::EventKind;
+use exact_plan::{EventKind, HandlersRow, Plan};
+
+/// A package view's declared event (LLP 1133.021 §9 item 2): a `message`
+/// handler whose one bound argument is the literal `exact:event:<name>`
+/// (contract-lower's `native_typed.rs`): its name and its action's
+/// parameter types, as `rt.js` `viewEvent` decodes the arguments.
+pub(crate) fn declared(plan: &Plan, h: &HandlersRow) -> Option<(String, Vec<String>)> {
+    if h.event != EventKind::Message || h.args.len != 1 {
+        return None;
+    }
+    let first = h.args.iter().next()?;
+    let literal = crate::style::literal(plan, plan.code(plan.arg(first).expr))?;
+    let name = literal.as_str()?.strip_prefix("exact:event:")?.to_owned();
+    let params = (plan.action(h.action).params.iter())
+        .map(|p| crate::emit::surface_type_json(plan, plan.param(p).ty))
+        .collect();
+    Some((name, params))
+}
 
 /// The motion or input piece's export for an event, if it is one.
 pub(crate) fn piece(event: EventKind) -> Option<&'static str> {
@@ -42,11 +59,21 @@ pub(crate) fn binder(event: EventKind) -> Option<&'static str> {
         EventKind::Contextmenu => Some("onContextmenu"),
         EventKind::Wheel => Some("onWheel"),
         EventKind::Drop => Some("onFileDrop"),
+        EventKind::Dragenter | EventKind::Dragleave => Some("onFileDrag"),
+        EventKind::Atompress => Some("onAtompress"),
         EventKind::Blur | EventKind::Focus => Some("onFocus"),
         EventKind::Focusin | EventKind::Focusout => Some("onFocusWithin"),
         EventKind::Copy | EventKind::Cut | EventKind::Paste => Some("onClipboard"),
         EventKind::Selectionchange => Some("onSelectionChange"),
         EventKind::Toggle => Some("onToggle"),
+        // @ref LLP 1020.002 D2 — an iframe's guest (the root's `navigate`
+        // is `navigateTo`, emit.rs), with its `FrameNavigation`.
+        EventKind::Navigate
+        | EventKind::Currententrychange
+        | EventKind::Navigatesuccess
+        | EventKind::Navigateerror => Some("onFrameNavigation"),
+        // @ref LLP 1020.002 D7 — a capture's `FrameCapture`, always refused on the web.
+        EventKind::Capture => Some("onFrameCapture"),
         _ => None,
     }
 }
@@ -81,6 +108,9 @@ mod tests {
             Contextmenu,
             Wheel,
             Drop,
+            Dragenter,
+            Dragleave,
+            Atompress,
             Blur,
             Focus,
             Focusin,
@@ -89,6 +119,10 @@ mod tests {
             Cut,
             Paste,
             Selectionchange,
+            Currententrychange,
+            Navigatesuccess,
+            Navigateerror,
+            Capture,
         ] {
             assert!(binder(k).is_some(), "{k:?}");
         }

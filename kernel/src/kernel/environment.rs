@@ -2,10 +2,54 @@
 use super::*;
 
 impl Kernel {
+    /// Format an instant with the same host that measures its reserved width.
+    pub fn format_time(&mut self, request: &crate::time::TimeRequest<'_>) -> Option<String> {
+        self.measurer.format_time(request)
+    }
+
+    /// Say which font stacks, by id, are the system's (LLP 1115.000 D12.3):
+    /// those whose first member is a generic family. Bold Text weights
+    /// them; unsaid, the eight generic stacks are.
+    pub fn set_system_stacks(&mut self, system: Vec<bool>) {
+        self.arena.system_stacks = system;
+    }
+
+    /// Whether Bold Text weights stack `family` now (LLP 1115.000 D12.3):
+    /// the setting on, as the last commit applied it, and the stack the
+    /// system's. A binding reading a font outside the plan (LLP 1121 D12)
+    /// steps its weight by it.
+    pub fn bold_text_weights(&self, family: u16) -> bool {
+        self.arena.bold_text && self.arena.system_family(family)
+    }
+
+    /// The pixels one device pixel is on this display (what the hairline
+    /// resolves to).
+    pub fn device_pixel(&self) -> f32 {
+        crate::style::relative::device_pixel(self.arena.display_scale.unwrap_or(1.0))
+    }
+
+    /// How many stacks [`Self::set_system_stacks`] has said: a runner says
+    /// a runtime stack's too once it interns one.
+    pub fn system_stack_count(&self) -> usize {
+        self.arena.system_stacks.len()
+    }
+
+    /// Say whether Bold Text is on (LLP 1115.000 D12.3): the person's
+    /// accessibility setting, which weights the system font, an authored
+    /// weight included, and leaves a family the app ships alone. The next
+    /// commit applies it. Whether it changed.
+    pub fn set_bold_text(&mut self, on: bool) -> bool {
+        if self.arena.bold_text_next.unwrap_or(self.arena.bold_text) == on {
+            return false;
+        }
+        self.arena.bold_text_next = Some(on);
+        true
+    }
+
     /// The page's environment: what `env(safe-area-inset-*)`,
-    /// `env(viewport-segment-*)` and the layout regions'
-    /// `env(-exact-<region>-inset-*)` lengths resolve to (LLP 1001 §2; LLP
-    /// 1078 D3; LLP 1123 D10).
+    /// `env(viewport-segment-*)`, `env(titlebar-area-*)` and the layout
+    /// regions' `env(-exact-<region>-inset-*)` lengths resolve to (LLP 1001
+    /// §2; LLP 1078 D3; LLP 1123 D10).
     pub fn env(&self) -> Env {
         self.arena.env().clone()
     }
@@ -16,8 +60,8 @@ impl Kernel {
         self.provisional_layouts
     }
 
-    /// Set the insets, the layout regions (LLP 1123 D10) and control text styles of the
-    /// environment — the safe-area insets and regions the host reports with the viewport (a
+    /// Set the insets, the layout regions (LLP 1123 D10), the title-bar area and control text
+    /// styles of the environment — what the host reports with the viewport (a
     /// rotation changes them); the segment grid
     /// `env` carries is ignored, [`Kernel::set_segments`] being its twin.
     /// Every node whose style holds an `env()` length gets its engine style
@@ -39,6 +83,7 @@ impl Kernel {
             button_fonts: env.button_fonts,
             screen: env.screen,
             regions: env.regions,
+            titlebar_area: env.titlebar_area,
             ..next
         };
         self.replace_env(next)
@@ -71,12 +116,46 @@ impl Kernel {
         let _ = self.replace_env(next);
     }
 
+    /// Resolve borders to whole device pixels before layout. The Apple host
+    /// enables this before boot; authored widths remain in the style rows.
+    pub fn set_pixel_borders(&mut self) {
+        let mut next = self.arena.env().clone();
+        next.border_scale = Some(self.display_scale());
+        let _ = self.replace_env(next);
+    }
+
+    /// Whether a display scale can move a hairline or a snapped border.
+    pub fn has_display_lengths(&self) -> bool {
+        self.has_hairlines()
+            || (self.arena.env().border_scale.is_some()
+                && self.arena.iter_live().any(|slot| {
+                    self.arena
+                        .effective_style(slot)
+                        .border_widths()
+                        .iter()
+                        .any(|w| *w > 0.0)
+                }))
+    }
+
+    /// Lay spaces out as a terminal does: a padding, margin or gap in points
+    /// is whole cells on its axis (LLP 1101 §4, LLP 1121 stage 11 (c)). The
+    /// terminal host sets it beside [`Self::set_cell_borders`]; it is this
+    /// kernel's alone.
+    pub fn set_cell_spaces(&mut self, on: bool) {
+        let next = self.arena.env().with_cell_spaces(on);
+        let _ = self.replace_env(next);
+    }
+
     pub(super) fn replace_env(&mut self, env: Env) -> Result<bool, KernelError> {
         if *self.arena.env() == env {
             return Ok(false);
         }
         let control_changed = self.arena.env().control_text_styles != env.control_text_styles
             || self.arena.env().button_fonts != env.button_fonts;
+        // Host border and cell rules can change plain px lengths too.
+        let box_rules_changed = self.arena.env().cell_spaces != env.cell_spaces
+            || self.arena.env().cell_borders != env.cell_borders
+            || self.arena.env().border_scale != env.border_scale;
         let before: Vec<_> = if control_changed {
             self.arena
                 .iter_live()
@@ -96,16 +175,23 @@ impl Kernel {
         if let Some(r) = &mut self.region {
             r.invalidate();
         }
-        let users: Vec<u32> = self
+        let mut users: Vec<u32> = self
             .arena
             .iter_live()
             // A covered box too: its top cover can hold an inset (cover.rs).
             .filter(|s| {
-                uses_env(self.arena.style(*s))
+                box_rules_changed
+                    || uses_env(self.arena.style(*s))
                     || self.arena.cover(*s).is_some()
                     || self.arena.neutral_alert(*s)
             })
             .collect();
+        // And a covered box's absolute children, placed past that inset.
+        let positioned: Vec<u32> = (users.iter())
+            .filter(|&&s| matches!(self.arena.cover(s), Some(super::HostCover::Edges(_))))
+            .flat_map(|&s| super::cover::positioned_children(&self.arena, s))
+            .collect();
+        users.extend(positioned);
         for slot in &users {
             if let (Some(node), Some(layout)) =
                 (self.arena.taffy(*slot), self.layout.as_deref_mut())
@@ -114,6 +200,7 @@ impl Kernel {
                 layout.mark_dirty(node);
             }
             self.arena.flags_mut(*slot).insert(NodeFlags::STYLE_DIRTY);
+            self.inline_image_resized(*slot);
         }
         // A replayed row checks its styles, which a handle leaves as they
         // were, not what the handle now resolves to

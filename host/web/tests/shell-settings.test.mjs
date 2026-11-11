@@ -3,23 +3,20 @@
 // paints honours the person's settings: with Reduce Transparency the bar is opaque and does not blur, and
 // under forced colours each drawn control is the browser's own again; an effect the author wrote is not
 // touched. The shell carries the resets a careful web app ships (text inflation, the double-tap zoom on a
-// control, a scroller's end pulling the page). A symbol, and an image in something pressable, is not
+// control, a drag moving the whole page). A symbol, and an image in something pressable, is not
 // dragged out as a picture; the select's chevron and the switch's thumb follow the page's direction; and a
 // plain `dialog` has no padding of the user agent's. The nodes are as the hosts write them.
 import { test, expect } from 'bun:test';
-import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { Cdp } from '../../../scripts/agent.mjs';
-import { chromium } from '../../../scripts/agent-launch.mjs';
+import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
 import { need } from '../../../scripts/coverage.mjs';
 import { readyPage } from './page.mjs';
 
 const WEB = resolve(new URL('..', import.meta.url).pathname);
-const { executable: chrome, unavailable } = chromium();
+const { unavailable } = chromium();
 const check = need('chrome', unavailable);
 
 const sheet = () => withLook(readFileSync(resolve(WEB, 'index.html'), 'utf8')).match(/<style>[\s\S]*?<\/style>/)[0];
@@ -66,13 +63,9 @@ async function inChrome(test) {
     res.writeHead(200, { 'content-type': 'text/javascript' }); res.end(readFileSync(resolve(WEB, 'navigation.js')));
   });
   await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
-  const profile = mkdtempSync(resolve(tmpdir(), 'exact-shell-settings-'));
-  const child = spawn(chrome, ['--headless=new', '--remote-debugging-pipe', '--window-size=600,900', `--user-data-dir=${profile}`,
-    '--no-sandbox', '--no-first-run', '--disable-background-networking', 'about:blank'], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+  const suite = await cdpBrowser({ args: ['--window-size=600,900'] }), { cdp } = suite;
   try {
-    const cdp = new Cdp(child.stdio[3], child.stdio[4]);
-    const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    const { sessionId } = await suite.page();
     const call = (method, params) => cdp.send(method, params, sessionId);
     await prefer(call, {});
     const evaluate = async (expression) => {
@@ -83,9 +76,8 @@ async function inChrome(test) {
     await readyPage(cdp, sessionId, `http://127.0.0.1:${server.address().port}/`);
     await test(evaluate, call);
   } finally {
-    child.kill();
+    await suite.close();
     server.close();
-    rmSync(profile, { recursive: true, force: true });
   }
 }
 const css = (evaluate, id, property, pseudo) => evaluate(`css(${JSON.stringify(id)}, ${JSON.stringify(property)}${pseudo ? `, ${JSON.stringify(pseudo)}` : ''})`);
@@ -134,9 +126,9 @@ check(`the shell carries the resets a careful web app ships`, () => inChrome(asy
   for (const id of ['button', 'bare', 'link', 'pressable', 'field', 'area', 'select', 'switch']) expect([id, await css(evaluate, id, 'touchAction')]).toEqual([id, 'manipulation']);
   expect(await css(evaluate, 'plain', 'touchAction')).toBe('auto');
   expect(await css(evaluate, 'panned', 'touchAction')).toBe('none');
-  // A shell that scrolls inside itself keeps a scroller's end from the page; a `scroll document` page is the browser's.
+  // A shell that scrolls inside itself stays put, without even its own bounce; a `scroll document` page is the browser's.
   const ends = 'JSON.stringify([getComputedStyle(document.documentElement).overscrollBehaviorY, getComputedStyle(document.body).overscrollBehaviorY])';
-  expect(await evaluate(ends)).toBe('["contain","contain"]');
+  expect(await evaluate(ends)).toBe('["none","none"]');
   expect(await evaluate(`document.documentElement.setAttribute('data-scrolldocument', ''); ${ends}`)).toBe('["auto","auto"]');
 }), 60000);
 

@@ -5,7 +5,7 @@ the device (its partition in SQLite, its outbox, local queries and
 predictions) and the client protocol over it (opening, sync rounds, store
 identity and generation adoption, at-most-once sends with receipts, the
 change poll), written once in Rust and performing no I/O. Each HTTP exchange
-is handed to whoever drives it. Pinned to Snapback4 **0.4.29**
+is handed to whoever drives it. Pinned to Snapback4 **0.4.33**
 (engine sources in `snapback4/Cargo.toml`); the npm CLI in the root
 `package.json` matches.
 
@@ -19,7 +19,7 @@ is handed to whoever drives it. Pinned to Snapback4 **0.4.29**
 > **Exact + Snapback checklist.** Each line is a pair that must agree; a
 > mismatch fails late, as data that never loads.
 >
-> - **Directories.** The backend (`snapback/schema.q`, `snapback4@0.4.29`)
+> - **Directories.** The backend (`snapback/schema.q`, `snapback4@0.4.33`)
 >   is the directory above the app (the one holding `app.json`). Run
 >   `snapback4` there and `bun exact.mjs …` (`snapback` among them) in the
 >   app; `assets/snapback4.wasm` is built into the app's `assets/`.
@@ -49,7 +49,8 @@ is handed to whoever drives it. Pinned to Snapback4 **0.4.29**
 > - **Tests.** `epoch now` in the test file (the server keeps real time);
 >   `snapback4 dev` listening before `test web`; `clock data` before `fail
 >   fetch`; `fresh` for an empty dev server before each test through
->   0.4.29's `POST /dev/reset`
+>   0.4.33's `POST /dev/reset`, which a password-only app's `dev` opens only
+>   with `--unsafe-dev-doors`
 >   (["Tests share the server"](#tests-share-the-server)).
 
 ## From TypeScript
@@ -57,8 +58,8 @@ is handed to whoever drives it. Pinned to Snapback4 **0.4.29**
 ### Set it up: one command
 
 A new app: from the backend's directory (`snapback/schema.q`, and
-`snapback4@0.4.29` installed there: `bun add snapback4@0.4.29` or `npm i
-snapback4@0.4.29`), `bun /path/to/exact2/scripts/exact.mjs new app --snapback`
+`snapback4@0.4.33` installed there: `bun add snapback4@0.4.33` or `npm i
+snapback4@0.4.33`), `bun /path/to/exact2/scripts/exact.mjs new app --snapback`
 (`--port <n>` for an origin other than 4400). With no backend schema yet, it writes the guestbook below as
 the app (`app.contract`, `app.ts` at that origin with its grants,
 `app.test.contract`) and `snapback/schema.q` when there is none, then wires it. With an existing schema it keeps the greeting app and mounts
@@ -105,9 +106,51 @@ above it): `bun exact.mjs snapback`. Either one:
 It names the `appId` line `app.ts` needs when the two disagree: `app.json`'s
 `"app": { "id" }`, which `exact new` set from the directory's name. Last it
 says the server to start, `bunx snapback4 dev --port <n>` above. The driver is
-pinned to Snapback4 0.4.29: install that version for the server. A new app
-made this way and tested as written against 0.4.29 (2026-10-16): both of the
+pinned to Snapback4 0.4.33: install that version for the server. A new app
+made this way and tested as written against 0.4.33 (2026-10-20): both of the
 guestbook's tests pass.
+
+### Updating an inherited app
+
+After the Exact checkout moves, run these in the app:
+
+```sh
+bun exact.mjs update
+bun exact.mjs contract migrate app.contract
+bun exact.mjs lock
+bun exact.mjs contract build app.contract --json --errors-only
+```
+
+`migrate` rewrites retired Contract spellings (`list<T>`, free string/array
+calls, `when` and `each`). It does not rewrite TypeScript business logic.
+`lock` refreshes the app's Cargo lock against this checkout. A CI gate uses
+`build --json --errors-only`: exit zero and `[]` mean no errors; ordinary
+`--json` includes advisory warnings too.
+
+**Breaking change (2026-10-16):** Snapback mutation sources with a bool `ok`
+field return `ok: true` on success. Replace `{ok: false}` replies with
+`throw refused(why)` and render `failure(slot)`; the mutation's `then` runs
+only on success. Before:
+
+```ts
+if (fate.state === 'failed') return { ok: false, message: fate.why.code };
+```
+
+After (import `refused` from `./snapback4/snapback.ts`):
+
+```ts
+if (fate.state === 'failed') throw refused(fate.why);
+return { ok: true, message: '' };
+```
+
+```
+derive sendError = match failure(posted) { case some(f) => f.code, case none => "" }
+```
+
+Put the derive in the component holding `posted`, and map codes to reader-facing text. A refused `send` keeps the
+slot's previous successful reply, so matching the reply alone cannot detect a
+failure. `pending(posted)`, `failed(posted)` and `failure(posted)` describe the
+current request; a refusal runs no `then`.
 
 ### Upgrading a wave-10-era app
 
@@ -174,7 +217,19 @@ try {
 
 Sessions live in Exact's app-scoped secret store (`secret.keep <key>`): the
 Keychain on Apple, the user's private secret files on Linux, and the app's
-web storage. Use a separate key for each origin. `open` drops malformed or
+web storage. Use a separate key for each origin. Keys must match
+`[a-z0-9._-]{1,64}`; a URL containing `:` or `/` is not a key. For example,
+for `http://127.0.0.1:4400` use `snapback-http-127.0.0.1-4400`, and for
+`https://api.example.com` use `snapback-https-api.example.com`:
+
+```ts
+const sessionKey = 'snapback-http-127.0.0.1-4400';
+export const grants = `net.fetch ${origin}\nsecret.keep ${sessionKey}`;
+// Pass the same key: auth: { store, key: sessionKey, now }
+```
+
+Choose a distinct stable key for each origin, including protocol and port.
+`open` drops malformed or
 expired stored sessions and refreshes within 60 seconds of expiry using the
 supplied Contract time. `refreshSession(now)` also rotates explicitly and
 stores the replacement before returning. `E_AUTH` on refresh forgets the
@@ -215,6 +270,7 @@ const viewers = Snapback.switcher((key: string) => ({ app: appId, origin,
 
 Bare `use identity` permits guests: call `await db.guest()` before any read,
 then keep its session in the same `auth` store as a password session.
+A guest session is a session: `await db.logout()` before `signup` or `login`.
 `await db.authConfig()` reads `GET /auth/config` and reports `guests`, `password`
 and `development`. `use identity password` removes guests. A complete tested guest
 and mixed persona/password recipe is [here](../docs/recipes/snapback-auth.md).
@@ -460,11 +516,11 @@ test "offline, a note is kept, then delivered on reconnect"
 ```
 
 The app is `bun <this checkout>/scripts/exact.mjs new app --snapback`, run in
-the backend's directory, which writes these four files and wires them. Built that way and tested as written against 0.4.29 (2026-10-16): both tests pass, and pass again on the data a first run leaves.
+the backend's directory, which writes these four files and wires them. Built that way and tested as written against 0.4.33 (2026-10-20): both tests pass, and pass again on the data a first run leaves.
 
 ### A complete online app
 
-For a schema that syncs nothing, install `snapback4@0.4.29` in the backend,
+For a schema that syncs nothing, install `snapback4@0.4.33` in the backend,
 write this `snapback/schema.q`, then run
 `bun <exact2>/scripts/exact.mjs new app --snapback --online --port 30100`.
 It mounts the online adapter and generated operations, and writes a query/mutation
@@ -595,6 +651,7 @@ test "a refused write exposes its domain code"
   type "draft" "refused"
   tap "post"
   clock data
+  expect refusal "posted"
   expect text "problem" == "The guestbook is full."
   expect state problemCode == "FULL"
   expect text "notice" == ""
@@ -774,6 +831,7 @@ test "password sessions restore and sign out"
   type "password" "wrong password"
   tap "login"
   clock data
+  expect refusal "signed"
   expect text "auth-error" == "E_AUTH"
   expect text "session" == "Signed out"
   type "password" "correct horse battery staple"
@@ -787,11 +845,14 @@ test "a new test has no account or browser session"
   expect tree missing "note-0"
 ```
 
-Generate the declaration, start `bun exact.mjs backend`, and run
-`bun exact.mjs test web`. The same UI works on `serve`; omit `fresh` there
-and use a unique signup email. `restore(now)` validates stored sessions and
+Generate the declaration, start `bun exact.mjs backend dev --unsafe-dev-doors`,
+and run `bun exact.mjs test web`. A password-only app's `dev` keeps its
+development doors (`fresh`'s `POST /dev/reset`, `/seed`, personas) closed
+unless started with `--unsafe-dev-doors`; without it `fresh` refuses the test.
+The same UI works on `serve`; omit `fresh` there and use a unique signup email. `restore(now)` validates stored sessions and
 refreshes within 60 seconds of expiry; `refreshSession(now)` rotates explicitly.
-Use a different secret key for each origin. Auth operations serialize across Exact's
+Use a different secret key for each origin, such as `snapback-http-127.0.0.1-4400`
+(the key grammar and example are [above](#personas-and-password-accounts)). Auth operations serialize across Exact's
 per-source secret facades; a late auth reply never overwrites a changed session.
 An old-token request denied during refresh waits for auth to finish before
 invalidating, so it cannot discard the replacement token. A later poll still
@@ -1013,7 +1074,9 @@ Run `bun exact.mjs contract types app.contract -o app.contract.d.ts`,
 The README retest command executes this example along with the guestbooks.
 The existing [password example](#a-complete-online-password-app)
 adds login and periodic session refresh. Remove persona controls for production;
-`serve` refuses persona headers. Use a distinct secret key for each backend origin.
+`serve` refuses persona headers. Use a distinct secret key for each backend origin,
+such as `snapback-https-api.example.com`; keys contain only lowercase letters,
+digits, dots, underscores and hyphens, at most 64 characters.
 
 ### Live resources on the online adapter
 
@@ -1061,7 +1124,8 @@ those from earlier tests in it. Two ways out:
     expect tree missing "note-0"
   ```
 
-  Snapback4 0.4.29 has this door in `dev`; `serve` has no development
+  Snapback4 0.4.33 has this door in `dev` (a password-only app's `dev`
+  opens it only with `--unsafe-dev-doors`); `serve` has no development
   reset. `fresh` is for tests against `dev`.
 - **Each test owns its rows.** It writes a code or name no other test uses
   and asserts on that: newest first (`note-0` in a `last … by byTime` list),
@@ -1129,6 +1193,17 @@ See [navigation](../docs/recipes/navigation-stack.md).
 A PDF picker needs `input type="file" accept="application/pdf"` and an app manifest
 handler such as `"file_handlers": [{"action":"/", "accept":{"application/pdf":[".pdf"]}}]`.
 Give the input an `id` for `showPicker` and a `testId` for `pick`.
+
+Look up the admitted vocabulary before choosing a platform name:
+
+| Need | Contract / manifest |
+| --- | --- |
+| Colour roles | `contract vocab color background-color`; use `-exact-label`, `-exact-secondary-label`, `-exact-system-red`, rather than UIKit role names |
+| List indexing | `xs.at(i)` is an option: `match xs.at(i) { case some(x) => x.title, case none => "" }`; no unchecked `xs[i]` |
+| Time | `performanceNow()` for durations; `resource time = exactTime() as shape Clock` with `epochAtZero: number`, then `time.epochAtZero + performanceNow()` for epoch milliseconds |
+| Symbols | `contract vocab symbol` lists roles; literal unknown roles fail the build. Computed sources still need runtime checks. `symbol:sf/<name>` draws only on Apple |
+| Source mounts | `app.json`'s `typescript.sources` maps module names to directories relative to the app, such as `"backend": "../snapback/generated"` |
+| File pickers | Both Contract `accept` and manifest `file_handlers` (the PDF example above) |
 
 A generic helper forwarding record arguments needs the same constraint as the
 adapter: `function helper<A extends Record<string, unknown>>(args: A) { … }`.
@@ -1350,7 +1425,7 @@ const renewed = await db.refreshSession(now);          // near expiresAt: keep r
   largest id as the newest: give the table a `time` the mutation sets (`at:
   now`) and read in its index's order (`last 50 by byTime`). A test file
   cannot know a minted id either, so a `testId` built from one is out of
-  its reach. Reach a row by position, from `for`'s index (`each note, i in
+  its reach. Reach a row by position, from `for`'s index (`for note, i in
   board.notes key=note.id` with ``testId=`note-${i}` ``, as the guestbook
   does: `expect text "note-0" == …`), by what it shows (`tap "<its exact
   text or label>"`), or through a derive of the row the test made (the
@@ -1358,6 +1433,11 @@ const renewed = await db.refreshSession(now);          // near expiresAt: keep r
   button on a row passes the row's id to its action: `button
   press=remove(note.id)` with `action remove(id: string)`, whose `send`
   carries it to the source.
+- **Wake by audience.** `poll()` declares its interest (`interest=1` and the
+  schema's online-only tables), so on a Snapback4 that carries LLP 3000.041 the
+  server answers it only for commits this viewer can read, an online-only
+  table, or an effect that names the viewer; a bystander's poll sleeps to its
+  deadline and learns nothing. An older server ignores the declaration.
 - **Live updates.** A data answer has a bounded life and tests settle on
   answers, so do not hold a long `poll(20)` inside a resource. Drive
   freshness from Contract: a `task` that calls an action every few seconds,

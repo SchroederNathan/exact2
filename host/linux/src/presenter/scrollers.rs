@@ -27,6 +27,10 @@
 //! ([`Presenter::pointer_cancel`]): no press fires for it.
 use super::contact::Candidate;
 use super::*;
+use std::collections::BTreeSet;
+
+#[cfg(test)]
+mod hidden_tests;
 
 /// The page itself, scrolled where the document is larger than the viewport
 /// and no scroller holds it: no node has this id.
@@ -77,11 +81,15 @@ pub(super) struct Reader {
 }
 
 impl Reader {
-    /// A list corrected its own offset from `was` to `now`: its content
+    /// A scroller corrected its own offset from `was` to `now`: its content
     /// stays where it shows, so the reader's moves still stand.
+    /// A reader that stood where it was stands where it is now, exactly: in
+    /// f32, `at + now - was` can miss `now` by an ulp, which the revision's
+    /// exact compare would take for an app scroll.
     pub(super) fn rebased(&mut self, id: ViewId, was: (f32, f32), now: (f32, f32)) {
         if let Some((_, at)) = self.tracked.get_mut(&id) {
-            *at = (at.0 + now.0 - was.0, at.1 + now.1 - was.1);
+            let axis = |at: f32, was: f32, now: f32| if at == was { now } else { at + now - was };
+            *at = (axis(at.0, was.0, now.0), axis(at.1, was.1, now.1));
         }
     }
 }
@@ -161,7 +169,7 @@ impl<D: DataSource> Presenter<D> {
                 contained(node.style.overscroll_behavior_x),
                 contained(node.style.overscroll_behavior_y),
             );
-            let parent = self.display.parent(kernel, id).or_else(|| {
+            let parent = self.scroll_parent(id).or_else(|| {
                 node.node_type
                     .is_svg_element()
                     .then_some(node.parent)
@@ -230,8 +238,25 @@ impl<D: DataSource> Presenter<D> {
 
     /// Scroll `id` to `to`, clamped to its travel on the axes it scrolls
     /// along; where it then is, or `None` when `id` is no scroll container.
+    /// The person's: a key, a scrollbar, an accessibility action, a tab
+    /// reselected, the agent's `scroll`.
     pub fn scroll_to(&mut self, id: ViewId, to: (f32, f32)) -> Option<(f32, f32)> {
-        self.scroll_to_completion(id, to, Completion::Instant)
+        if !to.0.is_finite() || !to.1.is_finite() {
+            return None;
+        }
+        self.person_scrolls += 1;
+        self.restore_scroll_anchors();
+        // An absolute destination supersedes the previous position's correction.
+        self.cancel_anchor_correction(id);
+        let result = self.scroll_to_completion(id, to, Completion::Instant, None);
+        self.arm_scroll_anchors();
+        result.map(|_| {
+            if id == PAGE {
+                self.page
+            } else {
+                self.scroll_of(id)
+            }
+        })
     }
 
     fn scroll_to_completion(
@@ -239,6 +264,7 @@ impl<D: DataSource> Presenter<D> {
         id: ViewId,
         to: (f32, f32),
         completion: Completion,
+        relative: Option<(f32, f32)>,
     ) -> Option<(f32, f32)> {
         if !to.0.is_finite() || !to.1.is_finite() {
             return None;
@@ -257,15 +283,27 @@ impl<D: DataSource> Presenter<D> {
                 s.offset.1
             },
         );
-        if next == s.offset {
+        let moved = relative
+            .and_then(|by| self.anchor_input(id, s.offset, if s.axes.1 { by.1 } else { 0. }, next));
+        if next == s.offset && moved.is_none_or(|dy| dy == 0.) {
             return Some(next);
+        }
+        if completion == Completion::Reader {
+            if let Some((_, accepted)) = self.reader.tracked.get_mut(&id) {
+                // A scroll handler may rebase this position before dispatch returns.
+                *accepted = next;
+            }
+        }
+        // A reader's move carries the list's own pending position across it (`ack.rs`).
+        if completion == Completion::Reader {
+            self.keep_own_position(id);
         }
         if id == PAGE {
             self.page = next;
         } else {
             self.scroll.insert(id, next);
-            self.scroll_end_moved(id, completion);
-            self.collection_scrolled(id);
+            self.scroll_end_input(id, s.offset, completion);
+            self.collection_scroll_input(id, s.offset);
         }
         self.dirty = true;
         if let Some(error) = self.refresh_transform_geometry() {
@@ -279,6 +317,8 @@ impl<D: DataSource> Presenter<D> {
     /// it knew the app had moved the scroller (dropped), or for a scroller
     /// it was never told of.
     pub fn reader_scrolled(&mut self, id: ViewId, by: (f32, f32), rev: u32) -> Option<(f32, f32)> {
+        self.person_scrolls += 1;
+        self.restore_scroll_anchors();
         if !self.reader.tracked.contains_key(&id) {
             return None;
         }
@@ -290,9 +330,12 @@ impl<D: DataSource> Presenter<D> {
             return None;
         }
         let from = s.offset;
-        let to =
-            self.scroll_to_completion(id, (from.0 + by.0, from.1 + by.1), Completion::Reader)?;
-        self.reader.tracked.insert(id, (rev, to));
+        let to = self.scroll_to_completion(
+            id,
+            (from.0 + by.0, from.1 + by.1),
+            Completion::Reader,
+            Some(by),
+        )?;
         Some((to.0 - from.0, to.1 - from.1))
     }
 
@@ -319,6 +362,50 @@ impl<D: DataSource> Presenter<D> {
     /// `scroll`): the reader is told nothing more of it.
     pub fn reader_forgets(&mut self, id: ViewId) {
         self.reader.tracked.remove(&id);
+    }
+
+    /// The scrollers the clamp leaves alone: each a list kept while its route is hidden (a
+    /// full-screen route over it), or shown again but not yet painted where it shows. The
+    /// picture holds no travel for such a list, so the clamp would put it at its top and it
+    /// would show its first rows when its route came back (Excord's picture dismiss). Shown
+    /// again, its first frame is bounded by its layout's travel, staged as its own clamp
+    /// (`stage_shown`) with its input offset kept until that frame is acknowledged, any rows put
+    /// above it while hidden kept by its anchor; painted, it is clamped as before. Only the node
+    /// whose offset it is keeps it: the one a shown clamp saw, or the one the acknowledged
+    /// picture painted at its id, however its offset was written (`shown_keys`). A hidden
+    /// tree built again is fresh ids, clamped afresh: no stale offset.
+    pub(super) fn hidden_scrollers(&mut self) -> BTreeSet<ViewId> {
+        let mut held = BTreeSet::new();
+        let limits = self.collection_scroll_limits();
+        for id in self.scroll.keys().copied().collect::<Vec<_>>() {
+            let Some(key) = self.host.kernel().node(id).map(|n| n.key) else {
+                self.collection.shown_keys.remove(&id);
+                continue;
+            };
+            let hidden = self.host.route_visibility(id).0;
+            if self.display.painted_key(id) == Some(key)
+                || (!hidden && self.display.witnessed(self.host.kernel(), id))
+            {
+                self.collection.shown_keys.insert(id, key);
+            }
+            if !hidden && self.display.witnessed(self.host.kernel(), id) {
+                continue;
+            }
+            if self.collection.shown_keys.get(&id) != Some(&key) {
+                continue;
+            }
+            if !hidden {
+                let kernel = self.host.kernel();
+                let node = kernel.node(id).unwrap();
+                let region = self.host.content_region();
+                let bounds =
+                    self.brush
+                        .scroll_bounds(kernel, region, &node, limits.get(&id).copied());
+                self.stage_shown(id, key, bounds);
+            }
+            held.insert(id);
+        }
+        held
     }
 
     /// The reader's revision of scroller `id`, moved on when the offset is

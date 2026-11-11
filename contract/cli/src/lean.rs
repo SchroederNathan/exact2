@@ -45,6 +45,7 @@ fn lean_source(src: &str, name: &str, ascribed: bool) -> Result<String, CompileE
     crate::compile(src)?;
     let mut file = contract_syntax::parse(src)?;
     contract_syntax::resolve_clock_timelines(&mut file)?;
+    crate::params(&mut file)?;
     emit_file(&file, name, None, ascribed)
 }
 
@@ -544,6 +545,22 @@ impl Emitter<'_> {
             if let Some(k) = &t.key {
                 gate += &format!(", key := .some ({})", self.expr(k)?);
             }
+            for (name, value, _) in &t.options {
+                match (name.as_str(), value) {
+                    ("wait", Expr::Ident(word, _)) => {
+                        let kind = match word.as_str() {
+                            "frame" => 1,
+                            "update" => 2,
+                            "scrollend" => 3,
+                            "idle" => 4,
+                            _ => 0,
+                        };
+                        gate += &format!(", waitKind := {kind}");
+                    }
+                    ("max", Expr::Number(ms, _)) => gate += &format!(", maxMs := {}", *ms as u32),
+                    _ => {}
+                }
+            }
             tasks.push(format!(
                 "{{ name := {}, kind := {kind}, ms := {}, action := {}{gate} }}",
                 string(&t.name),
@@ -651,6 +668,12 @@ impl Emitter<'_> {
                     unreachable!("matched above")
                 };
                 format!("(.call {} [{}])", string(name), self.expr(x)?)
+            }
+            // `x.length` that the checker read as a record's field.
+            Expr::Call(name, args, span)
+                if name == "length" && shapes.reads_length_field(*span) =>
+            {
+                format!("(.member {} {})", self.expr(&args[0])?, string(name))
             }
             Expr::Call(name, args, _) => {
                 let mut parts = args

@@ -40,29 +40,43 @@ mod arrive;
 mod back;
 pub mod bars;
 mod build_channel;
+pub mod clipboard;
 mod clock;
 mod collection;
 mod commands;
 mod contact;
 mod control;
 mod delivery;
+#[cfg(windows)]
+pub mod desktop_access;
 mod device;
 mod display_frame;
+pub mod edit_menu;
 mod events;
 mod feedback;
 mod field;
+mod field_pointer;
+mod field_scroll;
 #[cfg(test)]
 mod field_tests;
+#[cfg(test)]
+mod frame_target_tests;
 mod group;
 mod hatch;
+mod history;
+pub mod ime;
 mod painter;
 mod pan_release;
 mod picker;
 mod pointer;
+mod pump;
 mod radio;
+mod range_frame;
 #[cfg(test)]
 mod save_tests;
 mod svg_hit;
+#[cfg(windows)]
+mod windows_field;
 #[cfg(target_os = "linux")]
 pub(crate) use display_frame::SubmittedFrame;
 #[path = "content_region/presenter.rs"]
@@ -73,7 +87,8 @@ mod content_region_tests;
 #[cfg(test)]
 #[path = "content_region/wide_tests.rs"]
 mod content_region_wide_tests;
-#[cfg(target_os = "android")]
+pub(crate) mod contrast;
+#[cfg(any(target_os = "android", test))]
 mod feed;
 mod height;
 mod height_drag;
@@ -83,12 +98,18 @@ mod hosted;
 mod images;
 mod links;
 mod palette;
-mod preferences;
+pub mod preferences;
+pub(crate) mod remote;
 mod requests;
 mod retained_action;
 mod reveal;
+#[cfg(test)]
+mod scroll_anchor_tests;
 mod scroll_end;
+mod scrollbar;
 mod scrollers;
+pub(crate) mod split;
+mod wheel;
 use scroll_end::Completion;
 #[cfg(all(test, not(windows)))]
 mod scroll_end_tests;
@@ -101,6 +122,8 @@ mod transform;
 mod transform_geometry;
 mod typing;
 mod window;
+#[cfg(windows)]
+mod word;
 
 #[cfg(test)]
 mod collection_tests;
@@ -109,6 +132,8 @@ mod events_tests;
 #[cfg(test)]
 mod kept_rows_tests;
 #[cfg(test)]
+mod longpoll_tests;
+#[cfg(test)]
 mod spacing_tests;
 #[cfg(test)]
 mod swipe_tests;
@@ -116,13 +141,15 @@ mod swipe_tests;
 mod visibility_tests;
 
 pub use clock::{wall_since, Wall};
-pub use device::Device;
+pub use device::{touch_only, Device, Pointing};
 pub use hosted::action as field_action;
 use painter::cpu_info;
 pub(crate) use painter::PainterBoot;
+#[cfg(target_os = "macos")]
+pub use painter::SubmittedAppleFrame;
 pub use painter::{set_custom_painter, PainterChoice, PainterFactory, PainterInfo};
 pub(crate) use palette::reported_accent;
-pub use palette::{Material, Palette, MATERIAL_ROLES};
+pub use palette::{material, ContrastPalette, Material, Palette, MATERIAL_ROLES};
 pub use pointer::PointerKind;
 pub use requests::{Haptic, Pick, Request};
 pub use scrollers::{Scroller, Under, PAGE};
@@ -131,13 +158,19 @@ pub use window::{Chrome, Window};
 /// The presenter: one host, its painter, and the host state.
 pub struct Presenter<D: DataSource> {
     /// Scrolled lists whose collection turn waits for the frame (see
-    /// [`Presenter::set_deferred_collections`]); `None` when turns run at once.
-    deferred_collections: Option<Vec<ViewId>>,
+    /// [`Presenter::set_deferred_collections`]), with whether input moved the
+    /// acknowledged offset; `None` when turns run at once.
+    deferred_collections: Option<Vec<(ViewId, bool)>>,
     pub(crate) host: Host<D>,
     /// The scroller the last wheel moved.
     last_wheel: Option<ViewId>,
     /// The display's clock while it owns time, given to every host (`clock.rs`)
     live_clock: Option<clock::Wall>,
+    native_timers: bool,
+    timers_hidden: bool,
+    clock_generation: u64,
+    timer_observations: Option<(bool, bool, bool)>,
+    idle_timer_retry: bool,
     pub(crate) surfaces: crate::surfaces::Surfaces,
     module: Option<crate::delivery::Module>,
     painted: bool,
@@ -155,8 +188,7 @@ pub struct Presenter<D: DataSource> {
     page: (f32, f32),
     images: Images,
     pub(crate) assets: Assets,
-    /// The binary's `compat.json` (LLP 1030 D3a), once handed over: a
-    /// reload boots a fresh runner, which is told again.
+    /// The binary's `compat.json`, also given to a fresh runner on reload (LLP 1030 D3a).
     pub(crate) compat: String,
     /// How many hosts this presenter has had: a frame sampler starts over
     /// when another replaces the one it measured (LLP 1079 D3).
@@ -166,12 +198,24 @@ pub struct Presenter<D: DataSource> {
     focus_out: Vec<(ViewId, Event)>,
     /// The current pointer press may yield its focus to a newly mounted field.
     pub(crate) autofocus_from: Option<ViewId>,
+    /// The controls commits disabled and blurred (`blur_disabled_focus`) since
+    /// a press began, so its fallback does not give its own the focus back.
+    pub(crate) disabled_blur: Vec<ViewId>,
     /// The text field typed into since it took the focus: its `change`
     /// fires on blur or Enter, HTML's commit (LLP 1069.001 D4).
     pub(crate) edited: Option<ViewId>,
     /// Each text field's selection (x2apps codeedit #2), kept for the value
     /// it indexes, focused or not: the next key there edits at it.
     pub(crate) fields: BTreeMap<ViewId, field::FieldMark>,
+    field_history: history::Histories,
+    field_drag: Option<field_pointer::Drag>,
+    ime: Option<ime::Composition>,
+    ime_epoch: u64,
+    field_reveal: bool,
+    window_active: bool,
+    window_focus: Option<exact_kernel::NodeKey>,
+    clipboard: Option<Box<dyn clipboard::Clipboard>>,
+    url_opener: Option<links::UrlOpener>,
     /// The modifier keys held, each side a bit (Shift, Control, Alt, Meta,
     /// left then right): a `key` event's flags (`KeyboardEvent.shiftKey`…).
     pub(crate) held: u8,
@@ -196,29 +240,34 @@ pub struct Presenter<D: DataSource> {
     /// Where the pointer last moved for hover (`hover_at`): a frame that
     /// moves content under it hovers again there (`follow_pointer`).
     hover_point: Option<(f32, f32)>,
-    /// The node holding the pointer's `pointerdown` until it lifts: the
-    /// innermost hearing a pointer event, which hears the moves.
+    /// The node holding the pointer's `pointerdown` until it lifts: the innermost hearing a pointer event, which hears the moves.
     pointer_held: Option<exact_kernel::NodeKey>,
+    /// Where the last pointer press was, its `clientX`/`clientY` (LLP 1021 D2).
+    pub(crate) press_point: Option<(f32, f32)>,
     /// The nodes from the held one up that hear `pointerdown` or
     /// `pointerup`, innermost first: each hears the up.
     pointer_path: Vec<exact_kernel::NodeKey>,
     /// During a pointer or wheel walk, a retired contact is cancelled when it
     /// ends so no other walk runs inside it ([`Presenter::retire_pointer`]).
     pointer_walking: bool,
-    /// The held pointer's buttons as DOM counts them: 1 primary, 2
-    /// secondary, 4 middle (review b5-b 1).
+    /// The held pointer's buttons as DOM counts them: 1 primary, 2 secondary, 4 middle (review b5-b 1).
     pointer_buttons: u8,
+    pub(crate) pads: crate::surfaces::controls::PadRoute,
     pub(crate) control_bindings: BTreeMap<(u32, u32), crate::surfaces::ControlBinding>,
     pub(crate) control_contact: Option<(ViewId, f32, f32)>,
     boxes: Vec<PaintedBox>,
     /// Bumped whenever `boxes` is replaced.
     boxes_serial: u64,
+    /// The fields `rangeFrame` reads, as painted beside `boxes`.
+    ranges: std::rc::Rc<range_frame::Painted>,
     pub(crate) dirty: bool,
+    pub(crate) image_paint_pending: bool,
     /// The app's `setScheme` (`None`: follow the system) and the appearance
     /// its shell or an agent says (LLP 1061 D5); light until either does.
     pub(crate) scheme: (Option<bool>, bool),
     /// The device's settings as its shell last told them (LLP 1115.001 D3.1).
     device: Option<Device>,
+    text_scale: f32,
     /// Pointer kind and drag slop: mouse and shared slop until a shell says (D7.4).
     pointer_kind: PointerKind,
     slop: f64,
@@ -263,9 +312,21 @@ pub struct Presenter<D: DataSource> {
     transform_geometry: transform_geometry::State,
     /// The update store, once the app opened one (LLP 1026 D9; `app.rs`).
     updates: Option<Box<dyn crate::delivery::Store>>,
-    /// The commands the last commits' actions asked for, for the loop that
-    /// runs them (`run_commands`).
+    /// Commands from the last commits, consumed by `run_commands`.
     commands: Vec<exact_runner::Command>,
+    /// The activation a router change asked a fragment's scroll for, and
+    /// the person's scrolls by then (`person_scrolls`: a wheel, a key, a
+    /// scrollbar, the reader's drag): one since cancels that scroll; the
+    /// last activation armed, so a router change seen again arms nothing;
+    /// then the target held in place while the pictures load (LLP 1153 D5;
+    /// `reveal.rs`).
+    fragment_armed: Option<(u64, u64)>,
+    fragment_seen: u64,
+    fragment_anchor: Option<(ViewId, u64)>,
+    person_scrolls: u64,
+    /// HTML's sequential focus navigation starting point: where Tab starts
+    /// from while nothing has the focus (a fragment's target).
+    focus_start: Option<ViewId>,
     /// Range replacement selects wait until the action's commands finish.
     field_select_tasks: Vec<ViewId>,
     field_change_tasks: std::collections::BTreeSet<ViewId>,
@@ -287,50 +348,6 @@ fn r2(x: f32) -> f64 {
     (x as f64 * 100.0).round() / 100.0
 }
 impl<D: DataSource> Presenter<D> {
-    /// Boot the app under a viewport (points) at a device scale, with its
-    /// asset root. The boot error, if any, is reported beside the presenter
-    /// (the tree is what booted).
-    pub fn boot(
-        plan: &[u8],
-        data: D,
-        viewport: (f32, f32),
-        scale: f32,
-        assets: PathBuf,
-    ) -> Result<(Presenter<D>, Option<String>), HostError> {
-        Presenter::boot_with(
-            plan,
-            data,
-            viewport,
-            scale,
-            assets,
-            PainterChoice::from_env(),
-        )
-    }
-
-    /// Boot with a chosen painter (`boot` reads `EXACT_PAINTER`).
-    pub fn boot_with(
-        plan: &[u8],
-        data: D,
-        viewport: (f32, f32),
-        scale: f32,
-        assets: PathBuf,
-        choice: PainterChoice,
-    ) -> Result<(Presenter<D>, Option<String>), HostError> {
-        let (mut presenter, error) = Self::boot_with_assets(
-            PlanBytes::Copied(plan),
-            data,
-            viewport,
-            scale,
-            Assets::embedded(assets),
-            PainterBoot::selected(choice),
-            None,
-            "/",
-            None,
-        )?;
-        presenter.measure();
-        Ok((presenter, error))
-    }
-
     /// Boot from entry zero or one selected generation. The selected asset
     /// roster is complete: absent names cannot fall through to `root`.
     #[allow(clippy::too_many_arguments)]
@@ -389,13 +406,35 @@ impl<D: DataSource> Presenter<D> {
                 .map_err(|e| HostError::Painter(format!("content raster context: {e:?}")))?;
         }
         let t = std::time::Instant::now();
-        let decoded = plan.decode().map_err(HostError::Plan)?;
-        let text = TextEngine::shared_for_assets(&decoded, &assets);
+        #[cfg(target_os = "macos")]
+        let painted_boot = matches!(plan, PlanBytes::Painted(..));
+        #[cfg(not(target_os = "macos"))]
+        let painted_boot = false;
+        let decoded =
+            crate::traced(c"boot plan decode", || plan.decode()).map_err(HostError::Plan)?;
+        #[cfg(any(windows, target_os = "macos"))]
+        crate::app::boot_phase(c"plan-ready");
+        #[cfg(windows)]
+        let preparing = painter.prepare_direct();
+        let text = crate::traced(c"boot fonts", || {
+            TextEngine::shared_for_assets(&decoded, &assets)
+        });
         if let Some(reason) = assets.take_refusal() {
             return Err(HostError::Asset(reason));
         }
         let fonts_ms = t.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(any(windows, target_os = "macos"))]
+        crate::app::boot_phase(c"fonts-ready");
+        #[cfg(windows)]
+        let opened = preparing
+            .is_none()
+            .then(|| painter.open())
+            .transpose()
+            .map_err(HostError::Painter)?;
+        #[cfg(not(windows))]
         let (backend, painter) = painter.open().map_err(HostError::Painter)?;
+        let mut images = Images::with_assets(assets.clone());
+        images.fit(viewport, scale);
         let (mut host, error) = Host::boot_decoded(
             decoded,
             data,
@@ -407,11 +446,16 @@ impl<D: DataSource> Presenter<D> {
             launch,
             region,
             Some(text.clone()),
+            (painted_boot && !assets.is_selected()).then_some((&mut images, scale)),
         )?;
         // @ref LLP 1115.000 D10.3 — a hairline is one device pixel of this.
         let error = error.or(host.set_display_scale(f64::from(scale)));
-        let mut images = Images::with_assets(assets.clone());
-        images.fit(viewport, scale);
+        #[cfg(windows)]
+        let (backend, painter) = match preparing {
+            Some(preparing) => PainterBoot::finish_direct(preparing.map_err(HostError::Painter)?)
+                .map_err(HostError::Painter)?,
+            None => opened.expect("synchronous painter"),
+        };
         if assets.is_selected() {
             if let Some(error) = error {
                 return Err(HostError::Layout(error));
@@ -461,8 +505,18 @@ impl<D: DataSource> Presenter<D> {
             focus: None,
             focus_out: Vec::new(),
             autofocus_from: None,
+            disabled_blur: Vec::new(),
             edited: None,
             fields: BTreeMap::new(),
+            field_history: Default::default(),
+            field_drag: None,
+            ime: None,
+            ime_epoch: 0,
+            field_reveal: false,
+            window_active: true,
+            window_focus: None,
+            clipboard: None,
+            url_opener: None,
             held: 0,
             shortcut_keys: Default::default(),
             controls: BTreeMap::new(),
@@ -474,18 +528,28 @@ impl<D: DataSource> Presenter<D> {
             hovered: Vec::new(),
             hover_point: None,
             pointer_held: None,
+            press_point: None,
             pointer_path: Vec::new(),
             pointer_walking: false,
             pointer_buttons: 0,
             control_contact: None,
+            pads: Default::default(),
             control_bindings: BTreeMap::new(),
             boxes: Vec::new(),
             boxes_serial: 0,
+            ranges: Default::default(),
             dirty: true,
+            image_paint_pending: false,
             deferred_collections: None,
             live_clock: None,
+            native_timers: false,
+            timers_hidden: false,
+            clock_generation: 0,
+            idle_timer_retry: false,
+            timer_observations: cfg!(target_os = "android").then_some((false, false, true)),
             scheme: (None, false),
             device: None,
+            text_scale: 1.0,
             pointer_kind: PointerKind::Mouse,
             slop: exact_motion::gesture::SLOP,
             window: Default::default(),
@@ -512,15 +576,21 @@ impl<D: DataSource> Presenter<D> {
             painter,
             updates: None,
             commands: Vec::new(),
+            fragment_armed: None,
+            fragment_seen: 0,
+            fragment_anchor: None,
+            person_scrolls: 0,
+            focus_start: None,
             field_select_tasks: Vec::new(),
             field_change_tasks: Default::default(),
-            agent: false,
+            agent: crate::app::AGENT_BOOT.get(),
             booting: true,
             content_registration: region,
             last_region_frame: None,
             last_region_scale: None,
             hatches: Default::default(),
         };
+        p.read_ranges();
         p.set_system_scheme(false);
         let e = p.after_commit();
         p.booting = false;
@@ -566,14 +636,23 @@ impl<D: DataSource> Presenter<D> {
             self.host.runner().delivery(),
             let_go,
         )?;
-        let (mut host, error) = Host::boot_with(
-            plan,
-            data,
-            Box::new(Measurer(candidate_text.clone())),
-            self.viewport.0,
-            self.viewport.1,
-            Some(&carried),
-            Some(self.host.runner().delivery().clone()),
+        let (mut host, error) = exact_runner::time::launching_with(
+            exact_runner::time::Launch {
+                time: Some(self.host.runner().wall_time()),
+                place: Some(self.host.runner().place().clone()),
+                ..exact_runner::time::Launch::NONE
+            },
+            || {
+                Host::boot_with(
+                    plan,
+                    data,
+                    Box::new(Measurer(candidate_text.clone())),
+                    self.viewport.0,
+                    self.viewport.1,
+                    Some(&carried),
+                    Some(self.host.runner().delivery().clone()),
+                )
+            },
         )?;
         if let Some(error) = error {
             return Err(HostError::Layout(error));
@@ -595,7 +674,12 @@ impl<D: DataSource> Presenter<D> {
         self.module = module;
         self.text = candidate_text.clone();
         self.brush.text = candidate_text;
+        // The old executor lets go of everything, then says which uploads had
+        // begun to go out; the rest never left (LLP 1016.000 D10).
+        self.executor.forget(|_| false);
+        let started = self.executor.let_go_started(|_| false);
         self.executor = self.host.executor();
+        self.host.runner_mut().uploads_started(&started);
         self.parked.clear();
         self.scroll.clear();
         self.collection = collection::State::default();
@@ -667,11 +751,6 @@ impl<D: DataSource> Presenter<D> {
         self.dirty
     }
 
-    /// The last frame's (paint, readback) milliseconds; CPU readback is zero.
-    pub fn last_frame_ms(&self) -> Option<(f64, f64)> {
-        self.brush.last_frame_ms()
-    }
-
     /// Where the pointer is drawn (`None` draws none).
     pub fn set_pointer(&mut self, pointer: Option<(f32, f32)>) {
         if self.pointer != pointer {
@@ -703,6 +782,7 @@ impl<D: DataSource> Presenter<D> {
             return error;
         }
         let geometry_changed = self.viewport != (width, height);
+        self.field_reveal |= geometry_changed;
         self.dirty |= geometry_changed;
         self.viewport = (width, height);
         self.images.fit(self.viewport, self.brush.scale);
@@ -723,20 +803,28 @@ impl<D: DataSource> Presenter<D> {
     fn finish_commit(&mut self) -> Option<String> {
         let error = self.service_commit();
         self.size_controls();
-        self.queue_collections();
+        // This turn consumes the reports now. Only refinement left over may
+        // wake another turn; waking here makes an idle list redraw forever.
+        self.schedule_collections();
         let refined = crate::traced(c"exact refine collections", || self.refine_collections());
         let geometry = self.refresh_transform_geometry();
         self.sync_surface();
         error.or(refined).or(geometry)
     }
-
     // Collection feedback calls this directly: never recurse through refinement.
     fn sync_commit(&mut self) -> Option<String> {
         self.dirty = true;
         self.service_commit()
     }
-
     fn service_commit(&mut self) -> Option<String> {
+        self.sync_split();
+        // A resource refused, a request or a send failed (LLP 1142 D4): on
+        // stderr as well as in the journal. The runner queues none unless it
+        // measures, so a production binary prints none.
+        for line in self.host.runner().take_alerts() {
+            eprintln!("exact: {line}");
+        }
+        self.restore_scroll_anchors();
         self.alert_sync();
         // What the commit asked the host to run goes to the executor (LLP
         // 1016 D2); the reply comes back through `pump`. Its commands wait
@@ -745,8 +833,14 @@ impl<D: DataSource> Presenter<D> {
         // A continuation is dispatched here, on this thread, after the
         // commit that handed it out (LLP 1027.002 D3); one a source holds
         // is parked and released after a later commit.
+        // An app's aborted fetches first (any method), then what the runner let go.
+        self.executor
+            .cancel(&self.host.runner_mut().take_explicit_aborts());
         self.executor
             .forget(|ticket| self.host.runner().holds(ticket));
+        // Of the uploads it let go, which had begun to go out (LLP 1016.000 D10).
+        let started = (self.executor).let_go_started(|ticket| self.host.runner().holds(ticket));
+        self.host.runner_mut().uploads_started(&started);
         if !self.host.has_ordered_request_refusals() {
             for (ticket, reason) in self.executor.resume_ordered() {
                 self.host.refuse_request(ticket, reason, true);
@@ -758,9 +852,14 @@ impl<D: DataSource> Presenter<D> {
         self.sync_field_values();
         let admitted = self.host.grants();
         for r in self.host.take_requests() {
-            // A deadline the surface and auth paths can't keep: the executor
+            // A deadline the surface and auth paths can't keep, or a long poll
+            // on work that is no HTTP request (LLP 1016.000 D8): the executor
             // refuses it at admission, fencing later ordered work.
-            if r.request.timeout_refusal().is_some() {
+            if r.request
+                .timeout_refusal()
+                .or(r.request.long_poll_refusal())
+                .is_some()
+            {
                 self.run_dispatch(r, exact_runner::Dispatch::Missing);
                 continue;
             }
@@ -768,11 +867,11 @@ impl<D: DataSource> Presenter<D> {
                 self.surfaces.enqueue(r, &admitted);
                 continue;
             }
-            // No system browser here (LLP 1069.006 D5): 501, delivered by
-            // the next pump as an admission answer.
+            // No system browser here (LLP 1069.006 D5): 501, delivered by the next pump as an
+            // admission answer; under the agent it is held, as on every host (LLP 1146 D4).
             if r.request.is_auth() {
-                let runner = self.host.runner_mut();
-                exact_runner::auth::arm(runner, &r, false, exact_runner::auth::Browser::None, None);
+                let (agent, none) = (self.agent, exact_runner::auth::Browser::None);
+                exact_runner::auth::arm(self.host.runner_mut(), &r, agent, none, None);
                 self.executor.notify();
                 continue;
             }
@@ -790,12 +889,36 @@ impl<D: DataSource> Presenter<D> {
                 self.run_dispatch(r, dispatch);
             }
         }
+        // An abort made in this batch's turns is answered at the next pump: wake it.
+        if self.host.runner_mut().collected_aborts() {
+            self.executor.notify();
+        }
+        // The platform's checks for presence calls: the shell's (LLP 1133.010 D8).
+        for ask in self.host.runner_mut().take_presence_asks() {
+            match self.has_shell() {
+                true => _ = self.request(requests::Request::Presence(ask.json())),
+                false => self.host.runner_mut().presence_answer(
+                    ask.id,
+                    exact_runner::presence::PresenceAnswer::Failed(
+                        "NotSupportedError".into(),
+                        "this host has no shell to check the person".into(),
+                    ),
+                ),
+            }
+        }
         // Socket frames of the commits that stood (LLP 1016.000 D7).
         let executor = &self.executor;
         self.host
             .runner_mut()
             .publish_sockets(|batch| executor.socket(batch));
         let commands = self.host.take_commands();
+        if let Some(activation) = (self.host.router_op())
+            .map(|op| op.activation)
+            .filter(|a| *a > self.fragment_seen)
+        {
+            self.fragment_seen = activation;
+            self.fragment_armed = Some((activation, self.person_scrolls));
+        }
         if !commands.is_empty() {
             self.commands.extend(commands);
             self.executor.notify();
@@ -878,9 +1001,20 @@ impl<D: DataSource> Presenter<D> {
             return None;
         }
         for id in &renewed {
+            self.ime_forget(*id);
+            self.field_history.invalidate(*id);
+            if self.window_focus.is_some_and(|key| {
+                self.host
+                    .kernel()
+                    .node_by_key(key)
+                    .is_some_and(|n| n.id == *id)
+            }) {
+                self.window_focus = None;
+            }
             self.scroll_end.forget(*id);
             self.dirty |= self.scroll.remove(id).is_some();
         }
+        self.renew_scroll_anchors(&renewed);
         self.hosted_renewed(&renewed);
         self.hatches.renewed.extend(&renewed);
         let reports = self.images.renew(self.host.kernel(), &renewed);
@@ -892,12 +1026,14 @@ impl<D: DataSource> Presenter<D> {
     }
 
     fn clamp_scroll(&mut self) -> bool {
-        let collection_limits = self.collection_scroll_limits();
+        self.restore_scroll_anchors();
+        let (collection_limits, held) = (self.collection_scroll_limits(), self.hidden_scrollers());
         let kernel = self.host.kernel();
         let region = self.host.content_region();
         let mut gone = Vec::new();
+        let mut clamped = Vec::new();
         let mut changed = false;
-        for (id, off) in self.scroll.iter_mut() {
+        for (id, off) in self.scroll.iter_mut().filter(|(id, _)| !held.contains(*id)) {
             match kernel.node(*id) {
                 Some(n) => {
                     let next = self
@@ -912,11 +1048,17 @@ impl<D: DataSource> Presenter<D> {
                             )
                         })
                         .clamp(*off);
-                    changed |= *off != next;
+                    if *off != next {
+                        clamped.push((*id, *off, next));
+                        changed = true;
+                    }
                     *off = next;
                 }
                 None => gone.push(*id),
             }
+        }
+        for (id, before, after) in clamped {
+            self.rebase_clamped_anchor(id, before, after);
         }
         changed |= !gone.is_empty();
         for id in gone {
@@ -927,25 +1069,15 @@ impl<D: DataSource> Presenter<D> {
         let page = self.page;
         self.page.0 = self.page.0.clamp(0.0, (doc.0 - viewport.0).max(0.0));
         self.page.1 = self.page.1.clamp(0.0, (doc.1 - viewport.1).max(0.0));
+        self.rebase_clamped_anchor(PAGE, page, self.page);
         self.publish_scroll();
         changed || self.page != page
-    }
-
-    /// Tell the runner where every scroller and the page stand, for
-    /// `frame()` (LLP 1051.000 D1): after a clamp, and wherever a scroll
-    /// moves geometry (`refresh_transform_geometry`).
-    pub(crate) fn publish_scroll(&mut self) {
-        let runner = self.host.runner_mut();
-        runner.scrolled(None, f64::from(self.page.0), f64::from(self.page.1));
-        for (id, (left, top)) in &self.scroll {
-            runner.scrolled(Some(*id), f64::from(*left), f64::from(*top));
-        }
     }
 
     /// Every node's painted box, in paint order (a fresh frame when stale).
     pub fn boxes(&mut self) -> &[PaintedBox] {
         if self.dirty && !self.display.attached() {
-            let _ = self.frame();
+            let _ = self.frame_for(crate::paint::FrameTarget::Geometry);
         }
         &self.boxes
     }
@@ -956,6 +1088,28 @@ impl<D: DataSource> Presenter<D> {
             .iter()
             .find(|b| b.id == id && self.display.allows(self.host.kernel(), id))
             .copied()
+            .or_else(|| {
+                self.inline_box(id)
+                    .filter(|_| self.display.allows(self.host.kernel(), id))
+            })
+    }
+
+    /// How far scroll container `id`'s offset travels on each axis (LLP 1012 `rx`/`ry`): the bounds its offset is
+    /// clamped to, as `clamp_scroll` reads them.
+    fn scroll_range(&self, id: ViewId, collection_limits: &BTreeMap<ViewId, f32>) -> (f32, f32) {
+        let kernel = self.host.kernel();
+        let Some(node) = kernel.node(id) else {
+            return (0., 0.);
+        };
+        let bounds = self.display.bounds(kernel, id).unwrap_or_else(|| {
+            self.brush.scroll_bounds(
+                kernel,
+                self.host.content_region(),
+                &node,
+                collection_limits.get(&id).copied(),
+            )
+        });
+        (bounds.max.0.max(0.), bounds.max.1.max(0.))
     }
 
     /// The agent's `layout`: every node's box in the viewport (scroll
@@ -999,6 +1153,7 @@ impl<D: DataSource> Presenter<D> {
             );
         }
         s.push_str("]},\"nodes\":[");
+        let limits = self.collection_scroll_limits();
         for (i, b) in boxes.iter().enumerate() {
             if i > 0 {
                 s.push(',');
@@ -1013,7 +1168,15 @@ impl<D: DataSource> Presenter<D> {
                 num(r2(b.rect.3))
             );
             if let Some((sx, sy)) = b.scroll {
-                let _ = write!(s, ",\"sx\":{},\"sy\":{}", num(r2(sx)), num(r2(sy)));
+                let (rx, ry) = self.scroll_range(b.id, &limits);
+                let _ = write!(
+                    s,
+                    ",\"sx\":{},\"sy\":{},\"rx\":{},\"ry\":{}",
+                    num(r2(sx)),
+                    num(r2(sy)),
+                    num(r2(rx)),
+                    num(r2(ry))
+                );
             }
             s.push('}');
         }
@@ -1076,9 +1239,9 @@ impl<D: DataSource> Presenter<D> {
                 .filter(|s| s.starts_with("symbol:"))
             {
                 let name = &source[7..];
-                let reason = if name == "sf/" {
+                let reason = if name == "sf/" || name.is_empty() {
                     "empty"
-                } else if !name.starts_with("sf/") && exact_kernel::symbol(name).is_none() {
+                } else if !name.starts_with("sf/") && exact_kernel::symbol_path(name).is_none() {
                     "role"
                 } else {
                     "platform"
@@ -1113,11 +1276,28 @@ impl<D: DataSource> Presenter<D> {
 
     /// The deepest painted box under a point (viewport points), through every clip.
     pub fn hit(&mut self, x: f32, y: f32) -> Option<ViewId> {
+        self.hit_with_visibility(x, y, false)
+    }
+
+    /// Ordinary mouse releases use current CSS eligibility even before the
+    /// next display flip. Retained regions keep their picture's hit policy.
+    pub(super) fn hit_after_pointerdown(&mut self, x: f32, y: f32) -> Option<ViewId> {
+        self.hit_with_visibility(x, y, true)
+    }
+
+    fn hit_with_visibility(&mut self, x: f32, y: f32, current: bool) -> Option<ViewId> {
         // Under an open surface of the top layer the page is inert.
         if !self.display.contains(x, y) || (self.top_open() && self.alert.is_none()) {
             return None;
         }
         self.boxes();
+        self.painted_hit(x, y, current)
+            .map(|id| self.inline_hit(id, x, y).unwrap_or(id))
+    }
+
+    /// The deepest box of the latest paint under a point, as [`Self::hit`]
+    /// finds it once the boxes are fresh and the page takes a press.
+    pub(super) fn painted_hit(&self, x: f32, y: f32, current: bool) -> Option<ViewId> {
         self.boxes
             .iter()
             .rev()
@@ -1128,142 +1308,17 @@ impl<D: DataSource> Presenter<D> {
                     && !self.host.route_visibility(b.id).1
                     && self.display.allows(self.host.kernel(), b.id)
             })
-            .find_map(|b| self.svg_hit(b, x, y))
-    }
-
-    /// A wheel at a point (the web's sign: a positive `dy` scrolls down).
-    /// A phase-less tick is its own gesture and is not split (LLP 1070 G2,
-    /// Chrome's measured tick): the innermost scroll container under the point
-    /// that can take ANY of its components takes those it can, clamped, and
-    /// the rest is dropped. One that can take none chains to the next scroller
-    /// up, then the page, unless its `overscroll-behavior` is `contain` or
-    /// `none` on an axis the tick moves along: it keeps (drops) the tick.
-    pub fn wheel_at(&mut self, x: f32, y: f32, dx: f32, dy: f32) {
-        if ![x, y, dx, dy].iter().all(|v| v.is_finite())
-            || (dx == 0.0 && dy == 0.0)
-            || !self.display.contains(x, y)
-        {
-            return;
-        }
-        if self.alert.is_some() && self.hit(x, y).is_none() {
-            return;
-        }
-        // A canvas that wants input takes the wheel, and the nodes' own
-        // `wheel` is still heard (review b5-b 2), as the web's element hears it.
-        let canvas = self.surface_wheel(x, y, dx, dy, self.pointer_now());
-        if self.wheel_event(x, y, dx, dy) || canvas {
-            return;
-        }
-        // A UI wheel can take over a UI gesture, but does not release a game's
-        // captured pointer. Browser wheel events do not end pointer capture.
-        if self.contact_canvas().is_none() {
-            if let Err(error) = self.pointer_cancel(self.pointer_now()) {
-                self.host.log(error);
-            }
-        }
-        let mut at = self.hit(x, y);
-        // Only a node the display has no bounds for needs the collections'.
-        let mut collection_limits = None;
-        let kernel = self.host.kernel();
-        while let Some(id) = at {
-            let Some(node) = kernel.node(id) else { break };
-            let bounds = self.display.bounds(kernel, id).unwrap_or_else(|| {
-                let limits =
-                    collection_limits.get_or_insert_with(|| self.collection_scroll_limits());
-                self.brush.scroll_bounds(
-                    kernel,
-                    self.host.content_region(),
-                    &node,
-                    limits.get(&id).copied(),
-                )
-            });
-            let (ox, oy) = bounds.axes;
-            if matches!(ox, Overflow::Scroll | Overflow::Auto)
-                || matches!(oy, Overflow::Scroll | Overflow::Auto)
-            {
-                let max = bounds.max;
-                let off = self.scroll.get(&id).copied().unwrap_or((0.0, 0.0));
-                let takes = |scrolls: bool, d: f32, off: f32, max: f32| {
-                    scrolls
-                        && d != 0.0
-                        && max > 0.0
-                        && ((d > 0.0 && off < max) || (d < 0.0 && off > 0.0))
-                };
-                let take_x = takes(
-                    matches!(ox, Overflow::Scroll | Overflow::Auto),
-                    dx,
-                    off.0,
-                    max.0,
-                );
-                let take_y = takes(
-                    matches!(oy, Overflow::Scroll | Overflow::Auto),
-                    dy,
-                    off.1,
-                    max.1,
-                );
-                if take_x || take_y {
-                    let nx = if take_x {
-                        (off.0 + dx).clamp(0.0, max.0)
-                    } else {
-                        off.0
-                    };
-                    let ny = if take_y {
-                        (off.1 + dy).clamp(0.0, max.1)
-                    } else {
-                        off.1
-                    };
-                    self.scroll.insert(id, (nx, ny));
-                    if (nx, ny) != off {
-                        self.scroll_end_moved(id, Completion::Instant);
-                    }
-                    self.last_wheel = Some(id);
-                    self.dirty = true;
-                    self.collection_scrolled_or_deferred(id);
-                    if let Some(error) = self.refresh_transform_geometry() {
-                        self.host.log(error);
-                    }
-                    return;
+            .find_map(|b| {
+                let mut hit = *b;
+                if current && !self.brush.region_blocks_action(b.id) {
+                    let node = self.host.kernel().node(b.id)?;
+                    hit.pointer_hit = node
+                        .computed_row(exact_kernel::StyleId::PointerEvents, |s| s.pointer_events)
+                        != exact_kernel::PointerEvents::None
+                        && crate::paint::paints(self.host.kernel(), b.id, None);
                 }
-                // At its edge (or with no travel) along every component the
-                // tick has: a contained axis ends the chain here.
-                let contained = |b: exact_kernel::OverscrollBehavior| {
-                    b != exact_kernel::OverscrollBehavior::Auto
-                };
-                if (dx != 0.0 && contained(node.style.overscroll_behavior_x))
-                    || (dy != 0.0 && contained(node.style.overscroll_behavior_y))
-                {
-                    return;
-                }
-            }
-            // An SVG element (what a hit on a shape names, LLP 1055.000 D8)
-            // has no display box: it scrolls with its `svg`'s ancestors.
-            if self.alert_root() == Some(id) {
-                return;
-            }
-            at = self.display.parent(kernel, id).or_else(|| {
-                node.node_type
-                    .is_svg_element()
-                    .then_some(node.parent)
-                    .flatten()
-            });
-        }
-        if self.alert.is_some() {
-            return;
-        }
-        let doc = self.document();
-        let viewport = self.display.viewport().unwrap_or(self.viewport);
-        let max = ((doc.0 - viewport.0).max(0.0), (doc.1 - viewport.1).max(0.0));
-        let next = (
-            (self.page.0 + dx).clamp(0.0, max.0),
-            (self.page.1 + dy).clamp(0.0, max.1),
-        );
-        if next != self.page {
-            self.page = next;
-            self.dirty = true;
-            if let Some(error) = self.refresh_transform_geometry() {
-                self.host.log(error);
-            }
-        }
+                self.svg_hit(&hit, x, y)
+            })
     }
 
     /// The agent's wheel: over the node's center.
@@ -1307,50 +1362,6 @@ impl<D: DataSource> Presenter<D> {
         Ok(format!("{{\"tapped\":{id},\"into\":true}}"))
     }
 
-    /// The executor's replies into the runner (LLP 1016 D2), each a
-    /// commit: the display loop calls this when the executor's fd is
-    /// readable, the agent when it waits. `None` when nothing was queued.
-    pub fn pump(&mut self, now_ms: f64) -> Option<String> {
-        let region_error = self.poll_content_region();
-        self.executor.begin_pump();
-        let region_error = region_error.or(self.dispatch_authored_scroll());
-        self.refusal_turn = !self.refusal_turn;
-        let mut outcomes = if self.refusal_turn {
-            self.host
-                .take_request_refusal(self.executor.ordered_idle())
-                .into_iter()
-                .map(|(ticket, outcome)| (ticket, outcome, None))
-                .collect()
-        } else {
-            self.executor.drain()
-        };
-        if outcomes.is_empty() {
-            outcomes = if self.refusal_turn {
-                self.executor.drain()
-            } else {
-                self.host
-                    .take_request_refusal(self.executor.ordered_idle())
-                    .into_iter()
-                    .map(|(ticket, outcome)| (ticket, outcome, None))
-                    .collect()
-            };
-        }
-        if self.host.has_request_refusals(self.executor.ordered_idle()) {
-            self.executor.notify();
-        }
-        if outcomes.is_empty() && !self.host.has_announced() {
-            let refined = self.refine_collections();
-            return region_error
-                .or(refined)
-                .or(self.refresh_transform_geometry())
-                .or(self.deliver_scroll_ends());
-        }
-        let e = self.host.fulfill_all(outcomes, now_ms);
-        let after = self.after_commit();
-        let ends = self.deliver_scroll_ends();
-        region_error.or(e).or(after).or(ends)
-    }
-
     /// The executor's wake: readable when a reply is queued (for `poll`).
     #[cfg(unix)]
     pub fn executor_fd(&self) -> std::os::unix::io::RawFd {
@@ -1370,6 +1381,7 @@ impl<D: DataSource> Presenter<D> {
 
     /// Another host took over: it is measured as the last was, and counted.
     pub(crate) fn replaced(&mut self) {
+        self.read_ranges();
         self.scroll_end = Default::default();
         self.give_clock();
         // A new kernel may have the same epoch.
@@ -1382,13 +1394,17 @@ impl<D: DataSource> Presenter<D> {
         self.controls.clear();
         self.edited = None;
         self.fields.clear();
+        self.field_drag = None;
+        self.field_history = Default::default();
+        self.ime = None;
+        self.window_focus = None;
         self.menu = None;
         self.hovered.clear();
         self.pointer_held = None;
         self.pointer_path.clear();
         self.hatch_reset();
         self.top_replaced();
-        self.wakelock_replaced();
+        self.holds_changed();
         self.hosts += 1;
         self.measure();
     }
@@ -1412,35 +1428,14 @@ impl<D: DataSource> Presenter<D> {
         e.or(after)
     }
 
-    /// The runner's clock (timers), from the presenter's loop.
-    pub fn advance(&mut self, now_ms: f64) -> Option<String> {
-        let (e, paint) = self.host.advance_effects(now_ms);
-        self.dirty |= paint;
-        let after = self.finish_commit();
-        self.hatch_timers(now_ms);
-        let ends = self.deliver_scroll_ends();
-        e.or(after).or(ends)
-    }
-
-    /// A display frame for the frame tasks (LLP 1073 D5): timers due by
-    /// `now_ms`, then every frame task once at it.
-    pub fn animation_frame(&mut self, now_ms: f64) -> Option<String> {
-        let (e, paint) = self.host.frame(now_ms);
-        self.dirty |= paint;
-        let after = self.finish_commit();
-        self.hatch_presented(now_ms);
-        let ends = self.deliver_scroll_ends();
-        e.or(after).or(ends)
-    }
-
     /// A motion frame.
     pub fn tick(&mut self, now_ms: f64) {
-        let animating = self.host.motion()
-            || self.arrange.is_some()
+        let animating = self.arrange.is_some()
             || self.group.is_some()
             || self.focus.is_some()
             || self.brush.moving();
-        if self.host.tick(now_ms) {
+        let (layout, paint) = self.host.tick_effects(now_ms);
+        if layout {
             self.hatches.stale = true;
             self.dirty = true;
             self.clamp_scroll();
@@ -1453,23 +1448,7 @@ impl<D: DataSource> Presenter<D> {
         if let Some(error) = self.deliver_scroll_ends() {
             self.host.log(error);
         }
-        self.dirty |= animating;
-    }
-
-    /// The pixels, as a PNG at `path`.
-    pub fn screenshot(&mut self, path: &str) -> Result<String, String> {
-        let frame = self.frame();
-        let png = frame.encode_png().map_err(|e| format!("png: {e}"))?;
-        std::fs::write(path, png).map_err(|e| format!("write {path}: {e}"))?;
-        let mut s = String::from("{\"screenshot\":");
-        quote(path, &mut s);
-        let _ = write!(
-            s,
-            ",\"w\":{},\"h\":{}}}",
-            num(r2(self.viewport.0)),
-            num(r2(self.viewport.1))
-        );
-        Ok(s)
+        self.dirty |= paint || animating;
     }
 
     /// The box of a node, if painted.

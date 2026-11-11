@@ -42,13 +42,20 @@ pub(crate) trait Writes {
     fn opacity(&mut self, _: &[(u32, f32)]) {}
     /// Per record, 1 + its first merged part look (0: none), and those looks;
     /// set before `instances`.
-    fn part_looks(&mut self, _: &[u32], _: &[[f32; 8]]) {}
+    fn part_looks(&mut self, _: &[u32], _: &[crate::models::PartLook]) {}
     /// Each record's level of detail and the `ModelLod` entities; set before
     /// `instances`.
     fn levels(&mut self, _: &[u8], _: &[crate::lod::Lod]) {}
     /// Rewrite records `first..` looks in place (tint and glow), and part looks
     /// `part_first..` (starts relative to their meshes).
-    fn patch_looks(&mut self, _: usize, _: &[crate::DrawInstance], _: usize, _: &[[f32; 8]]) {}
+    fn patch_looks(
+        &mut self,
+        _: usize,
+        _: &[crate::DrawInstance],
+        _: usize,
+        _: &[crate::models::PartLook],
+    ) {
+    }
     fn model_poses(
         &mut self,
         _: &World,
@@ -116,6 +123,7 @@ impl<const ASSETS: bool> Writes for crate::renderer::RendererWithAssets<ASSETS> 
                     merged: &m.merged,
                     members: &m.members,
                     starts: &m.starts,
+                    parts: &m.parts,
                     materials: &m.materials,
                     custom: &self.models.custom,
                 })
@@ -131,7 +139,7 @@ impl<const ASSETS: bool> Writes for crate::renderer::RendererWithAssets<ASSETS> 
             self.rebind();
         }
     }
-    fn part_looks(&mut self, bases: &[u32], looks: &[[f32; 8]]) {
+    fn part_looks(&mut self, bases: &[u32], looks: &[crate::models::PartLook]) {
         let part_looks = &mut self.models.pending_looks;
         part_looks.0.clear();
         part_looks.0.extend_from_slice(bases);
@@ -143,7 +151,7 @@ impl<const ASSETS: bool> Writes for crate::renderer::RendererWithAssets<ASSETS> 
         first: usize,
         records: &[crate::DrawInstance],
         part_first: usize,
-        looks: &[[f32; 8]],
+        looks: &[crate::models::PartLook],
     ) {
         if ASSETS {
             self.patch_draw_looks(first, records, part_first, looks);
@@ -233,22 +241,28 @@ impl<const ASSETS: bool> Writes for crate::renderer::RendererWithAssets<ASSETS> 
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Shape {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Shape {
     Box,
     Sphere,
     Cylinder,
     Plane,
     Capsule,
+    Ring(u32),
+    Torus(u32),
+    Cone,
 }
 impl Shape {
-    fn of(mesh: &Mesh) -> Result<Self, RenderError> {
+    pub(super) fn of(mesh: &Mesh) -> Result<Self, RenderError> {
         Ok(match mesh {
             Mesh::Box { .. } => Self::Box,
             Mesh::Sphere { .. } => Self::Sphere,
             Mesh::Cylinder { .. } => Self::Cylinder,
             Mesh::Plane { .. } => Self::Plane,
             Mesh::Capsule { .. } => Self::Capsule,
+            Mesh::Ring { inner, outer } => Self::Ring((inner / outer).to_bits()),
+            Mesh::Torus { radius, tube } => Self::Torus((tube / radius).to_bits()),
+            Mesh::Cone { .. } => Self::Cone,
             Mesh::Asset(name) => {
                 return Err(RenderError::Scene(format!(
                     "Mesh.Asset({name}): asset meshes are not implemented"
@@ -256,13 +270,16 @@ impl Shape {
             }
         })
     }
-    fn geometry(self) -> (Vec<Vertex>, Vec<u32>) {
+    pub(super) fn geometry(self) -> (Vec<Vertex>, Vec<u32>) {
         let (mut vertices, indices) = match self {
             Self::Box => shapes::cube(),
             Self::Sphere => shapes::sphere(24),
             Self::Cylinder => shapes::cylinder(24),
             Self::Plane => shapes::plane(),
             Self::Capsule => shapes::capsule(0.5, 2.0, 24),
+            Self::Ring(ratio) => shapes::ring(f32::from_bits(ratio) * 0.5, 0.5, 48),
+            Self::Torus(ratio) => shapes::torus(0.5, f32::from_bits(ratio) * 0.5, 48),
+            Self::Cone => shapes::cone(0.5, 1., 32),
         };
         let half = vertices.len() / 2;
         for (i, v) in vertices.iter_mut().enumerate() {
@@ -277,13 +294,16 @@ impl Shape {
         (vertices, indices)
     }
 }
-fn dimensions(mesh: &Mesh) -> [f32; 3] {
+pub(super) fn dimensions(mesh: &Mesh) -> [f32; 3] {
     match mesh {
         Mesh::Box { size } => size.to_array(),
         Mesh::Sphere { radius } => [2.0 * radius; 3],
         Mesh::Cylinder { radius, height } => [2.0 * radius, *height, 2.0 * radius],
         Mesh::Plane { width, depth } => [*width, 1.0, *depth],
         Mesh::Capsule { radius, height } => [2.0 * radius, height * 0.5 - radius, 2.0 * radius],
+        Mesh::Ring { outer, .. } => [2. * outer, 1., 2. * outer],
+        Mesh::Torus { radius, .. } => [2. * radius; 3],
+        Mesh::Cone { radius, height } => [2. * radius, *height, 2. * radius],
         Mesh::Asset(_) => [1.0; 3], // Refused before any upload.
     }
 }
@@ -311,6 +331,7 @@ struct Versions {
     pose: u64,
     // Presentation offsets (exact_game::Offset) patch drawn poses like parents do.
     offset: u64,
+    node_offsets: u64,
     // Presentation tints (exact_game::Tint), by content for the same reason.
     tint: u64,
     live: u64,
@@ -376,7 +397,7 @@ fn offsets(w: &World) -> u64 {
 fn tints(w: &World) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for (e, t) in w.query::<&exact_game::Tint>().iter() {
-        let words = (t.color.iter().chain(&t.emissive))
+        let words = (t.color.0.iter().chain(&t.emissive))
             .map(|v| v.to_bits())
             .chain([e.index(), e.generation()]);
         for word in words {
@@ -389,11 +410,11 @@ fn tints(w: &World) -> u64 {
 /// spacing) multiplied, emission added.
 fn tinted(out: &mut [f32], t: &exact_game::Tint) {
     for c in 0..3 {
-        out[c] *= t.color[c];
+        out[c] *= t.color.0[c];
         out[6 + c] += t.emissive[c];
     }
     if out[3] >= 0. {
-        out[3] *= t.color[3];
+        out[3] *= t.color.0[3];
     }
 }
 impl Versions {
@@ -413,6 +434,7 @@ impl Versions {
             lod: w.revision::<exact_game::ModelLod>(),
             pose: w.revision::<exact_game::Pose>(),
             offset: offsets(w),
+            node_offsets: w.revision::<exact_game::NodeOffsets>(),
             tint: tints(w),
             live: w.entities_revision(),
             membership: w.membership::<Transform>(),
@@ -434,7 +456,7 @@ pub struct Feed {
     groups: Vec<Group>,
     shapes: BTreeMap<(Shape, bool), usize>,
     batches: Vec<Batch>,
-    draw_entities: Vec<(exact_game::Entity, bool)>,
+    draw_entities: Vec<(exact_game::Entity, bool, bool)>,
     visibility: visibility::Visibility,
     parent_changes: visibility::ParentChanges,
     slots: Vec<u32>,
@@ -510,6 +532,9 @@ impl Default for Feed {
     }
 }
 impl Feed {
+    pub(crate) fn retain_primes(&mut self, retain: bool) {
+        self.scene.attachments.retain_primes(retain);
+    }
     #[cfg(test)]
     pub(crate) fn attachment_diagnostics(&self) -> &scene::AttachmentDiagnostics {
         &self.scene.attachments.diagnostics
@@ -550,6 +575,20 @@ impl Feed {
         renderer: &mut crate::renderer::RendererWithAssets<ASSETS>,
     ) -> Result<(), RenderError> {
         self.feed_to(world, renderer)
+    }
+    /// Each primitive shape's mesh, named, for the look frame's draw listing.
+    pub(crate) fn shape_names(&self) -> Vec<(MeshId, String)> {
+        (self.shapes.iter())
+            .map(|((shape, viewmodel), &group)| {
+                let name = format!("{shape:?}").to_lowercase();
+                let name = if *viewmodel {
+                    name + " (viewmodel)"
+                } else {
+                    name
+                };
+                (self.groups[group].mesh, name)
+            })
+            .collect()
     }
     pub(crate) fn trace_camera(&self, alpha: f32) -> [f64; 3] {
         self.scene.trace_camera(alpha)
@@ -603,6 +642,7 @@ impl Feed {
             || next.parent != old.parent
             || next.pose != old.pose
             || next.offset != old.offset;
+        let node_offsets_changed = next.node_offsets != old.node_offsets;
         let material = initial
             || next.material != old.material
             || next.tint != old.tint
@@ -620,7 +660,7 @@ impl Feed {
             || next.lod != old.lod
             || next.live != old.live
             || next.membership != old.membership;
-        let draw_entities = if batches {
+        let draw_entities = if batches || next.material != old.material {
             // Entity/parent/visibility revisions include cameras, particles and
             // gameplay-only rows. Rebuild draw records only if their effective
             // membership changed, or a draw's own mesh/LOD/assets changed.
@@ -628,7 +668,14 @@ impl Feed {
             let entities: Vec<_> = w
                 .query::<(&Mesh, &Transform)>()
                 .iter()
-                .map(|(entity, _)| (entity, self.visibility.get(w, entity)))
+                .map(|(entity, _)| {
+                    (
+                        entity,
+                        self.visibility.get(w, entity),
+                        w.get::<Material>(entity)
+                            .is_some_and(|m| (0.0..1.0).contains(&m.color[3])),
+                    )
+                })
                 .collect();
             batches = initial
                 || next.assets != old.assets
@@ -671,12 +718,13 @@ impl Feed {
             let has_offsets = w.query::<&exact_game::Offset>().iter().next().is_some();
             let globals = w.globals();
             let world_pose = |e| {
-                if has_offsets {
-                    scene::drawn(w, e)
-                } else {
-                    globals.get(e)
-                }
-                .map(scene::decompose)
+                scene::primitive_endpoint(w, e, || {
+                    if has_offsets {
+                        scene::drawn(w, e)
+                    } else {
+                        globals.get(e)
+                    }
+                })
             };
             let rebuilt = initial
                 || parent_changed
@@ -839,7 +887,7 @@ impl Feed {
             }
             if !initial {
                 for &e in w.fresh() {
-                    if let Some(t) = world_pose(e) {
+                    if let Some(t) = scene::interpolation_origin(w, e).or_else(|| world_pose(e)) {
                         self.previous.push((e.index(), floats(t)));
                         self.transforms[1 - self.current].invalidate(e.index() as usize / PAGE);
                     }
@@ -861,7 +909,8 @@ impl Feed {
                             scene::snap(w, e, false)
                         }
                     {
-                        self.previous.push((e.index(), t));
+                        let previous = scene::interpolation_origin(w, e).map(floats).unwrap_or(t);
+                        self.previous.push((e.index(), previous));
                         self.transforms[1 - self.current].invalidate(e.index() as usize / PAGE);
                     }
                 }
@@ -909,7 +958,7 @@ impl Feed {
             for group in &mut self.groups {
                 group.slots.clear();
             }
-            for ((e, (mesh, _)), &(expected, visible)) in
+            for ((e, (mesh, _)), &(expected, visible, translucent)) in
                 w.query::<(&Mesh, &Transform)>().iter().zip(drawn)
             {
                 debug_assert_eq!(e, expected);
@@ -923,7 +972,7 @@ impl Feed {
                     self.dimensions.resize(slot + 1, [1.0; 3]);
                 }
                 self.dimensions[slot] = dimensions(mesh);
-                if !visible {
+                if !visible || translucent {
                     continue;
                 }
                 let viewmodel = w.has::<ViewModel>(e);
@@ -1054,7 +1103,7 @@ impl Feed {
             }
             r.batches(&self.batches, &self.slots)?;
         }
-        if !self.assets.records.is_empty() && (moved || batches || self.tick != w.tick()) {
+        if moved || node_offsets_changed || batches || self.tick != w.tick() {
             // Static instances cost nothing, parented or not: only blocks whose
             // local or propagated poses changed since the last pose step.
             changed_blocks(w, self.model_cursor, &mut self.changed_blocks);

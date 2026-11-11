@@ -79,6 +79,8 @@ package enum SystemColor {
                          tint resolvedTint: [Double]? = nil, tintColor: PlatformColor? = nil, fallback: [Double]?) -> [Double]? {
         let contrast = contrast ?? highContrast
         #if os(macOS)
+        // The grouped-card metric carries its identity until its window is known.
+        if name == "exactGroupedCardColor" { return dark && elevated ? [255, 255, 255, 8] : fallback }
         if selectedItem, Thread.isMainThread, let share = selectedInk[name],
            var c = rgba(.alternateSelectedControlTextColor, dark: dark, contrast: contrast) { c[3] *= share; return c }
         #endif
@@ -117,7 +119,7 @@ package enum SystemColor {
     /// The platform's own colour a row names (`{"sys": "systemTealColor"}`),
     /// which the platform resolves for each trait itself; nil for any other row.
     static func native(_ row: BatchValue?) -> PlatformColor? {
-        guard case .object(let o)? = row, let name = o["sys"]?.string, !name.hasPrefix("@") else { return nil }
+        guard case .object(let o)? = row, let name = o["sys"]?.string, !name.hasPrefix("@"), name != "exactGroupedCardColor" else { return nil }
         return lookup(name)
     }
 
@@ -234,14 +236,13 @@ package enum SystemColor {
 
 #if os(iOS) || os(tvOS)
 extension SystemColor {
-    /// The traits a platform colour resolves by: style, contrast and, on
-    /// iOS, the level (tvOS has none).
-    static var traits: [UITrait] {
+    /// Whether a platform colour resolves differently under `b` than under
+    /// `a`: by style, contrast and, on iOS, the level (tvOS has none).
+    static func resolvesDifferently(_ a: UITraitCollection, _ b: UITraitCollection) -> Bool {
         #if os(iOS)
-        return [UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self, UITraitUserInterfaceLevel.self]
-        #else
-        return [UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]
+        if a.userInterfaceLevel != b.userInterfaceLevel { return true }
         #endif
+        return a.userInterfaceStyle != b.userInterfaceStyle || a.accessibilityContrast != b.accessibilityContrast
     }
 }
 #endif
@@ -268,7 +269,7 @@ extension NodeView {
     }
     var viewTint: PlatformColor? {
         #if os(iOS) || os(tvOS)
-        return tintColor
+        return paintedTint
         #else
         return nearestAccent
         #endif
@@ -280,10 +281,11 @@ extension NodeView {
         tintPadBar()
         // An `svg`'s paints are resolved into its scene's layers.
         if kind == "svg" { presenter?.svg.reappear(id, dark: drawsDark, clock: presenter?.session?.clock, tint: viewTint) }
-        // A symbol counts: hierarchical and palette glyphs bake the tint in.
-        guard style.values.contains(where: \.namesTint) || inlineText.contains(where: \.namesTint) || symbolView != nil else { return }
-        paragraphOwner.invalidateText(); paragraphOwner.setNeedsDisplay()
-        applyStyle(style)
+        // A symbol counts: hierarchical and palette glyphs bake the tint in. In a control, every
+        // colour greys with the tint (TintDimmingIOS.swift).
+        guard style.values.contains(where: \.namesTint) || inlineText.contains(where: \.namesTint) || symbolView != nil || insideControl else { return }
+        repaintWithTint()
+        presenter?.controls.tintChanged(self)
     }
 
     /// An authored `accent-color` is its subtree's tint (LLP 1116.001 D2),
@@ -292,12 +294,13 @@ extension NodeView {
     /// `LinkText`, a symbol's default) resolves by it (`ownTint`). `auto`, or
     /// an accent that names the tint itself, leaves the inherited one.
     /// Called when the row changes; nothing else sets a node view's tint.
-    func applyAccentTint() {
-        guard style["accent_color"]?.namesTint != true, channels("accent_color", dark: false) != nil else {
-            tintColor = nil
-            return
-        }
-        tintColor = UIColor { [weak self] traits in
+    func applyAccentTint() { tintColor = authoredAccentTint }
+
+    /// The tint this node's authored `accent-color` gives its subtree, in each appearance as the
+    /// row resolves; nil for none, `auto`, or an accent that names the tint itself
+    var authoredAccentTint: UIColor? {
+        guard style["accent_color"]?.namesTint != true, channels("accent_color", dark: false) != nil else { return nil }
+        return UIColor { [weak self] traits in
             self?.channels("accent_color", dark: traits.userInterfaceStyle == .dark).map { TextEngine.color($0) } ?? .systemBlue
         }
     }

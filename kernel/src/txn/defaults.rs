@@ -12,7 +12,7 @@ pub(super) fn before_prop(
     }
     match prop {
         PropId::SemanticTag => std::iter::once(slot)
-            .chain(arena.children(slot).iter().copied())
+            .chain(rows(arena, slot))
             .map(|s| (s, arena.default_context(s)))
             .collect(),
         PropId::NavigationKey => arena
@@ -25,7 +25,10 @@ pub(super) fn before_prop(
         PropId::AccessibilityRole
         | PropId::AccessibilityControls
         | PropId::Type
-        | PropId::ButtonStyle => {
+        | PropId::ButtonStyle
+        | PropId::Popover
+        | PropId::DefaultSurface
+        | PropId::AlertPart => {
             let mut before = vec![(slot, arena.default_context(slot))];
             if let Some(parent) = arena.parent(slot) {
                 before.push((parent, arena.default_context(parent)));
@@ -39,19 +42,31 @@ pub(super) fn before_prop(
                     );
                 }
             }
-            if prop == PropId::AccessibilityRole {
-                before.extend(
-                    arena
-                        .children(slot)
-                        .iter()
-                        .copied()
-                        .map(|child| (child, arena.default_context(child))),
-                );
+            if matches!(prop, PropId::AccessibilityRole | PropId::AlertPart) {
+                before.extend(rows(arena, slot).map(|row| (row, arena.default_context(row))));
             }
             before
         }
         _ => Vec::new(),
     }
+}
+
+/// `slot`'s rows, whose defaults its tag, role or part decides: its
+/// children, and an alert's rows in its part boxes too (arena/alert.rs)
+fn rows(arena: &NodeArena, slot: u32) -> impl Iterator<Item = u32> + '_ {
+    arena.children(slot).iter().flat_map(move |&child| {
+        let parts = matches!(
+            arena.props(child).str(PropId::AlertPart),
+            Some("message" | "actions")
+        );
+        std::iter::once(child).chain(
+            parts
+                .then(|| arena.children(child))
+                .into_iter()
+                .flatten()
+                .copied(),
+        )
+    })
 }
 
 pub(super) fn after_prop(
@@ -75,7 +90,27 @@ pub(super) fn changed(
     receipt: &mut CommitReceipt,
 ) {
     let after = arena.default_context(slot);
-    if before == after {
+    // Whether a symbol image draws in its colour (LLP 1121 stage 9 B) can
+    // change with the colour equal: its images are sent again.
+    if before.ink_said != after.ink_said {
+        for s in arena.subtree(slot) {
+            let symbol = arena.node_type(s) == NodeType::Image
+                && arena
+                    .props(s)
+                    .str(PropId::ImageSource)
+                    .is_some_and(|v| v.starts_with("symbol:"));
+            if symbol {
+                arena.mark_export_dirty(s, NodeFlags::PAINT_DIRTY);
+                touched.push(arena.key(s));
+            }
+        }
+    }
+    if before
+        == (DefaultContext {
+            ink_said: before.ink_said,
+            ..after
+        })
+    {
         return;
     }
     let mut rows = StyleMask::EMPTY;
@@ -93,6 +128,13 @@ pub(super) fn changed(
         style_changed(arena, layout, slot, rows, receipt);
         propagate_inherited(arena, layout, slot, rows, touched, receipt);
     }
+    // What is said above changed, if no value here did: a bare text style
+    // below fills what is not (LLP 1115.000 D12.2).
+    let said = before
+        .said_style
+        .minus(after.said_style)
+        .union(after.said_style.minus(before.said_style));
+    propagate_inherited(arena, layout, slot, said.minus(rows), touched, receipt);
     if before.native_tab != after.native_tab {
         control_env_changed(arena, layout, slot);
         receipt.layout_invalidated = true;

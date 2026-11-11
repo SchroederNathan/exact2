@@ -1,4 +1,5 @@
 import XCTest
+import PDFKit
 import WebKit
 import CoreGraphics
 @testable import ExactKit
@@ -10,6 +11,63 @@ import AppKit
 final class WebDocumentsTests: XCTestCase {
     // scripts/fixtures/web-documents.contract: an iframe of an app file and its load and error actions.
     private func plan() throws -> Data { try fixturePlan("WEB_DOCUMENTS") }
+
+    #if os(macOS)
+    func testExplicitIframeFocusReachesTheWebViewAndRespectsInertAncestors() throws {
+        _ = NSApplication.shared
+        let presenter = Presenter()
+        presenter.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "view"],
+            ["op": "create", "id": 2, "kind": "iframe", "props": ["id": "guest"]],
+            ["op": "create", "id": 3, "kind": "input", "props": ["id": "outside", "value": "outside"]],
+            ["op": "children", "id": 1, "ids": [2, 3]], ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0, "y": 0, "w": 400, "h": 240],
+            ["op": "frame", "id": 2, "x": 0, "y": 0, "w": 400, "h": 160],
+            ["op": "frame", "id": 3, "x": 0, "y": 180, "w": 200, "h": 30],
+        ]))
+        let guest = try XCTUnwrap(presenter.views[2])
+        let outside = try XCTUnwrap(presenter.views[3]?.field)
+        let web = WKWebView(frame: guest.bounds)
+        guest.addSubview(web)
+        guest.web = web
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = presenter.viewport
+        defer { window.close() }
+        final class Loaded: NSObject, WKNavigationDelegate {
+            let ready: XCTestExpectation
+            init(_ ready: XCTestExpectation) { self.ready = ready }
+            func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { ready.fulfill() }
+        }
+        let ready = expectation(description: "embedded document loaded")
+        let loaded = Loaded(ready)
+        web.navigationDelegate = loaded
+        web.loadHTMLString("<input id='draft' value='retained'>", baseURL: nil)
+        wait(for: [ready], timeout: 30)
+        defer { web.navigationDelegate = nil }
+        func webHasFocus() -> Bool {
+            window.firstResponder === web || (window.firstResponder as? NSView)?.isDescendant(of: web) == true
+        }
+        XCTAssertTrue(window.makeFirstResponder(web), "the platform web view can receive focus")
+        XCTAssertTrue(webHasFocus())
+        presenter.focusElement(["outside"])
+        XCTAssertTrue(window.firstResponder === outside.currentEditor())
+        presenter.focusElement(["guest"])
+        XCTAssertTrue(webHasFocus(), "focus(iframeId) must reach its embedded web view")
+        presenter.focusElement(["outside"])
+        presenter.apply(wireBatch([["op": "props", "id": 1, "set": ["inert": "true"]]]))
+        let before = window.firstResponder
+        presenter.focusElement(["guest"])
+        XCTAssertTrue(window.firstResponder === before, "an inert ancestor refuses iframe focus")
+        presenter.apply(wireBatch([["op": "props", "id": 1, "set": ["inert": "false"]]]))
+        presenter.focusElement(["outside"])
+        let editor = window.firstResponder
+        presenter.focusElement(["guest"], selectText: true)
+        XCTAssertTrue(window.firstResponder === editor, "selectText remains limited to text controls")
+        presenter.focusElement(["guest"])
+        XCTAssertTrue(webHasFocus())
+    }
+    #endif
 
     func testAppTextFilePreservesMIMEAndLiteralMarkup() throws {
         guard let path = ProcessInfo.processInfo.environment["EXACT_TEST_WEB_MODULE"] else {
@@ -91,27 +149,18 @@ final class WebDocumentsTests: XCTestCase {
         // iOS runs in hostless XCTest, with no UIApplication/window scene; its PDF captures are black.
         // The iOS app drive in issues/closed/20261009-app-file-iframe-loading.md qualifies pixels there.
         #if os(macOS)
-        let web = try XCTUnwrap(node.web as? WKWebView)
-        let snapshot = expectation(description: "PDF pixels")
-        let config = WKSnapshotConfiguration()
-        config.snapshotWidth = 300
-        config.afterScreenUpdates = true
-        web.takeSnapshot(with: config) { image, error in
-            XCTAssertNil(error)
-            let cg = image?.cgImage(forProposedRect: nil, context: nil, hints: nil)
-            if let cg {
-                var pixels = [UInt8](repeating: 0, count: 100 * 100 * 4)
-                let red = pixels.withUnsafeMutableBytes { bytes -> Int in
-                    let context = CGContext(data: bytes.baseAddress, width: 100, height: 100, bitsPerComponent: 8,
-                        bytesPerRow: 400, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-                    context.draw(cg, in: CGRect(x: 0, y: 0, width: 100, height: 100))
-                    return stride(from: 0, to: bytes.count, by: 4).filter { bytes[$0] > 200 && bytes[$0 + 1] < 60 && bytes[$0 + 2] < 60 }.count
-                }
-                XCTAssertGreaterThan(red, 100, "the PDF's red rectangle must be visible")
-            } else { XCTFail("no PDF snapshot") }
-            snapshot.fulfill()
+        // An unsandboxed local PDF is PDFKit's view (LLP 1020.002 D10); the
+        // agent's picture of the frame is the arm's in-process drawing of it.
+        XCTAssertTrue(node.web is PDFView, "\(String(describing: node.web))")
+        let cg = try XCTUnwrap(session.webviews.snapshots()[node.id]?.cgImage(forProposedRect: nil, context: nil, hints: nil), "no PDF snapshot")
+        var pixels = [UInt8](repeating: 0, count: 100 * 100 * 4)
+        let red = pixels.withUnsafeMutableBytes { bytes -> Int in
+            let context = CGContext(data: bytes.baseAddress, width: 100, height: 100, bitsPerComponent: 8,
+                bytesPerRow: 400, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            context.draw(cg, in: CGRect(x: 0, y: 0, width: 100, height: 100))
+            return stride(from: 0, to: bytes.count, by: 4).filter { bytes[$0] > 200 && bytes[$0 + 1] < 60 && bytes[$0 + 2] < 60 }.count
         }
-        wait(for: [snapshot], timeout: 30)
+        XCTAssertGreaterThan(red, 100, "the PDF's red rectangle must be visible")
         #endif
         let failed = expectation(description: "missing file settles")
         node.props["src"] = "app:/data/missing.pdf"

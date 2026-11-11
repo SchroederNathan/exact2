@@ -29,7 +29,7 @@ impl Lowerer<'_> {
             );
         }
         if (event == "beforeinput" || event == "selectionchange" && tag != "text")
-            && control != Some("field")
+            && !contract_syntax::edits_text(control)
         {
             return err(
                 "lower-attr-tag",
@@ -48,7 +48,7 @@ impl Lowerer<'_> {
                 )
             }
         };
-        let Some(ai) = self.root.actions.iter().position(|x| x.name == name) else {
+        let Some(ai) = self.action_names.get(name).copied() else {
             return err(
                 "lower-unknown-action",
                 format!("`{name}` is not an action of the root"),
@@ -59,11 +59,7 @@ impl Lowerer<'_> {
         // prop names the real action here: its arity is checked now,
         // not at dispatch (LLP 1006 §8's circle-back; LLP 1017 P1b).
         let valid = contract_analyze::handler_accepts(
-            if event == "selectionchange" && control == Some("field") {
-                "beforeinput"
-            } else {
-                event
-            },
+            contract_syntax::typed_event(event, control),
             args.len(),
             &self.types.components[0].actions[ai],
         );

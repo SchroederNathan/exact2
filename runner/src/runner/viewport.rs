@@ -43,7 +43,22 @@ impl<D: DataSource> Runner<D> {
             preferences,
             ..self.viewport
         };
-        self.replace_viewport(viewport, "preferences")
+        // Bold Text is the kernel's, no resource's (LLP 1115.000 D12.3): a
+        // change commits, whether or not a resource reads the rest.
+        let bold = self.kernel.set_bold_text(preferences.bold_text);
+        let result = self.replace_viewport(viewport, "preferences");
+        if bold && result.is_err() {
+            // Refused: the setting waits for the next one, not the next commit.
+            let _ = self.kernel.set_bold_text(!preferences.bold_text);
+        }
+        if !bold || !matches!(result, Ok(None)) {
+            return result;
+        }
+        let result = self.commit_again(Vec::new(), "bold text");
+        if result.is_err() {
+            let _ = self.kernel.set_bold_text(!preferences.bold_text);
+        }
+        result.map(Some)
     }
 
     /// The device's posture or the segments a fold makes changed (LLP 1078
@@ -96,7 +111,14 @@ impl<D: DataSource> Runner<D> {
         let mut fields = Vec::with_capacity(ty.fields.len as usize);
         for f in ty.fields.iter() {
             let name = self.plan.str(self.plan.field(f).name);
-            match self.viewport.field(name) {
+            let value = if name == "gpuTier" {
+                Some(Value::str(self.page.gpu_tier()))
+            } else if name == "accessibilityTextSize" {
+                Some(Value::Bool(self.accessibility_text_size()))
+            } else {
+                self.viewport.field(name)
+            };
+            match value {
                 Some(v) => fields.push(v),
                 None => {
                     return Err(DataError::Unavailable(format!(

@@ -11,7 +11,7 @@ settlement that fails — leaves the configuration exactly as it was. A
 failure while rendering poisons the configuration: it keeps its state and
 refuses every later event (the runner's `poison`).
 -/
-import Contract.Eval
+import Contract.Tabs
 
 namespace Contract
 
@@ -161,8 +161,7 @@ def slotTy (p : Program) (x : String) : Ty :=
 
 /-! ## The data seam -/
 
-/-- Bit-for-bit sameness (NaN is itself; records by fields). What two
-calls to a source must share to be one call. -/
+/-- Bit-for-bit sameness (NaN is itself; records by fields). -/
 partial def Value.same : Value → Value → Bool
   | .num a, .num b => a.toBits == b.toBits
   | .bool a, .bool b => a == b
@@ -186,17 +185,34 @@ structure Oracle where
   kept value, by the state's name, as the host read it before boot — the
   device's, like every answer here. A fresh install's is empty. -/
   stored : List (String × Value) := []
+  /-- The host built every tab panel at boot and builds each as it is made
+  (LLP 1075.003 §9.14: a page rendered ahead of its runtime, which the
+  runtime adopts whole; `Runner::build_every_tab`). -/
+  everyTab : Bool := false
   deriving Inhabited
+
+/-- The differential oracle's keys (`difftest/src/oracle.rs`): all NaN
+signs and payloads share an answer, but signed zeros remain distinct.
+The transcript keeps the runner's bits; arithmetic may produce another NaN. -/
+private partial def oracleSame : Value → Value → Bool
+  | .num a, .num b => Number.canonicalBits a == Number.canonicalBits b
+  | .some a, .some b => oracleSame a b
+  | .list xs, .list ys => xs.length == ys.length && (xs.zip ys).all fun (a, b) => oracleSame a b
+  | .record _ xs, .record _ ys => xs.length == ys.length && (xs.zip ys).all fun (a, b) => oracleSame a b
+  | a, b => Value.same a b
 
 def Oracle.ask (o : Oracle) (src : String) (args : List Value) (resource : String := "") :
     Result Value :=
   match o.answers.find? (fun (s, as, _) =>
-      s == src && as.length == args.length && (as.zip args).all fun (a, b) => Value.same a b) with
+      s == src && as.length == args.length && (as.zip args).all fun (a, b) => oracleSame a b) with
   | .some (_, _, v) => .ok v
   | .none =>
     match lookup resource o.facts with
     | .some v => .ok v
-    | .none => .error (.refused s!"the oracle has no answer for {src}")
+    | .none =>
+      if src = "exactTransport" ∨ src = "exactMIDI" then
+        .error (.unsupported s!"`{src}`: the runner answers it from its transport or its MIDI ports, which change as they play (LLP 1125)")
+      else .error (.refused s!"the oracle has no answer for {src}")
 
 /-! ## Settlement -/
 
@@ -313,6 +329,7 @@ structure VNode where
   /-- A `list` whose `virtualized` is literally `true`: the runner shows
   the rows its window lays out, which the observation leaves out. -/
   windowed : Bool := false
+  navigation : TabInfo := {}
   /-- The rows this element stands in, innermost first. -/
   rows : List RowId
   children : List VNode
@@ -322,6 +339,7 @@ structure RenderCx where
   env : Env
   store : RowStore
   rows : List RowId := []
+  tabs : TabCx := {}
 
 /-- A row key as the runner identifies it (`key_text`): a string, a bool,
 or a finite number with `-0` read as `0`. -/
@@ -340,8 +358,9 @@ def elementText (fuel : Nat) (env : Env) (ls : Locals) (tag : String) (pos : Lis
   match pos with
   | e :: _ =>
     if tag == "text" || tag == "tspan" || tag == "option" then do
-      let v ← eval fuel env false ls e
-      pure (Option.some (← v.display))
+      match ← unsetRefused (eval fuel env false ls e) with
+      | .some v => pure (Option.some (← v.display))
+      | .none => pure Option.none
     else pure Option.none
   | [] => pure Option.none
 
@@ -349,7 +368,10 @@ def elementText (fuel : Nat) (env : Env) (ls : Locals) (tag : String) (pos : Lis
 def elementTestId (fuel : Nat) (env : Env) (ls : Locals) (props : List (String × Expr)) :
     Result (Option String) :=
   match lookupField "testId" props with
-  | .some e => do pure (Option.some (← (← eval fuel env false ls e).display))
+  | .some e => do
+    match ← unsetRefused (eval fuel env false ls e) with
+    | .some v => pure (Option.some (← v.display))
+    | .none => pure Option.none
   | .none => pure Option.none
 
 /-- The form control an element is, when not a text field. -/
@@ -371,17 +393,18 @@ def render : Nat → RenderCx → Locals → List Node → RowStore → Result (
   | fuel + 1, cx, ls, n :: rest, live => do
     let (here, live) ← (match n with
       | .element tag pos props hs children => do
-        -- Only what a host observes here is forced: the text and the
-        -- `testId`. Every other attribute is presentation, kept
-        -- unevaluated (the runner evaluates it as it binds it; on a
-        -- well-typed program neither can fail).
         let text ← elementText fuel cx.env ls tag pos
         let testId ← elementTestId fuel cx.env ls props
-        let (kids, live) ← render fuel cx ls children live
+        let values ← (tabProps props).mapM fun (name, e) => do
+          pure (name, ← unsetRefused (eval fuel cx.env false ls e))
+        let navigation := cx.tabs.element props (values.filterMap fun (n, v) => v.map (n, ·))
+        let (kids, live) ← (if navigation.opened then
+          render fuel { cx with tabs := cx.tabs.children props } ls children live
+          else pure ([], live))
         pure ([{ tag, testId, text, handlers := hs, locals := ls, rows := cx.rows,
                  control := elementControl tag props,
-                 windowed := tag == "list" && (lookupField "virtualized" props matches .some (.bool true)),
-                 children := kids : VNode }], live)
+                 windowed := tag == "list" && ((lookupField "virtualized" props).map tabLiteral matches .some (.bool true)),
+                 navigation, children := kids : VNode }], live)
       | .when tag c thn els => do
         match ← eval fuel cx.env false ls c with
         | .bool true => renderArm fuel cx ls tag 0 thn live
@@ -395,7 +418,7 @@ def render : Nat → RenderCx → Locals → List Node → RowStore → Result (
       | .each tag x ix list key body => do
         let items ← (← eval fuel cx.env false ls list).asList
         renderRows fuel cx ls tag x ix key body items 0 [] live : Result (List VNode × RowStore))
-    let (more, live) ← render fuel cx ls rest live
+    let (more, live) ← render fuel { cx with tabs := cx.tabs.next } ls rest live
     pure (here ++ more, live)
 where
   /-- The slots an arm instance owns: kept from `store`, or initialized in
@@ -421,7 +444,9 @@ where
     | fuel + 1, cx, ls, tag, arm, body, live => do
       let id : RowId := (cx.rows.head?.getD []) ++ [(tag, Value.num (F64.ofNat arm), 0)]
       let slots ← armSlots fuel cx ls id (tag, arm)
-      let cx' : RenderCx := { cx with env := { cx.env with rows := slots ++ cx.env.rows }, rows := id :: cx.rows }
+      let cx' : RenderCx := { cx with
+        env := { cx.env with rows := slots ++ cx.env.rows }, rows := id :: cx.rows,
+        tabs := cx.tabs.enter (.num (F64.ofNat arm)) }
       render fuel cx' ls body (live ++ [(id, slots)])
   /-- The rows of an `each`, in list order. `seen` holds the keys of the
   rows before this one, for `dup`. -/
@@ -440,10 +465,31 @@ where
       -- The row's slots: kept, or initialized from their initializers in
       -- the row's own scope (an initializer may read the item).
       let slots ← armSlots fuel cx ls' id (tag, 0)
-      let cx' : RenderCx := { cx with env := { cx.env with rows := slots ++ cx.env.rows }, rows := id :: cx.rows }
+      let cx' : RenderCx := { cx with
+        env := { cx.env with rows := slots ++ cx.env.rows },
+        rows := id :: cx.rows, tabs := cx.tabs.enter k dup }
       let (vs, live) ← render fuel cx' ls' body (live ++ [(id, slots)])
       let (more, live) ← renderRows fuel cx ls tag x ix key body items (i + 1) (seen ++ [k]) live
       pure (vs ++ more, live)
+
+/-- The selection sees the instance tree, without virtualized rows. -/
+def tabIndex : List VNode → Tabs.Index
+  | [] => []
+  | n@{ children, .. } :: rest => n.navigation ::
+      ((if n.windowed then [] else tabIndex children) ++ tabIndex rest)
+
+/-- Render empty waiting panels, then open the ones selection requires.
+Each pass retains the preceding pass's initialized slots. The bound only
+limits a render that keeps discovering more nested panels. -/
+def renderTabs : Nat → RenderCx → Result (List VNode × RowStore)
+  | 0, _ => .error outOfFuel
+  | n + 1, cx => do
+    let (view, live) ← render fuel cx [] cx.env.prog.view []
+    let opened := Tabs.toOpen (tabIndex view)
+    if opened.isEmpty then pure (view, live) else
+      renderTabs n { cx with
+        store := live,
+        tabs := { cx.tabs with opened := Tabs.visited (tabIndex view) ++ opened } }
 
 /-! ## Configurations and steps -/
 
@@ -452,11 +498,28 @@ the product first (the runner's `virtual_frame`), so sixty frames are
 exactly a second. -/
 def virtualFrame (base : F64) (k : Nat) : F64 := base + F64.ofNat k * 1000 / 60
 
+/-- The least virtual frame at or after a deadline, correcting binary64 division. -/
+def frameAtOrAfter (deadline : F64) : F64 :=
+  let k := F64.toNat (F64.ceil (deadline * 60 / 1000))
+  let k := if k > 0 && deadline ≤ virtualFrame 0 (k - 1) then k - 1 else k
+  let k := if virtualFrame 0 k < deadline then k + 1 else k
+  virtualFrame 0 k
+
+/-- The first nominal beat strictly after an execution time. -/
+def waitBeatAfter (deadline interval execution : F64) : F64 :=
+  let k := max 1 (F64.toNat (F64.floor ((execution - deadline) / interval)) + 1)
+  let beat := fun k => deadline + F64.ofNat k * interval
+  let k := if k > 1 && execution < beat (k - 1) then k - 1 else k
+  beat (if beat k ≤ execution then k + 1 else k)
+
 /-- A timer. A frame task's is a virtual display (the runner's, while the
 host does not present frames, as in a differential run): it is due at
 `virtualFrame base k`, and each fire moves to the next frame. -/
 structure Timer where
   action : String
+  waitKind : Nat := 0
+  nominal : F64 := 0
+  maxMs : Nat := 0
   interval : F64
   once : Bool
   next : F64
@@ -477,7 +540,18 @@ interval on. -/
 def Timer.fired (tm : Timer) : Timer :=
   if tm.once then { tm with next := F64.posInf }
   else if tm.frame then { tm with k := tm.k + 1, next := virtualFrame tm.base (tm.k + 1) }
+  else if tm.waitKind != 0 then
+    let nominal := waitBeatAfter tm.nominal tm.interval tm.next
+    { tm with nominal, next := if tm.waitKind == 1 then frameAtOrAfter nominal else nominal }
   else { tm with next := tm.next + tm.interval }
+
+/-- Execution time, then idle priority, nominal time and declaration order. -/
+def Timer.precedes (tm b : Timer) : Bool :=
+  tm.next < b.next || (tm.next == b.next &&
+    ((b.waitKind == 4 && tm.waitKind != 4) ||
+      ((b.waitKind == 4) == (tm.waitKind == 4) &&
+        (if tm.waitKind == 0 then tm.next else tm.nominal) <
+        (if b.waitKind == 0 then b.next else b.nominal))))
 
 /-- What a refused queued send saw: the slots, and the derives and
 resources settled against them (LLP 1092 D3). -/
@@ -534,11 +608,12 @@ def applyRowWrites (p : Program) (store : RowStore) (rows : List RowId)
 
 /-- Settle and render against new slots. -/
 def update (p : Program) (o : Oracle) (slots : List (String × Value)) (store : RowStore)
-    (now : F64) (prev : Settled := {}) (force : List String := []) :
+    (now : F64) (prev : Settled := {}) (force : List String := []) (view : List VNode := []) :
     Result (Settled × Result (List VNode × RowStore)) := do
   let st ← settle p o slots now prev force
   let env : Env := { prog := p, slots, derives := st.derives, resources := st.resources, now }
-  .ok (st, render fuel { env, store } [] p.view [])
+  .ok (st, renderTabs fuel
+    { env, store, tabs := { opened := Tabs.visited (tabIndex view), every := o.everyTab } })
 
 /-- Whether the router slot, if the program has one, holds a valid router
 (`Route.routerOf`). -/
@@ -598,7 +673,7 @@ def gateTimer (env : Env) (tm : Timer) : Result Timer :=
       else if tm.frame then
         { tm with armed := true, armedKey := key, base := env.now, k := 1,
                   next := virtualFrame env.now 1 }
-      else { tm with armed := true, armedKey := key, next := env.now + tm.interval })
+      else { tm with armed := true, armedKey := key, nominal := env.now + tm.interval, next := (if tm.waitKind == 1 then frameAtOrAfter (env.now + tm.interval) else env.now + tm.interval) })
 
 theorem gateTimer_fields {env : Env} {tm tm' : Timer} (h : gateTimer env tm = .ok tm') :
     tm'.action = tm.action ∧ tm'.gate = tm.gate ∧ tm'.key = tm.key := by
@@ -742,6 +817,13 @@ def Config.armNexts (p : Program) (c : Config) : Config :=
 /-- At most this many sends wait per mutation (the runner's `QUEUE_BOUND`). -/
 def queueBound : Nat := 64
 
+/-- The commands a commit tells a host: all but `setMode`, which the
+runner takes out and applies itself in the commit (LLP 1121 D5; the
+runner's `take_set_modes`). The window's mode only selects presentation,
+which the semantics does not evaluate. -/
+def hostCommands (cs : List (String × List Value)) : List (String × List Value) :=
+  cs.filter (·.1 != "setMode")
+
 /-- Run an action as one commit. `rows` are the rows in force where the
 event arrived (none for a timer). -/
 def runAction (p : Program) (o : Oracle) (c : Config) (name : String) (args : List Value)
@@ -781,7 +863,7 @@ def runAction (p : Program) (o : Oracle) (c : Config) (name : String) (args : Li
         -- runner's `router_change`): a forged value is refused.
         if !routerValid p slots then refuse (.refused "an invalid router value") else
         let store := applyRowWrites p c.store rows fx.rowWrites
-        match update p o slots store c.now c.settled fx.refreshes with
+        match update p o slots store c.now c.settled fx.refreshes c.view with
         | .error e => refuse e
         | .ok (st, r) =>
           -- D8's gate step, after settlement and inside the commit: a
@@ -792,11 +874,11 @@ def runAction (p : Program) (o : Oracle) (c : Config) (name : String) (args : Li
             match r with
             | .ok (view, live) =>
               (({ c with slots, settled := st, store := live, view, timers,
-                         commands := c.commands ++ fx.commands, queued,
+                         commands := c.commands ++ hostCommands fx.commands, queued,
                          armed := armThens p c.armed split.1 c.now }.unstall).armNexts p, .ok)
             | .error e =>
               ({ c with slots, settled := st, store, poisoned := true,
-                        commands := c.commands ++ fx.commands, queued := [], stalled := [],
+                        commands := c.commands ++ hostCommands fx.commands, queued := [], stalled := [],
                         nexts := [] }, .poisoned e)
 
 /-- The armed `next` due earliest by `t` (ties by declaration order): the
@@ -834,7 +916,7 @@ def nextCommit (p : Program) (o : Oracle) (c : Config) (m : String) : Config × 
         ({ c with stalled := c.stalled ++ [(m, (c.slots, c.settled))] }.armNexts p, .refused e)
       let slots := setSlot c.slots m (.some v)
       if !routerValid p slots then stall (.refused "an invalid router value") else
-      match update p o slots c.store c.now c.settled [] with
+      match update p o slots c.store c.now c.settled [] c.view with
       | .error e => stall e
       | .ok (st, r) =>
         match gateStep p slots st c.now c.timers with
@@ -913,7 +995,8 @@ def startTimers (p : Program) (slots : List (String × Value)) : Result (List Ti
                gate := t.gate, key := t.key, armed := !gated }
     let ms ← (← eval fuel { prog := p, slots } false [] t.ms).asNum
     pure { action := t.action, interval := ms, once := t.kind == .after,
-           next := if gated then F64.posInf else ms, gate := t.gate, key := t.key, armed := !gated }
+           waitKind := t.waitKind, maxMs := t.maxMs, nominal := ms,
+           next := if gated then F64.posInf else if t.waitKind == 1 then frameAtOrAfter ms else ms, gate := t.gate, key := t.key, armed := !gated }
 
 /-- The late slots, in declaration order, against the settled values. -/
 def lateSlots (p : Program) (st : Settled) (slots : List (String × Value)) :
@@ -948,7 +1031,7 @@ def boot (p : Program) (o : Oracle) : Config × Outcome :=
       | .error e => (empty, .refused e)
       | .ok timers =>
       let env : Env := { prog := p, slots, derives := st.derives, resources := st.resources, now := 0 }
-      match render fuel { env, store := [] } [] p.view [] with
+      match renderTabs fuel { env, store := [], tabs := { every := o.everyTab } } with
       | .ok (view, live) =>
         ({ slots, settled := st, store := live, view, now := 0, timers }, .ok)
       -- A view that fails to render at boot fails the boot: there is no
@@ -1043,7 +1126,7 @@ def advance (p : Program) (o : Oracle) (c : Config) (t : F64) : Config × Outcom
       if tm.next ≤ t then
         match best with
         | .none => Option.some (tm, i)
-        | .some (b, j) => if tm.next < b.next then Option.some (tm, i) else Option.some (b, j)
+        | .some (b, j) => if tm.precedes b then Option.some (tm, i) else Option.some (b, j)
       else best) Option.none
   let pick (c : Config) : Option Clock := clockPick p c t ((due c).map (·.1.next))
   let finish (c : Config) : Config × Outcome := ({ c with now := if t > c.now then t else c.now }, .ok)

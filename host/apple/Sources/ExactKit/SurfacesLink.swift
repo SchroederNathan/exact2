@@ -53,13 +53,28 @@ package protocol Canvases: AnyObject {
     var isEmpty: Bool { get }
     var status: String { get }
     var wantsFrames: Bool { get }
+    /// Renders that drew since launch, so a display-link callback can tell whether it drew one.
+    var drawn: Int { get }
+    /// Whether a canvas render drew nothing, as without its drawable, and has not drawn since. Each
+    /// waiting render draws when a drawable lands; once none waits, `Frames.canvasDrawn` says so,
+    /// and a waiting canvas that leaves first calls `Frames.canvasLost`.
+    var awaitingDrawable: Bool { get }
     var frameNow: Double? { get set }
     func reset()
     func surface(view: NodeView, name: String, values: Any)
     func destroy(view: UInt32)
     func loadIfNeeded()
     func surfaceWork(_ op: [String: Any], generation: Int)
-    func post(_ name: String, _ text: String)
+    @discardableResult func post(_ name: String, _ text: String) -> String?
+    func hasSurface(_ name: String) -> Bool
+    func surfaceName(_ view: UInt32) -> String?
+    func surfaceNames() -> [String]
+    func waiting(_ name: String) -> Bool
+    /// A sensor input's event for the live canvas of surface `name` (LLP 1133.013 D6); false when none is live.
+    @discardableResult func sensor(_ name: String, _ event: [String: Any]) -> Bool
+    /// A package's sample for surface `surface`'s canvas input, or its end
+    /// (LLP 1133.013 D6): kept until the next display frame delivers it.
+    func sensorWrite(_ surface: String, _ sensor: String, _ values: [Double], dropped: Int, at: Double, ended: Bool)
     func period(_ ms: Double)
     func tick(now: Double) -> Bool
     func settle(now: Double)
@@ -136,6 +151,10 @@ package protocol MetalView: UIView {
 /// A GPU surface's input: the pointer, keys and touches it takes.
 package protocol CanvasInput: AnyObject {
     func blur()
+    /// The canvas, or a control in it, took the focus.
+    func focused()
+    /// The canvas, or a control in it, gave the focus up.
+    func focusLeft()
     #if os(macOS)
     func pointer(_ event: NSEvent, phase: String) -> Bool
     func key(_ event: NSEvent, down: Bool, source: NodeView) -> Bool
@@ -145,6 +164,10 @@ package protocol CanvasInput: AnyObject {
     func touches(_ values: Set<UITouch>, phase: String, source: NodeView, event: UIEvent?) -> Bool
     func presses(_ presses: Set<UIPress>, down: Bool, source: NodeView) -> Bool
     #endif
+}
+extension CanvasInput {
+    package func focused() {}
+    package func focusLeft() {}
 }
 
 /// The Surfaces module, installed by the composition.
@@ -165,13 +188,21 @@ final class NoCanvases: Canvases {
     var isEmpty: Bool { true }
     var status: String { "not linked" }
     var wantsFrames: Bool { false }
+    var drawn: Int { 0 }
+    var awaitingDrawable: Bool { false }
     var frameNow: Double?
     func reset() {}
     func surface(view: NodeView, name: String, values: Any) {}
     func destroy(view: UInt32) {}
     func loadIfNeeded() {}
     func surfaceWork(_ op: [String: Any], generation: Int) {}
-    func post(_ name: String, _ text: String) {}
+    func post(_ name: String, _ text: String) -> String? { nil }
+    func hasSurface(_ name: String) -> Bool { false }
+    func surfaceName(_ view: UInt32) -> String? { nil }
+    func surfaceNames() -> [String] { [] }
+    func waiting(_ name: String) -> Bool { false }
+    func sensor(_ name: String, _ event: [String: Any]) -> Bool { false }
+    func sensorWrite(_ surface: String, _ sensor: String, _ values: [Double], dropped: Int, at: Double, ended: Bool) {}
     func period(_ ms: Double) {}
     func tick(now: Double) -> Bool { false }
     func settle(now: Double) {}

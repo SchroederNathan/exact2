@@ -37,7 +37,13 @@ final class PresenceIOSTests: XCTestCase {
 
     private func tabBarFixture() -> Presenter {
         let p = fixture()
-        p.apply(wireBatch([
+        p.apply(tabBar(y: 0, height: 20))
+        return p
+    }
+
+    /// A tablist of two symbol-over-label tabs, a root at `y`, `height` tall.
+    private func tabBar(y: Double, height: Double) -> Batch {
+        wireBatch([
             ["op": "create", "id": 10, "kind": "view", "props": ["accessibilityRole": "tablist"]],
             ["op": "create", "id": 11, "kind": "button", "props": ["accessibilityRole": "tab"], "handlers": ["press"]],
             ["op": "create", "id": 12, "kind": "button", "props": ["accessibilityRole": "tab"], "handlers": ["press"]],
@@ -49,9 +55,8 @@ final class PresenceIOSTests: XCTestCase {
             ["op": "children", "id": 12, "ids": [15, 16]],
             ["op": "children", "id": 10, "ids": [11, 12]],
             ["op": "roots", "ids": [1, 10]],
-            ["op": "frame", "id": 10, "x": 0.0, "y": 0.0, "w": 400.0, "h": 20.0],
-        ]))
-        return p
+            ["op": "frame", "id": 10, "x": 0.0, "y": y, "w": 400.0, "h": height],
+        ])
     }
 
     private func drainIntrinsicSizes() {
@@ -81,6 +86,23 @@ final class PresenceIOSTests: XCTestCase {
         p.apply(wireBatch([["op": "props", "id": 11, "set": ["accessibilityDisabled": "false"]]]))
         control.layoutIfNeeded()
         XCTAssertFalse(try XCTUnwrap(control.segmentViews.first).accessibilityTraits.contains(.notEnabled))
+    }
+
+    func testAnUnstyledTabSymbolLeavesTheBarsNativeTint() throws {
+        let p = tabBarFixture()
+        defer { p.reset(); window.isHidden = true }
+        p.apply(wireBatch([["op": "props", "id": 11, "set": ["accessibilitySelected": "true"]]]))
+        let bar = try XCTUnwrap(p.views[10]?.subviews.first { $0 is UITabBar } as? UITabBar)
+        let native = UITabBar()
+        window.addSubview(native)
+        XCTAssertEqual(bar.tintColor, native.tintColor)
+        let pink: [Double] = [240, 40, 120, 255]
+        p.apply(wireBatch([["op": "style", "id": 13, "style": ["text_color": pink]]]))
+        XCTAssertEqual(bar.tintColor, native.tintColor, "inherited page ink leaves UIKit's accent")
+        p.apply(wireBatch([["op": "style", "id": 13, "style": ["text_color": pink, "written": ["text_color"]]]]))
+        XCTAssertEqual(bar.tintColor?.cgColor.components, TextEngine.color(pink).cgColor.components)
+        p.apply(wireBatch([["op": "style", "id": 13, "style": ["text_color": pink]]]))
+        XCTAssertEqual(bar.tintColor, native.tintColor, "removing authored ink restores UIKit's accent")
     }
 
     func testTabBarReportsItsHeightAndAlwaysFillsTheKernelBox() throws {
@@ -116,6 +138,56 @@ final class PresenceIOSTests: XCTestCase {
         XCTAssertNil(bar.superview)
         XCTAssertFalse(try XCTUnwrap(p.views[11]).isHidden)
         p.reset()
+    }
+
+    /// A tablist padded at a side keeps its bar inside the padding, the
+    /// bar's edges on the device's pixel grid (LLP 1059 D2): duo-lab's tabs
+    /// on a book fold's trailing segment, from 495.5 points.
+    func testTabBarSpansAPaddedTablistsContentBoxOnThePixelGrid() throws {
+        let p = tabBarFixture()
+        defer { p.reset() }
+        p.apply(wireBatch([["op": "frame", "id": 10, "x": 0.0, "y": 0.0, "w": 951.0, "h": 83.0],
+                           ["op": "fieldContent", "id": 10, "rect": [495.5, 0.0, 455.5, 83.0], "padding": [0.0, 0.0, 0.0, 495.5]]]))
+        let owner = try XCTUnwrap(p.views[10])
+        let bar = try XCTUnwrap(owner.subviews.first { $0 is UITabBar })
+        XCTAssertEqual(bar.frame.minX, PixelGrid.round(495.5, scale: p.gridScale), accuracy: 0.0001, "the left edge on the grid, inside the padding")
+        XCTAssertEqual(bar.frame.maxX, owner.bounds.maxX, accuracy: 0.0001)
+        XCTAssertEqual(bar.frame.height, owner.bounds.height)
+        p.apply(wireBatch([["op": "fieldContent", "id": 10]]))
+        XCTAssertEqual(bar.frame, owner.bounds, "unpadded, the bar fills the box again")
+    }
+
+    /// A bar first laid out inside the home indicator's inset, before its box
+    /// took its measured height, has its labels sized again as it grows:
+    /// UIKit sizes them in the room the bar has then (duo-lab under the
+    /// agent's chrome). The selected tab's glyph is its symbol filled.
+    func testATabBarFirstLaidOutInTheBottomInsetSizesItsLabelsAgainAsItGrows() throws {
+        let p = fixture()
+        defer { p.reset(); window.isHidden = true }
+        let host = UIViewController()
+        host.additionalSafeAreaInsets.bottom = 34
+        window.rootViewController = host
+        host.view.addSubview(p.viewport)
+        p.apply(tabBar(y: 366, height: 34))
+        p.apply(wireBatch([["op": "props", "id": 11, "set": ["accessibilitySelected": "true"]]]))
+        let bar = try XCTUnwrap(p.views[10]?.subviews.first { $0 is UITabBar } as? UITabBar)
+        window.layoutIfNeeded()
+        XCTAssertEqual(bar.safeAreaInsets.bottom, host.view.safeAreaInsets.bottom, "laid out inside the inset, including the device's own safe area")
+        let height = bar.sizeThatFits(CGSize(width: 400, height: 0)).height
+        p.apply(wireBatch([["op": "frame", "id": 10, "x": 0.0, "y": 400 - Double(height), "w": 400.0, "h": Double(height)]]))
+        window.layoutIfNeeded()
+        drainIntrinsicSizes()
+        window.layoutIfNeeded()
+        func labels(_ view: UIView) -> [UILabel] { view.subviews.flatMap { ($0 as? UILabel).map { [$0] } ?? labels($0) } }
+        XCTAssertFalse(labels(bar).isEmpty)
+        for label in labels(bar) {
+            XCTAssertGreaterThanOrEqual(label.bounds.height, label.intrinsicContentSize.height - 0.5, "\(label.text ?? "") is cut short")
+        }
+        XCTAssertEqual(bar.items?.first?.selectedImage?.pngData(), UIImage(systemName: "house.fill")?.pngData())
+        // A symbol written filled stays filled when unselected.
+        p.apply(wireBatch([["op": "props", "id": 15, "set": ["imageSource": "symbol:sf/star.fill", "symbolName": "star.fill"]]]))
+        drainIntrinsicSizes()
+        XCTAssertEqual(bar.items?.last?.image?.pngData(), UIImage(systemName: "star.fill")?.pngData())
     }
 
     /// Measured again when what sizes it changes: a segment's title, the
@@ -370,11 +442,61 @@ final class PresenceIOSTests: XCTestCase {
     func testALayoutSpringCannotGiveTheSurfaceANegativeSize() throws {
         let p = fixture()
         let v = try XCTUnwrap(p.views[3])
-        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 4.0, "y": 10.0, "w": -0.5, "h": -2.0]]))
+        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 4.0, "y": 10.0, "w": -150.0, "h": -100.0]]))
         let surface = try XCTUnwrap(v.surface)
         XCTAssertEqual(surface.bounds.size, .zero)
         XCTAssertEqual(surface.frame.origin, .zero)
         XCTAssertEqual(v.bounds.size, CGSize(width: 100, height: 50))
+    }
+
+    func testABoxClosingToZeroWidthShowsTheWidthItClosesFrom() throws {
+        let p = fixture()
+        let v = try XCTUnwrap(p.views[3])
+        p.apply(wireBatch([["op": "style", "id": 3, "style": ["overflow_x": "hidden", "overflow_y": "hidden"]]]))
+        // Laid out closed, 200 wide on screen: the difference carries what
+        // no ratio of a zero width could (GitHub #940).
+        p.apply(wireBatch([
+            ["op": "frame", "id": 3, "x": 0.0, "y": 0.0, "w": 0.0, "h": 50.0],
+            ["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 200.0, "h": 0.0],
+        ]))
+        let surface = try XCTUnwrap(v.surface)
+        XCTAssertEqual(surface.frame, CGRect(x: 0, y: 0, width: 200, height: 50))
+        XCTAssertEqual(surface.clip.path?.boundingBox.width ?? 0, 200, accuracy: 1e-9)
+        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 100.0, "h": 0.0]]))
+        XCTAssertEqual(surface.frame.width, 100)
+        XCTAssertEqual(surface.clip.path?.boundingBox.width ?? 0, 100, accuracy: 1e-9)
+        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0]]))
+        XCTAssertNil(v.surface)
+        // A frame after the layout op in its batch resizes the surface.
+        p.apply(wireBatch([["op": "frame", "id": 3, "x": 0.0, "y": 0.0, "w": 200.0, "h": 50.0]]))
+        p.apply(wireBatch([
+            ["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 200.0, "h": 0.0],
+            ["op": "frame", "id": 3, "x": 0.0, "y": 0.0, "w": 0.0, "h": 50.0],
+        ]))
+        XCTAssertEqual(v.surface?.frame.width, 200)
+        // From the size layout gave, not the one drawn on the pixel grid.
+        p.apply(wireBatch([
+            ["op": "frame", "id": 3, "x": 0.0, "y": 0.0, "w": 100.25, "h": 50.0],
+            ["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": -100.25, "h": 0.0],
+        ]))
+        XCTAssertEqual(v.surface?.frame.width, 0)
+    }
+
+    func testAnExitRetiresAPopoverInItsLiftLayer() throws {
+        let p = fixture()
+        defer { p.menus.reset(); window.isHidden = true }
+        let leaving = try XCTUnwrap(p.views[2]), pop = try XCTUnwrap(p.views[3])
+        p.apply(wireBatch([["op": "props", "id": 3, "set": ["popover": "auto", "id": "lifted"]]]))
+        p.menus.agentShow(pop, named: "lifted", from: 4)
+        XCTAssertFalse(pop.isDescendant(of: leaving))
+        XCTAssertTrue(p.menus.isOpen(pop))
+        p.apply(wireBatch([["op": "exit", "id": 2], ["op": "children", "id": 1, "ids": [4]]]))
+        XCTAssertNil(p.views[3], "the lifted descendant retires with its authored parent")
+        XCTAssertFalse(p.menus.isOpen(pop))
+        XCTAssertNil(pop.superview)
+        XCTAssertEqual(Set(try XCTUnwrap(p.leaving[2]).members.map(\.id)), [2, 3])
+        p.apply(wireBatch([["op": "destroy", "id": 2]]))
+        XCTAssertNil(pop.presenter)
     }
 
     func testAnExitKeepsTheViewWhereItWasInertAndUnnamedUntilItsDestroy() throws {
@@ -415,7 +537,7 @@ final class PresenceIOSTests: XCTestCase {
         p.apply(wireBatch([["op": "style", "id": 3, "style": ["background_color": blue, "border_radius_top_left": 6, "border_radius_top_right": 6, "border_radius_bottom_left": 6, "border_radius_bottom_right": 6, "overflow_x": "hidden", "overflow_y": "hidden"]]]))
         XCTAssertTrue(clips())
         // Grown from 25 to 50 high and moved down 10: it starts where it was.
-        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 4.0, "y": 10.0, "w": 1.0, "h": 0.5]]))
+        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 4.0, "y": 10.0, "w": 0.0, "h": -25.0]]))
         // About the center, as UIKit applies a transform.
         let corner = { (x: CGFloat, y: CGFloat) -> CGPoint in
             let c = CGPoint(x: 50, y: 25)
@@ -443,10 +565,10 @@ final class PresenceIOSTests: XCTestCase {
         XCTAssertEqual(surface.clip.path?.boundingBox.height ?? 0, 25, accuracy: 1e-9)
         XCTAssertEqual(surface.clip.path?.boundingBox.width ?? 0, 100, accuracy: 1e-9)
         // Shrinking past the frame: the surface is larger than the view.
-        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.5]]))
+        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 0.0, "h": 25.0]]))
         XCTAssertEqual(surface.frame.height, 75)
         // At rest the node paints its own surface and clip again.
-        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0]]))
+        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0]]))
         XCTAssertNil(v.surface)
         XCTAssertNil(surface.superlayer)
         XCTAssertTrue(clips())
@@ -460,7 +582,7 @@ final class PresenceIOSTests: XCTestCase {
         let (red, blue) = ([255, 0, 0, 255], [0, 0, 255, 255])
         // Sides that differ: drawn, as the node's own `draw(_:)` draws them.
         p.apply(wireBatch([["op": "style", "id": 3, "style": ["border_width": 4, "border_color_top": red, "border_color_right": red, "border_color_bottom": blue, "border_color_left": red]]]))
-        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 1.0, "h": 0.5]]))
+        p.apply(wireBatch([["op": "present", "id": 3, "property": "layout", "x": 0.0, "y": 0.0, "w": 0.0, "h": -25.0]]))
         let surface = try XCTUnwrap(v.surface)
         XCTAssertNotNil(surface.drawn)
         let (w, h) = (100, 25)

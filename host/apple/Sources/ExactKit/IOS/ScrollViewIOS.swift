@@ -9,8 +9,14 @@ import UIKit
 package final class PlainView: UIView {
     package override func didAddSubview(_ subview: UIView) { super.didAddSubview(subview); FocusSearch.joined(subview) }
     package override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        guard !isHidden, isUserInteractionEnabled, bounds.contains(point) else { return nil }
+        // The document takes the page's bands too, where its edge scrollers reach (LLP 1130 D3).
+        let m = (superview as? Viewport)?.pageMargins ?? .zero
+        guard !isHidden, isUserInteractionEnabled, bounds.inset(by: UIEdgeInsets(top: -m.top, left: -m.left, bottom: -m.bottom, right: -m.right)).contains(point) else { return nil }
         return NodeView.hitChildren(in: self, at: point, with: event)
+    }
+    package override var accessibilityElements: [Any]? {
+        get { super.accessibilityElements ?? NodeView.emptyBoxAccessibility(in: self) }
+        set { super.accessibilityElements = newValue }
     }
 }
 
@@ -21,9 +27,72 @@ package final class PlainView: UIView {
 /// wheel (the agent's) applies the web's chaining rule itself
 /// (`AgentIOS.swift`).
 package class ScrollView: UIScrollView {
+    var scrollingNode: NodeView? { (superview as? NodeView) ?? (self as? Viewport)?.documentNode }
+    package override func layoutSubviews() {
+        super.layoutSubviews()
+        keepPlatformViewsOver()
+    }
+    /// The offset of a node's scroller or a route's viewport, which UIKit
+    /// itself also sets (keeping it at the start as a safe area reaches the
+    /// scroller and insets it): inside an animation UIKit has open it moves
+    /// only if the last frame showed the node (`Presenter.moveOrPlace`). The
+    /// session's viewport has no node and moves as UIKit sets it.
+    package override var bounds: CGRect {
+        get { super.bounds }
+        set {
+            guard UIView.inheritedAnimationDuration > 0, let node = scrollingNode, let presenter = node.presenter else { return super.bounds = newValue }
+            presenter.moveOrPlace(node) { super.bounds = newValue }
+        }
+    }
+    /// The insets the offset was last kept under (`adjustedContentInsetDidChange`).
+    private var keptInset = UIEdgeInsets.zero
+    /// A list that opens at its end (`scroll-start: end`) or follows it, at
+    /// its end, stays there as its insets change, as SwiftUI's
+    /// `defaultScrollAnchor(.bottom)` keeps it; UIKit keeps the offset. A
+    /// tab bar's inset reaches a grid after it opened at its newest row
+    /// (r25's photos, at launch and as a viewer closes), and kept, the
+    /// offset left that row under the bar.
+    package override func adjustedContentInsetDidChange() {
+        let was = keptInset
+        keptInset = adjustedContentInset
+        super.adjustedContentInsetDidChange()
+        guard let node = superview as? NodeView, node.props["scrollStart"] == "end" || node.props["scrollFollowEnd"] == "true",
+              node.presenter?.collections.entries[node.id]?.snapshot.horizontal != true,
+              !isTracking, !isDecelerating, contentSize.height > 0 else { return }
+        let end = { (inset: UIEdgeInsets) in max(-inset.top, self.contentSize.height + inset.bottom - self.bounds.height) }
+        guard contentOffset.y >= end(was) - 1, was.bottom != keptInset.bottom else { return }
+        contentOffset = PixelGrid.offset(CGPoint(x: contentOffset.x, y: end(keptInset)), in: self)
+    }
+    package override var accessibilityElements: [Any]? {
+        get { super.accessibilityElements ?? NodeView.emptyBoxAccessibility(in: self) }
+        set { super.accessibilityElements = newValue }
+    }
     package override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        guard let hit = super.hitTest(point, with: event) else { return nil }
-        return NodeView.hitChildren(in: self, at: point, with: event) ?? hit
+        // UIView's own checks, without its walk of the subviews: the walk
+        // below visits each of them, and walking twice at every nested
+        // scroller made a touch on a list walk its rows four times.
+        guard !isHidden, isUserInteractionEnabled, alpha >= 0.01, self.point(inside: point, with: event) else { return nil }
+        if let child = NodeView.hitChildren(in: self, at: point, with: event) { return child }
+        // A paragraph's scroller with nothing to scroll is its node, as on the
+        // web, where a click on it bubbles to the button around it: a
+        // `UIScrollView` keeps a touch from the responder chain. CSS makes one
+        // beside every `overflow-x: hidden` (`overflow-y` computes to `auto`),
+        // so a truncating title is one. A scroller holding nodes (a page) keeps
+        // its blank ground: its bounce, and the tap there that ends editing.
+        if !hasRange, !subviews.contains(where: { $0 is NodeView }), let owner = superview as? NodeView { return owner }
+        return self
+    }
+
+    /// Whether its content reaches past its port on an axis it scrolls, or a
+    /// pull-to-refresh hangs above it.
+    var hasRange: Bool {
+        let inset = adjustedContentInset
+        if scrollsX && contentSize.width + inset.left + inset.right > bounds.width + 0.5 { return true }
+        if scrollsY && contentSize.height + inset.top + inset.bottom > bounds.height + 0.5 { return true }
+        #if os(iOS)
+        if refreshControl != nil { return true }
+        #endif
+        return false
     }
 
     package var scrollsX = true
@@ -34,11 +103,14 @@ package class ScrollView: UIScrollView {
     /// from there.
     var remoteStepTarget: (offset: CGPoint, at: CFTimeInterval)?
     #endif
-    /// A pan cancels a touch in progress, as it does a custom button's; UIKit
-    /// would leave a `UIControl` its touch, so a native button (LLP 1069.011
-    /// D4) is named. A canvas that owns its input keeps it.
+    /// Let native body buttons (LLP 1069.011 D4) and tap-only invoker overlays
+    /// yield to scrolling; UIKit normally keeps a UIControl's touch. Input-owning
+    /// surfaces and other controls keep their existing rules.
     package override func touchesShouldCancel(in view: UIView) -> Bool {
-        !CanvasInputs.owns(view) && (view is NativeButtonIOS || super.touchesShouldCancel(in: view))
+        guard !CanvasInputs.owns(view) else { return false }
+        if view is NativeButtonIOS { return true }
+        if let button = view as? InvokerButton, !button.showsMenuAsPrimaryAction { return true }
+        return super.touchesShouldCancel(in: view)
     }
     package override func gestureRecognizerShouldBegin(_ gesture: UIGestureRecognizer) -> Bool {
         if gesture === panGestureRecognizer {
@@ -65,7 +137,7 @@ package class ScrollView: UIScrollView {
             if current === self { break }
             view = current.superview
         }
-        if let owner = superview as? NodeView, !owner.allowsTouchPan(direction) { return false }
+        if let owner = scrollingNode, !owner.allowsTouchPan(direction) { return false }
         return !handsOff(direction)
     }
     /// CSS's scroll chaining at a gesture's start (LLP 1070 G1, Q4 as ruled
@@ -76,7 +148,7 @@ package class ScrollView: UIScrollView {
     /// view actually scrolls; `contain` keeps the band, `none` keeps the
     /// gesture with no band. Never mid-gesture: UIKit asks once, at begin.
     func handsOff(_ velocity: CGPoint) -> Bool {
-        guard velocity != .zero, let owner = superview as? NodeView else { return false }
+        guard velocity != .zero, let owner = scrollingNode else { return false }
         let horizontal = abs(velocity.x) > abs(velocity.y)
         let behavior = owner.style[horizontal ? "overscroll_behavior_x" : "overscroll_behavior_y"]?.string ?? "auto"
         // One flag for both axes, written each gesture so a style that leaves
@@ -90,7 +162,7 @@ package class ScrollView: UIScrollView {
     /// `velocity` begun now chains to an enclosing scroller (a descendant's
     /// recognizer asks it, LLP 1057.001 rule 2).
     package func chains(_ velocity: CGPoint) -> Bool {
-        guard velocity != .zero, let owner = superview as? NodeView else { return false }
+        guard velocity != .zero, let owner = scrollingNode else { return false }
         let horizontal = abs(velocity.x) > abs(velocity.y)
         guard (owner.style[horizontal ? "overscroll_behavior_x" : "overscroll_behavior_y"]?.string ?? "auto") == "auto" else { return false }
         let i = adjustedContentInset
@@ -112,6 +184,8 @@ package class ScrollView: UIScrollView {
                     ? (outer.contentOffset.x, -o.left, outer.contentSize.width + o.right - outer.bounds.width, (outer as? ScrollView)?.scrollsX ?? false)
                     : (outer.contentOffset.y, -o.top, outer.contentSize.height + o.bottom - outer.bounds.height, (outer as? ScrollView)?.scrollsY ?? (outer.superview as? NodeView)?.scrollsVertically ?? false)
                 if scrolls && high > low && (toward > 0 ? at > low + 0.5 : at < high - 0.5) { return true }
+                if scrolls, let node = (outer as? ScrollView)?.scrollingNode ?? (outer.superview as? NodeView),
+                   (node.style[horizontal ? "overscroll_behavior_x" : "overscroll_behavior_y"]?.string ?? "auto") != "auto" { return false }
             }
             up = current.superview
         }
@@ -185,6 +259,7 @@ extension NodeView {
             more.nativeScrollContentInsets = view == nil ? .zero : contentInsets
         }
         guard extras?.nativeScrollView !== view else { return }
+        if pageBand != .zero { setPageBand(.zero) } // the scroll view leaving gives its band back (LLP 1130 D3)
         more.nativeScrollView = view
         more.nativeScrollDelegate = view?.delegate
         if scrollView == nil { presenter?.scrollers.remove(id) }
@@ -214,7 +289,7 @@ extension NodeView {
         return node.isDescendant(of: sv) && !node.isHidden ? node.convert(node.bounds, to: sv) : nil
     }
 
-    func captureScrollPosition() {
+    func captureScrollPosition(focused: NodeView?) {
         // UIKit may have pending row geometry and its own offset adjustment.
         // Snapshot both from the same layout before preserving the reader.
         if groupedOwner { scrollView?.layoutIfNeeded() }
@@ -229,7 +304,7 @@ extension NodeView {
                     // UIKit quantizes offsets independently of fractional insets.
                     // A rounding difference at the start is not a reading anchor.
                     if sv.contentOffset.y + sv.adjustedContentInset.top > 0.5 { readingAnchors = presenter?.groupedLists?.scrollAnchors(for: id) ?? [] }
-                } else { captureScrollAnchor(sv) }
+                } else { captureScrollAnchor(sv, focused: focused) }
             }
             return
         }
@@ -237,7 +312,8 @@ extension NodeView {
         // A retained route can gain height when another route hides the keyboard.
         // That clamp is not the reader choosing the end. Keep its intended offset
         // until the returning viewport can fit it, or the reader scrolls again.
-        if anchoredScrollTop != sv.contentOffset.y { retainedScrollTop = nil }
+        // (the anchor a value this host set, the offset UIKit's read-back of it: PixelGrid.same)
+        if !(anchoredScrollTop.map { PixelGrid.same($0, sv.contentOffset.y, in: sv) } ?? false) { retainedScrollTop = nil }
         // An animated follow of the end (below) is still the end, mid-flight.
         let capturedTop = retainedScrollTop ?? sv.contentOffset.y
         followedScroll = (capturedTop,
@@ -246,7 +322,7 @@ extension NodeView {
         guard let followedScroll, !followedScroll.end, followedScroll.top + sv.adjustedContentInset.top > 0.5 else { return }
         // A scroll by the reader invalidates the prior choice. Anchoring's
         // own adjustment does not: keep the same surviving row across batches.
-        if anchoredScrollTop == sv.contentOffset.y, let node = activeReadingAnchor,
+        if anchoredScrollTop.map({ PixelGrid.same($0, sv.contentOffset.y, in: sv) }) == true, let node = activeReadingAnchor,
            presenter?.views[node.id] === node, scrollRect(node, in: sv) != nil, !node.isHidden {
             let rect = scrollRect(node, in: sv) ?? .zero
             if rect.width > 0, rect.height > 0, rect.intersects(sv.bounds) { readingAnchors.append((node, rect.minY)) }
@@ -279,7 +355,9 @@ extension NodeView {
                     // the captured reading position, counting the row shift once.
                     let top = (beforeLayoutScroll?.offset.y ?? sv.contentOffset.y) + shift
                     let y = sv.isTracking || sv.isDecelerating ? top : min(max(top, -i.top), max(-i.top, sv.contentSize.height + i.bottom - sv.bounds.height))
-                    if y != sv.contentOffset.y { sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: y), animated: false) }
+                    // An element reveal heads for where its target now is instead (`IntoView.swift`).
+                    if presenter?.elementScrolls.revealing(sv) != nil { presenter?.elementScrolls.retarget(sv) }
+                    else if y != sv.contentOffset.y { sv.setContentOffset(PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: y), in: sv, clamped: !(sv.isTracking || sv.isDecelerating)), animated: false) }
                 } else if !groupedOwner { restoreScrollAnchor(sv) }
             }
             return
@@ -312,20 +390,23 @@ extension NodeView {
             if prior.end { followsEndAfterInteraction = true }
             else if top != prior.top {
                 if groupedOwner {
-                    if sv.contentOffset.y != top { sv.contentOffset.y = top }
+                    if sv.contentOffset.y != top { sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: top), in: sv, clamped: false) }
                 }
-                else { sv.contentOffset.y += top - prior.top }
+                else { sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: sv.contentOffset.y + top - prior.top), in: sv, clamped: false) }
             }
             anchoredScrollTop = sv.contentOffset.y
             return
         }
-        if sv.contentOffset.y != y {
+        if presenter?.elementScrolls.revealing(sv) != nil {
+            // An element reveal heads for where its target now is instead (`IntoView.swift`).
+            presenter?.elementScrolls.retarget(sv)
+        } else if sv.contentOffset.y != y {
             // `scroll-behavior: smooth`: an end that moved down (a message
             // appended) is followed with UIKit's scroll animation, as a
             // smooth `scrollTop` write is; a shrink or a jump up lands at once.
             let animate = prior.end && y > sv.contentOffset.y && style["scroll_behavior"]?.string == "smooth" && !ExactEnv.agentFreezes && window != nil
             followingEndAnimated = animate
-            sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: y), animated: animate)
+            sv.setContentOffset(PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: y), in: sv), animated: animate)
         }
         // UIKit quantizes the assigned offset. Compare its actual stored value
         // next time so that rounding cannot masquerade as a reader's scroll.
@@ -340,6 +421,8 @@ extension NodeView {
         if (pendingScrollTop != nil || pendingScrollLeft != nil), presenter?.collections.animating.contains(id) == true {
             presenter?.collections.stopAnimation(id)
         }
+        // It replaces an element reveal, as on the Mac (LLP 1070.000 §14).
+        if pendingScrollTop != nil || pendingScrollLeft != nil { presenter?.elementScrolls.cutReveal(sv) }
         if pendingScrollTop != nil { retainedScrollTop = nil }
         guard hasScrollLayoutBox else {
             if hiddenScroll == nil {
@@ -369,7 +452,11 @@ extension NodeView {
             let slack = titleSlack && scrollOrigin > 0 ? max(0, i.top - scrollCollapsed) : 0
             let y = top.map { CGFloat($0) - inset == sv.contentOffset.y ? sv.contentOffset.y : min(max(CGFloat($0) - inset, -i.top), max(-i.top, sv.contentSize.height + i.bottom - sv.bounds.height - slack)) } ?? sv.contentOffset.y
             let x = left.map { CGFloat($0) == sv.contentOffset.x ? sv.contentOffset.x : min(max(CGFloat($0), -i.left), max(-i.left, sv.contentSize.width + i.right - sv.bounds.width)) } ?? sv.contentOffset.x
-            return CGPoint(x: x, y: y)
+            // On the pixel grid inside the range, so the content it scrolls
+            // stays on it and UIKit does not clamp it off (`PixelGridIOS.swift`).
+            let s = presenter?.gridScale ?? 1
+            return CGPoint(x: PixelGrid.clamp(x, -i.left, max(-i.left, sv.contentSize.width + i.right - sv.bounds.width), scale: s),
+                           y: PixelGrid.clamp(y, -i.top, max(-i.top, sv.contentSize.height + i.bottom - sv.bounds.height - slack), scale: s))
         }
         let initial = target()
         guard sv.contentOffset != initial else { return }
@@ -396,8 +483,13 @@ extension NodeView {
                 let control = PaddedRefreshControl()
                 control.addTarget(self, action: #selector(pulledToRefresh), for: .valueChanged)
                 sv.refreshControl = control
+                sv.panGestureRecognizer.addTarget(self, action: #selector(refreshPullChanged(_:)))
             }
-            if props["refreshing"] != "true", let control = sv.refreshControl, control.isRefreshing {
+            // One pull, one refresh: a control ended while the finger still
+            // holds the list past its threshold fires again in the same pull
+            // (an app that refreshes in a frame or two fired seven times in
+            // one). It ends when the finger lifts (`refreshPullChanged`).
+            if props["refreshing"] != "true", let control = sv.refreshControl, control.isRefreshing, !sv.isTracking {
                 control.endRefreshing()
             }
         } else if sv.refreshControl != nil {
@@ -410,6 +502,11 @@ extension NodeView {
         presenter?.refresh(id)
         // An app that starts nothing leaves `refreshing` false: end promptly.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self, token = incarnation] in if self?.incarnation == token { self?.updateRefresh() } }
+    }
+    @objc func refreshPullChanged(_ pan: UIPanGestureRecognizer) {
+        guard pan.state == .ended || pan.state == .cancelled || pan.state == .failed,
+              props["refreshing"] != "true", let control = scrollView?.refreshControl, control.isRefreshing else { return }
+        control.endRefreshing()
     }
     #endif
 }

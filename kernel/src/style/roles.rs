@@ -26,6 +26,10 @@ pub fn role(text: &str) -> Option<u8> {
     {
         return role(name).filter(|&id| role_of(id).is_some_and(web_accent));
     }
+    // The ink on the accent as the web writes it (`reference_css`).
+    if lower.split_whitespace().collect::<String>() == "var(--exact-accent-text,accentcolortext)" {
+        return role("AccentColorText");
+    }
     let var = lower.strip_prefix("var(--exact-");
     let exact = match var {
         Some(rest) => Some(&rest[..rest.find([',', ')'])?]),
@@ -77,8 +81,9 @@ pub enum Column {
     /// Apple's measured pairs: what an Apple host shows before it reports
     /// its own, and what every host shows until it says otherwise.
     Apple,
-    /// The neutral pairs, no platform's palette: the web's under the
-    /// neutral look (D4), a host's that paints its own controls (D17).
+    /// The neutral pairs, no platform's palette: a host's that paints its
+    /// own controls (D17), and the web's for a role its page does not
+    /// report (the page draws Apple's and reports them, D4).
     Neutral,
 }
 
@@ -92,10 +97,10 @@ static NEUTRAL: AtomicBool = AtomicBool::new(false);
 /// (`var(--exact-<role>, …)`), what a painter reads. The look's metrics
 /// follow too (`style::metrics::column`), so this is the look's one switch.
 /// A reported colour still wins over either column. The web calls it, for a
-/// page in the neutral look, which every web build draws since 2026-10-12
-/// (host/web/look.mjs), and so do the Linux desktop and Windows, which have
-/// no platform toolkit under their painter; every other host shows Apple's
-/// pairs, in which a process starts.
+/// page in the neutral look, which every web build draws (host/web/look.mjs;
+/// its colours are Apple's, which the page reports), and so do the Linux
+/// desktop and Windows, which have no platform toolkit under their painter;
+/// every other host shows Apple's pairs, in which a process starts.
 pub fn set_column(column: Column) {
     NEUTRAL.store(column == Column::Neutral, Ordering::Release);
 }
@@ -194,7 +199,7 @@ pub fn follows_accent(id: u8, macos: bool) -> bool {
 /// tinted in its accent). Each reads the nearest `accent-color`
 /// (`--exact-accent`, LLP 1116.001 D2), else the browser's accent. CSS's
 /// `ButtonText` is the tint on iOS and the browser's own keyword here.
-fn web_accent(r: &ColorRole) -> bool {
+pub fn web_accent(r: &ColorRole) -> bool {
     matches!(r.name, "AccentColor" | "LinkText") || (!is_css_system(r) && r.ios == "@tint")
 }
 
@@ -311,6 +316,13 @@ pub fn theme_css() -> String {
                 "color:var(--exact-canvas-text);--exact-scheme-color:var(--exact-canvas-text);",
             ),
             "Canvas" => out.push_str("background-color:var(--exact-canvas);"),
+            // The design's accent is authored (LLP 1121 D9): a spinner reads it.
+            "AccentColor" => out.push_str(
+                "--exact-accent-design:var(--exact-accent);--exact-accent-said:var(--exact-accent-design);",
+            ),
+            // A destructive control draws the theme's red as written, where
+            // the web's own is held to a lightness that reads (neutral.css).
+            "system-red" => out.push_str("--exact-system-red-said:var(--exact-system-red);"),
             _ => {}
         }
     }
@@ -323,7 +335,41 @@ pub fn theme_css() -> String {
         true => format!("#exact-root [style*=color-scheme]{{{SCHEME_COLOR}}}"),
         false => String::new(),
     };
-    format!(":root{{{out}}}{scheme}")
+    format!(":root{{{out}}}{scheme}{}", brand_states())
+}
+
+/// @ref LLP 1129 D2, D3 — what a theme's accent and selection colours
+/// reach on the web beyond the controls. The keyboard's ring is drawn in
+/// the theme's accent, as iOS draws its focus halo in the tint the theme
+/// sets (LLP 1095 D1), and solid: Chrome's `auto` ring ignores its offset
+/// and hugs the control, so in the accent it vanishes on a control the
+/// accent fills. Selected text takes the theme's `Highlight` pair; unsaid,
+/// no `::selection` rule is written, since one changes how an engine draws
+/// an inactive selection.
+fn brand_states() -> String {
+    let said = |name: &str| role(name).is_some_and(|id| overridden(id).is_some());
+    let mut out = String::new();
+    if overridden(accent()).is_some() {
+        // Two ids and nothing else: over the shell's `outline: revert` on
+        // its controls (one id, index.html) and under the author's classes
+        // (two ids and a class), so an authored `outline` wins. An invalid
+        // field keeps its red ring. The bar's Back, and a platform button
+        // the accent fills, which the shell gives no offset, take one.
+        out.push_str(
+            "#exact-root#exact-root :where(:focus-visible:not([aria-invalid=true])),\
+             #exact-root#exact-root [navigationkey]>header::part(back):focus-visible\
+             {outline:2px solid var(--exact-accent)}\
+             #exact-root#exact-root :where(button[data-native]:is([data-button-style=filled],\
+             [data-button-style=bordered-prominent]):focus-visible){outline-offset:2px}",
+        );
+    }
+    if said("Highlight") || said("HighlightText") {
+        out.push_str(
+            "#exact-root ::selection{background-color:var(--exact-highlight,Highlight);\
+             color:var(--exact-highlight-text,HighlightText)}",
+        );
+    }
+    out
 }
 
 /// @ref LLP 1095 D4 — a theme's `CanvasText` is a `color` on the web's root,
@@ -443,6 +489,12 @@ pub fn authored_accent(accent: Option<ColorValue>) -> AccentScope {
         AUTHORED.with(|a| a.replace(accent)),
         std::marker::PhantomData,
     )
+}
+
+/// The accent the painting scope holds now ([`authored_accent`]): the
+/// nearest one the node being painted or an ancestor authored, or none.
+pub fn scoped_accent() -> Option<ColorValue> {
+    AUTHORED.with(|a| a.get())
 }
 
 /// What [`authored_accent`] restores; the thread's, so it stays on it.
@@ -707,6 +759,11 @@ pub(crate) fn reference_css(out: &mut String, c: ColorValue, mode: ColorText) {
                 if named {
                     out.push(')');
                 }
+            } else if mode == ColorText::Css && r.name == "AccentColorText" {
+                // The ink on the accent is the web's filled button's: black or
+                // white by the accent's lightness (`neutral.css`), where the
+                // browser's keyword is white on any accent.
+                out.push_str("var(--exact-accent-text, AccentColorText)");
             } else if is_css_system(r) {
                 out.push_str(r.name);
             } else {
@@ -779,6 +836,82 @@ impl ColorValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Mac's surface pairs: on current macOS windowBackgroundColor and controlBackgroundColor are one colour
+    /// (#ffffff / #1e1e1e), so each card role names an AppKit colour apart from its page's, the under-page grey; the
+    /// grouped page keeps the window's name, which SheetsMac and SplitMac read; the Apple and neutral columns are as
+    /// they were.
+    #[test]
+    fn the_macs_card_roles_name_a_colour_apart_from_their_pages() {
+        let by = |name: &str| COLOR_ROLES.iter().find(|r| r.name == name).unwrap();
+        for (page, card) in [
+            ("background", "secondary-background"),
+            ("grouped-background", "secondary-grouped-background"),
+        ] {
+            assert_ne!(by(page).macos, by(card).macos, "{card} on {page}");
+            assert_eq!(by(card).macos, "underPageBackgroundColor", "{card}");
+        }
+        assert_eq!(by("grouped-background").macos, "windowBackgroundColor");
+        let columns = |name: &str| {
+            let r = by(name);
+            (r.ios, r.light, r.dark, r.neutral_light, r.neutral_dark)
+        };
+        assert_eq!(
+            columns("secondary-background"),
+            (
+                "secondarySystemBackgroundColor",
+                0xf2f2_f7ff,
+                0x1c1c_1eff,
+                0xf5f5_f5ff,
+                0x1e1e_1eff
+            )
+        );
+        assert_eq!(
+            columns("secondary-grouped-background"),
+            (
+                "secondarySystemGroupedBackgroundColor",
+                0xffff_ffff,
+                0x1c1c_1eff,
+                0xffff_ffff,
+                0x1e1e_1eff
+            )
+        );
+    }
+
+    #[test]
+    fn a_themes_accent_and_highlight_reach_the_ring_and_the_selection() {
+        let pair = |l: u32, d: u32| ColorValue::LightDark(Color(l), Color(d));
+        let id = |name: &str| role(name).unwrap();
+        set_overrides(vec![(id("CanvasText"), pair(0x1f2a_22ff, 0xece7_daff))]);
+        let plain = theme_css();
+        assert!(
+            !plain.contains(":focus-visible") && !plain.contains("::selection"),
+            "{plain}"
+        );
+        set_overrides(vec![
+            (id("AccentColor"), pair(0x2f6b_3fff, 0x7cc0_8aff)),
+            (id("Highlight"), pair(0x2f6b_3fff, 0x7cc0_8aff)),
+        ]);
+        let branded = theme_css();
+        assert!(
+            branded.contains("#exact-root#exact-root :where(:focus-visible:not([aria-invalid=true])),#exact-root#exact-root [navigationkey]>header::part(back):focus-visible{outline:2px solid var(--exact-accent)}"),
+            "{branded}"
+        );
+        assert!(branded.contains("#exact-root ::selection{background-color:var(--exact-highlight,Highlight);color:var(--exact-highlight-text,HighlightText)}"), "{branded}");
+        // A theme's red is said, so a destructive control draws it as written (neutral.css).
+        set_overrides(vec![(
+            id("-exact-system-red"),
+            pair(0xff78_78ff, 0xff78_78ff),
+        )]);
+        let red = theme_css();
+        assert!(
+            red.starts_with(":root{--exact-system-red:")
+                && red.contains(";--exact-system-red-said:var(--exact-system-red);"),
+            "{red}"
+        );
+        set_overrides(Vec::new());
+        assert_eq!(theme_css(), "");
+    }
 
     #[test]
     fn a_reported_resolution_replaces_the_fallback_until_withdrawn() {
@@ -1160,6 +1293,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_ink_on_the_accent_reads_back_as_itself() {
+        let ink = role("AccentColorText").unwrap();
+        let mut css = String::new();
+        reference_css(&mut css, ColorValue::Role(ink), ColorText::Css);
+        assert_eq!(css, "var(--exact-accent-text, AccentColorText)");
+        assert_eq!(
+            role(&css),
+            Some(ink),
+            "the web's spelling is the role again"
+        );
     }
 
     #[test]

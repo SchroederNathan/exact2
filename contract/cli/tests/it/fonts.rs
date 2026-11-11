@@ -1,5 +1,5 @@
-//! LLP 1019 D1–D3/§5: declared static fonts lower to plan identity, and
-//! every portable refusal happens before a host can substitute a font.
+//! LLP 1019 D1–D3/§5: declared fonts lower to plan identity, and every
+//! portable refusal happens before a host can substitute a font.
 
 use exact_kernel::{FontStyle, Kernel};
 use exact_plan::Value;
@@ -45,6 +45,12 @@ impl AppDir {
             )
             .unwrap();
         }
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../host/apple/tests/fonts/InterVariable.ttf"),
+            dir.join("assets/InterVariable.ttf"),
+        )
+        .unwrap();
         std::fs::write(dir.join("app.contract"), source).unwrap();
         AppDir(dir)
     }
@@ -97,8 +103,141 @@ fn shorthand_declares_one_400_normal_face() {
     );
     let plan = app.compile().unwrap();
     assert_eq!(plan.faces.len(), 1);
-    assert_eq!(plan.faces[0].weight, 400);
+    assert_eq!((plan.faces[0].weight, plan.faces[0].weight_max), (400, 400));
+    assert_eq!(
+        (plan.faces[0].stretch_min, plan.faces[0].stretch_max),
+        (1000, 1000)
+    );
     assert!(!plan.faces[0].italic);
+}
+
+/// LLP 1019 D2: a variable face's range is its `@font-face` descriptor,
+/// read from the file's `wght` axis when the declaration leaves it unsaid.
+#[test]
+fn a_variable_face_declares_its_file_range_or_the_written_one() {
+    let app = AppDir::new(
+        "font \"Inter\" = \"assets/InterVariable.ttf\"\nfont \"Pinned\"\n  600 = \"assets/InterVariable.ttf\"\nfont \"Ranged\"\n  300 700 = \"assets/InterVariable.ttf\"\ncomponent App\n  view\n    text \"hello\" font-family=\"Inter\" font-weight=650 font-stretch=\"condensed\" testId=\"label\"\n",
+    );
+    let plan = app.compile().unwrap();
+    let weights: Vec<_> = plan
+        .faces
+        .iter()
+        .map(|f| (f.weight, f.weight_max))
+        .collect();
+    assert_eq!(weights, [(100, 900), (600, 600), (300, 700)]);
+    // Inter has no `wdth` axis: each face is normal width.
+    assert!(plan
+        .faces
+        .iter()
+        .all(|f| (f.stretch_min, f.stretch_max) == (1000, 1000)));
+
+    let runner = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let kernel = runner.kernel();
+    let node = kernel
+        .node_by_key(kernel.find_by_test_id("label")[0])
+        .unwrap();
+    assert_eq!(node.style.font_weight, 650);
+    assert_eq!(node.style.font_stretch, 75.0);
+}
+
+/// LLP 1019 D2: one variable file declared at several weights is one face
+/// over their span, so the web fetches it once; a span another face of the
+/// same style overlaps, a static file, and the italics stay apart.
+#[test]
+fn pinned_weights_of_one_variable_file_are_one_face() {
+    let app = AppDir::new(
+        "font \"Inter\"\n  400 = \"assets/InterVariable.ttf\"\n  500 = \"assets/InterVariable.ttf\"\n  700 = \"assets/InterVariable.ttf\"\n  400 italic = \"assets/InterVariable.ttf\"\nfont \"Split\"\n  400 = \"assets/InterVariable.ttf\"\n  500 = \"assets/DejaVuSans.ttf\"\n  700 = \"assets/InterVariable.ttf\"\nfont \"Static\"\n  400 = \"assets/DejaVuSans.ttf\"\n  600 = \"assets/DejaVuSans.ttf\"\ncomponent App\n  view\n    text \"hello\" font-family=\"Inter\"\n",
+    );
+    let plan = app.compile().unwrap();
+    let faces: Vec<_> = plan
+        .families
+        .iter()
+        .map(|family| {
+            family
+                .faces
+                .iter()
+                .map(|id| {
+                    let f = plan.face(id);
+                    (f.weight, f.weight_max, f.italic)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        faces,
+        [
+            vec![(400, 700, false), (400, 400, true)],
+            vec![(400, 400, false), (500, 500, false), (700, 700, false)],
+            vec![(400, 400, false), (600, 600, false)],
+        ]
+    );
+}
+
+/// LLP 1019 §13: `font-optical-sizing` is CSS's, inherited, and reaches
+/// the run style a host draws with.
+#[test]
+fn font_optical_sizing_reaches_the_run_style() {
+    let app = AppDir::new(
+        "component App\n  view\n    column\n      column font-optical-sizing=\"none\"\n        text \"hello\" testId=\"label\"\n      text \"auto\" testId=\"auto\"\n",
+    );
+    let runner = Runner::boot(
+        app.compile().unwrap(),
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let kernel = runner.kernel();
+    let sizing = |id: &str| {
+        let key = kernel.find_by_test_id(id)[0];
+        kernel
+            .node_by_key(key)
+            .unwrap()
+            .text_style()
+            .font_optical_sizing
+    };
+    assert_eq!(sizing("label"), exact_kernel::FontOpticalSizing::None);
+    assert_eq!(sizing("auto"), exact_kernel::FontOpticalSizing::Auto);
+    refusal(
+        "component App\n  view\n    text \"hello\" font-optical-sizing=\"off\"\n",
+        "lower-attr-value",
+    );
+}
+
+/// LLP 1019 D9: `font-variation-settings` reaches the kernel's row as CSS
+/// writes it, and a value CSS refuses is refused at compile.
+#[test]
+fn font_variation_settings_reach_the_row_and_bad_ones_are_refused() {
+    let app = AppDir::new(
+        "font \"Inter\" = \"assets/InterVariable.ttf\"\ncomponent App\n  view\n    text \"hello\" font-family=\"Inter\" font-variation-settings=`\"wght\" 650, \"opsz\" 32` testId=\"label\"\n",
+    );
+    let plan = app.compile().unwrap();
+    let runner = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let kernel = runner.kernel();
+    let node = kernel
+        .node_by_key(kernel.find_by_test_id("label")[0])
+        .unwrap();
+    let v = node.style.font_variation_settings;
+    assert_eq!((v.get(b"wght"), v.get(b"opsz")), (Some(650.0), Some(32.0)));
+    refusal(
+        "component App\n  view\n    text \"hello\" font-variation-settings=\"wght 650\"\n",
+        "lower-attr-value",
+    );
 }
 
 fn refusal(source: &str, id: &str) {
@@ -507,4 +646,42 @@ fn css_quoted_commas_do_not_alias_lists_and_family_matching_ignores_case() {
         .families
         .iter()
         .any(|f| plan.str(f.name) == "Comma, Family"));
+}
+
+#[test]
+fn font_variant_ligatures_reaches_text_and_fields_and_refuses_a_pair() {
+    let source = "component App\n  state off = true\n  view\n    column\n      text \"a://b\" testId=\"text\" font-variant-ligatures=(off ? \"none\" : \"normal\")\n      input testId=\"field\" value=\"a://b\" font-variant-ligatures=\"no-contextual\"\n";
+    let plan = contract::compile(source).unwrap();
+    let r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let k = r.kernel();
+    let style = |id: &str| {
+        k.node_by_key(k.find_by_test_id(id)[0])
+            .unwrap()
+            .style
+            .font_variant_ligatures
+    };
+    assert_eq!(
+        style("text"),
+        exact_kernel::FontVariantLigatures::bits("none").unwrap()
+    );
+    assert_eq!(
+        style("field"),
+        exact_kernel::FontVariantLigatures::NoContextual.keyword_bits()
+    );
+    let error = contract::compile(
+        "component App\n  view\n    text \"1\" font-variant-ligatures=\"contextual no-contextual\"\n",
+    )
+    .unwrap_err();
+    assert_eq!(error.id, "lower-attr-value");
+    assert!(
+        error.message.contains("at most one of each pair"),
+        "{error}"
+    );
 }

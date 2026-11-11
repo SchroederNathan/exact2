@@ -19,13 +19,14 @@ pub(crate) fn request_from_json(text: &str) -> Result<Request, String> {
             }
         }
     }
-    Ok(Request {
+    let request = Request {
         http: match j.get("max_response_bytes") {
             None => exact_runner::HttpScheduling::Ordered,
             Some(value) => exact_runner::HttpScheduling::Independent {
+                // Up to 1 GiB for a body written to a file (`ceiling_refusal`, below).
                 max_response_bytes: value
                     .as_u64()
-                    .filter(|n| (1..=64 << 20).contains(n))
+                    .filter(|n| (1..=u64::from(exact_runner::MAX_BODY_TO_BYTES)).contains(n))
                     .ok_or("invalid independent HTTP response ceiling")?
                     as u32,
             },
@@ -44,6 +45,40 @@ pub(crate) fn request_from_json(text: &str) -> Result<Request, String> {
         },
         stream: j.get("stream").and_then(Json::as_bool).unwrap_or(false),
         socket: j.get("socket").and_then(Json::as_bool).unwrap_or(false),
+        bytes: j.get("bytes").and_then(Json::as_bool).unwrap_or(false),
+        // `exactUploadProgress` (LLP 1016.000 D10).
+        upload_progress: j
+            .get("upload_progress")
+            .and_then(Json::as_bool)
+            .unwrap_or(false),
+        // `exactLongPoll` (LLP 1016.000 D8): its cursor parameter and the reply field it is taken from.
+        long_poll: match j.get("long_poll") {
+            None | Some(Json::Null) => None,
+            Some(lp) => {
+                let name = |k: &str| {
+                    lp.get(k)
+                        .and_then(Json::as_str)
+                        .filter(|s| (1..=256).contains(&s.chars().count()))
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            format!("exactLongPoll.{k} must be a name of 1 to 256 characters")
+                        })
+                };
+                Some(Box::new(exact_runner::LongPoll {
+                    cursor: name("cursor")?,
+                    from: name("from")?,
+                    same_cursor_event: match lp.get("same_cursor_event") {
+                        None | Some(Json::Null) => false,
+                        Some(Json::Bool(b)) => *b,
+                        Some(_) => {
+                            return Err(
+                                "exactLongPoll.sameCursor is \"heartbeat\" or \"event\"".into()
+                            )
+                        }
+                    },
+                }))
+            }
+        },
         timeout_ms: match j.get("timeout_ms") {
             None | Some(Json::Null) => None,
             Some(value) => Some(
@@ -60,8 +95,67 @@ pub(crate) fn request_from_json(text: &str) -> Result<Request, String> {
             Some(Json::String(path)) => Some(path.clone()),
             Some(_) => return Err("exactBodyFrom must be an app:/ path".into()),
         },
+        // `exactBodyTo`: the path alone; the host writes a 2xx body there.
+        body_to: match j.get("body_to") {
+            None | Some(Json::Null) => None,
+            Some(Json::String(path)) => Some(path.clone()),
+            Some(_) => return Err("exactBodyTo must be an app:/ path".into()),
+        },
         redirect: Redirect::parse(j.get("redirect").and_then(Json::as_str))?,
-    })
+        held: j.get("held").and_then(Json::as_bool).unwrap_or(false),
+        reach: Default::default(),
+        // `exactListen`'s options (LLP 1133.005 D1); the defaults where unsaid.
+        listen: match j.get("listen") {
+            None | Some(Json::Null) => None,
+            Some(l) => {
+                let number = |k: &str, default: u32| match l.get(k) {
+                    None | Some(Json::Null) => Ok(default),
+                    Some(v) => (v.as_u64().and_then(|n| u32::try_from(n).ok()))
+                        .ok_or(format!("exactListen: {k} is not a number")),
+                };
+                let defaults = exact_runner::listen::Listen::default();
+                Some(Box::new(exact_runner::listen::Listen {
+                    takeover: l.get("takeover").and_then(Json::as_bool).unwrap_or(false),
+                    first_line_timeout_ms: Some(number("first_line_timeout_ms", 0)?)
+                        .filter(|ms| *ms > 0),
+                    max_line_bytes: number("max_line_bytes", defaults.max_line_bytes)?,
+                    max_connections: number("max_connections", defaults.max_connections)?,
+                }))
+            }
+        },
+        due_ms: None,
+        wake_ms: None,
+        // Set when its answer awaits it (`Module::begin`), the name an abort uses.
+        fetch: None,
+    };
+    // A long poll's terms, checked as every host checks them (LLP 1016.000 D8), and an upload's.
+    match (request.long_poll_refusal().or(request.ceiling_refusal()))
+        .or(request.upload_progress_refusal())
+    {
+        Some(why) => Err(why.into()),
+        None => match request.listen_refusal() {
+            Some(why) => Err(why),
+            None => Ok(request),
+        },
+    }
+}
+
+/// A stream's outcome for its mapper, as [`outcome_to_json`] spells it but
+/// with a binary message's bytes handed back beside it, its JSON naming
+/// only their `size`: the prelude copies them into an ArrayBuffer through
+/// the bytes door (op 9), where base64 would cost a byte-by-byte decode in
+/// the interpreter.
+pub(crate) fn message_to_json(outcome: Outcome) -> (String, Vec<u8>) {
+    match outcome {
+        Outcome::Message(m) if m.binary.is_some() => {
+            let bytes = m.binary.unwrap_or_default();
+            let text = json!({
+                "message": { "event": m.event, "id": m.id, "data": "", "coalesced": m.coalesced, "size": bytes.len() }
+            });
+            (text.to_string(), bytes)
+        }
+        other => (outcome_to_json(&other).to_string(), Vec::new()),
+    }
 }
 
 pub(crate) fn outcome_to_json(outcome: &Outcome) -> Json {

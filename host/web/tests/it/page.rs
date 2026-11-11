@@ -283,7 +283,7 @@ fn the_plans_fonts_are_declared_for_a_reader_without_javascript() {
     assert!(family.starts_with("ExactPlanStack"), "{head}");
     assert!(
         head.contains(&format!(
-            r#"<style>@font-face{{font-family:"{family}";src:url("assets/ExcitingLilt-Bold.ttf");font-weight:700;font-style:normal}}</style>"#
+            r#"<style>@font-face{{font-family:"{family}";src:url("assets/ExcitingLilt-Bold.ttf");font-weight:700;font-stretch:100%;font-style:normal}}</style>"#
         )),
         "{head}"
     );
@@ -320,7 +320,7 @@ fn resolved_language_is_published_at_boot_and_after_switching() {
     plan.locale = Some(exact_plan::SlotsId(0));
     for rtl in [false, true] {
         let name = exact_plan::StrId(plan.strings.len() as u32);
-        plan.strings.push(if rtl { "ar" } else { "en" }.into());
+        plan.strings.push(if rtl { "ar" } else { "en" });
         plan.locales.push(exact_plan::LocalesRow {
             name,
             rtl,
@@ -330,7 +330,7 @@ fn resolved_language_is_published_at_boot_and_after_switching() {
     let plan = contract::bake(plan, Says("")).unwrap();
     let (mut host, batch) = Host::boot(&plan.encode(), Says(""), Default::default(), "/").unwrap();
     assert!(batch.contains(r#"{"op":"language","lang":"en","dir":"ltr"}"#));
-    let batch = host.set_place("ar-EG", "UTC", None);
+    let batch = host.set_place("ar-EG", "UTC", None, None);
     assert!(
         batch.contains(r#"{"op":"language","lang":"ar","dir":"rtl"}"#),
         "{batch}"
@@ -338,9 +338,9 @@ fn resolved_language_is_published_at_boot_and_after_switching() {
     let doc = host.document().unwrap();
     assert_eq!((doc.lang.as_str(), doc.dir.as_str()), ("ar", "rtl"));
     assert!(!host
-        .set_place("ar-SA", "UTC", None)
+        .set_place("ar-SA", "UTC", None, None)
         .contains(r#""op":"language""#));
-    let batch = host.set_place("de", "UTC", None);
+    let batch = host.set_place("de", "UTC", None, None);
     assert!(batch.contains(r#"{"op":"language","lang":"en","dir":"ltr"}"#));
 }
 
@@ -354,7 +354,7 @@ fn the_launch_place_and_date_are_the_first_batchs() {
     plan.locale = Some(exact_plan::SlotsId(0));
     for rtl in [false, true] {
         let name = exact_plan::StrId(plan.strings.len() as u32);
-        plan.strings.push(if rtl { "ar" } else { "en" }.into());
+        plan.strings.push(if rtl { "ar" } else { "en" });
         plan.locales.push(exact_plan::LocalesRow {
             name,
             rtl,

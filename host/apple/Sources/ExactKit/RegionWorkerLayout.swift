@@ -65,6 +65,36 @@ final class RegionWorkerLayout {
         if viewportLines.count < 512 { viewportLines[index] = value }
         return value
     }
+    /// Immutable event geometry; CoreText stays on this worker.
+    func selectionRects(_ selection: NSRange, in box: CGRect) -> [CGRect] {
+        precondition(!Thread.isMainThread)
+        guard selection.location >= 0, selection.length > 0,
+              selection.location <= source.utf16Count,
+              selection.length <= source.utf16Count - selection.location else { return [] }
+        var rects: [CGRect] = []
+        var low = 0, high = lineCount
+        while low < high {
+            let mid = low + (high - low) / 2
+            if NSMaxRange(metadata.lines[mid].range) <= selection.location { low = mid + 1 } else { high = mid }
+        }
+        for i in low..<lineCount {
+            let range = metadata.lines[i].range
+            if range.location >= NSMaxRange(selection) { break }
+            let lo = max(selection.location, range.location), hi = min(NSMaxRange(selection), NSMaxRange(range))
+            guard hi > lo else { continue }
+            let line = line(at: i)
+            let flush: CGFloat = source.align == 1 ? 0.5 : source.align == 2 ? 1 : 0
+            let x = box.minX + TextEngine.penOffset(line, flush: flush, room: Double(box.width), rtl: source.direction == 1,
+                                                    whiteSpace: source.whiteSpace, source: preparation.attributed)
+            let x0 = CTLineGetOffsetForStringIndex(line, lo, nil), x1 = CTLineGetOffsetForStringIndex(line, hi, nil)
+            var above: CGFloat = 0, below: CGFloat = 0
+            _ = CTLineGetTypographicBounds(line, &above, &below, nil)
+            rects.append(CGRect(x: x + min(x0, x1), y: box.minY + baselines[i].rounded() - above,
+                                width: max(1, abs(x1 - x0)), height: above + below))
+        }
+        return rects
+    }
+
     private init(source: RegionTextSource, lines: [CTLine], baselines: [CGFloat], metadata: RegionParagraph,
                  preparation: RegionPreparedSource) {
         self.source = source; self.lines = lines; self.baselines = baselines; self.metadata = metadata
@@ -84,10 +114,7 @@ final class RegionWorkerLayout {
         let attributed = preparation.attributed
         let typesetter = preparation.typesetter
         let length = source.utf16Count
-        func extents(_ run: RegionTextRun) -> (CGFloat, CGFloat) {
-            (run.font.above, run.font.below)
-        }
-        let minimum = source.strut.map { ($0.above, $0.below) } ?? (0, 0)
+        let minimum = source.strut?.box ?? TextLineBox()
         var explicit = false
         var lineBottoms: [CGFloat] = []
         var lines: [CTLine] = []
@@ -116,6 +143,10 @@ final class RegionWorkerLayout {
                 return preparation.suggestBreak(at: start, width: room, cursor: &cursor)
             }
         }
+        // A line's collapsible trailing spaces take none of its width, as a paragraph's (TextEngine.layout).
+        func removed(_ line: CTLine) -> CGFloat {
+            TextEngine.uncountedTrailingWidth(line, whiteSpace: source.whiteSpace, source: attributed, room: CGFloat(limit))
+        }
         // CSS `text-wrap-style: balance`, as a paragraph's (LineBreakPlan.balance).
         var balanced: (until: Int, room: Double)?
         var greedyWidest: CGFloat = 0
@@ -129,7 +160,7 @@ final class RegionWorkerLayout {
                     if widest {
                         let range = CFRangeMake(start, count)
                         let line = TextEngine.inkedSoftHyphen(CTTypesetterCreateLine(typesetter, range), source: attributed, range: range)
-                        greedyWidest = max(greedyWidest, CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil)))
+                        greedyWidest = max(greedyWidest, CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil)) - removed(line))
                     }
                     start += count; n += 1
                 }
@@ -161,27 +192,24 @@ final class RegionWorkerLayout {
             var line = TextEngine.inkedSoftHyphen(CTTypesetterCreateLine(typesetter, CFRangeMake(start, count)),
                                                   source: attributed, range: CFRangeMake(start, count))
             var clamps = false
-            if spec.lineClamp > 0 && lineCount + 1 == spec.lineClamp && start + count < length {
+            var natural: CGFloat? // as TextEngine.layout: a too-long word keeps its width
+            if spec.lineClamp > 0 && lineCount + 1 == spec.lineClamp
+                && TextEngine.clampsLast(line, start: start, count: count, length: length, width: limit) {
+                if start + count == length { natural = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil)) }
                 line = TextEngine.clampedLine(attributed, range: NSRange(location: start, length: count), width: limit) ?? line
                 clamps = true
             }
             var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
             // The natural width: justification fills the box, never sizes it.
-            let w = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+            let drawn = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+            let w = natural ?? (drawn - removed(line))
             if spec.align == 3, !clamps, width.isFinite {
                 line = TextEngine.justified(line, source: attributed, range: CFRangeMake(start, count), width: limit)
             }
             // CSS inline boxes share a baseline. Include the paragraph strut
             // and only the runs on this line, preserving each font's half-leading.
-            var above = minimum.0, below = minimum.1
+            var box = minimum
             var lineInk = fontInk
-            var aboveExplicit = source.strutExplicit, belowExplicit = aboveExplicit
-            func include(_ a: CGFloat, _ b: CGFloat, explicit: Bool) {
-                if a > above { above = a; aboveExplicit = explicit }
-                else if a == above { aboveExplicit = aboveExplicit && explicit }
-                if b > below { below = b; belowExplicit = explicit }
-                else if b == below { belowExplicit = belowExplicit && explicit }
-            }
             for glyphRun in CTLineGetGlyphRuns(line) as! [CTRun] {
                 let range = CTRunGetStringRange(glyphRun)
                 let attributes = CTRunGetAttributes(glyphRun) as NSDictionary
@@ -195,32 +223,30 @@ final class RegionWorkerLayout {
                     if authored.lineHeight != nil {
                         // Explicit boxes use authored metrics; fallback ink
                         // can overflow without enlarging the inline box.
-                        let (a, b) = extents(authored)
-                        include(a, b, explicit: true)
+                        box.include(authored.font.box)
                     } else {
                         includesNormal = true
                     }
                 }
                 if !matched, source.strutExplicit {
-                    let (a, b) = minimum
-                    include(a, b, explicit: true)
+                    box.include(minimum)
                     continue
                 }
                 if matched && !includesNormal { continue }
                 // Normal line height includes the actual emoji/fallback face's
                 // line box, as the browser's does.
-                let (a, d) = CSSLineBox.extents(shapedFont, height: nil)
-                include(a, d, explicit: false)
+                box.include(TextLineBox(shapedFont, height: nil))
             }
-            explicit = explicit || aboveExplicit || belowExplicit
-            if retainHits || lineCount == 0 { baselines.append(y + above) }
-            lastBaseline = y + above
-            y += above + below
+            explicit = explicit || box.explicit
+            if retainHits || lineCount == 0 { baselines.append(y + box.baseline) }
+            lastBaseline = y + box.baseline
+            y += box.height
             if retainHits { lineBottoms.append(y) }
             maxWidth = max(maxWidth, w)
             if retainHits {
                 if compact {
-                    summaries.append(RegionLine(line, flush: flush, width: width, rtl: source.direction == 1, captureHits: false,
+                    summaries.append(RegionLine(line, flush: flush, width: width, rtl: source.direction == 1, whiteSpace: source.whiteSpace,
+                                                text: attributed, captureHits: false,
                                                 conservativeInk: lineInk.isNull ? .zero : lineInk))
                 } else { lines.append(line) }
             }
@@ -248,7 +274,7 @@ final class RegionWorkerLayout {
             metadata = try RegionParagraph(source: source, sourceSHA256: preparation.sourceSHA256,
                 lines: lines, baselines: baselines, width: CSSLineBox.layoutWidth(maxWidth), height: height,
                 lineBottoms: lineBottoms, offeredWidth: width, retainHits: retainHits, captureHits: false,
-                metadataCheckpoint: beforeMetadata)
+                attributed: attributed, metadataCheckpoint: beforeMetadata)
         }
         return RegionWorkerLayout(source: source, lines: retainHits ? lines : [], baselines: retainHits ? baselines : [],
                                   metadata: metadata, preparation: preparation)

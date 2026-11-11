@@ -1,16 +1,27 @@
 {
   "ticks": {
-    "0": "0xdd18ad0f216a2cd9",
-    "60": "0x483c73a4464f6d73"
+    "0": "0x5afa5f0d9931aba8",
+    "60": "0x2987115a97f93508"
   },
   "saves": {
-    "continuation": "7792fcc2833d0554341c0aacccc912cffc3fb5609f8b4c9d715f2aa4da4ce9ff"
+    "continuation": "6dd7118ea89ca5fbedee9c1a59dd15ba60e95db62b80a292d7e429bfd5ee726a"
   },
   "hosts": [
-    "linux"
+    "linux",
+    "web"
   ],
-  "inputs": "41944440b05d5369a77a8bd7d90dee8fa8f64596980e9074f0c5a3bafac69d6d",
+  "modes": [
+    "0",
+    "1",
+    "fresh-game"
+  ],
+  "profiles": [
+    "gpu-dev"
+  ],
+  "inputs": "95c397cd28533ee1fb13c4d59dc15d5932e8b509efe5e2098749cbc4f300a1f0",
+  "sourceInputs": "6210d79b5fc4a4d7beb1ea7d8911ccf4a2b6aa92659b24f4c0673c40a1b1e98e",
   "game": "asset-fixture",
-  "generated": "bun game/prove.mjs asset-fixture --repin --hosts linux",
-  "at": "2c19c834853f9a169c70704b58f0ed255a8d7daa"
+  "generated": "bun game/prove.mjs asset-fixture --repin --hosts 'linux,web'",
+  "at": "4d0b8ce3cbdcf172d27290af8e9d6542ee979274",
+  "reason": "EXSIM v8 (player: u8, pads) over EXGAME v6: continuation bytes change; tick hashes unchanged"
 }

@@ -11,7 +11,9 @@ impl Event {
     /// (scroll), 19 (media), 20 (pan), 21 (select), 28 (panrelease, LLP
     /// 1057 §10.6), 29 to 31 (the pointer's down, up and move), 32 to 34
     /// (the clipboard's copy, cut and paste), 35 (`selectionchange`), 36
-    /// (beforeunload), 37 (wheel), 38 (drop), 39 (resize, its
+    /// (beforeunload), 37 (wheel), 38 (drop), 55 and 56 (a file drag's
+    /// dragenter and dragleave), 57 (a paste with files), 59 (atompress),
+    /// 39 (resize, its
     /// `contentRect` as `x,y,width,height`), 40 to 42 and 48 (a field's
     /// input, change, select and replacement input), 45 (intersect,
     /// `0|1,ratio`), 46 and 47 (focusin, focusout), 50 (toggle, oldState,newState)
@@ -19,8 +21,8 @@ impl Event {
     /// (beforeinput/input metadata) from its UTF-8 payload.
     pub fn of_host_kind(kind: u32, payload: &str) -> Result<Event, &'static str> {
         match kind {
-            // A key's down (6), up (43) or capture (44, #140): the chord, then its code
-            // and repeat (`KeyboardEvent::parse`).
+            // A key's down (6), up (43) or capture (44, #140): the chord, then its code,
+            // repeat and isComposing (`KeyboardEvent::parse`).
             6 => super::KeyboardEvent::parse(payload)
                 .map(Event::Key)
                 .ok_or("invalid key event"),
@@ -54,6 +56,27 @@ impl Event {
             38 => super::DropEvent::parse(payload)
                 .map(Event::Drop)
                 .ok_or("invalid drop event"),
+            // A file drag's enter (55) and leave (56): the point line alone.
+            55 | 56 => super::DropEvent::parse_point(payload)
+                .map(if kind == 55 {
+                    Event::Dragenter
+                } else {
+                    Event::Dragleave
+                })
+                .ok_or("invalid drag event"),
+            57 => Event::paste_files_payload(payload).ok_or("invalid clipboard event"),
+            // @ref LLP 1020.002 D2, D5 — an iframe's guest: its event, then the record.
+            58 => super::event::frame_navigation::FrameNavigation::parse(payload)
+                .map(|(kind, n)| Event::FrameNavigation(kind, Box::new(n)))
+                .or_else(|| {
+                    super::event::frame_navigation::other(payload)
+                        .map(|(kind, v)| Event::FrameRecord(kind, Box::new(v)))
+                })
+                .ok_or("invalid frame event"),
+            // A press on an inline atom (LLP 1045.000 D7).
+            59 => super::AtomEvent::parse(payload)
+                .map(Event::Atompress)
+                .ok_or("invalid atom press"),
             45 => {
                 let (hit, ratio) = payload
                     .split_once(',')
@@ -99,11 +122,12 @@ impl Event {
         }
     }
 
-    /// Decode host kind 21: formats, mixed (0/1), unavailable, then the link
+    /// Decode host kind 21: formats, mixed (0/1), unavailable, the selected
+    /// atom's source (LLP 1045.000 D3; never a line break), then the link
     /// remainder, separated by newlines. Token lists never contain newlines;
     /// a target may, so the final remainder is kept verbatim.
     pub fn selection_payload(payload: &str) -> Option<Self> {
-        let mut parts = payload.splitn(4, '\n');
+        let mut parts = payload.splitn(5, '\n');
         let formats = parts.next()?;
         let mixed = match parts.next()? {
             "0" => false,
@@ -111,6 +135,7 @@ impl Event {
             _ => return None,
         };
         let unavailable = parts.next()?;
+        let atom = parts.next()?;
         let link = parts.next()?;
         let tokens = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b' ');
         if !tokens(formats) || !tokens(unavailable) {
@@ -121,6 +146,7 @@ impl Event {
             mixed,
             link: link.into(),
             unavailable: unavailable.into(),
+            atom: atom.into(),
         })
     }
 
@@ -134,11 +160,21 @@ impl Event {
         let session = super::media_session::ACTIONS.contains(&kind);
         // `fullscreenchange` (LLP 1042) is listed after them too: a boolean.
         let fullscreen = kind == EventKind::Fullscreenchange;
+        // An image's picture in picture (LLP 1042 §9), later still: entering
+        // and leaving carry nothing, a failure its reason.
+        let floating = matches!(
+            kind,
+            EventKind::Enterpictureinpicture | EventKind::Leavepictureinpicture
+        );
+        let refused = kind == EventKind::Pictureinpictureerror;
         if !session
             && !fullscreen
+            && !floating
+            && !refused
             && !(EventKind::Loadedmetadata as u8..=EventKind::Canplay as u8).contains(&(kind as u8))
             || session && super::media_session::details(value).is_none()
             || fullscreen && !matches!(value, "true" | "false")
+            || floating && !value.is_empty()
         {
             return None;
         }
@@ -203,7 +239,29 @@ impl Event {
             34 => EventKind::Paste,
             _ => return None,
         };
-        Some(Self::Clipboard(kind, payload.into()))
+        Some(Self::Clipboard(kind, payload.into(), Vec::new()))
+    }
+
+    /// Decode ABI kind 57, a `paste` whose clipboard holds files: the count
+    /// of files, a `doc:` handle a line, then the plain text verbatim (it may
+    /// hold newlines). `None` when a line is not a handle.
+    pub fn paste_files_payload(payload: &str) -> Option<Self> {
+        let (count, mut rest) = payload.split_once('\n')?;
+        let count: usize = count.parse().ok().filter(|&n| n > 0)?;
+        let mut files = Vec::with_capacity(count.min(64));
+        for i in 0..count {
+            let (file, after) = match rest.split_once('\n') {
+                Some(split) => split,
+                None if i + 1 == count => (rest, ""),
+                None => return None,
+            };
+            if !file.starts_with("doc:/") {
+                return None;
+            }
+            files.push(file.to_owned());
+            rest = after;
+        }
+        Some(Self::Clipboard(EventKind::Paste, rest.into(), files))
     }
 }
 
@@ -259,7 +317,36 @@ mod tests {
         );
         assert!(matches!(
             Event::of_host_kind(34, "a\tb\n1\t2"),
-            Ok(Event::Clipboard(exact_plan::EventKind::Paste, text)) if text == "a\tb\n1\t2"
+            Ok(Event::Clipboard(exact_plan::EventKind::Paste, text, files)) if text == "a\tb\n1\t2" && files.is_empty()
+        ));
+        // A paste with files: their count, a handle a line, then the text.
+        assert!(matches!(
+            Event::of_host_kind(57, "2\ndoc:/1/a.png\ndoc:/2/b c.txt\nline\nnext"),
+            Ok(Event::Clipboard(exact_plan::EventKind::Paste, text, files))
+                if text == "line\nnext" && files == ["doc:/1/a.png", "doc:/2/b c.txt"]
+        ));
+        assert!(matches!(
+            Event::of_host_kind(57, "1\ndoc:/3/image.png"),
+            Ok(Event::Clipboard(_, text, files)) if text.is_empty() && files == ["doc:/3/image.png"]
+        ));
+        for bad in ["0\n", "1\n/tmp/a.png\n", "2\ndoc:/1/a", "x\ndoc:/1/a\n", ""] {
+            assert_eq!(
+                Event::of_host_kind(57, bad).err(),
+                Some("invalid clipboard event"),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            Event::of_host_kind(55, "3,4,Shift"),
+            Ok(Event::Dragenter(d)) if d.offset_y == 4.0 && d.held.shift && d.files.is_empty()
+        ));
+        assert!(matches!(
+            Event::of_host_kind(56, "0,0"),
+            Ok(Event::Dragleave(_))
+        ));
+        assert!(matches!(
+            Event::of_host_kind(56, "0,0\ndoc:/1/a"),
+            Err("invalid drag event")
         ));
         assert!(matches!(
             Event::of_host_kind(35, "3,9,0,a, b\nc"),

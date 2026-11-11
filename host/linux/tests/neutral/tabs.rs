@@ -130,7 +130,7 @@ pub(super) fn narrow_tab_bars_follow_the_neutral_paint_rules() {
             assert_eq!(pixel(&mut p, name, 0.0, 16.0), ground, "no ordinary edge");
         }
         assert_eq!(
-            pixel(&mut p, "gray", 4.0, 16.0),
+            pixel(&mut p, "gray", 32.0, 2.0),
             ground,
             "gray tabs have no fill"
         );
@@ -198,6 +198,11 @@ pub(super) fn narrow_tab_bars_follow_the_neutral_paint_rules() {
             Some("Taps 1")
         );
         assert_eq!(p.focus(), Some(id(&p, "tab-b")));
+        // A press's focus shows no ring; a key then shows it.
+        assert_ne!(pixel(&mut p, "tab-b", 32.0, 0.0), [0, 0x55, 0xcc]);
+        let tab = id(&p, "tab-b");
+        p.type_key(tab, "KeyX", "x", true, false).unwrap();
+        p.type_key(tab, "KeyX", "x", false, false).unwrap();
         assert_eq!(pixel(&mut p, "tab-b", 32.0, 0.0), [0, 0x55, 0xcc]);
         // Compare the selected face after observing and releasing its focus ring.
         p.blur();

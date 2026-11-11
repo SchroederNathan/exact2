@@ -1,7 +1,7 @@
 // The runner's evaluation bounds on the JS target (LLP 1090; runner/src/vm.rs): an app module imports what it calls from
 // here, beside rt.js, which never does. A metered body counts its own list steps in a local `$s` (code.rs); what is here
 // measures values as the runner's `Extent` does, and checks the strings the roster builds.
-import { Refusal, text, segmentOf } from "./rt.js";
+import { Refusal, text, segmentOf, say } from "./rt.js";
 
 /** `MAX_STRING` and `MAX_VALUE_BYTES`, in UTF-8 bytes; `MAX_VALUE_NODES`. */
 const MAX = 67108864, NODES = 16777216;
@@ -9,6 +9,13 @@ const MAX = 67108864, NODES = 16777216;
 export class Trap extends Refusal { constructor(kind, pc) { super(`Trap(${kind} { pc: ${pc} })`); this.kind = kind; this.pc = pc; } }
 /** Throw a trap, where an expression stands. */
 export function $T(kind, pc) { throw new Trap(kind, pc); }
+/** Prop or style binding `f` of plan node `site` on element `e`, whose trap unsets its row `row` and the commit goes on
+ * (LLP 1017.003 D3; the runner's `instance/trapped.rs`). One journal line when it starts trapping, however many writes
+ * read it: the element keeps which of its rows' bindings trapped last, until one evaluates to a value. */
+export const tg = (e, site, row, f) => () => {
+  try { const v = f(); e.$tg?.delete(row); return v; }
+  catch (x) { if (!(x instanceof Trap)) throw x; const t = (e.$tg ??= new Set); if (!t.has(row)) { t.add(row); say(`site ${site}: ${row} trapped ${x.message}; unset`); } return null; }
+};
 /** A string's UTF-8 bytes, as Rust's `str::len`; a lone surrogate is U+FFFD's 3 (LLP 1088 D2). */
 export function utf8(s, limit = Infinity) {
   let n = s.length;
@@ -84,7 +91,7 @@ export function K(a, pc) {
 }
 
 // ---------------------------------------------------------------- lists (LLP 1088 §9.1)
-// `concat`, `split`, and `slice`, `includes` and `indexOf` over a list, on the caller's budget as `join` is: each takes
+// `concat`, `split`, `sum`, `range`, `flat`, and `slice`, `includes` and `indexOf` over a list, on the caller's budget as `join` is: each takes
 // the caller's `$s` and traps where the sum passes the bound, before it builds (`vm.rs`, `list_call`), leaving its own
 // steps in `ST`, which the caller adds to its `$s` (code.rs); a list it builds is `K`'s. Over text, `slice`, `includes`
 // and `indexOf` take no step.
@@ -124,6 +131,52 @@ export function x_indexOf(v, x, s, pc) {
   }
   step(s, v.length, pc);
   return -1;
+}
+/** `sortBy(xs, x => key, direction)` once a `Map` computed `keys` (LLP 1116.016 §5): the items by key, equal keys in
+ * input order both ways; numbers by `<` with NaN as +0, strings by `<` (UTF-16 code units). No step: the `Map` took one an
+ * item. The runner's bottom-up merge sort (`lists::sort_by`), step for step, never `Array.prototype.sort`. */
+export function x_sortBy(xs, keys, desc, pc) {
+  const n = xs.length, k = new Array(n);
+  // The checker gives every key one type, a number or a string.
+  for (let i = 0; i < n; i++) k[i] = keys[i] !== keys[i] ? 0 : keys[i];
+  // Whether the item at position `b` goes before the one at `a`.
+  const before = desc ? (b, a) => k[a] < k[b] : (b, a) => k[b] < k[a];
+  let src = new Array(n), dst = new Array(n);
+  for (let i = 0; i < n; i++) src[i] = i;
+  for (let width = 1; width < n; width *= 2) {
+    for (let lo = 0; lo < n; lo += 2 * width) {
+      const mid = Math.min(lo + width, n), hi = Math.min(lo + 2 * width, n);
+      let i = lo, j = mid, o = lo;
+      while (i < mid && j < hi) dst[o++] = before(src[j], src[i]) ? src[j++] : src[i++];
+      while (i < mid) dst[o++] = src[i++];
+      while (j < hi) dst[o++] = src[j++];
+    }
+    const t = src; src = dst; dst = t;
+  }
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = xs[src[i]];
+  return K(out, pc);
+}
+/** `sum(xs)`: `xs.reduce((a, x) => a + x, 0)`, a step an item, taken before it adds. */
+export function x_sum(l, s, pc) {
+  step(s, l.length, pc);
+  let total = 0;
+  for (const x of l) total += x;
+  return total;
+}
+/** `range(n)`: 0 to n - 1, a step an item, taken before it builds; an `n` that is not a whole number at least 0 does not
+ * fit, the runner's `TypeMismatch` (format.json `range`). */
+export function x_range(n, s, pc) {
+  if (!Number.isInteger(n) || n < 0) throw new Trap("TypeMismatch", pc);
+  step(s, n, pc);
+  return K(Array.from({ length: n }, (_, i) => i), pc);
+}
+/** `xs.flat()`: `Array.prototype.flat()` at depth 1, a step an outer item and one an item it keeps, taken before it builds. */
+export function x_flat(l, s, pc) {
+  let n = l.length;
+  for (const x of l) n += x.length;
+  step(s, n, pc);
+  return K(l.flat(), pc);
 }
 /** `split(t, sep)`: a step a piece; an empty `sep` splits into code units, each made well formed (LLP 1088 D2), and
  * steps before it splits, as the runner counts first. */
@@ -176,10 +229,14 @@ function jsonBytes(s) {
   }
   return bytes;
 }
-/** A native module's props (LLP 1024 D1): key/value pairs to one JSON object of strings, a none left out (`stdlib::native_props`). */
+/** A native module's props (LLP 1024 D1): key/value pairs to one JSON object of strings, a none left out (`stdlib::native_props`).
+ * A key that is `[name, schema]` carries its value as JSON by the schema (a package view's record or list prop, LLP 1133.021 §9 item 1). */
 export function NP(p, pc) {
   const o = {};
-  for (let i = 0; i < p.length; i += 2) if (p[i + 1] != null) o[p[i]] = String(p[i + 1]);
+  for (let i = 0; i < p.length; i += 2) if (p[i + 1] != null) {
+    if (Array.isArray(p[i])) o[p[i][0]] = JSON.stringify(typed(p[i + 1], JSON.parse(p[i][1])));
+    else o[p[i]] = String(p[i + 1]);
+  }
   let bytes = 2, first = true;
   for (const [key, value] of Object.entries(o)) {
     bytes += (first ? 0 : 1) + jsonBytes(key) + 1 + jsonBytes(value);
@@ -187,6 +244,14 @@ export function NP(p, pc) {
     first = false;
   }
   return JSON.stringify(o);
+}
+/** A value by its schema (`native_props`'s `typed_json`): `0` itself, `o` an option, `l` a list, `r` a record by position, a none field left out. */
+function typed(v, s) {
+  if (v == null) return null;
+  if (s?.o !== undefined) return typed(v, s.o);
+  if (s?.l !== undefined) return v.map(x => typed(x, s.l));
+  if (s?.r) { const out = {}; s.r.forEach(([f, t], i) => { if (v[i] != null) out[f] = typed(v[i], t); }); return out; }
+  return typeof v === "number" && !isFinite(v) ? null : v;
 }
 /** `t(key, name=value…)` (rt.js `text`). */
 export function x_t(name, key, pairs, pc) {
@@ -257,17 +322,21 @@ export function x_replaceAll(s, find, w, pc, max = MAX) {
   if (high && bytes + 3 > max) throw new Trap("StringTooLong", pc);
   return out.join("").toWellFormed();
 }
-/** `toLowerCase(s)` (LLP 1088 D2): the browser's whole-string mapping, context rules kept, with bytes checked in chunks before building a large result. */
-export function x_toLowerCase(s, pc) {
+/** `toLowerCase(s)` and `toUpperCase(s)` (LLP 1088 D2): the browser's whole-string mapping, context rules kept, with bytes
+ * checked in chunks before building a large result (a final sigma's two forms are both 2 bytes, and uppercasing has no
+ * context rule, so the chunks' bytes are the whole's). */
+function cased(s, map, pc) {
   if (9 * s.length > MAX) {
     let bytes = 0;
     for (let at = 0; at < s.length;) {
       let end = Math.min(at + 65536, s.length);
       if (end < s.length && s.charCodeAt(end - 1) >= 0xd800 && s.charCodeAt(end - 1) <= 0xdbff && s.charCodeAt(end) >= 0xdc00 && s.charCodeAt(end) <= 0xdfff) end++;
-      bytes += utf8(s.slice(at, end).toLowerCase().toWellFormed());
+      bytes += utf8(map(s.slice(at, end)).toWellFormed());
       if (bytes > MAX) throw new Trap("StringTooLong", pc);
       at = end;
     }
   }
-  return str(s.toLowerCase().toWellFormed(), pc);
+  return str(map(s).toWellFormed(), pc);
 }
+export const x_toLowerCase = (s, pc) => cased(s, t => t.toLowerCase(), pc);
+export const x_toUpperCase = (s, pc) => cased(s, t => t.toUpperCase(), pc);

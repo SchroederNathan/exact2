@@ -395,6 +395,60 @@ final class SurfaceControlTests: XCTestCase {
         XCTAssertTrue(controlEvents.isEmpty, "a prevented key goes no further")
         withExtendedLifetime(window) {}
     }
+    func testAgentStandaloneModifiersReachCanvasWithStableDownAndReleaseEdges() {
+        let (s, canvas, _) = fixture(); defer { s.destroy() }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = s.presenter.viewport
+        let agent = s.agentInstance
+        for code in ["ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight"] {
+            controlEvents = []
+            XCTAssertNil(agent.type(["id": 100, "key": "KeyW", "phase": "down"])["error"])
+            XCTAssertNil(agent.type(["id": 100, "key": code, "phase": "down"])["error"])
+            XCTAssertNil(agent.type(["id": 100, "key": code, "phase": "down", "repeat": true])["error"])
+            XCTAssertNil(agent.type(["id": 100, "key": "KeyF"])["error"])
+            XCTAssertNil(agent.type(["id": 100, "key": code, "phase": "up"])["error"])
+            XCTAssertNil(agent.type(["id": 100, "key": "KeyW", "phase": "up"])["error"])
+            let packets = controlEvents.filter { $0["t"] as? String == "key" }
+            XCTAssertEqual(packets.compactMap { $0["code"] as? String }, ["KeyW", code, code, "KeyF", "KeyF", code, "KeyW"], code)
+            XCTAssertEqual(packets.compactMap { $0["down"] as? Bool }, [true, true, true, true, false, false, false], code)
+        }
+        canvas.handlers.insert("key")
+        s.presenter.onKey = { _, _ in s.presenter.defaultPrevented = true }
+        controlEvents = []
+        XCTAssertNil(agent.type(["id": 100, "key": "ControlLeft"])["error"])
+        XCTAssertTrue(controlEvents.isEmpty, "prevented modifiers do not reach the canvas")
+        withExtendedLifetime(window) {}
+    }
+
+    func testAgentModifierReleaseTokensRetainSideAndOriginalFocusOwner() {
+        let (s, canvas, _) = fixture(); defer { s.destroy() }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = s.presenter.viewport
+        let agent = s.agentInstance
+        controlEvents = []
+        XCTAssertNil(agent.type(["id": 100, "key": "ControlLeft", "phase": "down", "releaseKey": "left"])["error"])
+        XCTAssertNil(agent.type(["id": 100, "key": "ControlRight", "phase": "down", "releaseKey": "right"])["error"])
+        XCTAssertNotNil(agent.keyReleases.removeValue(forKey: "left")?())
+        XCTAssertNil(agent.type(["id": 100, "key": "ControlRight", "phase": "down", "repeat": true])["error"])
+        XCTAssertNotNil(agent.keyReleases.removeValue(forKey: "right")?())
+        let packets = controlEvents.filter { $0["t"] as? String == "key" }
+        XCTAssertEqual(packets.compactMap { $0["code"] as? String }, ["ControlLeft", "ControlRight", "ControlLeft", "ControlRight", "ControlRight"])
+        XCTAssertEqual(packets.compactMap { $0["down"] as? Bool }, [true, true, false, true, false])
+
+        XCTAssertNil(agent.type(["id": 100, "key": "ControlLeft", "phase": "down", "releaseKey": "blurred"])["error"])
+        let editor = NSTextView(frame: NSRect(x: 0, y: 100, width: 100, height: 50))
+        s.presenter.root.addSubview(editor)
+        controlEvents = []
+        XCTAssertTrue(window.makeFirstResponder(editor))
+        XCTAssertTrue(controlEvents.contains { $0["t"] as? String == "blur" })
+        controlEvents = []
+        XCTAssertNotNil(agent.keyReleases.removeValue(forKey: "blurred")?())
+        XCTAssertTrue(controlEvents.isEmpty, "a release after blur must not deliver input to the former canvas")
+        XCTAssertTrue(window.firstResponder === editor)
+        withExtendedLifetime(canvas) {}
+        withExtendedLifetime(window) {}
+    }
+
     func testAgentCancelClearsMouseContact() {
         let (s,_,_) = fixture(); defer { s.destroy() }
         let window=NSWindow(contentRect:NSRect(x:0,y:0,width:200,height:200),styleMask:[.borderless],backing:.buffered,defer:false)

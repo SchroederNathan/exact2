@@ -26,6 +26,19 @@ extension NodeView {
         if let field { applyField(field, set: props, clear: []) }
         layoutField()
     }
+    /// HTML's `enterkeyhint` as UIKit's return key, for an `input` and a
+    /// `textarea` alike; `unsaid` is the key with no hint.
+    static func returnKey(_ hint: String?, unsaid: UIReturnKeyType) -> UIReturnKeyType {
+        switch hint {
+        case "done": .done
+        case "go": .go
+        case "next": .next
+        case "search": .search
+        case "send": .send
+        case "enter", "previous": .default
+        default: unsaid
+        }
+    }
     /// The props an `input`'s field shows: `set` and `clear` are what changed.
     func applyField(_ f: UITextField, set: [String: String], clear: [String]) {
         #if os(iOS)
@@ -69,15 +82,7 @@ extension NodeView {
         // field unless the action focuses it again (D9.2), so Done says
         // what it does (LLP 1116.019 D5). The document keeps no hint, so
         // the web's keyboard stays its own.
-        switch props["enterKeyHint"] {
-        case "done": f.returnKeyType = .done
-        case "go": f.returnKeyType = .go
-        case "next": f.returnKeyType = .next
-        case "search": f.returnKeyType = .search
-        case "send": f.returnKeyType = .send
-        case "enter", "previous": f.returnKeyType = .default
-        default: f.returnKeyType = type == "search" ? .search : .done
-        }
+        f.returnKeyType = NodeView.returnKey(props["enterKeyHint"], unsaid: type == "search" ? .search : .done)
         f.isEnabled = !disabled
         if headerField != nil { presenter?.menus.promptInputChanged(self) } // a prompt's field stands in for it (PromptFieldIOS.swift)
         if isNativeTextControl { styleNativeField() }
@@ -101,12 +106,52 @@ extension NodeView {
     func applyFieldStyle() {
     field?.textAlignment = NSTextAlignment(rawValue: textAlignmentCode) ?? .left
     if let f = field, let t = text {
-        f.font = t.font(size: number("font_size", PageFacts.defaultRootFontSize), weight: Int(number("font_weight", 400)), family: Int(number("font_family")), italic: (style["font_style"]?.string) == "italic", numeric: Int(number("font_variant_numeric")))
-        f.textColor = color("text_color", SystemColor.canvasText)
+        f.font = t.font(size: number("font_size", PageFacts.defaultRootFontSize), weight: Int(number("font_weight", 400)), family: Int(number("font_family")), italic: (style["font_style"]?.string) == "italic", numeric: Int(number("font_variant_numeric")),
+            ligatures: Int(number("font_variant_ligatures")), stretch: CGFloat(number("font_stretch", 100)), variations: FontAxis.of(style))
+        f.textColor = fieldInk
         applyPlaceholder(f)
         styleNativeField()
         updateNumberStepper() // `appearance` may have changed (LLP 1116.007 D4)
+        applyFieldDirection()
     }
+    }
+    /// The node's `direction` as the text's base, at its side (LLP 1001 §1),
+    /// in its field and in the one standing in for it (a search bar's, an
+    /// alert prompt's: `headerField`). UIKit sets default attributes over the
+    /// whole text, a composition's marked text too, so not while one is
+    /// marked: its end (`unmarkText`, `fieldChanged`) applies it.
+    func applyFieldDirection() {
+        let alignment = NSTextAlignment(rawValue: textAlignmentCode) ?? .left
+        for f in [field, headerField].compactMap({ $0 }) where f.markedTextRange == nil {
+            if f.textAlignment != alignment { f.textAlignment = alignment } // a stand-in's too: CSS's side, not UIKit's
+            let paragraph = (f.defaultTextAttributes[.paragraphStyle] as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle ?? NSMutableParagraphStyle()
+            guard paragraph.baseWritingDirection != fieldBaseDirection || paragraph.alignment != alignment else { continue }
+            paragraph.baseWritingDirection = fieldBaseDirection
+            paragraph.alignment = alignment
+            f.defaultTextAttributes[.paragraphStyle] = paragraph
+        }
+    }
+    /// A plain field's paragraph base direction: CSS `direction`, said either
+    /// way as Apple text's is (`TextEngine.setBaseDirection`), so no first
+    /// strong character picks it (LLP 1001 §1).
+    var fieldBaseDirection: NSWritingDirection {
+        style["direction"]?.string == "rtl" ? .rightToLeft : .leftToRight
+    }
+    /// A field's ground where it writes none: the design's `Field` where it
+    /// overrides that role (LLP 1121 D9), else none, as before (the page
+    /// shows through the box Exact paints; a search field's chrome keeps
+    /// UIKit's fill).
+    var fieldGroundColor: UIColor? {
+        guard isNativeTextControl, !wrote("background_color") else { return nil }
+        return ThemeRoles.color("Field", in: self)
+    }
+    /// The ground the node's layer paints under its field: none where a
+    /// search field's chrome fills it (`styleNativeField`).
+    var fieldGround: CGColor? {
+        #if !os(tvOS)
+        if searchChrome != nil { return nil }
+        #endif
+        return fieldGroundColor?.resolvedColor(with: traitCollection).cgColor
     }
     var isNativeTextControl: Bool {
         (field != nil || textArea != nil) && props["markup"] != "markdown" && style["appearance"]?.string != "none"
@@ -114,6 +159,14 @@ extension NodeView {
     /// A native field in a grouped list's row (LLP 1116.005 D2), as the
     /// kernel publishes it with the editor box: borderless, its cell being
     /// the field, as a hand-built settings form's is.
+    /// The design's Field under a field's own bezel sits on the bezel's
+    /// corners (BoxLayerIOS.swift); the background's own clip still holds
+    /// inside it. Nil in a grouped cell, which has no corners.
+    func fieldOutline() -> CGPath? {
+        guard !isCellField else { return nil }
+        let r = min(FieldChromeCache.textareaRadius, bounds.width / 2, bounds.height / 2)
+        return CGPath(roundedRect: bounds, cornerWidth: r, cornerHeight: r, transform: nil)
+    }
     var isCellField: Bool { isNativeTextControl && fieldInCell }
     /// Whether a touch a grouped row leaves to no control falls to the row's
     /// field (`cellField`). It widens the field's target to the cell, as a
@@ -129,8 +182,11 @@ extension NodeView {
         // Return the published insets applied to that argument, rather than
         // an absolute rect: the latter hid values or moved their baseline.
         // UIKit centres its single line within the resulting content box.
+        // Layout's inset less what the drawn box lost to the pixel grid, so
+        // the text keeps layout's width (`PixelGridIOS.swift`).
         var insets = UIEdgeInsets(top: rect.minY, left: rect.minX,
-            bottom: max(0, bounds.height - rect.maxY), right: max(0, bounds.width - rect.maxX))
+            bottom: max(0, layoutBounds.height - rect.maxY) + bounds.height - layoutBounds.height,
+            right: max(0, layoutBounds.width - rect.maxX) + bounds.width - layoutBounds.width)
         // A number input's stepper takes the text's trailing end (LLP 1116.007 D4).
         let room = stepperRoom
         if room > 0 { if style["direction"]?.string == "rtl" { insets.left += room } else { insets.right += room } }
@@ -162,6 +218,8 @@ extension NodeView {
         } else if !search, let chrome = searchChrome {
             chrome.removeFromSuperview()
         }
+        // The chrome's fill is the design's Field where it overrides it.
+        searchChrome?.backgroundColor = fieldGroundColor
         #endif
         if isNativeTextControl {
             field.defaultTextAttributes[.kern] = number("letter_spacing")
@@ -266,10 +324,20 @@ extension Presenter {
     /// Applies a `fieldContent` op. A content box touches its node here,
     /// where it takes effect: the paragraph laid out in it, and a native
     /// button's face, whose padding the kernel resolved with it, asked for
-    /// again at the next controls sync.
+    /// again at its next read.
     func applyContentGeometry(_ v: NodeView, _ op: BatchOp) {
         v.applyFieldContent(op.payload)
-        touched(v.id, textChanged: true)
+        // A paragraph's content box is where its pixels are, not what they
+        // say (`textRasterGeometryChanged`). One with no pixels for it (a new
+        // paragraph, a box of another size) is painted as the batch ends, with
+        // the batch's other new words (`paintChangedText`). A paragraph drawn
+        // in its view instead (lines flowed around shapes placed in the view,
+        // columns) and a field's words are laid out in the box again.
+        if v.isParagraph {
+            v.textRasterGeometryChanged()
+            if applying, v.textRasterKey == nil { changedText.insert(v.id) }
+        }
+        touched(v.id, textChanged: !v.isParagraph || !v.canRasterText)
         controls.faceChanged(v.id)
     }
 }

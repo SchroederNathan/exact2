@@ -8,14 +8,14 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { backLayer, chromium, launchFacts, listenOn, netOptions, refuseStale, staleError, warnStale, webChanges, withEpoch, withFaults } from './agent-launch.mjs';
+import { agentPage, backLayer, builtSettingLines, chromium, launchFacts, listenOn, netOptions, refuseStale, staleError, warnStale, webChanges, withEpoch, withFaults } from './agent-launch.mjs';
 import { deliverClipboard, pasteChord } from './agent-keys.mjs';
 import { pageAim } from './agent-aim.mjs';
-import { builtAppMatches, jsTargetBuild, serveBuildTree, serveStatic } from '../host/web/serve.mjs';
+import { builtAppMatches, jsTargetBuild, serveBuildTree, serveStatic } from '../host/web/serve.mjs'; import { bootedGeneration, leaseGeneration } from '../host/web/generations.mjs';
 import { resolveApp, webBuildCommand, webDist as defaultWebDist } from './app.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const INSTALL = 'bunx playwright@1.63.0 install firefox webkit';
+const INSTALL = `bunx playwright@${JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8')).devDependencies['playwright-core']} install firefox webkit`;
 const WORLD_LIMIT = 256 * 1024 * 1024;
 
 const FIREFOX_PREFS = {
@@ -36,8 +36,8 @@ function unavailable(name, error) {
   return new Error(`web carrier unavailable: ${name}: ${message.replace(/\s+/g, ' ').trim()}`);
 }
 
-/** Why the engine `name` (chromium, firefox, webkit) cannot be driven here, or null: Chrome as agent.mjs
- * finds it, Firefox and WebKit as Playwright installs them. For tests to choose themselves (scripts/coverage.mjs). */
+/** Why the engine `name` (chromium, firefox, webkit) cannot be driven here, or null: Chromium as agent-launch.mjs
+ * `chromium` finds it, Firefox and WebKit as Playwright installs them. For tests to choose themselves (scripts/coverage.mjs). */
 export async function browserMissing(name) {
   if (name === 'chromium') return chromium().unavailable;
   const playwright = await import('playwright-core');
@@ -85,12 +85,15 @@ async function files({ plan, pageURL, app, webDist, port, env }) {
     if (b.status !== 0) { rmSync(planBuild, { recursive: true, force: true }); throw new Error(`--plan ${plan}: its JS build failed: ${(b.stderr ?? '').trim().split('\n').slice(-3).join(' ')}`); }
     served = planBuild;
   }
+  // The drive's build, leased while its server runs (host/web/generations.mjs; agent.mjs's carrier does the same).
+  const pinned = js ? await bootedGeneration(served) : null, release = pinned ? leaseGeneration(served, pinned) : () => {};
   const server = createServer((req, res) => {
     if (req.url === '/__plan' && plan) { res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(readFileSync(plan)); return; }
     if (req.url === '/favicon.ico') { res.writeHead(204); res.end(); return; }
-    if (js) return serveBuildTree(served, req, res);
+    if (js) return serveBuildTree(served, req, res, { pinned });
     serveStatic(dist, req, res);
   });
+  server.once('close', release);
   // `--port`/EXACT_PORT (agent-launch.mjs `webPort`), else a free one.
   await listenOn(server, port ?? 0, '127.0.0.1', undefined, port != null, env);
   return { js, server, planBuild, url: pageURL ?? `http://127.0.0.1:${server.address().port}/` };
@@ -110,7 +113,7 @@ const init = `
 
 async function waitForBoot(page, why = 'the page never booted') {
   try { await page.waitForFunction(() => document.getElementById('exact-root')?.dataset.bootMs != null, null, { timeout: 30000 }); }
-  catch { throw new Error(why); }
+  catch { throw new Error(typeof why === 'function' ? why() : why); }
   await page.evaluate(() => globalThis.exact.ready);
   return Number(await page.locator('#exact-root').getAttribute('data-boot-ms'));
 }
@@ -223,7 +226,9 @@ export async function openPlaywrightWeb({ browser: name, plan, world, size, url:
   const hosted = await files({ plan, pageURL, app, webDist, port, env });
   let browserServer, browser, context, page, poolKey;
   // Only Chrome keeps a named store's profile between drives (agent.mjs `openWeb`); here it is this drive's own.
-  const hostLines = storage === undefined ? [] : [`${name}: --storage ${storage} is this drive's own profile, emptied when it ends; Chrome keeps a store between drives`];
+  const hostLines = [...pageURL ? [] : builtSettingLines(resolve(webDist ?? defaultWebDist())), ...storage === undefined ? [] : [`${name}: --storage ${storage} is this drive's own profile, emptied when it ends; Chrome keeps a store between drives`]];
+  // Why a page never booted: its last 20 lines when the wait gave up, as a hangup's report (agent-wire.mjs).
+  const neverBooted = what => () => `${what}; ${hostLines.slice(-20).join('\n')}`;
   const closeFiles = () => {
     hosted.server.close();
     if (hosted.planBuild) rmSync(hosted.planBuild, { recursive: true, force: true });
@@ -264,12 +269,9 @@ export async function openPlaywrightWeb({ browser: name, plan, world, size, url:
       const encoded = worldFile(world).toString('base64');
       await page.addInitScript(value => { globalThis.exactWorldCarry = Uint8Array.from(atob(value), c => c.charCodeAt(0)); }, encoded);
     }
-    const address = new URL(hosted.url);
-    address.searchParams.set('agent', '1');
-    for (const [key, value] of Object.entries(facts)) address.searchParams.set(key, value);
-    if (storage !== undefined) address.searchParams.set('storage', storage);
+    const address = agentPage(new URL(hosted.url), { facts, storage, env });
     await page.goto(address.href, { waitUntil: 'commit' });
-    let boot = await waitForBoot(page, `the page never booted; ${hostLines.join('\n')}`);
+    let boot = await waitForBoot(page, neverBooted('the page never booted'));
     if (await page.evaluate(() => matchMedia('(prefers-reduced-transparency: reduce)').matches)) throw new Error(`${name} cannot emulate the required prefers-reduced-transparency: no-preference launch fact`);
     if (plan && !hosted.js) {
       const carry = world ? worldFile(world).toString('base64') : null;
@@ -352,12 +354,12 @@ export async function openPlaywrightWeb({ browser: name, plan, world, size, url:
         heldKeys.clear();
         await page.evaluate(async (keep) => { sessionStorage.clear(); if (keep) return; localStorage.clear(); await Promise.all((await indexedDB.databases?.() ?? []).map(x => x.name && new Promise(ok => { const r = indexedDB.deleteDatabase(x.name); r.onsuccess = r.onerror = r.onblocked = ok; }))); }, keep);
         if (!keep) await context.clearCookies();
-        hostLines.length = 0; await page.goto(withEpoch(withFaults(keep ? page.url() : address.href, failFetch), epoch), { waitUntil: 'commit' }); this.boot = await waitForBoot(page, 'the reused page never booted');
+        hostLines.length = 0; await page.goto(withEpoch(withFaults(keep ? page.url() : address.href, failFetch), epoch), { waitUntil: 'commit' }); this.boot = await waitForBoot(page, neverBooted('the reused page never booted'));
       },
       ask,
       async reveal(id) { const r = await ask({ op: 'reveal', id }); if (r.scrolled) await frame(); return r; },
       async prefer(media, pageFacts, fold = {}, mode = {}) {
-        const unsupported = Object.entries(media).find(([key, value]) => key === 'display-mode' || (key === 'prefers-reduced-transparency' && value !== 'no-preference') || (key === 'prefers-contrast' && !['more', 'no-preference'].includes(value)));
+        const unsupported = Object.entries(media).find(([key, value]) => key === 'display-mode' || key === 'pointer' || key === 'hover' || (key === 'prefers-reduced-transparency' && value !== 'no-preference') || (key === 'prefers-contrast' && !['more', 'no-preference'].includes(value)));
         if (unsupported) throw new Error(`${name} prefer cannot emulate ${unsupported[0]} ${unsupported[1]} through Playwright`);
         if (pageFacts['display-scale'] != null && pageFacts['display-scale'] !== 1) throw new Error(`${name} prefer cannot set display-scale ${pageFacts['display-scale']}: a browser's scale is fixed when it launches, and Playwright's is 1 here`);
         Object.assign(emulated, media);
@@ -383,7 +385,7 @@ export async function openPlaywrightWeb({ browser: name, plan, world, size, url:
         if (kind === 'mediasession') { const r = await page.evaluate(([id, action, seconds]) => globalThis.exact?.mediaSession?.act(id, action, seconds) ?? { error: 'mediasession: this page publishes no media session (no media glue)' }, [id, opts.mediaSession, opts.seconds ?? null]); MalformedOperation.reply(r); if (r.error) throw new Error(r.error); await frame(); return r; }
         const box = id == null ? null : (await ask({ op: 'layout' })).nodes.find(n => n.id === id);
         if (id != null && (!box || (box.w === 0 && box.h === 0))) throw new Error(`view ${id} has no box on screen`);
-        const point = kind === 'contextmenu' || kind === 'press' ? opts.at : null;
+        const point = ['contextmenu', 'press', 'clicks'].includes(kind) ? opts.at : null;
         let x = box ? box.x + (point?.[0] ?? box.w / 2) : undefined, y = box ? box.y + (point?.[1] ?? box.h / 2) : undefined;
         if (kind === 'press' || kind === 'key' || kind === 'type') {
           const request = kind === 'press' ? { op: 'tap', id, selector: opts.selector, x: opts.x, y: opts.y }
@@ -393,7 +395,7 @@ export async function openPlaywrightWeb({ browser: name, plan, world, size, url:
         }
         if (kind === 'key' && (opts.phase != null || await page.evaluate(id => globalThis.exact.gpu?.wantsInput(id) || globalThis.exact.views.get(id)?.matches('button, a[href], [role="button"], [role="link"]') || false, id))) return browserKey(id, opts, true);
         if (id != null && ['press', 'contextmenu', 'dblclick'].includes(kind)) {
-          const why = await page.evaluate(({ id, x, y }) => { const el = globalThis.exact.views.get(id), hit = document.elementFromPoint(x, y); return !el ? null : !hit ? 'its middle is outside the viewport; scroll it into view first' : el === hit || el.contains(hit) || hit.contains(el) ? null : `${hit.dataset?.view ? `node #${hit.dataset.view}` : hit.tagName.toLowerCase()} covers its middle`; }, { id, x, y });
+          const why = await page.evaluate(({ id, x, y }) => { const view = globalThis.exact.views.get(id), el = globalThis.exact.backButton?.(view) ?? view, hit = (el?.getRootNode() ?? document).elementFromPoint(x, y); return !el ? null : !hit ? 'its middle is outside the viewport; scroll it into view first' : el === hit || el.contains(hit) || hit.contains(el) ? null : `${hit.dataset?.view ? `node #${hit.dataset.view}` : hit.tagName.toLowerCase()} covers its middle`; }, { id, x, y });
           if (why) throw new Error(`tap #${id} at (${x}, ${y}): ${why}`);
         }
         // A plain press presses what it names (LLP 1012 §1): beside a control its middle holds, or refused (agent-aim.mjs).
@@ -449,6 +451,8 @@ export async function openPlaywrightWeb({ browser: name, plan, world, size, url:
         else if (kind === 'hover') await page.mouse.move(x, y);
         else if (kind === 'contextmenu') await page.mouse.click(x, y, { button: 'right' });
         else if (kind === 'dblclick') await page.mouse.dblclick(x, y);
+        // `clicks <n> at x y`, the mouse form a part's tap uses (agent-inspect.mjs `partTap`), as Chrome's carrier has it.
+        else if (kind === 'clicks') await withHeldKeys(page.keyboard, opts.modifiers, () => page.mouse.click(x, y, { clickCount: opts.clicks }));
         else if (kind === 'press') await withHeldKeys(page.keyboard, opts.modifiers, () => page.mouse.click(x, y));
         else if (kind === 'type') { await focus(id); await page.keyboard.insertText(opts.text); }
         else if (kind === 'key') return browserKey(id, opts, false);

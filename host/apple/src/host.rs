@@ -2,26 +2,25 @@
 //!
 //! @ref LLP 1008 §1
 //!
-//! After every commit the host walks the receipt (destroy, create, props,
-//! style, children — the web host's rule: the view tree mirrors the kernel
-//! tree), feeds the motion engine the commit (LLP 1003 §4), and seeks it to
-//! the app's clock before laying out the roots under the viewport. Layout
-//! projects the explicitly registered Height, then emits changed frames and
-//! scroll content sizes; other presentation values follow. The kernel is the single source of
-//! truth; the mirror is a memo of what the presenter has been told.
+//! After every commit the host walks the receipt (destroy, create, props, style, children — the
+//! web host's rule: the view tree mirrors the kernel tree), feeds the motion engine the commit
+//! (LLP 1003 §4), and seeks it to the app's clock before laying out the roots under the viewport.
+//! Layout projects the explicitly registered Height, then emits changed frames and scroll content
+//! sizes; other presentation values follow. The kernel is the single source of truth; the mirror
+//! is a memo of what the presenter has been told.
 
-use crate::batch::Batch;
-use crate::style;
-use exact_kernel::motion::{motion_node, targets, MotionSync};
+use crate::{batch::Batch, style};
+use exact_kernel::motion::{motion_node, node_key, targets, MotionSync};
 use exact_kernel::{
-    Frame, Kernel, NodeKey, NodeRef, NodeType, Offer, Overflow, PropId, PropValue, TextMeasurer,
-    ViewId,
+    CommitReceipt, Frame, Kernel, NodeKey, NodeRef, NodeType, Offer, Overflow, PropId, PropValue,
+    TextMeasurer, ViewId,
 };
 use exact_motion::{Change, Engine, HoldToken, Property};
 
+#[path = "activities.rs"]
+mod activities;
 #[path = "agent.rs"]
 mod agent;
-
 #[path = "arrange.rs"]
 mod arrange;
 #[path = "arrange_group.rs"]
@@ -69,6 +68,9 @@ mod midi;
 mod paint;
 #[path = "paragraph.rs"]
 mod paragraph;
+use paragraph::props_for;
+#[path = "persistence.rs"]
+mod persistence;
 #[path = "presence.rs"]
 mod presence;
 #[path = "tamber.rs"]
@@ -76,7 +78,8 @@ mod tamber;
 #[cfg(test)]
 #[path = "transform_drag_tests.rs"]
 mod transform_drag_tests;
-use exact_plan::{EventKind, Plan};
+pub use covers::Restyle;
+use exact_plan::EventKind;
 use exact_runner::{Carried, DataSource, Event, Outcome, RequestOut, Runner, RunnerError, Timed};
 pub use height::{HeightOwnerChange, HeightOwnerDisposition, HeightOwnerError};
 use height_drag::{HeightDrag, HeightHandle};
@@ -95,6 +98,11 @@ use layout::{content_size, published_content_box};
 mod resize;
 #[path = "scale.rs"]
 mod scale;
+#[path = "share_in.rs"]
+mod share_in;
+#[path = "snapshot.rs"]
+pub(crate) mod snapshot;
+pub(crate) use scale::LaunchLayout;
 #[cfg(test)]
 #[path = "spacing_tests.rs"]
 mod spacing_tests;
@@ -102,7 +110,7 @@ mod spacing_tests;
 #[path = "storage_tests.rs"]
 mod storage_tests;
 #[path = "svg.rs"]
-mod svg;
+pub(crate) mod svg;
 #[path = "svg_lower.rs"]
 mod svg_lower;
 #[cfg(test)]
@@ -139,20 +147,26 @@ impl std::fmt::Display for HostError {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Mirror {
-    props: exact_kernel::SortedMap<String, String>,
-    style: String,
-    children: Vec<ViewId>,
+    props: exact_kernel::SortedMap<&'static str, String>,
+    /// The style the presenter last heard, one allocation per text ([`paragraph::StyleTexts`]).
+    style: std::rc::Rc<str>,
+    children: Box<[ViewId]>,
     frame: Option<(f32, f32, f32, f32)>,
     content: Option<(f32, f32)>,
-    flow: Vec<exact_kernel::FlowShape>,
-    field_content: Option<crate::batch::ContentBox>,
+    flow: Box<[exact_kernel::FlowShape]>,
+    /// Boxed: only a text field has one, and inline it was a quarter of the mirror.
+    field_content: Option<Box<crate::batch::ContentBox>>,
     field_cell: bool,
     block: Option<(f32, f32)>,
+    /// Whether the block is the kernel's (a popover's, the viewport): a
+    /// host that gives the popover its own is sent the used size again.
+    implied: bool,
 }
 
 /// One runner, one presenter.
 pub struct Host<D: DataSource> {
     runner: Runner<D>,
+    admitting_frame: bool,
     font_hook: Option<(crate::measure::FontsFn, *mut std::ffi::c_void, usize)>,
     /// Whether the plan declares a `head`, and the title the presenter was
     /// last told (LLP 1048.003 D1): the window or scene title.
@@ -161,7 +175,9 @@ pub struct Host<D: DataSource> {
     /// The active head's `edited` (LLP 1069.010 D6), sent with the title.
     head_edited: bool,
     language: Option<String>,
-    mirror: IdMap<ViewId, Mirror>,
+    /// Boxed: a mirror is 128 bytes, and the table has up to twice as many slots as views.
+    mirror: IdMap<ViewId, Box<Mirror>>,
+    style_texts: paragraph::StyleTexts,
     keys: IdMap<NodeKey, ViewId>,
     inline_runs: IdMap<ViewId, (ViewId, Vec<EventKind>)>,
     /// Hatch words: those journaled as viewless here, and those the plan does not give this platform.
@@ -178,6 +194,11 @@ pub struct Host<D: DataSource> {
     dirty_paragraphs: BTreeSet<ViewId>,
     pending_layout: IdSet<NodeKey>,
     layout_withheld: bool,
+    /// A layout failed or a commit's did not run: `inert_layout` lays out.
+    layout_owed: bool,
+    /// Committing an advance's or a presented frame's timers, answers and
+    /// frame tasks ([`Host::advanced`]), where only their commits move the tree.
+    in_advance: bool,
     /// Routes whose `navigationDetent` names `fit-content` (LLP 1075.003
     /// §9.11), each with its width, resolved padding, border and bottom cover when last measured.
     fit_routes: Vec<(ViewId, Option<[f32; 10]>)>,
@@ -189,6 +210,7 @@ pub struct Host<D: DataSource> {
     roots: Vec<ViewId>,
     /// Last published common collection snapshot; refreshed only after layout.
     collections_json: String,
+    collection_heads: Option<Vec<exact_runner::CollectionSnapshot>>,
     engine: Engine,
     paint: paint::Paint,
     holds: BTreeMap<u64, HoldToken>,
@@ -220,7 +242,13 @@ pub struct Host<D: DataSource> {
     /// a commit (LLP 1018 D6); `None` keeps them in the runner only (a test,
     /// or grants that do not parse).
     secrets: Option<Box<dyn crate::store::KeptStore>>,
+    pending_store_writes: Vec<exact_runner::StoreWrite>,
     data_activated: bool,
+    /// The source's activation, run ahead of `activate_data` by `prepare_data`.
+    source_prepared: Option<Result<(), String>>,
+    store_refresh_pending: bool,
+    store_activation_pending: bool,
+    store_retry_names: Vec<String>,
     /// The session's wake (`listen`), which a pending activation leaves with the data source.
     preload_wake: exact_runner::PreloadWake,
     doc_watch: Option<crate::doc_watch::DocWatch>,
@@ -232,28 +260,13 @@ pub struct Host<D: DataSource> {
     colors_seen: Option<u64>,
     /// The root font size and the window's modes as a batch last said them (`Host::facts_moved`).
     facts_told: Option<(f64, Vec<(String, String)>)>,
-    /// Whether the wake lock was held as a batch last said it (`Host::wakelock_moved`).
-    wakelock_told: Option<bool>,
+    /// The holds as a batch last said them (`Host::wakelock_moved`, `Host::orientation_moved`, `Host::finish_moved`).
+    holds_told: colors::Told,
     /// The top-layer boxes covered while closed (`closed.rs`).
     closed: layout::closed::Closed,
 }
 
-/// A plan's bytes at boot: copied from while decoding, or linked into the
-/// program, whose data pool the decoded plan then keeps in place.
-#[derive(Clone, Copy)]
-pub(crate) enum PlanBytes<'a> {
-    Copied(&'a [u8]),
-    Static(&'static [u8]),
-}
-
-impl PlanBytes<'_> {
-    fn decode(self) -> Result<Plan, exact_plan::PlanError> {
-        match self {
-            PlanBytes::Copied(bytes) => Plan::decode(bytes),
-            PlanBytes::Static(bytes) => Plan::decode_static(bytes),
-        }
-    }
-}
+pub(crate) use crate::plan_bytes::PlanBytes;
 
 impl<D: DataSource> Host<D> {
     /// Boot from plan bytes with the app's text measurer and viewport (points):
@@ -321,6 +334,7 @@ impl<D: DataSource> Host<D> {
             PlanBytes::Copied(plan_bytes),
             data,
             measurer,
+            scale::LaunchLayout::NONE,
             exact_runner::Viewport::sized(width as f64, height as f64),
             carried,
             snapshot,
@@ -346,6 +360,7 @@ impl<D: DataSource> Host<D> {
         plan_bytes: PlanBytes<'_>,
         data: D,
         measurer: Box<dyn TextMeasurer>,
+        layout: scale::LaunchLayout,
         viewport: exact_runner::Viewport,
         carried: Option<&Carried>,
         snapshot: Vec<(String, Vec<u8>)>,
@@ -364,6 +379,7 @@ impl<D: DataSource> Host<D> {
             plan_bytes,
             data,
             measurer,
+            layout,
             viewport,
             carried,
             snapshot,
@@ -386,6 +402,7 @@ impl<D: DataSource> Host<D> {
         plan_bytes: PlanBytes<'_>,
         data: D,
         measurer: Box<dyn TextMeasurer>,
+        layout: scale::LaunchLayout,
         viewport: exact_runner::Viewport,
         carried: Option<&Carried>,
         snapshot: Vec<(String, Vec<u8>)>,
@@ -410,13 +427,21 @@ impl<D: DataSource> Host<D> {
             }
         }
         let plan = plan_bytes.decode().map_err(HostError::Plan)?;
+        let entry_props = match plan_bytes {
+            PlanBytes::Entry(_, _, Some(bytes)) => {
+                Some(snapshot::props(&plan, bytes).map_err(HostError::Layout)?)
+            }
+            _ => None,
+        };
+        let carried = entry_props.as_ref().or(carried);
         // Before anything is built from it (LLP 1047.001 D5).
         if let Some(names) = crate::link::missing(&plan, crate::link::linked()) {
             return Err(HostError::Unlinked(names));
         }
         // This archive links its grammars; every public boot links all (LLP 1047.001 D3; 1053.000 §2).
         links.grammars.link();
-        let kernel = scale::kernel(measurer);
+        let mut kernel = scale::kernel(measurer);
+        layout.prepare(&mut kernel)?;
         let facts = candidate_delivery.unwrap_or_else(|| {
             let mut facts = exact_runner::Delivery::default();
             if let Some(json) = compat {
@@ -445,7 +470,11 @@ impl<D: DataSource> Host<D> {
         // Its own roles from here, not those of the session it replaces (a
         // caller's scope is that one's; LLP 1121 stage 5).
         let _roles = runner.bind_roles();
+        runner.share_app_state(activation::app_state());
         runner.set_device_links(links.device);
+        if links.activities {
+            runner.link_activities().map_err(HostError::Runner)?;
+        }
         // @ref LLP 1079 D1 — a development build measures its work, a
         // release build from the first ask (`Bridge::measure_work`).
         crate::abi::measure_at_boot(&mut runner, compat);
@@ -481,10 +510,13 @@ impl<D: DataSource> Host<D> {
             language: None,
             hatches: paragraph::HatchWords::of(runner.plan()),
             runner,
+            admitting_frame: false,
             font_hook,
             mirror: IdMap::default(),
+            style_texts: paragraph::StyleTexts::default(),
             keys: IdMap::default(),
             inline_runs: IdMap::default(),
+            // LLP 1126 D10: watchOS has no Core Animation presenter for box motion or path morphs.
             svg: svg::SvgState::new(cfg!(any(target_os = "ios", target_os = "tvos"))),
             canvas_held: IdSet::default(),
             canvas_kept: Default::default(),
@@ -492,16 +524,20 @@ impl<D: DataSource> Host<D> {
             dirty_paragraphs: BTreeSet::new(),
             pending_layout: IdSet::default(),
             layout_withheld: false,
+            layout_owed: false,
+            in_advance: false,
             fit_routes: Vec::new(),
             stickies: IdMap::default(),
             fragments: IdMap::default(),
             ranks: IdMap::default(),
             roots: Vec::new(),
             collections_json: "[]".into(),
+            collection_heads: Some(Vec::new()),
             engine: {
                 // Settled values only when the plan animates nothing (LLP 1047.001).
                 let mut engine = Engine::linked(links.engine);
                 let _ = engine.set_start_on_frame(start_on_frame, 0.0);
+                // LLP 1126 D10: watchOS keeps box motion sampled for its SwiftUI driver.
                 engine.set_lowered_properties(&svg::lowered(cfg!(any(
                     target_os = "ios",
                     target_os = "tvos"
@@ -533,20 +569,26 @@ impl<D: DataSource> Host<D> {
             viewport: (viewport.width as f32, viewport.height as f32),
             now_ms: 0.0,
             data_activated: false,
+            source_prepared: None,
+            store_refresh_pending: false,
+            store_activation_pending: false,
+            store_retry_names: Vec::new(),
             preload_wake: Default::default(),
             doc_watch: None,
             secrets,
+            pending_store_writes: Vec::new(),
             update_line: None,
             delivery,
             colors_seen: None,
             facts_told: None,
-            wakelock_told: None,
+            holds_told: Default::default(),
             closed: Default::default(),
         };
         let mut batch = Batch::new();
         host.native_prepare_candidate().map_err(HostError::Layout)?;
         let order = host.preorder();
         host.close_top_layer(&order);
+        host.cover_root_tablist();
         let handlers = host.runner.handlers();
         for id in &order {
             host.create(*id, handlers.get(id).map_or(&[], Vec::as_slice), &mut batch);
@@ -604,8 +646,7 @@ impl<D: DataSource> Host<D> {
         host.emit_transform_drags(&mut batch);
         host.present(&mut batch, true);
         let (mut batch, _) = host.resize_rounds(batch, None);
-        batch.spatial = host.engine.spatial();
-        batch.frames = host.runner.wants_frames();
+        host.state_onto(&mut batch);
         let batch = host.write(batch, None);
         Ok((host, batch))
     }
@@ -646,12 +687,12 @@ impl<D: DataSource> Host<D> {
         if op.as_deref() == Some("appRoots") {
             return Some(crate::picker::roots_reply());
         }
-        // The documents a person chose (LLP 1069.010 D1), minted for the
-        // session that asks: `openDocument` for a host route, `mintDocument`
-        // for what a picker returned, `forgetDocuments` as the session ends.
-        if let Some(op @ ("openDocument" | "mintDocument" | "forgetDocuments")) = op.as_deref() {
-            let grants = self.runner.data_ref().grants().to_owned();
-            return Some(crate::picker::documents(op, request, &grants));
+        if op.as_deref() == Some("sensorEvents") {
+            return Some(self.sensor_events(request));
+        }
+        // The documents a person chose, and those the app keeps (LLP 1069.010 D1, 1069.010.000).
+        if let Some(reply) = crate::documents::answer(op.as_deref(), request, &self.runner) {
+            return Some(reply);
         }
         let picked = op.as_deref() == Some("pickedPath");
         exact_runner::agent::answer(&mut self.runner, request).map(|(reply, _)| {
@@ -717,12 +758,6 @@ impl<D: DataSource> Host<D> {
         source.configure_storage(data, cache, temporary)
     }
 
-    /// The common post-pixel activation order for committed sources.
-    pub(crate) fn activate_source(source: &mut D) -> Result<(), exact_runner::DataError> {
-        Self::configure_storage(source)?;
-        source.activate()
-    }
-
     /// The work behind a continuation, dispatched on this thread after the
     /// commit that handed it out (LLP 1027.002 D3).
     pub fn dispatch_work(&mut self, token: u64) -> exact_runner::Dispatch {
@@ -735,12 +770,15 @@ impl<D: DataSource> Host<D> {
         self.runner.listen(wake);
     }
 
-    /// [`Host::listen`] to `io`, and read sockets' buffered bytes from it
-    /// (D7); watch the documents the answers watch, as `owner`'s (LLP 1069.010.000 D1).
+    /// [`Host::listen`] to `io`, and read sockets' buffered bytes (D7) and
+    /// long polls' backoff waits (D8) from it; watch the documents the answers watch, as `owner`'s (LLP 1069.010.000 D1).
     pub fn listen_io(&mut self, io: &dyn crate::executor::Io, owner: u64) {
         self.doc_watch = Some(crate::doc_watch::DocWatch::new(owner, &mut self.runner));
         self.listen(io.waker());
         self.runner.set_socket_reader(io.socket_reader());
+        self.runner.set_retry_reader(io.retry_reader());
+        self.runner.set_listen_reader(io.listen_reader());
+        self.runner.set_work_clock(io.work_clock());
     }
     /// The source's native slot, where the host installs the app module.
     pub fn native_slot(&self) -> exact_runner::Native {
@@ -770,26 +808,6 @@ impl<D: DataSource> Host<D> {
             .ok()
             .flatten()
             .map(|(roots, _)| roots)
-    }
-
-    /// What the last commit kept or forgot, into the platform's store (LLP
-    /// 1018 D6): secrets synchronously, on this thread, milliseconds once per
-    /// login; kept answers queued for their writer thread (`store.rs`). A
-    /// write that fails is journaled (a kept answer's at a later commit);
-    /// the app is otherwise unaffected, as a web app is when `setItem`
-    /// throws: the next launch will not remember.
-    fn persist(&mut self) {
-        for line in self.kept_failures() {
-            self.runner.log(line);
-        }
-        for w in self.runner.take_store_writes() {
-            let Some(secrets) = &self.secrets else {
-                continue;
-            };
-            if let Err(e) = secrets.write(&w) {
-                self.runner.log(format!("store {} failed: {e}", w.name));
-            }
-        }
     }
 
     /// The kept answers the writer failed to write since the last call.
@@ -926,10 +944,28 @@ impl<D: DataSource> Host<D> {
 
     /// The platform's own Back from visit `id` (LLP 1115 D5), at `now_ms`.
     pub fn host_back(&mut self, id: u64, now_ms: f64) -> String {
+        self.own_navigation(now_ms, |runner| runner.host_back(id))
+    }
+
+    /// Return to the visit selected in the platform's Back-history menu.
+    pub fn host_back_to(&mut self, source: u64, destination: u64, now_ms: f64) -> String {
+        self.own_navigation(now_ms, |runner| runner.host_back_to(source, destination))
+    }
+
+    /// Follow a declared route without an authored navigate handler.
+    pub fn host_go(&mut self, location: &str, now_ms: f64) -> String {
+        self.own_navigation(now_ms, |runner| runner.host_go(location))
+    }
+
+    fn own_navigation(
+        &mut self,
+        now_ms: f64,
+        navigate: impl FnOnce(&mut Runner<D>) -> Result<Option<CommitReceipt>, RunnerError>,
+    ) -> String {
         let mut a = self.runner.advance_timed(now_ms.max(self.now_ms));
         self.now_ms = a.now_ms.max(self.now_ms);
         if a.error.is_none() {
-            match self.runner.host_back(id) {
+            match navigate(&mut self.runner) {
                 Ok(receipt) => a.receipts.extend(receipt.map(|receipt| Timed {
                     at_ms: self.now_ms,
                     receipt,
@@ -959,31 +995,16 @@ impl<D: DataSource> Host<D> {
 
     /// [`Host::advance`], stopping after a timer that sends as well: an
     /// agent's jump ([`exact_runner::Runner::advance_until_request`]).
+    /// While a node declares a layout transition, in steps (`presence.rs`).
     pub fn advance_until_request(&mut self, now_ms: f64) -> String {
-        let a = self.runner.advance_until_request(now_ms);
-        self.advanced(a)
-    }
-
-    /// The `then`s an agent's input settled, the clock unmoved
-    /// ([`exact_runner::Runner::land_then`]).
-    pub fn land_then(&mut self) -> String {
-        let a = self.runner.land_then();
-        self.advanced(a)
+        self.advance_in_layout_steps(now_ms)
     }
 
     /// Whether this host's display drives frame tasks (LLP 1073 D4): off when
     /// the agent's clock takes over, so its advances fire virtual frames.
+    /// Set whether the display drives frame tasks.
     pub fn present_frames(&mut self, on: bool) {
         self.runner.present_frames(on);
-    }
-
-    /// A presented frame (LLP 1073 D2): the timers due by `now_ms`, then
-    /// every frame task once at it, in one batch as [`Host::advance`]'s.
-    pub fn frame(&mut self, now_ms: f64) -> String {
-        // The frame source started: frame tasks are its, not the timers' (LLP 1073 D4).
-        self.runner.present_frames(true);
-        let a = self.runner.frame(now_ms);
-        self.advanced(a)
     }
 
     fn advanced(&mut self, a: exact_runner::Advanced) -> String {
@@ -994,7 +1015,10 @@ impl<D: DataSource> Host<D> {
         }
         self.runner.canvas_frame();
         let error = a.error.map(|e| format!("{e:?}"));
-        self.commit(&a.receipts, error)
+        self.in_advance = true;
+        let out = self.commit(&a.receipts, error);
+        self.in_advance = false;
+        out
     }
 
     /// An image loaded: its intrinsic size, in points (`None` when it failed
@@ -1003,8 +1027,9 @@ impl<D: DataSource> Host<D> {
     pub fn set_intrinsic(&mut self, view: ViewId, size: Option<(f32, f32)>) -> String {
         self.height_targets_dirty = true;
         let mut batch = Batch::new();
+        batch.controls = self.option_part(view);
         let error = match self.runner.kernel_mut().set_intrinsic_size(view, size) {
-            Ok(()) => self.layout(&mut batch).err(),
+            Ok(()) => self.layout_resized(view, &mut batch).err(),
             Err(e) => Some(format!("intrinsic: {e:?}")),
         };
         self.finish(batch, error)
@@ -1018,9 +1043,11 @@ impl<D: DataSource> Host<D> {
         let mut batch = Batch::new();
         let mut error = None;
         for &(view, size) in sizes {
+            batch.controls |= self.option_part(view);
             if let Err(e) = self.runner.kernel_mut().set_intrinsic_size(view, size) {
                 error.get_or_insert(format!("intrinsic: {e:?}"));
             }
+            self.inline_image_resized(view, &mut batch);
         }
         if let Err(e) = self.layout(&mut batch) {
             error.get_or_insert(e);
@@ -1062,89 +1089,73 @@ impl<D: DataSource> Host<D> {
 
     /// The viewport's new size, in one batch.
     pub fn resize(&mut self, width: f32, height: f32) -> String {
-        self.resize_inner(width, height, Batch::new(), None)
+        self.resize_at(width, height, self.now_ms)
+    }
+
+    /// A placement root's resolved margins and whether its width is the author's
+    /// (`Kernel::placement_box`), as JSON `[left, top, right, bottom, authored, minimum]`;
+    /// an error names the view.
+    pub fn placement_box(&mut self, view: ViewId) -> String {
+        let kernel = self.runner.kernel();
+        let Some(key) = kernel.node(view).map(|n| n.key) else {
+            return serde_json::json!({"error": format!("no view {view}")}).to_string();
+        };
+        match kernel.placement_box(key) {
+            Some(b) => serde_json::to_string(&b).unwrap(),
+            None => {
+                serde_json::json!({"error": format!("view {view} is not laid out")}).to_string()
+            }
+        }
     }
 
     /// The date (LLP 1027.000.000): re-answer `exactTime` in one commit.
     pub fn set_time(&mut self, epoch_at_zero: f64, utc_offset: f64) -> String {
-        match self.runner.set_time(epoch_at_zero, utc_offset) {
-            Ok(Some(receipt)) => self.commit(
-                &[Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => self.finish(Batch::new(), None),
-            Err(e) => self.finish(Batch::new(), Some(format!("time: {e:?}"))),
-        }
+        let answer = self.runner.set_time(epoch_at_zero, utc_offset);
+        self.told(answer, "time")
     }
 
     /// The user's display preferences (LLP 1061 D4): re-answer
     /// `exactViewport` in one commit; the same preferences commit nothing.
     pub fn set_preferences(&mut self, preferences: exact_runner::Preferences) -> String {
-        match self.runner.set_preferences(preferences) {
-            Ok(Some(receipt)) => self.commit(
-                &[Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => self.finish(Batch::new(), None),
-            Err(e) => self.finish(Batch::new(), Some(format!("preferences: {e:?}"))),
-        }
+        let answer = self.runner.set_preferences(preferences);
+        self.told(answer, "preferences")
     }
 
     /// The page's visibility, connectivity and share sheet (LLP 1069.000
     /// D2): re-answer `exactPage` in one commit; the same facts commit nothing.
     pub fn set_page(&mut self, page: exact_runner::Page) -> String {
-        match self.runner.set_page(page) {
-            Ok(Some(receipt)) => self.commit(
-                &[Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => self.finish(Batch::new(), None),
-            Err(e) => self.finish(Batch::new(), Some(format!("page: {e:?}"))),
-        }
-    }
-
-    /// The root font size `rem` follows (LLP 1069.000 D3): a relayout in
-    /// one commit, no resource asked again; the same size commits nothing.
-    pub fn set_root_font_size(&mut self, px: f64) -> String {
-        match self.runner.set_root_font_size(px) {
-            Ok(Some(receipt)) => self.commit(
-                &[Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => self.finish(Batch::new(), None),
-            Err(e) => self.finish(Batch::new(), Some(format!("root font size: {e:?}"))),
-        }
+        let answer = self.runner.set_page(page);
+        self.told(answer, "page")
     }
 
     /// The viewer's locale and zone, beside the date: one commit when it changes.
-    pub fn set_place(&mut self, locale: &str, time_zone: &str, seed: Option<f64>) -> String {
-        let (receipts, error) = match self.runner.set_place(locale, time_zone, seed) {
-            Ok(Some(receipt)) => (
-                vec![Timed {
+    pub fn set_place(
+        &mut self,
+        locale: &str,
+        time_zone: &str,
+        seed: Option<f64>,
+        format_locale: Option<&str>,
+    ) -> String {
+        let answer = self
+            .runner
+            .set_place_formatted(locale, time_zone, seed, format_locale);
+        self.told(answer, "place")
+    }
+
+    /// A told fact's answer: its commit, an empty batch when the fact is
+    /// unchanged, or the refusal named by `what`.
+    fn told(&mut self, answer: Result<Option<CommitReceipt>, RunnerError>, what: &str) -> String {
+        match answer {
+            Ok(Some(receipt)) => self.commit(
+                &[Timed {
                     at_ms: self.now_ms,
                     receipt,
                 }],
                 None,
             ),
-            Ok(None) => (vec![], None),
-            Err(e) => (vec![], Some(format!("place: {e:?}"))),
-        };
-        if receipts.is_empty() {
-            return self.finish(Batch::new(), error);
+            Ok(None) => self.finish(Batch::new(), None),
+            Err(e) => self.finish(Batch::new(), Some(format!("{what}: {e:?}"))),
         }
-        self.commit(&receipts, error)
     }
 
     /// The viewport's change into `batch`, after what it holds (`set_view`).
@@ -1319,6 +1330,12 @@ impl<D: DataSource> Host<D> {
                 &|v| !runner.handlers_of(v).is_empty(),
             );
             svg_lower::hand_over_paths(runner.kernel(), &mut self.engine, self.svg.box_motion);
+            // A reveal changes a held play without changing its style row.
+            for (key, _) in &sync.animations {
+                if let Some(view) = self.keys.get(&node_key(*key)).copied() {
+                    self.svg.element(runner.kernel(), view);
+                }
+            }
             for view in svg_lower::glass_sampling(self.runner.kernel(), &mut self.engine) {
                 self.svg.element(self.runner.kernel(), view);
             }
@@ -1339,10 +1356,17 @@ impl<D: DataSource> Host<D> {
         }
         let seek = self.engine.advance(self.engine_time(self.now_ms));
         debug_assert!(seek.is_ok(), "the clock never runs backwards here");
+        // An advance whose commits changed no node (a frame task that only
+        // moved state nothing shows; a `sent` reader answered at each MIDI
+        // message's time, LLP 1125 D6, with nothing on screen reading it)
+        // lays out only what such a commit can move (`inert_layout`): each
+        // would cost a whole layout and paint order walk otherwise.
+        let inert = self.in_advance && receipts.iter().all(|t| unchanged(&t.receipt));
         let layout_error = if height_target_error.is_some() {
+            self.layout_owed = true;
             height_target_error
-        } else if receipts.is_empty() {
-            self.height_layout_if_needed(&mut batch).err()
+        } else if inert {
+            self.inert_layout(&mut batch, !receipts.is_empty()).err()
         } else {
             self.layout(&mut batch).err()
         };
@@ -1373,6 +1397,20 @@ impl<D: DataSource> Host<D> {
         self.present(&mut batch, false);
         self.finish(batch, error)
     }
+}
+
+/// Whether a commit left every node as it was.
+fn unchanged(r: &CommitReceipt) -> bool {
+    !r.layout_invalidated
+        && r.created.is_empty()
+        && r.destroyed.is_empty()
+        && r.touched.is_empty()
+        && r.exits.is_empty()
+        && r.handoffs.is_empty()
+        && r.display_changed.is_empty()
+        && r.timelines.is_empty()
+        && r.renewed.is_empty()
+        && r.revealed.is_empty()
 }
 
 /// A frame in its parent's space (a root's is absolute).
@@ -1438,53 +1476,6 @@ fn kind_for(node: &NodeRef<'_>) -> &'static str {
 pub(super) fn fit_scale(node: &NodeRef<'_>) -> Option<String> {
     let scale = node.fit_scale();
     (node.node_type == NodeType::Text && scale != 1.0).then(|| style::num(scale))
-}
-
-/// Props by their own names, as strings. An empty `href` is no link: not told.
-fn props_for(node: &NodeRef<'_>) -> exact_kernel::SortedMap<String, String> {
-    let mut out = exact_kernel::SortedMap::default();
-    for (id, value) in node.props.iter() {
-        let text = match value {
-            PropValue::Str(_) if id == PropId::Href && node.props.link().is_none() => continue,
-            PropValue::Str(s) => s.to_string(),
-            PropValue::Bool(b) => b.to_string(),
-            PropValue::Int(i) => i.to_string(),
-            PropValue::Float(f) => style::num(*f as f32),
-        };
-        out.insert(id.name().to_string(), text);
-    }
-    // Swift paints the measured paragraph with text-transform applied (LLP 1064 D5).
-    if let Some(std::borrow::Cow::Owned(shown)) = node.shown_text() {
-        out.insert(PropId::Text.name().to_string(), shown);
-    }
-    style::glass_auto_props(node, &mut out); // LLP 1053.000.000.000 D2
-    if let Some(scale) = fit_scale(node) {
-        out.insert("fitScale".into(), scale);
-    }
-    if node.node_type == NodeType::List && node.props.bool(PropId::Virtualized) == Some(true) {
-        // The runner preserves collection anchors and follows the end using
-        // sequence-checked corrections. Eager native autoscroll would compete.
-        out.remove(PropId::ScrollFollowEnd.name());
-    }
-    if node.node_type == NodeType::TextInput {
-        out.remove("spellcheck");
-        if let Some(value) = node.spellcheck() {
-            out.insert("spellcheck".into(), value.to_string());
-        }
-    }
-    if node.node_type == NodeType::Image {
-        if let Some(role) = node
-            .props
-            .str(PropId::ImageSource)
-            .and_then(|s| s.strip_prefix("symbol:"))
-        {
-            out.insert(
-                "symbolName".into(),
-                exact_kernel::apple_symbol_name(role).into(),
-            );
-        }
-    }
-    out
 }
 
 fn handler_name(e: EventKind) -> Option<&'static str> {

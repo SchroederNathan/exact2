@@ -147,7 +147,7 @@ struct SelectMenu: Equatable {
 
 /// A button's face (`exact_press_face`, LLP 1069.011.000 D1), custom or
 /// native, as the kernel reads it from its children: its title, its symbol as
-/// the platform names it, whether its image is a raster instead, whether the
+/// the platform names it (an svg-only icon's path as its `FaceSymbol` token), whether its image is a raster instead, whether the
 /// image leads, its `aria-label`, whether its children fit (one text, one
 /// image, nothing else); and a native button's `buttonStyles` row (LLP
 /// 1069.011 D2) — each platform's draw, a `~` marking a stand-in. `style` is
@@ -163,6 +163,14 @@ struct ButtonFace: Equatable {
     var placement: String?
     var rows = ButtonFaceRows()
     var symbol: String?
+    /// An svg-only icon's token name (`icon.reply`), the agent's name for its path.
+    var symbolIcon: String?
+    struct Image: Equatable {
+        var view: UInt32
+        var source: String
+        var size: CGSize?
+    }
+    var image: Image?
     var raster = false
     var leading = true
     var label: String?
@@ -181,8 +189,14 @@ struct ButtonFace: Equatable {
         subtitle = o["subtitle"] as? String
         placement = o["placement"] as? String
         rows = ButtonFaceRows(o["rows"] as? [String: Any] ?? [:])
-        symbol = o["symbol"] as? String
+        // An svg-only icon's path as its token (FaceSymbol, stage 9 A2).
+        symbol = FaceSymbol.of(o)
+        symbolIcon = o["symbolIcon"] as? String
         raster = o["raster"] as? Bool ?? false
+        if let i = o["image"] as? [String: Any], let source = i["source"] as? String, let view = i["view"] as? NSNumber {
+            let size = (i["size"] as? [Double]).flatMap { $0.count == 2 ? CGSize(width: $0[0], height: $0[1]) : nil }
+            image = Image(view: view.uint32Value, source: source, size: size)
+        }
         leading = o["leading"] as? Bool ?? true
         label = o["label"] as? String
         fits = o["fits"] as? Bool ?? true

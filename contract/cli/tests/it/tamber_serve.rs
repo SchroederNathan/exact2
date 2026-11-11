@@ -11,7 +11,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const CLONE: &str = include_str!("../../../../tamber/tests/fmt/bluesky-clone.tamber");
 
-fn app(tag: &str, design: &str) -> std::path::PathBuf {
+pub(crate) fn app(tag: &str, design: &str) -> std::path::PathBuf {
     let dir =
         std::env::temp_dir().join(format!("exact2-tamber-serve-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -29,15 +29,36 @@ fn app(tag: &str, design: &str) -> std::path::PathBuf {
     dir
 }
 
-struct Serve {
+/// An import planned alone, as the wire plans one (`contract tamber
+/// import-plan`, stage 10b): the app's design on stdin; its reply.
+pub(crate) fn plan_alone(dir: &std::path::Path, request: Value) -> (Value, Vec<Value>) {
+    let design = dir.join("app.tamber");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_contract"))
+        .args(["tamber", "import-plan", design.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let text = std::fs::read_to_string(&design).ok();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({"request": request, "design": text})
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (serde_json::from_slice(&out.stdout).unwrap(), Vec::new())
+}
+
+pub(crate) struct Serve {
     child: Child,
-    input: ChildStdin,
+    input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
     next: u64,
 }
 
 impl Serve {
-    fn start(dir: &std::path::Path, env: &[(&str, &str)]) -> Serve {
+    pub(crate) fn start(dir: &std::path::Path, env: &[(&str, &str)]) -> Serve {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_contract"));
         cmd.args(["tamber", "serve", "--stdio", dir.to_str().unwrap()])
             .stdin(Stdio::piped())
@@ -47,7 +68,7 @@ impl Serve {
             cmd.env(k, v);
         }
         let mut child = cmd.spawn().unwrap();
-        let input = child.stdin.take().unwrap();
+        let input = child.stdin.take();
         let output = BufReader::new(child.stdout.take().unwrap());
         Serve {
             child,
@@ -58,11 +79,12 @@ impl Serve {
     }
 
     /// One request; its reply, and the event lines that followed it.
-    fn ask(&mut self, mut request: Value) -> (Value, Vec<Value>) {
+    pub(crate) fn ask(&mut self, mut request: Value) -> (Value, Vec<Value>) {
         self.next += 1;
         request["id"] = json!(self.next);
-        writeln!(self.input, "{request}").unwrap();
-        self.input.flush().unwrap();
+        let input = self.input.as_mut().expect("open");
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
         let mut events = Vec::new();
         loop {
             let mut line = String::new();
@@ -85,6 +107,22 @@ impl Serve {
     }
 }
 
+impl Serve {
+    /// Close its input, as a client closes, and wait for it to exit, at most
+    /// `limit`: whether it did.
+    pub(crate) fn close(&mut self, limit: std::time::Duration) -> bool {
+        self.input = None;
+        let began = std::time::Instant::now();
+        while began.elapsed() < limit {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+}
+
 impl Drop for Serve {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -92,7 +130,7 @@ impl Drop for Serve {
     }
 }
 
-fn digest(path: &std::path::Path) -> String {
+pub(crate) fn digest(path: &std::path::Path) -> String {
     use sha2::Digest;
     sha2::Sha256::digest(std::fs::read(path).unwrap())
         .iter()
@@ -105,7 +143,7 @@ fn reads_answer_on_the_clones_design() {
     let dir = app("reads", CLONE);
     let mut s = Serve::start(&dir, &[]);
     let (hello, _) = s.ask(json!({"method": "hello", "client": "test"}));
-    assert_eq!(hello["ok"]["protocol"], "tamber/1.4");
+    assert_eq!(hello["ok"]["protocol"], "tamber/1.18");
     assert_eq!(hello["ok"]["builds"], json!([]));
     assert_eq!(
         hello["ok"]["files"]["app.tamber"],
@@ -147,6 +185,12 @@ fn reads_answer_on_the_clones_design() {
 #[test]
 fn a_transaction_writes_a_line_its_inverse_undoes_and_a_stale_digest_conflicts() {
     let dir = app("write", CLONE);
+    // A view naming one token, which the plan keeps (D7).
+    std::fs::write(
+        dir.join("app.contract"),
+        "component App\n  view\n    text \"a\" color=\"mute_banner\"\n",
+    )
+    .unwrap();
     let file = dir.join("app.tamber");
     let before = std::fs::read_to_string(&file).unwrap();
     let mut s = Serve::start(&dir, &[]);
@@ -188,9 +232,14 @@ fn a_transaction_writes_a_line_its_inverse_undoes_and_a_stale_digest_conflicts()
     let (conflict, _) = s.ask(json!({"method": "transaction", "client": "two", "files": {"app.tamber": seen}, "ops": [{"op": "set-token", "name": "contrast_0", "value": "#000000"}]}));
     assert_eq!(conflict["error"]["conflict"], true);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), after);
-    // A structural edit is a rebuild; the inverse gives the bytes back.
+    // A kept token renamed where a row names it breaks the row: refused at
+    // the write in the compiler's words, where the row is (the rows check,
+    // theme2's 14:19 ruling), where it was a rebuild the build then
+    // refused. The inverse gives the bytes back.
     let (rename, _) = s.ask(json!({"method": "propose", "ops": [{"op": "rename-token", "from": "mute_banner", "to": "banner.mute"}]}));
-    assert_eq!(rename["ok"]["class"], "rebuild");
+    let refused = &rename["error"]["diagnostics"][0];
+    assert_eq!(refused["id"], "tamber-unknown-token", "{rename}");
+    assert_eq!(refused["file"], "app.contract", "{rename}");
     let (undone, _) =
         s.ask(json!({"method": "undo", "client": "one", "inverse": done["ok"]["inverse"]}));
     assert!(undone["ok"]["inverse"].is_string(), "{undone}");
@@ -377,8 +426,8 @@ fn requests_are_typed_bounded_and_attributed() {
     );
     // A line over the limit, and one that is not UTF-8, are answered and
     // the server reads on.
-    writeln!(s.input, "{}", "x".repeat(1 << 21)).unwrap();
-    s.input.write_all(b"\xff\xfe\n").unwrap();
+    writeln!(s.input.as_mut().unwrap(), "{}", "x".repeat(1 << 21)).unwrap();
+    s.input.as_mut().unwrap().write_all(b"\xff\xfe\n").unwrap();
     for _ in 0..2 {
         let mut line = String::new();
         s.output.read_line(&mut line).unwrap();
@@ -386,7 +435,7 @@ fn requests_are_typed_bounded_and_attributed() {
         assert!(v["error"].is_object(), "{v}");
     }
     let (hello, _) = s.ask(json!({"method": "hello"}));
-    assert_eq!(hello["ok"]["protocol"], "tamber/1.4");
+    assert_eq!(hello["ok"]["protocol"], "tamber/1.18");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -571,10 +620,10 @@ fn compare_revert_plan_and_import_plan() {
     assert_eq!(guarded["error"]["conflict"], true, "{guarded}");
     assert_eq!(guarded["error"]["stale"], json!(["brand.tamber"]));
     let css = include_str!("../../../../tamber/tests/import/shadcn-neutral.css");
-    let (imported, _) = s.ask(json!({"method": "import-plan", "kind": "shadcn", "source": css}));
+    let (imported, _) = plan_alone(&dir, json!({"kind": "shadcn", "source": css}));
     assert_eq!(
         imported["ok"]["counted"],
-        json!({"source": 47, "mapped": 46, "reported": 1})
+        json!({"source": 47, "mapped": 47, "reported": 0})
     );
     assert_eq!(imported["ok"]["offers"].as_array().unwrap().len(), 5);
     // A DTCG export of several files, each named as the file picker gave it.
@@ -587,20 +636,39 @@ fn compare_revert_plan_and_import_plan() {
             json!({"name": p.file_name().unwrap().to_str().unwrap(), "text": std::fs::read_to_string(&p).unwrap()})
         })
         .collect();
-    let (figma, _) = s.ask(json!({"method": "import-plan", "kind": "dtcg", "sources": sources}));
+    let (figma, _) = plan_alone(&dir, json!({"kind": "dtcg", "sources": sources}));
     assert_eq!(
         figma["ok"]["counted"],
-        json!({"source": 104, "mapped": 40, "reported": 64}),
+        json!({"source": 104, "mapped": 101, "reported": 3}),
         "{figma}"
     );
     // A file name of any characters is no way to stop the server.
-    let (named, _) =
-        s.ask(json!({"method": "import-plan", "kind": "dtcg", "name": "日本語", "source": "{}"}));
+    let (named, _) = plan_alone(
+        &dir,
+        json!({"kind": "dtcg", "name": "日本語", "source": "{}"}),
+    );
     assert!(
         named.get("ok").is_some() || named.get("error").is_some(),
         "{named}"
     );
-    let (astryx, _) = s.ask(json!({"method": "import-plan", "kind": "astryx", "source": "{}"}));
+    // The serve itself reads no source: only a held re-import's marks.
+    let (refused, _) = s.ask(json!({"method": "import-plan", "kind": "shadcn", "source": css}));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no method"),
+        "{refused}"
+    );
+    let (riding, _) = s.ask(json!({"method": "import-plan", "marks": [], "source": css}));
+    assert!(
+        riding["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no method"),
+        "{riding}"
+    );
+    let (astryx, _) = plan_alone(&dir, json!({"kind": "astryx", "source": "{}"}));
     assert!(astryx["error"]["message"]
         .as_str()
         .unwrap()
@@ -654,10 +722,73 @@ fn propose_judges_live_or_rebuild_by_the_closure() {
     let (lost, _) =
         s.ask(json!({"method": "propose", "ops": [{"op": "remove-token", "name": "CanvasText"}]}));
     assert_eq!(lost["ok"]["class"], "rebuild", "{lost}");
-    // Structure.
+    // A token no view names, in an app with no bindings, is in no plan:
+    // adding it leaves the plan as it is (D7's retention).
     let (added, _) = s.ask(json!({"method": "propose", "ops": [{"op": "add-token", "name": "fresh", "value": "#123456"}]}));
-    assert_eq!(added["ok"]["class"], "rebuild", "{added}");
+    assert_eq!(added["ok"]["class"], "live", "{added}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `propose` classes by the plan's retained shape, as the compiler keeps
+/// tokens (D7) and the dev loops compare plans (theme2's ruling, LLP 1121
+/// stage 5): in an app that can name a token outside its views (a data
+/// crate) every token is kept, so adding one is structure; a first `when`
+/// on a kept token that did not vary is structure (the plan gains its
+/// slices); in a plain app, an unnamed token's add and first `when` are
+/// not.
+#[test]
+fn propose_classes_by_the_plans_retained_shape() {
+    let design = "tamber app
+
+axes
+  tone = warm | cool
+
+theme
+  ink = #111111
+  spare = #222222
+";
+    let view = "component App\n  view\n    text \"a\" color=\"ink\"\n";
+    let add = json!({"method": "propose", "ops": [{"op": "add-token", "name": "fresh", "value": "#123456"}]});
+    let when = |name: &str| json!({"method": "propose", "ops": [{"op": "set-token", "name": name, "when": [{"axis": "tone", "value": "cool"}], "value": "#0a7aff"}]});
+    // Bindable: data/Cargo.toml beside app.contract.
+    let bound = app("retained-bound", design);
+    std::fs::write(bound.join("app.contract"), view).unwrap();
+    std::fs::create_dir_all(bound.join("data")).unwrap();
+    std::fs::write(
+        bound.join("data/Cargo.toml"),
+        "[package]\nname = \"t-data\"\n",
+    )
+    .unwrap();
+    let mut s = Serve::start(&bound, &[]);
+    let (added, _) = s.ask(add.clone());
+    assert_eq!(added["ok"]["class"], "rebuild", "{added}");
+    let (varies, _) = s.ask(when("spare"));
+    assert_eq!(varies["ok"]["class"], "rebuild", "{varies}");
+    drop(s);
+    // Plain: the view names `ink` alone.
+    let plain = app("retained-plain", design);
+    std::fs::write(plain.join("app.contract"), view).unwrap();
+    let mut s = Serve::start(&plain, &[]);
+    let (added, _) = s.ask(add);
+    assert_eq!(added["ok"]["class"], "live", "{added}");
+    let (unkept, _) = s.ask(when("spare"));
+    assert_eq!(unkept["ok"]["class"], "live", "{unkept}");
+    let (kept, _) = s.ask(when("ink"));
+    assert_eq!(kept["ok"]["class"], "rebuild", "{kept}");
+    let (value, _) = s.ask(json!({"method": "propose", "ops": [{"op": "set-token", "name": "ink", "value": "#333333"}]}));
+    assert_eq!(value["ok"]["class"], "live", "{value}");
+    // A data crate added beside the running server: every token kept now.
+    std::fs::create_dir_all(plain.join("data")).unwrap();
+    std::fs::write(
+        plain.join("data/Cargo.toml"),
+        "[package]\nname = \"t-data\"\n",
+    )
+    .unwrap();
+    let (bound_now, _) = s.ask(json!({"method": "propose", "ops": [{"op": "add-token", "name": "fresh", "value": "#123456"}]}));
+    assert_eq!(bound_now["ok"]["class"], "rebuild", "{bound_now}");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&bound);
+    let _ = std::fs::remove_dir_all(&plain);
 }
 
 /// A synthetic token that comes to fold is a rebuild (the plan's table
@@ -685,27 +816,72 @@ fn a_synthetic_token_that_comes_to_fold_is_rebuild_then_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An icon naming another in the design too, with and without params:
+/// with them the write's check read nothing of such a design and let the
+/// write through, without them the design was refused (stage 9's alias
+/// fix).
 #[test]
 fn a_write_that_makes_a_role_vary_by_an_axis_is_refused_as_the_build_would() {
-    let dir = app(
-        "role-axis",
-        "tamber t\n\naxes\n  mode = a | b\n\ntheme\n  ink = #000000\n  -exact-label = ink\n",
-    );
+    let design =
+        "tamber t\n\naxes\n  mode = a | b\n\ntheme\n  ink = #000000\n  -exact-label = ink\n";
+    let aliased =
+        format!("{design}\nicons\n  icon.house = icon(sf \"house\")\n  icon.home = icon.house\n");
+    let view = "component App\n  params\n    gap: length = \"4px\"  range=\"0..40\"\n  view\n    column gap=\"param.gap\"\n";
+    for (tag, design, params) in [
+        ("role-axis", design, false),
+        ("role-axis-alias", &aliased, false),
+        ("role-axis-params", &aliased, true),
+    ] {
+        let dir = app(tag, design);
+        if params {
+            std::fs::write(dir.join("app.contract"), view).unwrap();
+        }
+        let file = dir.join("app.tamber");
+        let before = std::fs::read_to_string(&file).unwrap();
+        let mut s = Serve::start(&dir, &[]);
+        let op = json!({"op": "set-token", "name": "ink", "when": [{"axis": "mode", "value": "b"}], "value": "#111111"});
+        let (proposed, _) = s.ask(json!({"method": "propose", "ops": [op]}));
+        assert_eq!(
+            proposed["error"]["diagnostics"][0]["id"], "tamber-role-axis",
+            "{tag}: {proposed}"
+        );
+        let (done, _) = s.ask(json!({"method": "transaction", "client": "one", "files": {"app.tamber": digest(&file)}, "ops": [op]}));
+        assert_eq!(
+            done["error"]["diagnostics"][0]["id"], "tamber-role-axis",
+            "{tag}: {done}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A write that sets a base name to anything but a length is refused by
+/// the shared checker before it lands, as the build would (stage 11 B
+/// round 2, Astra 3): not only at lowering.
+#[test]
+fn a_write_that_makes_a_base_name_a_colour_is_refused() {
+    let dir = app("base-kind", "tamber t\n\ntheme\n  ink = #000000\n");
     let file = dir.join("app.tamber");
     let before = std::fs::read_to_string(&file).unwrap();
     let mut s = Serve::start(&dir, &[]);
-    let op = json!({"op": "set-token", "name": "ink", "when": [{"axis": "mode", "value": "b"}], "value": "#111111"});
+    // `set-token` sets a base name for this app (theme2's 17:09 ruling: `add-token` refuses one).
+    let op = json!({"op": "set-token", "name": "space.md", "value": "#ff0000"});
     let (proposed, _) = s.ask(json!({"method": "propose", "ops": [op]}));
     assert_eq!(
-        proposed["error"]["diagnostics"][0]["id"], "tamber-role-axis",
+        proposed["error"]["diagnostics"][0]["id"], "tamber-base-kind",
         "{proposed}"
     );
     let (done, _) = s.ask(json!({"method": "transaction", "client": "one", "files": {"app.tamber": digest(&file)}, "ops": [op]}));
     assert_eq!(
-        done["error"]["diagnostics"][0]["id"], "tamber-role-axis",
+        done["error"]["diagnostics"][0]["id"], "tamber-base-kind",
         "{done}"
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    // A length is the app's to set.
+    let length = json!({"op": "set-token", "name": "space.md", "value": "12px"});
+    let (ok, _) = s.ask(json!({"method": "propose", "ops": [length]}));
+    assert!(ok.get("ok").is_some(), "{ok}");
+    drop(s);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -878,12 +1054,39 @@ fn export_gives_the_dtcg_text_and_keeps_its_baseline_for_import() {
     assert!(again["ok"]["text"].is_string(), "{again}");
     assert_eq!(std::fs::read_to_string(&design).unwrap(), before);
     // The unedited export, imported, plans nothing against its baseline.
-    let (planned, _) = s.ask(
-        json!({"method": "import-plan", "kind": "dtcg", "source": text, "name": "app.tokens.json"}),
+    let (planned, _) = plan_alone(
+        &dir,
+        json!({"kind": "dtcg", "source": text, "name": "app.tokens.json"}),
     );
     assert_eq!(planned["ok"]["ops"], json!([]), "{planned}");
     assert_eq!(
         planned["ok"]["counted"]["source"],
         planned["ok"]["counted"]["mapped"]
     );
+    // `keep: false` (a client below write): the text, and nothing kept.
+    std::fs::remove_dir_all(dir.join(".exact/tamber-dtcg")).unwrap();
+    let (unkept, _) = s.ask(json!({"method": "export", "kind": "dtcg", "keep": false}));
+    assert_eq!(unkept["ok"]["text"], exported["ok"]["text"], "{unkept}");
+    assert!(unkept["ok"]["baseline"].is_null(), "{unkept}");
+    assert!(!dir.join(".exact/tamber-dtcg").exists());
+}
+
+/// LLP 1121 D10 (stage 6 F): an icon's sources in the IR and from
+/// `resolve`, the same in every tuple.
+#[test]
+fn describe_and_resolve_read_an_icon() {
+    let design = "tamber t\n\naxes\n  density = regular | compact\n\ntheme\n  ink = #000000\n\nicons\n  icon.reply = icon(sf \"bubble.left\", material \"chat_bubble\", svg \"icons/reply.svg\")\n";
+    let dir = app("icon", design);
+    let mut s = Serve::start(&dir, &[]);
+    let (describe, _) = s.ask(json!({"method": "describe"}));
+    assert_eq!(
+        describe["ok"]["ir"]["icons"][0]["sf"], "bubble.left",
+        "{describe}"
+    );
+    let (resolve, _) = s.ask(json!({"method": "resolve", "token": "icon.reply"}));
+    let tuples = resolve["ok"]["tuples"].as_array().unwrap();
+    assert_eq!(tuples.len(), 2, "{resolve}");
+    assert_eq!(tuples[1]["kind"], "icon");
+    assert_eq!(tuples[1]["svg"], "icons/reply.svg");
+    assert_eq!(tuples[1]["modes"], json!({"density": "compact"}));
 }

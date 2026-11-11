@@ -56,6 +56,99 @@ final class ProgressIOSTests: XCTestCase {
         for (got, want) in zip([r, g, b, a], [want.0, want.1, want.2, want.3]) { XCTAssertEqual(got, want, accuracy: 0.01, "\([r, g, b, a])") }
     }
 
+    /// A colour its author wrote that names the tint reaches the indicator undimmed, also from a
+    /// refresh while UIKit dims tints: the indicator keeps the colour it is given
+    func testATintColourReachesTheIndicatorUndimmed() throws {
+        var ops = progress(2, written: true)
+        ops[0]["style"] = ["text_color": ["sys": "@tint", "c": [0, 122, 255, 255]], "written": ["text_color"]]
+        let p = presenter(ops + [["op": "roots", "ids": [2]]])
+        window.tintColor = UIColor(red: 1, green: 0, blue: 0, alpha: 1)
+        let spinner = try XCTUnwrap(p.controls.spinners[2])
+        p.viewport.tintAdjustmentMode = .dimmed
+        p.controls.syncProgress()
+        p.viewport.tintAdjustmentMode = .automatic
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        spinner.color.resolvedColor(with: spinner.traitCollection).getRed(&r, green: &g, blue: &b, alpha: &a)
+        for (got, want) in zip([r, g, b, a], [CGFloat(1), 0, 0, 1]) { XCTAssertEqual(got, want, accuracy: 0.01, "the red tint once the dimming ends: \([r, g, b, a])") }
+    }
+
+    /// `accent-color: AccentColor` under an authored accent keeps that one,
+    /// as the web's `var(--exact-accent, AccentColor)` does (LLP 1121 D9,
+    /// stage 9 F1); with none authored above, the role's own.
+    func testTheAccentRoleUnderAnAuthoredAccentKeepsIt() throws {
+        let tint: [String: Any] = ["sys": "@tint", "c": [[0, 136, 255, 255], [0, 145, 255, 255]]]
+        let green: [Double] = [0, 200, 0, 255]
+        var ops = box(1) + box(5) + progress(2) + box(6) + progress(3)
+        ops[0]["style"] = ["text_color": [0, 0, 0, 255], "accent_color": green]
+        ops[2]["style"] = ["text_color": [0, 0, 0, 255], "accent_color": tint]
+        ops[4]["style"] = ["text_color": [255, 0, 0, 255], "accent_color": tint]
+        ops[6]["style"] = ["text_color": [0, 0, 0, 255], "accent_color": tint]
+        ops[8]["style"] = ["text_color": [255, 0, 0, 255], "accent_color": tint]
+        let p = presenter(ops + [["op": "children", "id": 1, "ids": [5]], ["op": "children", "id": 5, "ids": [2]],
+                                 ["op": "children", "id": 6, "ids": [3]], ["op": "roots", "ids": [1, 6]]])
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        try XCTUnwrap(p.controls.spinners[2]).color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        XCTAssertEqual([r, g, b, a].map { ($0 * 255).rounded() }, [0, 200, 0, 255], "the authored accent, kept through the role")
+        try XCTUnwrap(p.controls.spinners[3]).color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        XCTAssertNotEqual([r, g, b, a].map { ($0 * 255).rounded() }, [0, 200, 0, 255], "none authored above: the role's own")
+    }
+
+    /// A system colour is an authored accent (only the bare tint is the
+    /// role): under the role, a systemRed ancestor's accent is kept.
+    func testASystemColourAboveTheRoleIsAuthored() throws {
+        let tint: [String: Any] = ["sys": "@tint", "c": [[0, 136, 255, 255], [0, 145, 255, 255]]]
+        let red: [String: Any] = ["sys": "systemRedColor", "c": [[255, 56, 60, 255], [255, 66, 69, 255]]]
+        var ops = box(1) + box(5) + progress(2)
+        ops[0]["style"] = ["text_color": [0, 0, 0, 255], "accent_color": red]
+        ops[2]["style"] = ["text_color": [0, 0, 0, 255], "accent_color": tint]
+        ops[4]["style"] = ["text_color": [255, 0, 0, 255], "accent_color": tint]
+        let p = presenter(ops + [["op": "children", "id": 1, "ids": [5]], ["op": "children", "id": 5, "ids": [2]], ["op": "roots", "ids": [1]]])
+        let spinner = try XCTUnwrap(p.controls.spinners[2])
+        var want: (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0), r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor.systemRed.resolvedColor(with: spinner.traitCollection).getRed(&want.0, green: &want.1, blue: &want.2, alpha: &want.3)
+        spinner.color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        for (got, want) in zip([r, g, b, a], [want.0, want.1, want.2, want.3]) { XCTAssertEqual(got, want, accuracy: 0.02, "\([r, g, b, a])") }
+    }
+
+    func testAnInheritedAccentResolvesInTheSpinnersAppearance() throws {
+        let tint: [String: Any] = ["sys": "@tint", "c": [[0, 136, 255, 255], [0, 145, 255, 255]]]
+        let pair: [Any] = [[200, 0, 0, 255], [0, 200, 0, 255]]
+        var ops = box(1) + box(5) + progress(2)
+        ops[0]["style"] = ["accent_color": pair]
+        ops[2]["style"] = ["accent_color": tint]
+        ops[4]["style"] = ["accent_color": tint]
+        let p = presenter(ops + [["op": "children", "id": 1, "ids": [5]], ["op": "children", "id": 5, "ids": [2]], ["op": "roots", "ids": [1]]])
+        let author = try XCTUnwrap(p.views[1]), requestor = try XCTUnwrap(p.views[2])
+        author.applyStyle(author.style.merging(["color_scheme": "light"]) { $1 })
+        requestor.applyStyle(requestor.style.merging(["color_scheme": "dark"]) { $1 })
+        requestor.updateTraitsIfNeeded()
+        p.controls.syncProgress()
+        XCTAssertFalse(try XCTUnwrap(p.views[1]).drawsDark)
+        XCTAssertTrue(try XCTUnwrap(p.views[2]).drawsDark)
+        let color = try XCTUnwrap(p.controls.spinners[2]?.color)
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        XCTAssertEqual([r, g, b, a].map { ($0 * 255).rounded() }, [0, 200, 0, 255])
+    }
+
+    func testHighlightUnderTheRoleUsesTheAuthoringViewsTint() throws {
+        let tint: [String: Any] = ["sys": "@tint", "c": [[0, 136, 255, 255], [0, 145, 255, 255]]]
+        let highlight: [String: Any] = ["sys": "@tint/0.2", "c": [[0, 136, 255, 51], [0, 145, 255, 51]]]
+        var ops = box(1) + box(5) + progress(2)
+        ops[0]["style"] = ["accent_color": highlight]
+        ops[2]["style"] = ["accent_color": tint]
+        ops[4]["style"] = ["accent_color": tint]
+        let p = presenter(ops + [["op": "children", "id": 1, "ids": [5]], ["op": "children", "id": 5, "ids": [2]], ["op": "roots", "ids": [1]]])
+        p.views[1]?.tintColor = .systemRed
+        p.views[2]?.tintColor = .systemBlue
+        p.controls.syncProgress()
+        let owner = try XCTUnwrap(p.views[1]), requestor = try XCTUnwrap(p.views[2]), spinner = try XCTUnwrap(p.controls.spinners[2])
+        let expected = try XCTUnwrap(owner.style["accent_color"]?.channels(dark: requestor.drawsDark, tint: owner.tintColor))
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        spinner.color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        for (got, want) in zip([r, g, b, a].map { Double($0) * 255 }, expected) { XCTAssertEqual(got, want, accuracy: 0.01) }
+    }
+
     func testItIsUIKitsActivityIndicatorSizedByItsBox() throws {
         let p = presenter(box(1) + progress(2, ["testId": "busy", "accessibilityLabel": "Loading"], written: true) + progress(3, side: 40, y: 40)
                           + [["op": "children", "id": 1, "ids": [2, 3]], ["op": "roots", "ids": [1]]])

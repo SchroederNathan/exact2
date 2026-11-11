@@ -13,7 +13,7 @@ use exact_kernel::id::NodeKey;
 use exact_kernel::motion::MotionSync;
 use exact_kernel::{Kernel, NodeType};
 use exact_motion::animation::Keyframe;
-use exact_motion::{AnimationPlay, Easing, Engine, Property, Value};
+use exact_motion::{AnimationPlay, Easing, Engine, LinearStop, PlayedCurve, Property, Value};
 use std::fmt::Write as _;
 
 /// One CA keyframe track: key times, values and a cubic per segment.
@@ -38,9 +38,16 @@ pub(crate) fn bezier(e: &Easing) -> Option<[f64; 4]> {
 
 const LINEAR: [f64; 4] = [0.0, 0.0, 1.0, 1.0];
 
+/// A key's distance before a jump it approaches, in an interval's progress,
+/// at most half the gap to the key before it.
+const HAIR: f64 = 1e-4;
+
 /// One forward iteration of `property`, keyframe easings as cubics; a
 /// `steps()` or `linear()` interval becomes linear sub-keyframes at its own
-/// breakpoints (a step is a hold: two keys a hair apart).
+/// breakpoints ([`stepped_keys`]). Each interval starts with a key at its
+/// own keyframe's value, as the engine samples it at the keyframe's offset:
+/// an interval that ends elsewhere (a `linear()` extrapolated past its last
+/// stop) keeps its end a hair before the boundary ([`begin`]).
 fn forward(frames: &[Keyframe], default: &Easing, property: Property, underlying: Value) -> Track {
     let mut pts: Vec<(f64, Option<&Easing>, Value)> = frames
         .iter()
@@ -64,44 +71,153 @@ fn forward(frames: &[Keyframe], default: &Easing, property: Property, underlying
     };
     for w in pts.windows(2) {
         let (a, b) = (&w[0], &w[1]);
+        // Two keyframes at one offset: the later one holds from there, which
+        // the next interval's start says.
+        if b.0 <= a.0 {
+            continue;
+        }
         let easing = a.1.unwrap_or(default);
         // Core Animation interpolates colours in the display's colour space,
         // not CSS's sRGB: a colour interval is sampled every sixteenth, so
         // its own interpolation only bridges near neighbours.
-        let curve = bezier(easing).filter(|_| !property.is_color());
-        match curve {
+        let colour = property.is_color();
+        match bezier(easing).filter(|_| !colour) {
             Some(c) => {
-                t.times.push(b.0);
-                t.values.push(b.2);
-                t.curves.push(c);
+                begin(&mut t, a.0, a.2);
+                push(&mut t, b.0, b.2, c);
             }
-            None => {
-                let span = b.0 - a.0;
-                let mut xs: Vec<f64> = match easing {
-                    Easing::Steps { count, .. } => (1..*count)
-                        .map(|j| j as f64 / *count as f64)
-                        .flat_map(|x| [x - 1e-4, x])
-                        .chain([1e-4, 1.0 - 1e-4])
-                        .collect(),
-                    Easing::PiecewiseLinear(stops) => stops.iter().map(|s| s.input).collect(),
-                    _ => Vec::new(),
-                };
-                if property.is_color() {
-                    xs.extend((1..16).map(|j| j as f64 / 16.0));
-                }
-                xs.push(1.0);
-                xs.retain(|x| *x > 0.0 && *x <= 1.0);
-                xs.sort_by(f64::total_cmp);
-                xs.dedup();
-                for x in xs {
-                    t.times.push(a.0 + span * x);
-                    t.values.push(a.2.lerp(b.2, easing.progress(x)));
-                    t.curves.push(LINEAR);
-                }
-            }
+            None => stepped_keys(&mut t, a.0, b.0, easing, colour, |p| a.2.lerp(b.2, p)),
         }
     }
     t
+}
+
+/// The interval from `from` to `to` under an easing Core Animation can't
+/// say, as linear keys. `steps()` is the `linear()` it equals (each step a
+/// pair of stops at one input); a cubic, which only a colour reaches here,
+/// is sampled. Between keys the curve is straight, so Core Animation plays
+/// it exactly; a colour also has a key every sixteenth.
+///
+/// A jump is two stops at one input, never inferred from values. Its key at
+/// the input has the curve's output there (the last of those stops), and a
+/// key a hair before it the curve's output at that point, on the line that
+/// approaches the jump. Keys are placed in increasing progress, each after
+/// the one before it, so none replaces another.
+///
+/// A colour extrapolated out of gamut is clamped at its keys, and Core
+/// Animation draws a straight line across where the engine's clamp bends
+/// it, within a sixteenth of the interval, as with colour space.
+fn stepped_keys(
+    t: &mut Track,
+    from: f64,
+    to: f64,
+    easing: &Easing,
+    colour: bool,
+    value: impl Fn(f64) -> Value,
+) {
+    let stops: Vec<LinearStop> = match easing {
+        Easing::PiecewiseLinear(stops) => stops.clone(),
+        Easing::Steps { count, .. } => {
+            let n = (*count).max(1) as f64;
+            let mut stops: Vec<LinearStop> = (0..*count)
+                .flat_map(|k| {
+                    let output = easing.progress((k as f64 + 0.5) / n);
+                    [k as f64 / n, (k as f64 + 1.0) / n].map(|input| LinearStop { input, output })
+                })
+                .collect();
+            stops.push(LinearStop {
+                input: 1.0,
+                output: easing.progress(1.0),
+            });
+            stops
+        }
+        _ => (0..=16)
+            .map(|j| j as f64 / 16.0)
+            .map(|input| LinearStop {
+                input,
+                output: easing.progress(input),
+            })
+            .collect(),
+    };
+    // Keys visit inputs in order, including the hair before a jump.
+    let mut cursor = 0;
+    let mut progress = |x: f64| {
+        if stops.is_empty() {
+            return x;
+        }
+        while cursor + 1 < stops.len() && stops[cursor + 1].input <= x {
+            cursor += 1;
+        }
+        if stops.len() == 1 || stops[cursor].input == x {
+            return stops[cursor].output;
+        }
+        let (a, b) = if x < stops[0].input {
+            (stops[0], stops[1])
+        } else if cursor + 1 < stops.len() {
+            (stops[cursor], stops[cursor + 1])
+        } else {
+            (stops[stops.len() - 2], stops[stops.len() - 1])
+        };
+        if a.input == b.input {
+            b.output
+        } else {
+            a.output + (b.output - a.output) * (x - a.input) / (b.input - a.input)
+        }
+    };
+    let span = to - from;
+    begin(t, from, value(progress(0.0)));
+    // Each input in (0, 1], ascending, and whether stops share it (a jump):
+    // a stop's, or a colour's sixteenth.
+    let mut inputs: Vec<(f64, bool)> = Vec::new();
+    for s in &stops {
+        match inputs.last_mut() {
+            Some((x, jump)) if *x == s.input => *jump = true,
+            _ if s.input > 0.0 => inputs.push((s.input, false)),
+            _ => {}
+        }
+    }
+    if colour {
+        inputs.extend((1..16).map(|j| (j as f64 / 16.0, false)));
+        inputs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        inputs.dedup_by(|later, kept| {
+            let same = later.0 == kept.0;
+            kept.1 |= same && later.1;
+            same
+        });
+    }
+    if inputs.last().is_none_or(|(x, _)| *x < 1.0) {
+        inputs.push((1.0, false));
+    }
+    let mut prev = 0.0;
+    for (x, jump) in inputs {
+        if jump {
+            let at = x - HAIR.min((x - prev) / 2.0);
+            push(t, from + span * at, value(progress(at)), LINEAR);
+        }
+        push(t, from + span * x, value(progress(x)), LINEAR);
+        prev = x;
+    }
+}
+
+/// Start an interval at `at` with `v`: the track's first key takes it; an
+/// interval that ended at another value keeps that end a hair (of its last
+/// segment, straight wherever an end can differ) before `at`, at the value
+/// its segment has there.
+fn begin(t: &mut Track, at: f64, v: Value) {
+    let n = t.times.len();
+    if n == 1 {
+        t.values[0] = v;
+    } else if t.values[n - 1] != v {
+        t.times[n - 1] -= HAIR * (t.times[n - 1] - t.times[n - 2]);
+        t.values[n - 1] = t.values[n - 1].lerp(t.values[n - 2], HAIR);
+        push(t, at, v, LINEAR);
+    }
+}
+
+fn push(t: &mut Track, at: f64, v: Value, curve: [f64; 4]) {
+    t.times.push(at);
+    t.values.push(v);
+    t.curves.push(curve);
 }
 
 /// The same iteration played backwards: times mirrored, each cubic reversed
@@ -159,6 +275,9 @@ pub(crate) fn specs_in(
     underlying: &dyn Fn(Property) -> (Value, f64),
     size: Option<(f64, f64)>,
 ) -> String {
+    if !crate::host::svg::render_server() {
+        return "[]".into();
+    }
     let mut s = String::from("[");
     let mut first = true;
     for (i, play) in engine.animation_plays(key).iter().enumerate() {
@@ -230,6 +349,39 @@ fn spec(
             a.iterations / 2.0,
         ),
     };
+    let (times, values, curves) = track_json(&track, p, scale, axis, size);
+    let _ = write!(
+        s,
+        "{{\"id\":\"{}#{index}#{key}\",\"k\":\"{key}\",\"s\":{},\"dl\":{},\"d\":{},\"n\":{},\"t\":[{}],\"v\":[{}],\"c\":[{}],\"fill\":{},\"h\":",
+        a.name.replace(['"', '\\'], ""),
+        play.start,
+        a.delay,
+        period,
+        if repeat.is_infinite() { -1.0 } else { repeat },
+        times,
+        values,
+        curves,
+        a.fill as u8,
+    );
+    // A play waiting for the first presented frame is held where it waits
+    // (LLP 1003.001 D4): Core Animation never runs ahead of the engine.
+    match play.hold.or(play.pending.map(|begin| begin - play.start)) {
+        Some(h) => {
+            let _ = write!(s, "{h}");
+        }
+        None => s.push_str("null"),
+    }
+    s.push('}');
+}
+
+/// A track's key times, values and curves as a spec's `t`, `v` and `c`.
+fn track_json(
+    track: &Track,
+    p: Property,
+    scale: f64,
+    axis: usize,
+    size: Option<(f64, f64)>,
+) -> (String, String, String) {
     let list = |v: &[f64]| {
         v.iter()
             .map(|n| num(*n as f32))
@@ -270,28 +422,7 @@ fn spec(
             .map(|c| format!("[{}]", list(c)))
             .collect()
     };
-    let _ = write!(
-        s,
-        "{{\"id\":\"{}#{index}#{key}\",\"k\":\"{key}\",\"s\":{},\"dl\":{},\"d\":{},\"n\":{},\"t\":[{}],\"v\":[{}],\"c\":[{}],\"fill\":{},\"h\":",
-        a.name.replace(['"', '\\'], ""),
-        play.start,
-        a.delay,
-        period,
-        if repeat.is_infinite() { -1.0 } else { repeat },
-        list(&track.times),
-        values.join(","),
-        curves.join(","),
-        a.fill as u8,
-    );
-    // A play waiting for the first presented frame is held where it waits
-    // (LLP 1003.001 D4): Core Animation never runs ahead of the engine.
-    match play.hold.or(play.pending.map(|begin| begin - play.start)) {
-        Some(h) => {
-            let _ = write!(s, "{h}");
-        }
-        None => s.push_str("null"),
-    }
-    s.push('}');
+    (list(&track.times), values.join(","), curves.join(","))
 }
 
 /// Per node, whether Core Animation can play its lowered animations as
@@ -366,6 +497,9 @@ pub(crate) fn eligibility(
             // A glass group ignores the opacity Core Animation plays between
             // it and its glass; the host isolates on what it is told.
             || (props.contains(&Property::Opacity) && in_glass_group(kernel, &n))
+            // What the host paints over the node's own (a press, a look: LLP
+            // 1061 D7, LLP 1121 D8) composes on the engine's sample.
+            || props.iter().any(|p| crate::looks::paints_over(&n, *p))
             // Drawn into an island's pixels, which Core Animation does not
             // animate (except a live filter picture on iOS).
             || (svg && in_picture(kernel, &n, box_motion))
@@ -428,8 +562,12 @@ pub(crate) fn eligibility(
 /// runs on while the area under it is sampled (the chart's).
 pub(crate) fn hand_over_paths(kernel: &Kernel, engine: &mut Engine, live: bool) {
     use exact_kernel::svg::Paint;
+    if !crate::host::svg::render_server() {
+        return;
+    }
     let moving: Vec<u64> = engine
         .running_transitions()
+        .chain(engine.played_transitions())
         .filter(|(_, p)| *p == Property::D)
         .map(|(node, _)| node)
         .collect();
@@ -477,10 +615,299 @@ pub(crate) fn hand_over_paths(kernel: &Kernel, engine: &mut Engine, live: bool) 
     for (playable, nodes) in scenes.into_values() {
         if playable {
             for node in nodes {
-                engine.play_transition(node, Property::D);
+                if !engine.is_played(node, Property::D) {
+                    engine.play_transition(node, Property::D);
+                }
+            }
+        } else {
+            for node in nodes {
+                engine.reclaim_transition(node, Property::D);
             }
         }
     }
+}
+
+/// The properties whose transitions Core Animation plays for a box
+/// ([`hand_over_transitions`]).
+const BOX_PLAYED: [Property; 5] = [
+    Property::Opacity,
+    Property::BackgroundColor,
+    Property::Translate,
+    Property::Scale,
+    Property::Rotate,
+];
+
+/// LLP 1055.001 §3 — on iOS each running opacity transition of a box, and
+/// each eligible transform or background-colour one, goes to Core Animation
+/// ([`Engine::play_transition`]) as LLP 1055.001 lowers a box's keyframes:
+/// the engine presents the target, the box's specs carry the transition
+/// ([`transition_specs`]), and nothing samples it, so a fade keeps no
+/// display link awake. One waiting for its first frame goes at that frame
+/// (LLP 1003.001 D4), and none goes unless `new` (the display drives the
+/// clock). Every batch, a played transition that no longer qualifies
+/// ([`playable`]: an ancestor gained a filter, the box a border), or any once
+/// `new` is off (the agent took the clock), comes back to the engine at the
+/// value its curve has reached, and its spec goes in the same batch. Returns
+/// the views either way.
+pub(crate) fn hand_over_transitions(
+    kernel: &Kernel,
+    engine: &mut Engine,
+    skip: &dyn Fn(exact_kernel::ViewId) -> bool,
+    interactive: &dyn Fn(exact_kernel::ViewId) -> bool,
+    new: bool,
+) -> Vec<exact_kernel::ViewId> {
+    let played: Vec<(u64, Property)> = engine
+        .played_transitions()
+        .filter(|(_, p)| BOX_PLAYED.contains(p))
+        .collect();
+    let moving: Vec<(u64, Property)> = engine
+        .running_transitions()
+        .filter(|(_, p)| BOX_PLAYED.contains(p))
+        .collect();
+    let mut views = Vec::new();
+    let node = |key: u64| kernel.node_by_key(exact_kernel::motion::node_key(key));
+    for (key, p) in played {
+        if (!new || !playable(kernel, engine, key, p, skip, interactive))
+            && engine.reclaim_transition(key, p)
+        {
+            views.extend(node(key).map(|n| n.id));
+        }
+    }
+    for (key, p) in moving.into_iter().filter(|_| new) {
+        let waits = engine.transition_ends(key, p).is_none_or(|t| t.waits);
+        if !waits
+            && playable(kernel, engine, key, p, skip, interactive)
+            && engine.play_transition(key, p).is_some()
+        {
+            views.extend(node(key).map(|n| n.id));
+        }
+    }
+    views
+}
+
+/// Whether Core Animation can play the transition on `p` of box `key` as
+/// CSS does: not what a press or a look paints over, not a property an
+/// animation also plays (it composes over the transition), no box under a
+/// CSS filter (its picture is drawn from the model), no opacity in a glass
+/// group, a background colour only where the layer paints it with one alpha
+/// at both ends (Core Animation interpolates unpremultiplied), and no view
+/// `skip` names.
+fn playable(
+    kernel: &Kernel,
+    engine: &Engine,
+    key: u64,
+    p: Property,
+    skip: &dyn Fn(exact_kernel::ViewId) -> bool,
+    interactive: &dyn Fn(exact_kernel::ViewId) -> bool,
+) -> bool {
+    let Some(n) = kernel.node_by_key(exact_kernel::motion::node_key(key)) else {
+        return false;
+    };
+    if n.node_type.is_svg_element()
+        || n.node_type == NodeType::Svg
+        || skip(n.id)
+        || crate::looks::paints_over(&n, p)
+        || under_box_filter(kernel, &n)
+        || engine
+            .animation_plays(key)
+            .iter()
+            .any(|play| play.animation.keyframes.properties().contains(&p))
+    {
+        return false;
+    }
+    match p {
+        Property::Opacity => !in_glass_group(kernel, &n),
+        Property::Translate | Property::Scale | Property::Rotate => {
+            box_eligible(kernel, &n, &[p], interactive)
+        }
+        Property::BackgroundColor => {
+            layer_paints_background(&n)
+                && background_on_layer(kernel, &n)
+                && engine
+                    .transition_ends(key, p)
+                    .is_some_and(|t| t.from.w == t.to.w)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the background colour a box's layer would paint is the box's
+/// fill as UIKit shows it (`BoxLayerIOS.applyBoxLayer`'s `bg`): a fixed or
+/// light-dark colour (a platform or role colour may draw as vibrancy, a wide
+/// one in its own space), over the border box, with one circular radius, a
+/// round or continuous corner, no material, no layout transition that moves
+/// it to a surface, and shown. Anything UIKit rasterizes stays sampled.
+fn background_on_layer(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>) -> bool {
+    use exact_kernel::{ColorValue, Dimension};
+    let s = n.style;
+    let radii: Vec<Option<f32>> = [
+        s.border_radius_top_left,
+        s.border_radius_top_right,
+        s.border_radius_bottom_right,
+        s.border_radius_bottom_left,
+    ]
+    .iter()
+    .map(|d| match d {
+        Dimension::Points(r) => Some(*r),
+        Dimension::Percent(r) if *r == 0.0 => Some(0.0),
+        _ => None,
+    })
+    .collect();
+    let set: Vec<f32> = radii
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|r| *r > 0.0)
+        .collect();
+    let one_radius = radii.iter().all(Option::is_some)
+        && set.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01)
+        && set
+            .first()
+            .is_none_or(|r| *r <= n.frame.width.min(n.frame.height) / 2.0 + 0.01);
+    let shown = {
+        let mut at = Some(n.id);
+        loop {
+            let Some(node) = at.and_then(|id| kernel.node(id)) else {
+                break true;
+            };
+            if node.style.mask.has(exact_kernel::StyleId::Visibility) {
+                break node.style.visibility == exact_kernel::Visibility::Visible;
+            }
+            at = node.parent;
+        }
+    };
+    matches!(
+        s.background_color,
+        Some(ColorValue::Fixed(_) | ColorValue::LightDark(..))
+    ) && s.cold.background_clip == exact_kernel::BackgroundClip::BorderBox
+        && (s.rare.corner_shape.is_round() || s.rare.corner_shape.is_apple_continuous())
+        && s.rare.layout_transition.0.is_empty()
+        && n.props
+            .str(exact_kernel::PropId::BackgroundMaterial)
+            .is_none()
+        && one_radius
+        && shown
+}
+
+#[derive(Debug)]
+pub(crate) struct PlayedSpec {
+    ends: exact_motion::TransitionEnds,
+    size: (f32, f32),
+    text: String,
+}
+
+/// A box's played transitions ([`hand_over_transitions`]) as specs, one
+/// iteration of each transition's curve from when it starts moving, holding
+/// its start through a delay (a backwards fill); after it ends, the target
+/// the engine presents shows. A spec is made once per transition and kept in
+/// `made` until the transition changes: a spring's track samples its whole
+/// curve.
+pub(crate) fn transition_specs(
+    engine: &Engine,
+    key: u64,
+    size: (f32, f32),
+    made: &mut std::collections::BTreeMap<(u64, usize), PlayedSpec>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in BOX_PLAYED {
+        let slot = (key, p as usize);
+        let ends = engine
+            .transition_ends(key, p)
+            .filter(|_| engine.is_played(key, p));
+        let Some(ends) = ends else {
+            made.remove(&slot);
+            continue;
+        };
+        if let Some(spec) = made
+            .get(&slot)
+            .filter(|kept| kept.ends == ends && kept.size == size)
+        {
+            out.push(spec.text.clone());
+            continue;
+        }
+        let Some((t, _)) = engine.transition(key, p) else {
+            continue;
+        };
+        let (duration, mut track) = match &t.curve {
+            PlayedCurve::Easing { easing, duration } => {
+                let end = |offset: f64, v: Value| Keyframe {
+                    offset,
+                    easing: None,
+                    values: vec![(p, v)],
+                    dark: Vec::new(),
+                };
+                let ends = [end(0.0, t.from), end(1.0, t.to)];
+                (*duration, forward(&ends, easing, p, t.from))
+            }
+            PlayedCurve::Frames { duration, values } => {
+                let last = values.len().saturating_sub(1).max(1) as f64;
+                let track = Track {
+                    times: (0..values.len()).map(|i| i as f64 / last).collect(),
+                    values: values.clone(),
+                    curves: vec![LINEAR; values.len().saturating_sub(1)],
+                };
+                (*duration, track)
+            }
+        };
+        // Backwards fill holds the uneased value through a transition's delay.
+        // Keep the eased start just inside the active interval, as at a jump.
+        if track.values[0] != t.from && track.times.len() > 1 {
+            track.times[0] = HAIR * track.times[1];
+            track.values[0] = track.values[0].lerp(track.values[1], HAIR);
+            track.times.insert(0, 0.0);
+            track.values.insert(0, t.from);
+            track.curves.insert(0, LINEAR);
+        }
+        let parts: &[(usize, &str)] = match p {
+            Property::Translate => &[
+                (0, "transform.translation.x"),
+                (1, "transform.translation.y"),
+            ],
+            Property::Scale => &[(0, "transform.scale")],
+            Property::Rotate => &[(0, "transform.rotation.z")],
+            Property::Opacity => &[(0, "opacity")],
+            _ => &[(0, "backgroundColor")],
+        };
+        let scale = if p == Property::Rotate {
+            std::f64::consts::PI / 180.0
+        } else {
+            1.0
+        };
+        let specs: Vec<String> = parts.iter().map(|(axis, path)| {
+            let (times, values, curves) = track_json(&track, p, scale, *axis, Some((size.0 as f64, size.1 as f64)));
+            format!(
+                "{{\"id\":\"transition#{path}\",\"k\":\"{path}\",\"s\":{},\"dl\":0,\"d\":{duration},\"n\":1,\"t\":[{times}],\"v\":[{values}],\"c\":[{curves}],\"fill\":2,\"h\":null}}", t.start,
+            )
+        }).collect();
+        let spec = specs.join(",");
+        made.insert(
+            slot,
+            PlayedSpec {
+                ends,
+                size,
+                text: spec.clone(),
+            },
+        );
+        out.push(spec);
+    }
+    out
+}
+
+/// Whether a box's layer paints its background colour: no side has a
+/// border that paints and there is no `background-image` (else the view
+/// draws its box in `draw(_:)`).
+fn layer_paints_background(n: &exact_kernel::NodeRef<'_>) -> bool {
+    let s = n.style;
+    // A side paints only with a style: `border-width`'s initial is 3.
+    let bordered = [
+        (s.border_width_top, s.border_style_top),
+        (s.border_width_right, s.border_style_right),
+        (s.border_width_bottom, s.border_style_bottom),
+        (s.border_width_left, s.border_style_left),
+    ]
+    .iter()
+    .any(|(w, style)| *w > 0.0 && *style != exact_kernel::BorderStyle::None);
+    !bordered && s.background_image.gradient().is_none()
 }
 
 /// Whether markers draw on this shape: its own or an inherited
@@ -658,23 +1085,30 @@ fn box_eligible(
         .iter()
         .any(|p| matches!(p, Property::Translate | Property::Scale | Property::Rotate));
     if turns
-        && (!s.transform_origin.centred()
+        && (n.layout_position() == exact_kernel::PositionType::Sticky
+            || !s.transform_origin.centred()
             || !s.rare.layout_transition.0.is_empty()
-            || subtree_any(kernel, n.id, interactive))
+            || subtree_any(kernel, n.id, &|id| {
+                interactive(id)
+                    || kernel.node(id).is_some_and(|node| {
+                        matches!(
+                            node.node_type,
+                            NodeType::Control
+                                | NodeType::Pressable
+                                | NodeType::TextInput
+                                | NodeType::ScrollView
+                                | NodeType::List
+                                | NodeType::WebView
+                                | NodeType::NativeView
+                                | NodeType::Video
+                        ) || node.props.link().is_some()
+                    })
+            }))
     {
         return false;
     }
     if props.contains(&Property::BackgroundColor) {
-        // A side paints only with a style: `border-width`'s initial is 3.
-        let bordered = [
-            (s.border_width_top, s.border_style_top),
-            (s.border_width_right, s.border_style_right),
-            (s.border_width_bottom, s.border_style_bottom),
-            (s.border_width_left, s.border_style_left),
-        ]
-        .iter()
-        .any(|(w, style)| *w > 0.0 && *style != exact_kernel::BorderStyle::None);
-        if bordered || s.background_image.gradient().is_some() {
+        if !layer_paints_background(n) || !background_on_layer(kernel, n) {
             return false;
         }
         // The row's own colour is interpolated only where a keyframe at 0% or
@@ -737,4 +1171,32 @@ fn subtree_any(
         || kernel
             .node(id)
             .is_some_and(|n| n.children().into_iter().any(|c| subtree_any(kernel, c, f)))
+}
+
+#[cfg(test)]
+mod stepped_cost_tests {
+    use super::*;
+
+    #[test]
+    fn the_largest_steps_curve_keeps_every_jump() {
+        let easing = Easing::Steps {
+            count: 65535,
+            position: exact_motion::StepPosition::JumpEnd,
+        };
+        let mut track = Track {
+            times: vec![0.0],
+            values: vec![Value::ZERO],
+            curves: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        stepped_keys(&mut track, 0.0, 1.0, &easing, false, Value::scalar);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the largest steps curve exceeded its 3 s construction budget: {elapsed:?}"
+        );
+        assert_eq!(track.times.len(), 131071);
+        assert_eq!(track.values.last(), Some(&Value::scalar(1.0)));
+        assert!(track.times.windows(2).all(|w| w[0] < w[1]));
+    }
 }

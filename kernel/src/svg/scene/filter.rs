@@ -358,11 +358,16 @@ impl Resolver<'_, '_> {
                 else {
                     return Some(nothing);
                 };
-                let Some(region) = self.filter_element(&target, bbox, vp, &mut chain) else {
+                let before = chain.primitives.len();
+                let region = self.filter_element(&target, bbox, vp, &mut chain);
+                // A list can name one filter many times: each a copy.
+                let made = &chain.primitives[before..];
+                let Some(region) = region.filter(|_| self.budget.primitives(made)) else {
                     return Some(nothing);
                 };
                 chain.region = Some(chain.region.map_or(region, |c| union(c, region)));
             } else {
+                let before = chain.primitives.len();
                 function(
                     &mut chain,
                     f,
@@ -370,6 +375,9 @@ impl Resolver<'_, '_> {
                     node.style.text_color.resolve(false),
                     false,
                 );
+                if !self.budget.primitives(&chain.primitives[before..]) {
+                    return Some(nothing);
+                }
             }
         }
         let region = chain.region.unwrap_or((0.0, 0.0, 0.0, 0.0));
@@ -431,7 +439,7 @@ impl Resolver<'_, '_> {
             (true, Some(b)) => (b.2, b.3),
             _ => (1.0, 1.0),
         };
-        let inherited = f.computed_style(StyleMask::INHERITED);
+        let inherited = f.arena.computed_rows(f.slot, StyleMask::INHERITED);
         let fstyle = cascade(f, &inherited);
         let base = chain.primitives.len() as u16;
         let source = chain.source();

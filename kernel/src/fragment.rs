@@ -174,7 +174,7 @@ impl FragState {
 /// Whether a style makes its node a multi-column container (D1): a block
 /// container whose `column-count` or `column-width` is not `auto`.
 pub(crate) fn is_multicol(s: &StyleProps) -> bool {
-    s.display == Display::Block && (s.column_count != 0 || s.column_width != Dimension::Auto)
+    s.display == Display::Block && (s.column_count != 0 || s.rare.column_width != Dimension::Auto)
 }
 
 /// The used gap (§1): the row when authored, else CSS's `normal`, 1em of the
@@ -197,11 +197,15 @@ pub(crate) fn taffy_multicol(arena: &NodeArena, slot: u32) -> Option<taffy::Mult
     let cut = arena.frag.multicol.get(&slot);
     Some(taffy::Multicol {
         count: (s.column_count != 0).then_some(s.column_count),
-        width: match s.column_width.resolve(arena.env()) {
+        width: match s.rare.column_width.resolve(arena.env()) {
             Dimension::Points(w) => Some(w.max(0.0)),
             _ => None,
         },
-        gap: gap(s),
+        // Across, in whole columns under a terminal's space rule.
+        gap: match arena.env().cell_spaces {
+            true => crate::style::cells::space(gap(s), crate::style::cells::COLUMN),
+            false => gap(s),
+        },
         used_height: cut.and_then(|c| c.used_height),
         overflow: cut.and_then(|c| c.overflow),
     })

@@ -10,7 +10,7 @@ use std::{
 };
 pub(crate) const HBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/storage.hbc"));
 pub(crate) const APP: &str = "dev.exact.storage-test";
-pub(crate) const GRANTS: &str = "fs.read app:/data\nfs.write app:/data\nfs.read doc:/\nfs.write doc:/\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n";
+pub(crate) const GRANTS: &str = "fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n";
 pub(crate) fn plan() -> Plan {
     contract::compile(
         r#"
@@ -104,17 +104,12 @@ fn native_modules_are_deferred_retired_and_unavailable_to_validation() {
         data: Option<PathBuf>,
     }
     impl exact_js::NativeModule for Native {
-        fn configure_storage(
-            &mut self,
-            data: PathBuf,
-            _: PathBuf,
-            _: PathBuf,
-        ) -> Result<(), String> {
+        fn configure_storage(&mut self, storage: exact_js::NativeStorage) -> Result<(), String> {
             assert!(
-                !data.exists(),
+                !storage.data().exists(),
                 "native configuration must precede storage activation"
             );
-            self.data = Some(data);
+            self.data = Some(storage.data().to_path_buf());
             Ok(())
         }
         fn call(&mut self, request: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -162,84 +157,6 @@ fn native_modules_are_deferred_retired_and_unavailable_to_validation() {
         std::fs::read_to_string(root.0.join("data/native.txt")).unwrap(),
         "after fetch"
     );
-}
-
-/// `native.later`: the answer leaves as a native request, the host hands its
-/// body to the module's handler, the module's own thread replies, and the
-/// answer resumes with the value — or with the module's refusal.
-#[test]
-fn native_later_answers_from_the_modules_own_thread() {
-    struct Native;
-    impl exact_js::NativeModule for Native {
-        fn configure_storage(&mut self, _: PathBuf, _: PathBuf, _: PathBuf) -> Result<(), String> {
-            Ok(())
-        }
-        fn call(&mut self, request: &serde_json::Value) -> Result<serde_json::Value, String> {
-            Ok(serde_json::json!({"text": format!("now:{}", request["value"].as_str().unwrap())}))
-        }
-        fn later(&mut self) -> Option<exact_js::LaterHandler> {
-            Some(std::sync::Arc::new(|request, reply| {
-                let value = request["value"].as_str().unwrap_or("").to_string();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                    reply.send(if value == "bad" {
-                        Err("the model is unavailable".into())
-                    } else {
-                        Ok(serde_json::json!({"text": value.to_uppercase()}))
-                    });
-                });
-            }))
-        }
-    }
-    let root = Root::new();
-    let mut m = root.module().with_native(|_| Box::new(Native));
-    let mut s = Store::new(GRANTS, Vec::<(String, Vec<u8>)>::new());
-    m.activate().unwrap();
-    let native = m.native().expect("a module offers its native handle");
-    for (value, expected) in [
-        ("slow", "SLOW"),
-        ("bad", "refused: the model is unavailable"),
-    ] {
-        let a = args("later", value);
-        let Answer::Later(request) = m.answer(&mut s, "work", &a).unwrap() else {
-            panic!("a long native call answers later")
-        };
-        assert!(request.is_native(), "{request:?}");
-        let handler = native.handler().expect("filled at activation");
-        let (tx, rx) = std::sync::mpsc::channel();
-        // Returns at once: the work is on the module's thread.
-        let started = std::time::Instant::now();
-        handler(
-            request.body.clone(),
-            exact_runner::Reply::new(move |outcome| tx.send(outcome).unwrap()),
-        );
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
-        let outcome = rx.recv().unwrap();
-        let answer = m.parse(&mut s, "work", &a, outcome).unwrap();
-        assert_eq!(finish(&mut m, &mut s, &a, answer), expected);
-    }
-    // Unloaded, the handle is empty: a late request fails, it does not run.
-    m.unload();
-    assert!(native.handler().is_none());
-}
-
-/// A module that takes no long calls answers `native.later` through `call`.
-#[test]
-fn native_later_without_a_handler_answers_now() {
-    struct Native;
-    impl exact_js::NativeModule for Native {
-        fn configure_storage(&mut self, _: PathBuf, _: PathBuf, _: PathBuf) -> Result<(), String> {
-            Ok(())
-        }
-        fn call(&mut self, request: &serde_json::Value) -> Result<serde_json::Value, String> {
-            Ok(serde_json::json!({"text": format!("now:{}", request["value"].as_str().unwrap())}))
-        }
-    }
-    let root = Root::new();
-    let mut m = root.module().with_native(|_| Box::new(Native));
-    let mut s = Store::new(GRANTS, Vec::<(String, Vec<u8>)>::new());
-    m.activate().unwrap();
-    assert_eq!(call(&mut m, &mut s, "later", "quick"), "now:quick");
 }
 
 #[test]
@@ -298,14 +215,20 @@ fn storage_refuses_during_bake_even_if_a_host_configured_it() {
         call(&mut unconfigured, &mut s, "bake", ""),
         "Unavailable:unsupported:storage is unsupported by this host"
     );
-    // A drive that names no scratch store: the web's refusal, word for word.
+    // A drive that names no scratch store reads an empty one (ENOENT), as the web's says it, word for word.
     let mut agent = Module::new(HBC.to_vec(), APP, GRANTS).with_agent_seed(Some(1));
     agent.bind(&plan());
     agent.activate().unwrap();
-    assert_eq!(
-        call(&mut agent, &mut s, "bake", ""),
-        "Unavailable:agent:storage is unavailable in agent mode unless the drive names a scratch store (--storage <name>)"
-    );
+    let read = call(&mut agent, &mut s, "bake", "");
+    assert!(read.starts_with("Unavailable:ENOENT:filesystem: no such file or directory: app:/"));
+    assert!(read.ends_with(
+        " (a drive that names no scratch store reads an empty one; --storage <name> names one)"
+    ));
+    // That caught refused read is journaled once, for the driver's note.
+    let said = |j: Vec<String>| j.iter().filter(|l| l.contains("refused (agent)")).count();
+    assert_eq!(said(DataSource::take_logs(&mut agent)), 1);
+    call(&mut agent, &mut s, "bake", "");
+    assert_eq!(said(DataSource::take_logs(&mut agent)), 0, "once a drive");
 }
 
 #[test]
@@ -1092,7 +1015,7 @@ fn storage_refusals_carry_a_stable_code() {
 /// A folder the person chose is reached from TypeScript as from Rust (LLP
 /// 1069.010 D1, files F2): the same `doc:` path, the same grants, the same
 /// executor, and with no app storage at all (a drive with no scratch store),
-/// where an `app:/` path is still refused as `agent`.
+/// where an `app:/` read finds an empty store, as a fresh install's does.
 #[test]
 fn a_document_the_person_chose_is_storage_without_app_directories() {
     let dir = Root::new();
@@ -1110,7 +1033,7 @@ fn a_document_the_person_chose_is_storage_without_app_directories() {
     agent.activate().unwrap();
     assert_eq!(
         call(&mut agent, &mut s, "doc", &doc),
-        format!("{expected} Unavailable agent")
+        format!("{expected} Unavailable ENOENT")
     );
     let mut m = dir.module();
     m.set_document_owner(9101);
@@ -1250,7 +1173,8 @@ fn retired_deferred_writes_finish_without_another_answer() {
         "an issued write still lands after its answer is discarded (LLP 1097)"
     );
     assert_eq!(store.get("session"), Some("original"));
-    assert!(m.take_logs().is_empty());
+    let logs = crate::authored_logs(m.take_logs());
+    assert!(logs.is_empty(), "{logs:?}");
     // A later live mutation still commits its Store write normally.
     assert_eq!(call(&mut m, &mut store, "file-kept", "live"), "live");
     assert_eq!(store.get("session"), Some("live"));

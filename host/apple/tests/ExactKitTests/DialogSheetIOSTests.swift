@@ -13,6 +13,14 @@ import XCTest
 /// back. The native fixture's `native-dialog` is the app-level evidence.
 /// UIKit, so a simulator runs it: bun host/apple/build.mjs --test --ios
 final class DialogSheetIOSTests: XCTestCase {
+    private final class SheetTouch: UITouch {
+        let target: UIView
+        var point: CGPoint
+        init(_ target: UIView, at point: CGPoint) { self.target = target; self.point = point; super.init() }
+        override var view: UIView? { target }
+        override func location(in view: UIView?) -> CGPoint { target.convert(point, to: view) }
+    }
+
     private var window: UIWindow?
     private var session: ExactSession?
     private var kept: Presenter?
@@ -57,8 +65,9 @@ final class DialogSheetIOSTests: XCTestCase {
     /// (`closerequest`, LLP 1115.000 D13.4) unless `confirmClosedby` says
     /// another. A presentation completes only in a scene's window.
     private func page(dialog: [String: String] = [:], handlers: [String] = [], field: [String: String] = [:],
-                      confirmClosedby: String = "closerequest", controller: UIViewController = UIViewController()) -> (Presenter, UIViewController, Bool) {
-        let p = Presenter()
+                      confirmClosedby: String = "closerequest", controller: UIViewController = UIViewController(),
+                      session: ExactSession? = nil) -> (Presenter, UIViewController, Bool) {
+        let p = session?.presenter ?? Presenter()
         kept = p
         p.buttonFace = { id in var f = ButtonFace(); f.title = [4: "Save", 5: "Cancel", 22: "Remove", 23: "Cancel"][id]; return f }
         let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
@@ -97,6 +106,76 @@ final class DialogSheetIOSTests: XCTestCase {
         try XCTUnwrap(controller.presentedViewController as? DialogSheetController, "the dialog's sheet")
     }
 
+    func testTheSheetsBlankGroundEndsEditing() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "a sheet's editor needs its scene window") }
+        p.dialogCommand("showModal", "form")
+        settle { !p.menus.inTransition }
+        let sheet = try sheet(controller), field = try XCTUnwrap(p.views[3]?.field)
+        XCTAssertTrue(field.becomeFirstResponder())
+        let touch = SheetTouch(sheet.scroller, at: CGPoint(x: 2, y: 2))
+        sheet.scroller.touchesBegan([touch], with: nil)
+        sheet.scroller.touchesEnded([touch], with: nil)
+        XCTAssertFalse(field.isFirstResponder)
+    }
+
+    func testVoiceOverEscapeHonoursClosedbyAndFiresCancel() throws {
+        let (p, controller, scene) = page(dialog: ["closedby": "none"], handlers: ["cancel"])
+        guard scene else { throw missing("scene", "VoiceOver escape needs a presented sheet") }
+        var cancelled: [UInt32] = []
+        p.menus.sheets.onCancel = { cancelled.append($0) }
+        p.dialogCommand("showModal", "form")
+        settle { !p.menus.inTransition }
+        let sheet = try sheet(controller)
+        XCTAssertFalse(sheet.accessibilityPerformEscape())
+        XCTAssertTrue(p.menus.sheets.isOpen(try XCTUnwrap(p.views[2])))
+        p.views[2]?.props["closedby"] = "closerequest"
+        XCTAssertTrue(sheet.accessibilityPerformEscape())
+        settle { !p.menus.inTransition }
+        XCTAssertEqual(cancelled, [2])
+    }
+
+    func testFractionalSheetPortsDoNotScrollSidewaysOrClipThePlacedBottom() throws {
+        let (p, controller, scene) = page()
+        p.dialogCommand("showModal", "form")
+        let sheet = try sheet(controller), dialog = try XCTUnwrap(p.views[2])
+        if scene { settle { !p.menus.inTransition } }
+        for scale in [2, 3] as [CGFloat] {
+            sheet.view.traitOverrides.displayScale = scale
+            sheet.view.updateTraitsIfNeeded()
+            let scroll = sheet.scroller
+            scroll.contentInsetAdjustmentBehavior = .never
+            sheet.view.frame.size = CGSize(width: 400, height: 200)
+            scroll.frame = sheet.view.bounds
+            scroll.contentInset = UIEdgeInsets(top: 0, left: 20.1, bottom: 0, right: 20.1)
+            // A placed box can straddle the authored height by a pixel.
+            dialog.bounds.size = CGSize(width: 300, height: 180.5)
+            sheet.fit(CGSize(width: 300, height: 180.2))
+            let port = scroll.bounds.width - scroll.adjustedContentInset.left - scroll.adjustedContentInset.right
+            XCTAssertLessThanOrEqual(scroll.contentSize.width, port + 1e-6, "a fitting dialog has no sideways range")
+            XCTAssertGreaterThanOrEqual(scroll.contentSize.height, dialog.frame.maxY, "the placed bottom is reachable")
+        }
+    }
+
+    func testAnExitRetiresTheDialogsSheetSubtree() throws {
+        let (p, controller, scene) = page()
+        p.dialogCommand("showModal", "form")
+        let presented = try sheet(controller)
+        if scene { settle { !p.menus.inTransition } }
+        let dialog = try XCTUnwrap(p.views[2]), field = try XCTUnwrap(p.views[3])
+        XCTAssertTrue(dialog.superview === presented.scroller)
+        p.apply(wireBatch([["op": "exit", "id": 1], ["op": "roots", "ids": []]]))
+        XCTAssertNil(p.views[2], "the dialog retires from its authored ancestry")
+        XCTAssertNil(p.views[3], "its field retires in the same walk")
+        XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+        XCTAssertNil(dialog.superview)
+        XCTAssertFalse(field.field?.isFirstResponder == true)
+        XCTAssertTrue(try XCTUnwrap(p.leaving[1]).members.contains { $0 === dialog })
+        XCTAssertTrue(try XCTUnwrap(p.leaving[1]).members.contains { $0 === field })
+        p.apply(wireBatch([["op": "destroy", "id": 1]]))
+        XCTAssertNil(field.presenter)
+    }
+
     /// A key at the field in the sheet reaches the dialog's authored
     /// ancestors' key handlers; an authored `inert` still silences one.
     func testKeysAtTheSheetFieldReachTheDialogsAuthoredAncestors() throws {
@@ -129,7 +208,7 @@ final class DialogSheetIOSTests: XCTestCase {
         // What `tree --ax` reads: the ids of the elements under the session's roots.
         func read() -> [UInt32] {
             p.syncAccessibility()
-            return (p.axElements(roots: [p.viewport] + p.menus.sheets.roots)["elements"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? UInt32 }
+            return (p.axElements(roots: p.accessibilitySurfaces)["elements"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? UInt32 }
         }
         XCTAssertTrue(read().contains(7), "the page's button, before")
         p.dialogCommand("showModal", "nothing")
@@ -145,7 +224,7 @@ final class DialogSheetIOSTests: XCTestCase {
         XCTAssertFalse(sheet.sheetPresentationController?.prefersGrabberVisible ?? true)
         XCTAssertTrue(dialog.accessibilityViewIsModal, "VoiceOver stays in the dialog")
         XCTAssertTrue(p.viewport.accessibilityElementsHidden, "and does not reach the page beneath")
-        XCTAssertTrue(p.menus.sheets.roots == [sheet.view], "the sheet is a root of the tree `tree --ax` reads")
+        XCTAssertTrue(p.surfaces().filter { $0.kind == .dialog }.map(\.view) == [sheet.view], "the sheet is a root of the tree `tree --ax` reads")
         XCTAssertFalse(read().contains(7), "which holds nothing of the page beneath")
         XCTAssertTrue(p.menus.isOpen(dialog))
         XCTAssertEqual(p.menus.observation()?["kind"] as? String, "dialog")
@@ -187,6 +266,74 @@ final class DialogSheetIOSTests: XCTestCase {
         XCTAssertTrue(read().contains(7))
     }
 
+    func testGrowingSheetKeepsItsContentCenteredDuringTheDetentAnimation() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "a detent animation needs a presented sheet") }
+        let animations = UIView.areAnimationsEnabled
+        UIView.setAnimationsEnabled(true)
+        defer { UIView.setAnimationsEnabled(animations) }
+        p.dialogCommand("showModal", "form")
+        let sheet = try sheet(controller), dialog = try XCTUnwrap(p.views[2])
+        settle { !p.menus.inTransition }
+        CATransaction.flush()
+        let center = dialog.convert(dialog.bounds, to: sheet.view).midX
+        let start = sheet.view.bounds.height, height = start + 60
+        var samples: [(height: CGFloat, x: CGFloat)] = []
+        // Frame ops retain the dialog's position in its authored parent, even
+        // after its subtree has moved into the native sheet.
+        p.apply(wireBatch([["op": "frame", "id": 2, "x": 10.0, "y": 300.0, "w": 300.0, "h": 240.0]]))
+        CATransaction.flush()
+        settle {
+            if let content = dialog.layer.presentation(), let surface = sheet.view.layer.presentation() {
+                samples.append((surface.bounds.height, content.convert(CGPoint(x: content.bounds.midX, y: content.bounds.midY), to: surface).x))
+            }
+            let shown = sheet.view.layer.presentation()?.bounds.height ?? sheet.view.bounds.height
+            return abs(shown - height) < 0.5 && (dialog.layer.animationKeys()?.isEmpty ?? true)
+        }
+        XCTAssertTrue(samples.contains { $0.height > start + 0.5 && $0.height < height - 0.5 }, "sample the animation, not only its ends")
+        for (_, x) in samples {
+            XCTAssertEqual(x, center, accuracy: 0.5, "a height change must not move the sheet's content sideways")
+        }
+    }
+
+    /// A sheet with side insets (a phone in landscape, the iPhone Duo's
+    /// status column) shows its dialog between them and scrolls nothing
+    /// sideways: UIKit adds the insets around the content (`.always`), so the
+    /// content is as wide as what shows between them, not as the sheet.
+    func testASheetWithSideInsetsShowsTheDialogBetweenThemAndNoSidewaysRange() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "a sheet's safe area is its window's") }
+        let dialog = try XCTUnwrap(p.views[2])
+        p.dialogCommand("showModal", "form")
+        let sheet = try sheet(controller)
+        settle { !p.menus.inTransition }
+        // Add side insets the dialog still fits between, beside any the sheet already has (the iPhone Duo's status column)
+        let sv = sheet.scroller, own = sv.adjustedContentInset
+        let side = min(40, ((sv.bounds.width - own.left - own.right - sheet.box.width) / 3).rounded(.down))
+        XCTAssertGreaterThan(side, 0, "the dialog fits in the sheet with room beside it")
+        sheet.additionalSafeAreaInsets = UIEdgeInsets(top: 0, left: side, bottom: 0, right: side)
+        sheet.view.layoutIfNeeded()
+        let inset = sv.adjustedContentInset
+        XCTAssertEqual(inset.left, sheet.view.safeAreaInsets.left, accuracy: 0.5, "UIKit insets the sides")
+        XCTAssertGreaterThanOrEqual(inset.left, side)
+        XCTAssertLessThan(sheet.box.width, sv.bounds.width - inset.left - inset.right, "the dialog fits between them")
+        func centred(_ why: String) {
+            let shown = dialog.convert(dialog.bounds, to: sheet.view), inset = sv.adjustedContentInset
+            XCTAssertLessThanOrEqual(sv.contentSize.width + inset.left + inset.right, sv.bounds.width + 0.5, "no sideways range, \(why)")
+            XCTAssertEqual(shown.midX, inset.left + (sv.bounds.width - inset.left - inset.right) / 2, accuracy: 0.5, "centred between the insets, \(why)")
+        }
+        centred("both sides")
+        // One side only, as the iPhone Duo's status column is, then none again
+        sheet.additionalSafeAreaInsets = UIEdgeInsets(top: 0, left: 0, bottom: 0, right: side)
+        sheet.view.layoutIfNeeded()
+        centred("the right side")
+        sheet.additionalSafeAreaInsets = .zero
+        sheet.view.layoutIfNeeded()
+        centred("no side")
+        p.dialogCommand("close", "form")
+        settle { controller.presentedViewController == nil && !p.menus.inTransition }
+    }
+
     /// A touch in the sheet reaches the dialog's authored ancestors, as DOM's
     /// events bubble out of the top layer: the sheet's view carries their
     /// pointer observer, long press and double tap (`MountRelay`), and a
@@ -202,6 +349,610 @@ final class DialogSheetIOSTests: XCTestCase {
         XCTAssertTrue(relay.listener(field) { $0.handlers.contains("dblclick") } === root)
         dialog.handlers = ["pointerdown"]
         XCTAssertNil(relay.listener(field) { $0.wantsPointer }, "the dialog's own observer sends it, its ancestors' included")
+    }
+
+    func testAPressInTheSheetUsesItsContentBoxAndNearestAuthoredAncestor() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "a lift during the sheet's dismiss animation needs a presented sheet") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 9, "kind": "text", "props": ["text": "Plain content"]],
+            ["op": "frame", "id": 9, "x": 120, "y": 80, "w": 160, "h": 40],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+            ["op": "create", "id": 10, "kind": "view", "handlers": ["press"]],
+            ["op": "children", "id": 10, "ids": [1]], ["op": "roots", "ids": [10]],
+            ["op": "frame", "id": 10, "x": 0, "y": 0, "w": 400, "h": 800],
+        ]))
+        let root = try XCTUnwrap(p.views[1]), dialog = try XCTUnwrap(p.views[2]), text = try XCTUnwrap(p.views[9])
+        root.handlers = ["press", "focus"]
+        p.dialogCommand("showModal", "form")
+        _ = try sheet(controller)
+        if scene { settle { !p.menus.inTransition } }
+        root.frame.size = CGSize(width: 10, height: 10)
+        var presses: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        let point = CGPoint(x: text.bounds.midX, y: text.bounds.midY)
+        let touch = SheetTouch(text, at: point)
+        XCTAssertTrue(p.listenerParent(of: dialog) === root)
+        XCTAssertTrue(p.viewport.accessibilityElementsHidden, "the modal keeps the page behind it")
+        XCTAssertFalse(root.authoredInert)
+        XCTAssertTrue(text.activationTarget(at: touch.location(in: nil)) === root)
+        text.touchesBegan([touch], with: nil)
+        XCTAssertTrue(root.pressContact?.bubbled == true)
+        XCTAssertTrue(root.pressed)
+        touch.point.x += 2
+        text.touchesMoved([touch], with: nil)
+        XCTAssertTrue(root.pressed)
+        text.touchesEnded([touch], with: nil)
+        XCTAssertEqual(presses, [1], "modal inertness does not silence the bubbling press")
+        XCTAssertFalse(root.pressed)
+        XCTAssertFalse(root.isFirstResponder)
+        XCTAssertFalse(try XCTUnwrap(p.views[8]?.field).isFirstResponder)
+
+        touch.point = point
+        text.touchesBegan([touch], with: nil)
+        XCTAssertTrue(root.pressed)
+        touch.point = CGPoint(x: text.bounds.maxX + 100, y: text.bounds.maxY + 100)
+        text.touchesMoved([touch], with: nil)
+        XCTAssertTrue(root.pressed)
+        text.touchesEnded([touch], with: nil)
+        XCTAssertEqual(presses, [1])
+
+        touch.point = point
+        text.handlers.insert("press")
+        XCTAssertTrue(text.activationTarget(at: touch.location(in: nil)) === text)
+        text.touchesBegan([touch], with: nil)
+        XCTAssertTrue(text.pressed)
+        XCTAssertFalse(root.pressed)
+        text.touchesEnded([touch], with: nil)
+        XCTAssertEqual(presses, [1, 9])
+        text.handlers = []
+
+        // A page editor focused programmatically must not be blurred by a
+        // click bubbling from the dialog, nor may the ancestor take focus.
+        let search = try XCTUnwrap(p.views[8]?.field)
+        XCTAssertTrue(search.becomeFirstResponder())
+        text.touchesBegan([touch], with: nil)
+        text.touchesEnded([touch], with: nil)
+        XCTAssertEqual(presses, [1, 9, 1])
+        XCTAssertTrue(search.isFirstResponder)
+        XCTAssertFalse(root.isFirstResponder)
+
+        root.props["inert"] = "true"
+        XCTAssertNil(text.activationTarget(at: touch.location(in: nil)))
+        text.touchesBegan([touch], with: nil)
+        XCTAssertFalse(root.pressed)
+        text.touchesEnded([touch], with: nil)
+        XCTAssertEqual(presses, [1, 9, 1], "authored inertness still silences the ancestor")
+        XCTAssertTrue(p.menus.isOpen(dialog))
+
+        root.props.removeValue(forKey: "inert")
+        presses = []
+        text.touchesBegan([touch], with: nil)
+        XCTAssertTrue(root.pressed)
+        let mount = dialog.superview
+        p.menus.sheets.close(dialog, animated: true)
+        XCTAssertTrue(p.menus.inTransition)
+        XCTAssertTrue(dialog.superview === mount, "the lift arrives before dismissal reparents the dialog")
+        XCTAssertFalse(root.pressed, "closing cancels the ancestor before the animation ends")
+        text.touchesEnded([touch], with: nil)
+        XCTAssertEqual(presses, [], "a lift during dismissal presses nothing")
+        XCTAssertFalse(root.pressed)
+    }
+
+    func testPointerDownClosingTheSheetRefusesTheLaterTouchDown() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "the touch begins during the sheet's dismissal animation") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 9, "kind": "text", "props": ["text": "Plain content"], "handlers": ["pointerdown", "pointerup"]],
+            ["op": "frame", "id": 9, "x": 120, "y": 80, "w": 160, "h": 40],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+        ]))
+        let ancestor = try XCTUnwrap(p.views[1]), dialog = try XCTUnwrap(p.views[2]), content = try XCTUnwrap(p.views[9])
+        ancestor.handlers = ["press", "pointerup"]
+        p.dialogCommand("showModal", "form")
+        _ = try sheet(controller)
+        settle { !p.menus.inTransition }
+        let observer = try XCTUnwrap(content.gestureRecognizers?.compactMap { $0 as? PointerRecognizer }.first)
+        let touch = SheetTouch(content, at: CGPoint(x: 20, y: 20)), event = UIEvent(), mount = dialog.superview
+        var presses: [UInt32] = [], pointers: [String] = []
+        p.onPress = { presses.append($0) }
+        p.onPointer = { id, phase, _ in
+            pointers.append("\(id) \(phase == .down ? "down" : "up")")
+            if phase == .down { p.menus.sheets.close(dialog, animated: true) }
+        }
+        // UIKit delivers the recognizer's down before the hit view's.
+        observer.touchesBegan([touch], with: event)
+        XCTAssertEqual(pointers, ["9 down"])
+        XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+        XCTAssertTrue(p.menus.inTransition)
+        XCTAssertTrue(dialog.superview === mount)
+        content.touchesBegan([touch], with: event)
+        XCTAssertFalse(ancestor.pressed, "a closing sheet cannot arm the page ancestor")
+        XCTAssertTrue(ancestor.pressContact.map(\.cancelled) ?? true, "no live contact reaches the ancestor")
+        observer.touchesEnded([touch], with: event)
+        content.touchesEnded([touch], with: event)
+        XCTAssertEqual(presses, [])
+        XCTAssertFalse(ancestor.pressed)
+        XCTAssertEqual(pointers, ["9 down", "9 up", "1 up"], "pointerup still bubbles while the sheet dismisses")
+    }
+
+    func testPointerDownClosingTheSheetKeepsPressesInsideTheSheet() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "the touch lifts during the sheet's dismissal animation") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 9, "kind": "view", "handlers": ["pointerdown", "pointerup"]],
+            ["op": "frame", "id": 9, "x": 120, "y": 80, "w": 160, "h": 40],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+        ]))
+        let dialog = try XCTUnwrap(p.views[2]), content = try XCTUnwrap(p.views[9])
+        let observer = try XCTUnwrap(content.gestureRecognizers?.compactMap { $0 as? PointerRecognizer }.first)
+        for target in [content, dialog] {
+            content.handlers.remove("press"); dialog.handlers.remove("press")
+            target.handlers.insert("press")
+            p.dialogCommand("showModal", "form")
+            _ = try sheet(controller)
+            settle { !p.menus.inTransition }
+            let touch = SheetTouch(content, at: CGPoint(x: 20, y: 20)), event = UIEvent(), mount = dialog.superview
+            var presses: [UInt32] = []
+            p.onPress = { presses.append($0) }
+            p.onPointer = { _, phase, _ in if phase == .down { p.menus.sheets.close(dialog, animated: true) } }
+            XCTAssertTrue(content.activationTarget(at: touch.location(in: nil)) === target)
+            observer.touchesBegan([touch], with: event)
+            XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+            XCTAssertTrue(p.menus.inTransition)
+            XCTAssertTrue(dialog.superview === mount)
+            XCTAssertFalse(p.cancelledPressTouches.contains(touch), "closing a containing sheet does not cross a press boundary")
+            content.touchesBegan([touch], with: event)
+            XCTAssertTrue(target.pressed)
+            observer.touchesEnded([touch], with: event)
+            content.touchesEnded([touch], with: event)
+            XCTAssertEqual(presses, [target.id])
+            XCTAssertFalse(target.pressed)
+            settle { !p.menus.inTransition }
+            observer.reset()
+        }
+    }
+
+    func testPointerUpOrFocusClosingTheSheetKeepsItsOwnPress() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "the press finishes during the sheet's dismissal animation") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 9, "kind": "button", "props": ["tabIndex": "0"], "handlers": ["press", "pointerup", "focus"]],
+            ["op": "frame", "id": 9, "x": 120, "y": 80, "w": 160, "h": 40],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+        ]))
+        let dialog = try XCTUnwrap(p.views[2]), button = try XCTUnwrap(p.views[9])
+        let observer = try XCTUnwrap(button.gestureRecognizers?.compactMap { $0 as? PointerRecognizer }.first)
+        for closesOnFocus in [false, true] {
+            p.dialogCommand("showModal", "form")
+            _ = try sheet(controller)
+            settle { !p.menus.inTransition }
+            let touch = SheetTouch(button, at: CGPoint(x: 20, y: 20)), event = UIEvent(), mount = dialog.superview
+            var presses: [UInt32] = [], closes = 0
+            func close() { closes += 1; p.menus.sheets.close(dialog, animated: true) }
+            p.onPress = { presses.append($0) }
+            p.onPointer = { _, phase, _ in if phase == .up && !closesOnFocus { close() } }
+            p.onFocus = { id in if id == button.id && closesOnFocus { close() } }
+            observer.touchesBegan([touch], with: event)
+            button.touchesBegan([touch], with: event)
+            XCTAssertTrue(button.pressed)
+            observer.touchesEnded([touch], with: event)
+            button.touchesEnded([touch], with: event)
+            XCTAssertEqual(closes, 1)
+            XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+            XCTAssertTrue(p.menus.inTransition)
+            XCTAssertTrue(dialog.superview === mount, "the press finishes before the animated dismissal reparents the sheet")
+            XCTAssertEqual(presses, [button.id], "closing on \(closesOnFocus ? "focus" : "pointerup") preserves the sheet's own press")
+            XCTAssertFalse(button.pressed)
+            settle { !p.menus.inTransition }
+            observer.reset()
+        }
+    }
+
+    func testNativeButtonFocusClosingTheSheetCancelsItsBubbledPress() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "the native action continues during the sheet's dismissal animation") }
+        p.apply(wireBatch(native(9, [:], press: false, y: 80) + [
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+        ]))
+        let ancestor = try XCTUnwrap(p.views[1]), dialog = try XCTUnwrap(p.views[2]), button = try XCTUnwrap(p.views[9])
+        ancestor.handlers = ["press"]
+        button.handlers = ["focus"]
+        p.dialogCommand("showModal", "form")
+        _ = try sheet(controller)
+        settle { !p.menus.inTransition }
+        var presses: [UInt32] = [], focuses: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        p.onFocus = { id in
+            focuses.append(id)
+            if id == button.id { p.menus.sheets.close(dialog, animated: true) }
+        }
+        let mount = dialog.superview
+        XCTAssertFalse(button.isFirstResponder)
+        XCTAssertTrue(button.activationTarget(at: button.convert(CGPoint(x: 20, y: 20), to: nil)) === ancestor)
+        try XCTUnwrap(p.controls.controls[9]).sendActions(for: .primaryActionTriggered)
+        XCTAssertEqual(focuses, [9])
+        XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+        XCTAssertTrue(p.menus.inTransition)
+        XCTAssertTrue(dialog.superview === mount)
+        XCTAssertEqual(presses, [], "the focus callback ended the presentation that owned this action")
+        XCTAssertFalse(ancestor.pressed)
+    }
+
+    func testNativeButtonFocusMakingTheAncestorUnavailableCancelsItsBubbledPress() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "the native button takes focus in the presented sheet") }
+        p.apply(wireBatch(native(9, [:], press: false, y: 80) + native(10, [:], press: false, y: 130) + [
+            ["op": "children", "id": 2, "ids": [3, 9, 10]],
+        ]))
+        let ancestor = try XCTUnwrap(p.views[1]), dialog = try XCTUnwrap(p.views[2])
+        ancestor.handlers = ["press"]
+        p.dialogCommand("showModal", "form")
+        _ = try sheet(controller)
+        settle { !p.menus.inTransition }
+        for (id, property): (UInt32, String) in [(9, "inert"), (10, "disabled")] {
+            p.apply(wireBatch([["op": "props", "id": 1, "set": [:], "clear": ["inert", "disabled"]]]))
+            let button = try XCTUnwrap(p.views[id])
+            button.handlers = ["focus"]
+            var presses: [UInt32] = [], focuses: [UInt32] = []
+            p.onPress = { presses.append($0) }
+            p.onFocus = { focused in
+                focuses.append(focused)
+                if focused == id { p.apply(wireBatch([["op": "props", "id": 1, "set": [property: "true"], "clear": []]])) }
+            }
+            XCTAssertFalse(button.isFirstResponder)
+            XCTAssertTrue(button.activationTarget(at: button.convert(CGPoint(x: 20, y: 20), to: nil)) === ancestor)
+            try XCTUnwrap(p.controls.controls[id]).sendActions(for: .primaryActionTriggered)
+            XCTAssertEqual(focuses, [id])
+            XCTAssertEqual(ancestor.props[property], "true")
+            XCTAssertEqual(presses, [], "focus made the bubbled target \(property)")
+            XCTAssertTrue(p.menus.sheets.isOpen(dialog))
+        }
+    }
+
+    func testNativeButtonFocusRechecksEveryNodeOfTheBubbledPath() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "the native button takes focus in the presented sheet") }
+        p.apply(wireBatch(native(9, [:], press: false, y: 80) + [
+            ["op": "create", "id": 30, "kind": "view"],
+            ["op": "frame", "id": 30, "x": 0, "y": 0, "w": 400, "h": 800],
+            ["op": "children", "id": 1, "ids": [8, 7, 20, 30]],
+            ["op": "children", "id": 30, "ids": [2]],
+            ["op": "create", "id": 31, "kind": "view"],
+            ["op": "frame", "id": 31, "x": 0, "y": 0, "w": 300, "h": 180],
+            ["op": "children", "id": 2, "ids": [3, 31]],
+            ["op": "children", "id": 31, "ids": [9]],
+        ]))
+        let ancestor = try XCTUnwrap(p.views[1]), dialog = try XCTUnwrap(p.views[2]), button = try XCTUnwrap(p.views[9])
+        let outside = try XCTUnwrap(p.views[30]), inside = try XCTUnwrap(p.views[31])
+        ancestor.handlers = ["press"]
+        button.handlers = ["focus"]
+        p.dialogCommand("showModal", "form")
+        _ = try sheet(controller)
+        settle { !p.menus.inTransition }
+        for node in [outside, inside, button] {
+            for property in ["disabled", "inert"] {
+                button.resignFirstResponder()
+                var presses: [UInt32] = [], focuses: [UInt32] = []
+                p.onPress = { presses.append($0) }
+                p.onFocus = { focused in
+                    focuses.append(focused)
+                    if focused == button.id { p.apply(wireBatch([["op": "props", "id": node.id, "set": [property: "true"], "clear": []]])) }
+                }
+                XCTAssertFalse(button.isFirstResponder)
+                XCTAssertTrue(button.activationTarget(at: button.convert(CGPoint(x: 20, y: 20), to: nil)) === ancestor)
+                try XCTUnwrap(p.controls.controls[9]).sendActions(for: .primaryActionTriggered)
+                XCTAssertEqual(focuses, [9])
+                XCTAssertEqual(node.props[property], "true")
+                XCTAssertEqual(presses, [], "focus made path node \(node.id) \(property)")
+                XCTAssertTrue(p.menus.sheets.isOpen(dialog))
+                p.apply(wireBatch([["op": "props", "id": node.id, "set": [:], "clear": [property]]]))
+            }
+        }
+    }
+
+    func testBubbledInvocationsRequireATargetInsideTheModal() throws {
+        final class Links: ExactSessionDelegate {
+            var urls: [String] = []
+            func exactSession(_ session: ExactSession, command name: String, args: [Any]) {
+                if name == "openURL", let url = args.first as? String { urls.append(url) }
+            }
+        }
+        let links = Links(), session = ExactApp.shared.makeSession(delegate: links, label: "modal-invocations")
+        self.session = session
+        let (p, _, scene) = page(session: session)
+        p.apply(wireBatch(native(30, [:], press: true, y: 200) + [
+            ["op": "create", "id": 9, "kind": "text", "props": ["text": "Plain content"]],
+            ["op": "create", "id": 40, "kind": "view", "props": ["id": "inside", "popover": "manual"]],
+            ["op": "create", "id": 41, "kind": "view", "props": ["id": "outside", "popover": "manual"]],
+            ["op": "children", "id": 1, "ids": [8, 7, 30, 20, 41]],
+            ["op": "children", "id": 30, "ids": [2]],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9, 40]],
+            ["op": "frame", "id": 9, "x": 120, "y": 80, "w": 120, "h": 40],
+            ["op": "frame", "id": 40, "x": 0, "y": 0, "w": 60, "h": 40],
+            ["op": "frame", "id": 41, "x": 0, "y": 0, "w": 60, "h": 40],
+        ]))
+        let ancestor = try XCTUnwrap(p.views[30]), content = try XCTUnwrap(p.views[9])
+        let dialog = try XCTUnwrap(p.views[2]), inside = try XCTUnwrap(p.views[40]), outside = try XCTUnwrap(p.views[41])
+        p.dialogCommand("showModal", "form")
+        if scene { settle { !p.menus.inTransition } }
+        var presses: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        func press() {
+            XCTAssertTrue(content.activate(at: content.convert(CGPoint(x: 20, y: 20), to: nil)) === ancestor)
+        }
+        for target in [outside, inside] {
+            for command in [false, true] {
+                ancestor.props = ["type": "button"].merging(command
+                    ? ["commandfor": target.props["id"]!, "command": "show-popover"]
+                    : ["popovertarget": target.props["id"]!, "popovertargetaction": "show"]) { $1 }
+                press()
+                XCTAssertEqual(presses, [30], "the ancestor's handler survives either target's eligibility")
+                XCTAssertEqual(p.menus.isOpen(target), target === inside)
+                XCTAssertTrue(p.menus.sheets.topDialog === dialog)
+                presses = []
+                p.menus.action("hidePopover", [target.props["id"]!])
+            }
+        }
+        ancestor.props = ["type": "button", "commandfor": "confirm", "command": "show-modal"]
+        press()
+        XCTAssertEqual(presses, [30])
+        XCTAssertFalse(p.menus.isOpen(try XCTUnwrap(p.views[20])), "a dialog outside the modal subtree is unusable too")
+        XCTAssertTrue(p.menus.sheets.topDialog === dialog)
+        XCTAssertEqual(links.urls, [])
+    }
+
+    func testPopoverPressInsideModalUsesDirectInvocationRules() throws {
+        let (p, _, scene) = page()
+        guard scene else { throw missing("scene", "a popover lifts over a presented sheet only in a scene") }
+        p.apply(wireBatch(native(30, ["popovertarget": "outside", "popovertargetaction": "show"], press: true, y: 80) + [
+            ["op": "create", "id": 9, "kind": "text", "props": ["text": "Plain content"]],
+            ["op": "create", "id": 40, "kind": "view", "props": ["id": "inside", "popover": "manual"]],
+            ["op": "create", "id": 41, "kind": "view", "props": ["id": "outside", "popover": "manual"]],
+            ["op": "children", "id": 1, "ids": [8, 7, 2, 20, 41]],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 30]],
+            ["op": "children", "id": 30, "ids": [40]],
+            ["op": "children", "id": 40, "ids": [9]],
+            ["op": "frame", "id": 9, "x": 10, "y": 10, "w": 100, "h": 30],
+            ["op": "frame", "id": 40, "x": 0, "y": 0, "w": 120, "h": 60],
+            ["op": "frame", "id": 41, "x": 0, "y": 0, "w": 60, "h": 40],
+        ]))
+        let invoker = try XCTUnwrap(p.views[30]), content = try XCTUnwrap(p.views[9])
+        let dialog = try XCTUnwrap(p.views[2]), inside = try XCTUnwrap(p.views[40]), outside = try XCTUnwrap(p.views[41])
+        p.dialogCommand("showModal", "form")
+        if scene { settle { !p.menus.inTransition } }
+        var presses: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        for bubbled in [false, true] {
+            p.menus.action("showPopover", ["inside"])
+            XCTAssertTrue(p.menus.isOpen(inside))
+            XCTAssertTrue(p.listenerParent(of: inside) === invoker)
+            XCTAssertTrue(invoker.isDescendant(of: dialog))
+            XCTAssertFalse(outside.isDescendant(of: dialog))
+            if bubbled {
+                let touch = SheetTouch(content, at: CGPoint(x: 20, y: 20))
+                content.touchesBegan([touch], with: nil)
+                XCTAssertTrue(invoker.pressed)
+                content.touchesEnded([touch], with: nil)
+            } else {
+                try XCTUnwrap(p.controls.controls[invoker.id]).sendActions(for: .primaryActionTriggered)
+            }
+            XCTAssertEqual(presses, [invoker.id], "\(bubbled ? "bubbled" : "direct") press runs the invoker once")
+            XCTAssertTrue(p.menus.isOpen(outside), "a crossing inside the modal keeps direct invocation behavior")
+            XCTAssertTrue(p.menus.sheets.topDialog === dialog)
+            p.menus.action("hidePopover", ["outside"])
+            p.menus.action("hidePopover", ["inside"])
+            presses = []
+        }
+    }
+
+    func testNativeButtonBubblesWithoutInvokingAPopoverOutsideTheModal() throws {
+        let (p, _, scene) = page()
+        p.apply(wireBatch(native(9, [:], press: false, y: 80) + native(30, [:], press: true, y: 200) + [
+            ["op": "create", "id": 40, "kind": "view", "props": ["id": "outside", "popover": "manual"]],
+            ["op": "children", "id": 1, "ids": [8, 7, 30, 20, 40]],
+            ["op": "children", "id": 30, "ids": [2]],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+            ["op": "frame", "id": 40, "x": 0, "y": 0, "w": 60, "h": 40],
+        ]))
+        let ancestor = try XCTUnwrap(p.views[30]), dialog = try XCTUnwrap(p.views[2]), outside = try XCTUnwrap(p.views[40])
+        ancestor.handlers = ["press"]
+        ancestor.props["popovertarget"] = "outside"
+        ancestor.props["popovertargetaction"] = "show"
+        p.dialogCommand("showModal", "form")
+        if scene { settle { !p.menus.inTransition } }
+        var pressed: [UInt32] = []
+        p.onPress = { pressed.append($0) }
+        try XCTUnwrap(p.controls.controls[9]).sendActions(for: .primaryActionTriggered)
+        XCTAssertEqual(pressed, [30])
+        XCTAssertFalse(p.menus.isOpen(outside), "the bubbled native action cannot open a popover outside the modal")
+        XCTAssertTrue(p.menus.sheets.topDialog === dialog)
+    }
+
+    func testCapturedAgentPressIsCancelledWhileTheDialogIsStillDismissing() throws {
+        let session = ExactApp.shared.makeSession(label: "closing-captured-press")
+        self.session = session
+        let (p, controller, scene) = page(session: session)
+        guard scene else { throw missing("scene", "a captured lift during dismissal needs a presented sheet") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 9, "kind": "text", "props": ["text": "Plain content"]],
+            ["op": "frame", "id": 9, "x": 120, "y": 80, "w": 160, "h": 40],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+        ]))
+        let ancestor = try XCTUnwrap(p.views[1]), dialog = try XCTUnwrap(p.views[2]), source = try XCTUnwrap(p.views[9])
+        ancestor.handlers = ["press", "pointerup"]
+        p.dialogCommand("showModal", "form")
+        _ = try sheet(controller)
+        settle { !p.menus.inTransition }
+        let agent = Agent(session: session)
+        var presses: [UInt32] = [], ups: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        p.onPointer = { id, phase, _ in if phase == .up { ups.append(id) } }
+        for target in [ancestor, source] {
+            source.handlers = target === source ? ["press"] : []
+            if !p.menus.sheets.isOpen(dialog) {
+                settle { !p.menus.inTransition }
+                p.dialogCommand("showModal", "form")
+                settle { !p.menus.inTransition }
+            }
+            ups = []
+            let down = try XCTUnwrap(agent.recognizedPan("down", ["id": 9]))
+            XCTAssertNil(down["error"], "\(down)")
+            XCTAssertTrue(agent.panContact?.reach?.action?.node === target)
+            let contact = try XCTUnwrap(agent.panContact), reach = try XCTUnwrap(contact.reach)
+            XCTAssertTrue(reach.presentationsOpen)
+            let mount = dialog.superview
+            p.menus.sheets.close(dialog, animated: true)
+            XCTAssertEqual(reach.presentationsOpen, target === source, "only a crossing press depends on the sheet staying open")
+            XCTAssertTrue(p.menus.inTransition)
+            XCTAssertTrue(dialog.superview === mount)
+            XCTAssertNotNil(source.window)
+            let point = source.convert(CGPoint(x: source.bounds.midX, y: source.bounds.midY), to: nil)
+            XCTAssertTrue(source.bounds.contains(source.local(point)), "lift inside the content's current box, even while it moves")
+            XCTAssertEqual(agent.stillPresses(reach) === target, target === source, "the bubbled path includes the captured opening")
+            agent.panContact?.at = p.client(point)
+            let up = try XCTUnwrap(agent.recognizedPan("up", [:]))
+            XCTAssertEqual(up["pressed"] as? Int, target === source ? Int(source.id) : nil)
+            XCTAssertEqual(presses, target === source ? [source.id] : [], "the mounted source keeps its own press during dismissal")
+            XCTAssertEqual(ups, [1])
+            XCTAssertFalse(target.pressed)
+        }
+    }
+
+    func testAgentTapKeepsTheSheetsOwnPressWhenPointerUpClosesIt() throws {
+        let session = ExactApp.shared.makeSession(label: "closing-own-press")
+        self.session = session
+        let (p, controller, scene) = page(session: session)
+        guard scene else { throw missing("scene", "the tap finishes during the sheet's dismissal animation") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 9, "kind": "view", "handlers": ["press", "pointerup"]],
+            ["op": "frame", "id": 9, "x": 120, "y": 80, "w": 160, "h": 40],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+        ]))
+        let dialog = try XCTUnwrap(p.views[2])
+        p.dialogCommand("showModal", "form")
+        _ = try sheet(controller)
+        settle { !p.menus.inTransition }
+        let mount = dialog.superview
+        var presses: [UInt32] = [], ups: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        p.onPointer = { id, phase, _ in
+            if phase == .up { ups.append(id); p.menus.sheets.close(dialog, animated: true) }
+        }
+        let tap = Agent(session: session).tap(["id": 9])
+        XCTAssertNil(tap["error"], "\(tap)")
+        XCTAssertEqual(ups, [9])
+        XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+        XCTAssertTrue(p.menus.inTransition)
+        XCTAssertTrue(dialog.superview === mount)
+        XCTAssertEqual(tap["pressed"] as? Int, 9)
+        XCTAssertEqual(presses, [9])
+    }
+
+    func testInlinePressSurvivesPointerDownClosingItsSheet() throws {
+        let session = ExactApp.shared.makeSession(label: "closing-inline-press")
+        self.session = session
+        let (p, controller, scene) = page(session: session)
+        guard scene else { throw missing("scene", "the inline touch finishes during the sheet's dismissal animation") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 9, "kind": "text", "handlers": ["pointerdown"], "style": ["font_size": 16]],
+            ["op": "paragraph", "id": 9, "runs": [
+                ["id": 10, "parent": 9, "paint": true, "props": ["text": "Read the guide"], "style": [:], "handlers": ["press"]],
+            ]],
+            ["op": "frame", "id": 9, "x": 120, "y": 80, "w": 160, "h": 40],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+        ]))
+        let ancestor = try XCTUnwrap(p.views[1]), dialog = try XCTUnwrap(p.views[2]), paragraph = try XCTUnwrap(p.views[9])
+        ancestor.handlers = ["press"]
+        let observer = try XCTUnwrap(paragraph.gestureRecognizers?.compactMap { $0 as? PointerRecognizer }.first)
+        let agent = Agent(session: session)
+        for recognized in [false, true] {
+            p.dialogCommand("showModal", "form")
+            _ = try sheet(controller)
+            settle { !p.menus.inTransition }
+            let fragment = try XCTUnwrap(paragraph.inlineRects(try XCTUnwrap(p.inlineText(10))).first)
+            let point = CGPoint(x: fragment.midX, y: fragment.midY)
+            XCTAssertTrue(paragraph.activationTarget(at: paragraph.convert(point, to: nil)) === ancestor)
+            let mount = dialog.superview
+            var presses: [UInt32] = [], downs: [UInt32] = []
+            p.onPress = { presses.append($0) }
+            p.onPointer = { id, phase, _ in
+                if phase == .down { downs.append(id); p.menus.sheets.close(dialog, animated: true) }
+            }
+            if recognized {
+                let tap = agent.tap(["id": 9, "at": [Double(point.x), Double(point.y)]])
+                XCTAssertNil(tap["error"], "\(tap)")
+                XCTAssertEqual(tap["pressed"] as? Int, 10)
+            } else {
+                let touch = SheetTouch(paragraph, at: point), event = UIEvent()
+                observer.touchesBegan([touch], with: event)
+                paragraph.touchesBegan([touch], with: event)
+                XCTAssertFalse(p.cancelledPressTouches.contains(touch))
+                XCTAssertEqual(paragraph.inlinePressed, 10)
+                observer.touchesEnded([touch], with: event)
+                paragraph.touchesEnded([touch], with: event)
+                observer.reset()
+            }
+            XCTAssertEqual(downs, [9])
+            XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+            XCTAssertTrue(p.menus.inTransition)
+            XCTAssertTrue(dialog.superview === mount)
+            XCTAssertEqual(presses, [10], "\(recognized ? "agent" : "touch") activates the inline run once")
+            settle { !p.menus.inTransition }
+        }
+    }
+
+    func testModalPressActivatesAncestorLinkAndCommand() throws {
+        final class Links: ExactSessionDelegate {
+            var urls: [String] = []
+            func exactSession(_ session: ExactSession, command name: String, args: [Any]) {
+                if name == "openURL", let url = args.first as? String { urls.append(url) }
+            }
+        }
+        let links = Links(), url = "https://example.test/bubbled"
+        let session = ExactApp.shared.makeSession(delegate: links, label: "modal-activation")
+        self.session = session
+        let (p, controller, scene) = page(session: session)
+        p.apply(wireBatch([
+            ["op": "create", "id": 9, "kind": "text", "props": ["text": "Plain content"]],
+            ["op": "create", "id": 10, "kind": "button", "props": ["href": url]],
+            ["op": "children", "id": 1, "ids": [8, 7, 10, 20]],
+            ["op": "children", "id": 10, "ids": [2]],
+            ["op": "children", "id": 2, "ids": [3, 4, 5, 9]],
+            ["op": "frame", "id": 9, "x": 120, "y": 80, "w": 160, "h": 40],
+            ["op": "frame", "id": 10, "x": 0, "y": 0, "w": 10, "h": 10],
+        ]))
+        let ancestor = try XCTUnwrap(p.views[10]), content = try XCTUnwrap(p.views[9]), dialog = try XCTUnwrap(p.views[2])
+        p.dialogCommand("showModal", "form")
+        _ = try sheet(controller)
+        if scene { settle { !p.menus.inTransition } }
+        // UIKit's sheet, not inertness, keeps a finger off the page behind it.
+        XCTAssertFalse(ancestor.inert)
+        let touch = SheetTouch(content, at: CGPoint(x: 20, y: 20))
+        func tap() {
+            content.touchesBegan([touch], with: nil)
+            content.touchesEnded([touch], with: nil)
+        }
+        tap()
+        XCTAssertEqual(links.urls, [url], "the bubbled link requests navigation")
+        XCTAssertTrue(content.activate(at: touch.location(in: nil)) === ancestor)
+        XCTAssertEqual(links.urls, [url, url], "recognized activation follows the same link")
+        let agent = Agent(session: session), point = touch.location(in: nil)
+        _ = agent.lift(agent.fingerReach(content, at: point), at: point, held: "")
+        XCTAssertEqual(links.urls, [url, url, url], "the agent's captured lift follows the same link")
+        ancestor.props["inert"] = "true"
+        tap()
+        XCTAssertEqual(links.urls, [url, url, url], "authored inertness still blocks the link")
+        ancestor.props = ["commandfor": "form", "command": "close"]
+        ancestor.handlers = ["press"]
+        p.onPress = { _ in ancestor.props["inert"] = "true" }
+        tap()
+        XCTAssertTrue(p.menus.isOpen(dialog), "invocation rechecks authored inertness after the handler")
+        ancestor.props.removeValue(forKey: "inert")
+        ancestor.handlers = []
+        p.onPress = nil
+        tap()
+        XCTAssertFalse(p.menus.isOpen(dialog), "the bubbled command closes the modal")
     }
 
     /// Its invoker opens it, and its Save presses once and closes it.
@@ -296,10 +1047,13 @@ final class DialogSheetIOSTests: XCTestCase {
         let sheet = try sheet(controller)
         settle { !p.menus.inTransition }
         let previous = p.openTopLayer
+        XCTAssertEqual(previous.frames.map { $0.0 }, [2])
+        XCTAssertEqual(previous.modal, 0)
         p.dialogCommand("showModal", "confirm")
         settle { !p.menus.inTransition }
         XCTAssertTrue(sheet.presentedViewController is UIAlertController)
         let open = p.openTopLayer
+        XCTAssertEqual(open.frames.map { $0.0 }, [2, 20])
         XCTAssertEqual(open.frames.last?.0, 20)
         XCTAssertEqual(open.modal, open.frames.count - 1)
         p.dialogCommand("close", "confirm")
@@ -325,6 +1079,8 @@ final class DialogSheetIOSTests: XCTestCase {
                 settle { !p.menus.inTransition }
             }
             let previous = p.openTopLayer
+            XCTAssertEqual(previous.frames.map { $0.0 }, overSheet ? [2] : [])
+            XCTAssertEqual(previous.modal, overSheet ? 0 : nil)
             let host = overSheet ? try sheet(controller) : controller
             func checkBoundary() {
                 let open = p.openTopLayer
@@ -493,8 +1249,8 @@ final class DialogSheetIOSTests: XCTestCase {
 
     // MARK: the native fixture
 
-    private func boot() throws -> ExactSession {
-        let plan = try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_FIXTURE_PLAN"], "build.mjs --test --ios compiles the fixture's plan")))
+    private func boot(planKey: String = "EXACT_FIXTURE_PLAN") throws -> ExactSession {
+        let plan = try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment[planKey], "build.mjs --test --ios compiles the fixture's plan")))
         let session = ExactApp.shared.makeSession(label: "dialog-sheet")
         self.session = session
         let view = ExactView(session: session), host = UIViewController()
@@ -508,12 +1264,81 @@ final class DialogSheetIOSTests: XCTestCase {
         XCTAssertNil(session.boot(plan: plan, size: window.bounds.size).error)
         view.frame = host.view.bounds
         view.layoutIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        let agent = Agent(session: session)
+        settle {
+            session.state == .ready && session.presenter.root.window === window
+                && !session.presenter.viewport.bounds.isEmpty && !agent.nativeInFlight()
+        }
         kept = session.presenter
         return session
     }
     private func node(_ session: ExactSession, _ testId: String) throws -> NodeView {
         try XCTUnwrap(session.presenter.views.values.first { $0.props["testId"] == testId }, testId)
+    }
+
+    func testADialogResolvesPercentagesAgainstItsSheetsContainingBlock() throws {
+        guard Self.scene else { throw missing("scene", "the sheet owns its layout while presented") }
+        let session = try boot(planKey: "EXACT_DIALOG_SHEET_READS_PLAN"), p = session.presenter
+        p.dialogCommand("showModal", "responsive")
+        settle { !p.menus.inTransition }
+        let sheet = try sheet(XCTUnwrap(window?.rootViewController))
+        let dialog = try XCTUnwrap(p.views.values.first { $0.props["id"] == "responsive" })
+        sheet.scroller.frame.size.width = 220
+        p.owners.publish()
+        XCTAssertEqual(dialog.bounds.width, 220, accuracy: 0.01)
+        XCTAssertNotNil(p.owners.told[dialog.id])
+        p.dialogCommand("close", "responsive")
+        settle { !p.menus.inTransition }
+        XCTAssertNil(p.owners.told[dialog.id], "closing returns the containing block")
+    }
+
+    func testAnAutomaticSheetGrowsWhenItsRuntimeContentGrows() throws {
+        guard Self.scene else { throw missing("scene", "content growth changes the sheet detent") }
+        let session = try boot(planKey: "EXACT_DIALOG_SHEET_READS_PLAN"), p = session.presenter
+        p.dialogCommand("showModal", "growing")
+        settle { !p.menus.inTransition }
+        let sheet = try sheet(XCTUnwrap(window?.rootViewController))
+        XCTAssertEqual(sheet.box.height, 100, accuracy: 0.01)
+        p.press(try node(session, "grow-sheet").id)
+        XCTAssertEqual(sheet.box.height, 300, accuracy: 0.01)
+        settle { !p.menus.inTransition }
+        XCTAssertEqual(sheet.box.height, 300, accuracy: 0.01)
+    }
+
+    /// A popover over a dialog's sheet is outside the sheet's scroller: it
+    /// moves with its button as the sheet scrolls, not at the next batch.
+    func testAPopoverOverASheetFollowsItsButtonAsTheSheetScrolls() throws {
+        guard Self.scene else { throw missing("scene", "a sheet's scroll and its popovers") }
+        let session = try boot(planKey: "EXACT_DIALOG_SHEET_READS_PLAN"), p = session.presenter
+        p.dialogCommand("showModal", "tall")
+        settle { !p.menus.inTransition }
+        let sheet = try sheet(XCTUnwrap(window?.rootViewController))
+        let scroller = sheet.scroller
+        p.menus.action("showPopover", ["tall-tip", "tall-tip-button"])
+        let tip = try XCTUnwrap(p.views.values.first { $0.props["id"] == "tall-tip" })
+        let button = try XCTUnwrap(p.views.values.first { $0.props["id"] == "tall-tip-button" })
+        let gap = { tip.convert(tip.bounds, to: nil).minY - button.convert(button.bounds, to: nil).minY }
+        let before = gap()
+        scroller.contentOffset.y += 40
+        XCTAssertEqual(gap(), before, accuracy: 0.5, "the popover keeps its place by its button")
+    }
+
+    func testAPercentageSheetKeepsThePresentationContainersHeightBasis() throws {
+        guard Self.scene else { throw missing("scene", "percentage height is independent of the detent") }
+        let session = try boot(planKey: "EXACT_DIALOG_SHEET_READS_PLAN"), p = session.presenter
+        p.dialogCommand("showModal", "percentage")
+        settle { !p.menus.inTransition }
+        let sheet = try sheet(XCTUnwrap(window?.rootViewController))
+        let available = try XCTUnwrap(sheet.presentationController?.containerView).bounds.height
+        let height = sheet.box.height
+        XCTAssertGreaterThan(height, available * 0.4)
+        XCTAssertLessThan(height, available * 0.6)
+        for _ in 0..<3 {
+            sheet.view.setNeedsLayout()
+            sheet.view.layoutIfNeeded()
+            p.owners.publish()
+        }
+        XCTAssertEqual(sheet.box.height, height, accuracy: 0.01)
     }
 
     /// The fixture's `native-dialog`, `dialog width=320 padding=16
@@ -542,5 +1367,118 @@ final class DialogSheetIOSTests: XCTestCase {
         XCTAssertFalse(p.menus.isOpen(dialog))
         XCTAssertNil(p.menus.observation())
     }
+    func testMovingAPageDialogKeepsItsEditAndFocusEvents() throws {
+        let (p, controller, scene) = page(field: ["autofocus": "true"])
+        guard scene else { throw missing("scene", "dialog relocation needs a presented sheet") }
+        let node = try XCTUnwrap(p.views[3])
+        node.handlers.formUnion(["focus", "blur", "change"])
+        p.dialogCommand("showModal", "form")
+        let old = try sheet(controller), field = try XCTUnwrap(node.field)
+        settle { !p.menus.inTransition && field.isFirstResponder }
+        field.text = "Uncommitted name"
+        node.fieldChanged()
+        var events: [String] = []
+        p.onChange = { _, _ in events.append("change") }
+        p.onBlur = { _ in events.append("blur") }
+        p.onFocus = { _ in events.append("focus") }
+        let unrelated = NodeView(id: 90, kind: "view", presenter: p)
+        let finish = p.menus.retire(over: controller, removing: unrelated)
+        controller.dismiss(animated: false, completion: finish)
+        settle { p.menus.sheets.top !== old && p.menus.sheets.top?.viewIfLoaded?.window != nil && field.isFirstResponder }
+        XCTAssertEqual(events, [], "moving an open dialog is not an editing end")
+        XCTAssertEqual(p.edited, node.id)
+        XCTAssertEqual(field.text, "Uncommitted name")
+        p.dialogCommand("close", "form")
+        settle { controller.presentedViewController == nil }
+        XCTAssertEqual(events.filter { $0 == "change" }.count, 1, "the real close commits once")
+    }
+
+    func testMovingAPageDialogPreservesAFocusStillPendingInIt() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "pending dialog focus needs a presented sheet") }
+        p.dialogCommand("showModal", "form")
+        let old = try sheet(controller), node = try XCTUnwrap(p.views[3])
+        settle { !p.menus.inTransition }
+        old.scroller.removeFromSuperview()
+        p.focusNode(node)
+        XCTAssertTrue(p.pendingFocusNode === node)
+        let unrelated = NodeView(id: 90, kind: "view", presenter: p)
+        let finish = p.menus.retire(over: controller, removing: unrelated)
+        controller.dismiss(animated: false, completion: finish)
+        settle { p.menus.sheets.top !== old && node.field?.isFirstResponder == true }
+        XCTAssertTrue(node.field?.isFirstResponder == true)
+        XCTAssertNil(p.pendingFocusNode)
+    }
+
+    func testClosingTheLowerDialogDismissesItsWholeNativeStack() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "stack dismissal needs presented sheets") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 30, "kind": "view", "props": ["semanticTag": "dialog", "id": "upper"], "handlers": []],
+            ["op": "create", "id": 31, "kind": "input", "props": [:], "handlers": []],
+            ["op": "children", "id": 30, "ids": [31]],
+            ["op": "frame", "id": 30, "x": 0.0, "y": 0.0, "w": 300.0, "h": 160.0],
+            ["op": "frame", "id": 31, "x": 20.0, "y": 20.0, "w": 200.0, "h": 40.0],
+            ["op": "children", "id": 1, "ids": [8, 7, 2, 20, 30]],
+        ]))
+        p.dialogCommand("showModal", "form")
+        settle { !p.menus.inTransition }
+        p.dialogCommand("showModal", "upper")
+        let lower = try sheet(controller)
+        settle { lower.presentedViewController?.viewIfLoaded?.window != nil && !p.menus.inTransition }
+        p.dialogCommand("close", "form")
+        settle { !p.menus.inTransition }
+        XCTAssertNil(controller.presentedViewController, "no empty lower sheet remains")
+        XCTAssertNil(p.menus.sheets.top)
+    }
+
+    func testAnEmbedderDismissingAConfirmationReleasesItsOwnerAndPrompt() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "external alert dismissal needs a presentation") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 24, "kind": "input", "props": ["value": "Name"], "handlers": ["change"]],
+            ["op": "children", "id": 20, "ids": [24, 21, 22, 23]],
+        ]))
+        p.dialogCommand("showModal", "confirm")
+        let alert = try XCTUnwrap(controller.presentedViewController as? UIAlertController)
+        settle { !p.menus.inTransition }
+        XCTAssertNotNil(p.views[24]?.headerField)
+        controller.dismiss(animated: false)
+        settle { alert.presentingViewController == nil }
+        // Drain the disappearance cleanup, which waits for UIKit's callback stack.
+        let drained = expectation(description: "disappearance cleanup")
+        DispatchQueue.main.async { DispatchQueue.main.async { drained.fulfill() } }
+        wait(for: [drained], timeout: 2)
+        XCTAssertNil(p.menus.nativeConfirmation)
+        XCTAssertNil(p.views[24]?.headerField)
+        XCTAssertFalse(p.menus.isOpen(try XCTUnwrap(p.views[20])))
+    }
+
+    func testMovingAPromptKeepsItsUncommittedTextAndFocusEvents() throws {
+        let (p, controller, scene) = page()
+        guard scene else { throw missing("scene", "prompt relocation needs a presented alert") }
+        p.apply(wireBatch([
+            ["op": "create", "id": 24, "kind": "input", "props": ["value": "Name"], "handlers": ["input", "change", "focus", "blur"]],
+            ["op": "children", "id": 20, "ids": [24, 21, 22, 23]],
+        ]))
+        p.dialogCommand("showModal", "confirm")
+        let old = try XCTUnwrap(controller.presentedViewController as? UIAlertController)
+        let field = try XCTUnwrap(old.textFields?.first)
+        settle { !p.menus.inTransition && field.isFirstResponder }
+        field.text = "New name"
+        field.sendActions(for: .editingChanged)
+        var events: [String] = []
+        p.onChange = { _, _ in events.append("change") }
+        p.onBlur = { _ in events.append("blur") }
+        p.onFocus = { _ in events.append("focus") }
+        let unrelated = NodeView(id: 90, kind: "view", presenter: p)
+        let finish = p.menus.retire(over: controller, removing: unrelated)
+        controller.dismiss(animated: false) { finish(); p.menus.resumeAfterRouteDismissal() }
+        settle { controller.presentedViewController !== old && (controller.presentedViewController as? UIAlertController)?.textFields?.first?.isFirstResponder == true }
+        XCTAssertEqual(events, [])
+        XCTAssertEqual((controller.presentedViewController as? UIAlertController)?.textFields?.first?.text, "New name")
+        XCTAssertEqual(p.edited, 24)
+    }
+
 }
 #endif

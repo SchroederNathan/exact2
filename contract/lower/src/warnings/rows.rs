@@ -17,9 +17,12 @@ use contract_syntax::{Expr, Node, Span, TemplatePart};
 use contract_types::{infer, Checked, Ref, Scope, Shapes, Ty};
 use std::collections::BTreeSet;
 
+#[path = "own_list.rs"]
+mod own_list;
+
 /// The roster's list work that walks its receiver.
 const WALKS: &[&str] = &[
-    "filter", "map", "includes", "indexOf", "join", "concat", "slice",
+    "filter", "map", "includes", "indexOf", "join", "concat", "slice", "sortBy",
 ];
 
 /// `data.users`, `favorites`: the receiver as written, when it is a name or
@@ -85,7 +88,12 @@ impl Rows<'_> {
                 (WALKS.contains(&name.as_str()), args.first().and_then(path))
             {
                 if data(root, scope) && inner != outer && table(&args[0], scope, self.shapes) {
-                    self.warn(outer, &inner, &format!("`.{name}`"), *span);
+                    let how = if contract_syntax::idioms::is_method(name) {
+                        format!("`.{name}`")
+                    } else {
+                        format!("`{name}(…)`")
+                    };
+                    self.warn(outer, &inner, &how, *span);
                 }
             }
         }
@@ -224,11 +232,13 @@ impl Rows<'_> {
     }
 }
 
-/// `lower-row-lookup`'s sites in the expanded root's view.
+/// `lower-row-lookup`'s sites in the expanded root's view, then
+/// `lower-row-own-list`'s and `lower-key-position`'s ([`key_position`]).
 pub(super) fn row_lookup(checked: &Checked<'_>) -> Vec<LowerError> {
     let root = &checked.expanded.root;
+    let keys = key_position(checked);
     let Some(types) = checked.types.components.first() else {
-        return Vec::new();
+        return keys;
     };
     let mut rows = Rows {
         shapes: &checked.types.shapes,
@@ -243,5 +253,82 @@ pub(super) fn row_lookup(checked: &Checked<'_>) -> Vec<LowerError> {
     };
     let scope = checked.types.component_scope(root, types);
     rows.nodes(&root.view, &scope, None);
+    rows.out.extend(own_list::own_list(checked));
+    rows.out.extend(keys);
     rows.out
+}
+
+/// Whether `e` reads `name` where it is not rebound (an arrow's parameter, a
+/// `let`, a `match` arm shadow it).
+fn reads(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Ident(n, _) => n == name,
+        Expr::Template(parts, _) => parts
+            .iter()
+            .any(|p| matches!(p, TemplatePart::Expr(x) if reads(x, name))),
+        Expr::Ternary(a, b, c, _) => [a, b, c].iter().any(|x| reads(x, name)),
+        Expr::Binary(_, a, b, _) => reads(a, name) || reads(b, name),
+        Expr::Unary(_, inner, _)
+        | Expr::Some(inner, _)
+        | Expr::NamedArg(_, inner, _)
+        | Expr::Typed(inner, _, _)
+        | Expr::Member(inner, _, _) => reads(inner, name),
+        Expr::Call(_, items, _) | Expr::List(items, _) => items.iter().any(|x| reads(x, name)),
+        Expr::Match {
+            subject,
+            var,
+            some,
+            none,
+            ..
+        } => reads(subject, name) || (var != name && reads(some, name)) || reads(none, name),
+        Expr::Let {
+            name: bound,
+            value,
+            body,
+            ..
+        } => reads(value, name) || (bound != name && reads(body, name)),
+        Expr::Arrow { params, body, .. } => !params.iter().any(|p| p == name) && reads(body, name),
+        Expr::Number(..) | Expr::Str(..) | Expr::Bool(..) | Expr::None(_) => false,
+    }
+}
+
+/// `lower-key-position` (LLP 1142 D6): a `for` whose `key=` reads its
+/// position variable. After an insertion or a removal before them, rows keep
+/// a key that now names another record: what an instance holds (its state, a
+/// field's text, its motion) goes with the position, not the record, and rows
+/// may be built again. An append-only list keyed so is correct, so it warns.
+fn key_position(checked: &Checked<'_>) -> Vec<LowerError> {
+    fn walk(nodes: &[Node], out: &mut Vec<LowerError>) {
+        for node in nodes {
+            match node {
+                Node::Element { children, .. } | Node::Use { children, .. } => walk(children, out),
+                Node::When {
+                    then, otherwise, ..
+                } => {
+                    walk(then, out);
+                    walk(otherwise, out);
+                }
+                Node::Each {
+                    index, key, body, ..
+                } => {
+                    if let Some(i) = index.as_deref().filter(|i| reads(key, i)) {
+                        out.push(LowerError {
+                            id: "lower-key-position",
+                            message: format!("this key reads `{i}`, the row's position: after a row is inserted or removed before others, their keys name other records, so what a row holds (its state, a field's text, its motion) follows the position and rows may be built again; key by something the record keeps, such as its id"),
+                            span: key.span(),
+                        });
+                    }
+                    walk(body, out);
+                }
+                Node::Match { some, none, .. } => {
+                    walk(&some.1, out);
+                    walk(none, out);
+                }
+                Node::Children { .. } => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&checked.expanded.root.view, &mut out);
+    out
 }

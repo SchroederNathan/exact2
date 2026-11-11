@@ -11,7 +11,7 @@
 //! digest, which is over the runtime's form of the root (the JavaScript
 //! runtime never reads it).
 
-use crate::page::{body_close_js, body_open_js, runtime_style_of, Js};
+use crate::page::{body_close_js, body_open_js, runtime_style_of, Js, Sheet};
 use crate::{activation, direct_for, encoded, retire, settle_at, Ids, Projection, Rendered};
 use exact_plan::{ActivatePolicy, PaintPolicy, Plan};
 use exact_runner::DataSource;
@@ -55,8 +55,8 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
     // boot document: it settles as it boots.
     let paints_boot = route_at(plan, location).is_some_and(|r| r.paint == PaintPolicy::Boot);
     let mut boot: Option<Boot> = None;
-    let page = {
-        let mut on_boot = |runner: &exact_runner::Runner<crate::Anonymous<D>>| {
+    let mut page = {
+        let mut on_boot = |runner: &mut exact_runner::Runner<crate::Anonymous<D>>| {
             if runner.pending().is_empty() {
                 return;
             }
@@ -75,7 +75,7 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
                 return;
             };
             let (keyframes, scroll) = before_root(&tree);
-            let lead = body_open_js(shell, js, &head, scroll, false, false);
+            let lead = body_open_js(shell, js, &head, scroll, false, false, Sheet::Whole);
             let open = crate::page::root_open(shell);
             let lead = lead.strip_suffix(open).unwrap_or(&lead);
             // The shell's root with its attributes (LLP 1096 D7), marked.
@@ -99,20 +99,20 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
             deadline,
             true,
             crate::render_time(),
-            paints_boot.then_some(&mut on_boot as &mut dyn FnMut(&_)),
+            paints_boot.then_some(&mut on_boot as &mut dyn FnMut(&mut _)),
         )?
     };
     let tree = match page.runner.document_tree() {
         Ok(tree) => tree,
         Err(why) => {
-            println!("render {location}: with a kernel ({why})");
+            crate::log(format_args!("render {location}: with a kernel ({why})"));
             retire(page, data);
             return Ok(None);
         }
     };
     let state = read_checkpoint(&page.checkpoint).map_err(|e| format!("the checkpoint: {e}"))?;
     let handlers = tree.handlers(plan);
-    let activate = activation(plan, location, &state, &handlers);
+    let (activate, wake) = activation(plan, location, &state, &handlers, page.clocked, &viewport);
     // The head's fields, before any element: the tree's head, its first
     // root's viewport policies, and the `@keyframes` its elements name.
     let (keyframes, scroll) = before_root(&tree);
@@ -148,7 +148,7 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
     };
     let late = late(activate);
     // The page as a cache keeps it: the settled head, no boot document.
-    let open = body_open_js(shell, js, &head, scroll, late, false);
+    let open = body_open_js(shell, js, &head, scroll, late, false, Sheet::Whole);
     match &boot {
         // After a boot document, the head's fields went with it: what the
         // settled page adds is the `@keyframes` its elements name beyond the
@@ -165,6 +165,7 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
                 scroll && !b.scroll,
                 late,
                 false,
+                Sheet::Sent,
             ));
             hand(more.as_bytes());
         }
@@ -192,7 +193,7 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
     hand(rest.as_bytes());
     let checkpoint = page.checkpoint.clone();
     let digest = digest(&encoded(plan), location, &checkpoint, &document.root);
-    let close = body_close_js(shell, js, &digest, activate, &checkpoint);
+    let close = body_close_js(shell, js, &digest, activate, &wake, &checkpoint);
     if boot.is_some() {
         // Right after the settled root's `</div>`: before the runtime runs.
         let (root_end, rest) = close.split_at("</div>".len());
@@ -215,6 +216,7 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
             state,
             settled,
             activate,
+            wake,
             runtime_form: true,
         },
         body,

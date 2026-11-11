@@ -65,10 +65,14 @@ impl<D: DataSource> Runner<D> {
         }
         let previous = self.time;
         self.time = time;
-        let which = (0..self.plan.resources.len())
+        let which: Vec<usize> = (0..self.plan.resources.len())
             .filter(|i| self.plan.str(self.plan.resources[*i].source) == SOURCE)
             .collect();
-        let result = self.recommit(which, "time");
+        let result = if which.is_empty() && !self.live_times.is_empty() {
+            self.tick_live_times()
+        } else {
+            self.recommit(which, "time")
+        };
         if result.is_err() {
             self.time = previous;
         }
@@ -90,10 +94,25 @@ impl<D: DataSource> Runner<D> {
         time_zone: &str,
         seed: Option<f64>,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
+        self.set_place_formatted(locale, time_zone, seed, None)
+    }
+
+    /// [`Runner::set_place`] with the regional format ([`Place`]'s
+    /// `format_locale`, `""` for none apart from the locale); `None` keeps
+    /// the one last told, as a `None` seed does.
+    pub fn set_place_formatted(
+        &mut self,
+        locale: &str,
+        time_zone: &str,
+        seed: Option<f64>,
+        format_locale: Option<&str>,
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
         let place = Place {
             locale: locale.into(),
             time_zone: time_zone.into(),
             seed: seed.unwrap_or(self.place.seed),
+            format_locale: format_locale
+                .map_or_else(|| self.place.format_locale.clone(), str::to_owned),
         };
         if let Err(error) = place.validate() {
             self.log(format!("place refused: {error:?}"));
@@ -117,7 +136,11 @@ impl<D: DataSource> Runner<D> {
             })
             .collect();
         if which.is_empty() && written.is_none() {
-            return Ok(None);
+            return if self.live_times.is_empty() {
+                Ok(None)
+            } else {
+                self.tick_live_times()
+            };
         }
         let result = self.commit_again(which, "place");
         if result.is_err() {
@@ -134,6 +157,8 @@ impl<D: DataSource> Runner<D> {
     /// [`Runner::apply_announced`] on its own. A source with no native
     /// handle announces nothing.
     pub fn listen(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        // An abort heard off this thread wakes the host to collect it.
+        self.data.abort_wake(wake.clone());
         let native = self.native_slot();
         let queue = self.announced.clone();
         native.on_changed(Some(std::sync::Arc::new(move |topic: &str| {
@@ -169,16 +194,58 @@ impl<D: DataSource> Runner<D> {
     /// call: one commit per topic that anything watches. Announcements
     /// between two calls coalesce, so a fast producer costs one re-ask.
     pub fn apply_announced(&mut self) -> (Vec<CommitReceipt>, Option<RunnerError>) {
+        // A module's reply that carried handles may have left its
+        // implementation for a request no longer in flight (LLP 1133.009 D6).
+        self.dispose_dropped();
         let topics = std::mem::take(&mut *self.announced.lock().unwrap_or_else(|e| e.into_inner()));
         let mut receipts = Vec::new();
         for topic in topics {
+            // An event a bound implementation emitted, said through its
+            // module's `changed` (LLP 1133.004 D6): raised, not a topic.
+            if let Some(event) = topic.strip_prefix(super::modules::EMITTED) {
+                self.raise_emitted(event);
+                continue;
+            }
+            // The platform expired a wake an implementation raised.
+            if let Some(expired) = topic.strip_prefix(super::modules::EXPIRED) {
+                let (more, error) = self.expire_told_wake(expired);
+                receipts.extend(more);
+                if let Some(error) = error {
+                    return (receipts, Some(error));
+                }
+                continue;
+            }
+            // A wake a bound implementation raised (LLP 1133.017 D8).
+            if let Some(wake) = topic.strip_prefix(super::modules::TOLD) {
+                self.raise_told_wake(wake);
+                continue;
+            }
+            // A person's act on a bound implementation's own screen, on a
+            // list the runner keeps (LLP 1133.033 §13).
+            if let Some(choice) = topic.strip_prefix(super::modules::CHOSEN) {
+                self.listed_choice(choice);
+                continue;
+            }
+            // An implementation's own objects, for `state.extensions` (LLP 1133.008 D8 item 9).
+            if let Some(state) = topic.strip_prefix(super::modules::STATED) {
+                self.disclosed_told(state);
+                continue;
+            }
+            // A foreground-service claim under the agent (LLP 1133.033 D21).
+            if let Some(claim) = topic.strip_prefix(super::modules::CLAIMED) {
+                self.foreground_service_told(claim);
+                continue;
+            }
             match self.changed(&topic) {
                 Ok(Some(receipt)) => receipts.push(receipt),
                 Ok(None) => {}
                 Err(error) => return (receipts, Some(error)),
             }
         }
-        (receipts, None)
+        // Then the module events raised meanwhile (LLP 1133.004 D6).
+        let (events, error) = self.deliver_module_events();
+        receipts.extend(events);
+        (receipts, error)
     }
 
     /// The device says `topic` changed (LLP 1016.002): every resource whose
@@ -193,7 +260,8 @@ impl<D: DataSource> Runner<D> {
     pub fn changed(&mut self, topic: &str) -> Result<Option<CommitReceipt>, RunnerError> {
         let mut which = Vec::new();
         for i in 0..self.watching.len() {
-            if !self.watching[i].iter().any(|t| t == topic) {
+            // An upload is asked once for its arguments (LLP 1016.000 D10).
+            if !self.watching[i].iter().any(|t| t == topic) || self.upload_stands(i) {
                 continue;
             }
             // A stream keeps no reply to wait for, and a refused request
@@ -214,7 +282,8 @@ impl<D: DataSource> Runner<D> {
                 None => which.push(i),
             }
         }
-        self.recommit(which, "changed")
+        // Each reader asks again under its own last ask's origin (LLP 1133.002 D12).
+        self.reasking(|r| r.recommit(which, "changed"))
     }
 
     pub(super) fn time_answer(&self, i: usize) -> Result<Value, DataError> {

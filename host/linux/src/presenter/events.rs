@@ -6,6 +6,87 @@
 use super::*;
 
 impl<D: DataSource> Presenter<D> {
+    /// A carrier's memory-pressure notification releases idle painter targets.
+    pub fn memory_warning(&mut self) {
+        self.brush.trim();
+    }
+
+    /// A desktop window's activation preserves the focused allocation for
+    /// its return. Explicit focus changes while inactive take precedence.
+    pub fn set_window_active(&mut self, active: bool) {
+        if self.window_active == active {
+            return;
+        }
+        self.window_active = active;
+        if !active {
+            self.brush.trim();
+            self.window_focus = self
+                .focus
+                .and_then(|id| self.host.kernel().node(id).map(|n| n.key));
+            self.held = 0;
+            self.shortcut_keys.clear();
+            self.blur();
+            return;
+        }
+        let Some(key) = self.window_focus.take().filter(|_| self.focus.is_none()) else {
+            return;
+        };
+        let Some(id) = self
+            .host
+            .kernel()
+            .node_by_key(key)
+            .map(|n| n.id)
+            .filter(|&id| self.focusable(id) && self.focus_refusal(id).is_none())
+        else {
+            return;
+        };
+        if let Some(error) = self.set_focus(Some(id), self.host.now()) {
+            self.host.log(error);
+        }
+    }
+
+    /// A native module may only answer for the node allocation its painted view represents.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn reader_module_event(
+        &mut self,
+        id: ViewId,
+        key: exact_kernel::NodeKey,
+        kind: &str,
+        payload: String,
+        now_ms: f64,
+    ) -> bool {
+        let valid = self
+            .host
+            .kernel()
+            .node(id)
+            .is_some_and(|node| node.node_type == NodeType::NativeView && node.key == key);
+        // A control disabled or hidden since its view was shown (by itself or
+        // an ancestor) takes no action, as a popup it opened before may still send one.
+        let action = matches!(kind, "press" | "change" | "input");
+        let eligible = || {
+            self.host.retained_action_eligible(key)
+                && crate::paint::paints(self.host.kernel(), id, None)
+        };
+        if !valid || (action && !eligible()) {
+            return false;
+        }
+        let event = match kind {
+            "press" => Event::Press,
+            "change" => Event::Change(payload.into()),
+            "input" => Event::Input(payload.into()),
+            "load" => Event::Load,
+            "message" => Event::Message(payload),
+            _ => return false,
+        };
+        if let Some(error) = self.host.dispatch_at(id, event, now_ms) {
+            eprintln!("exact: native module: {error}");
+        }
+        if let Some(error) = self.after_commit() {
+            eprintln!("exact: native module: {error}");
+        }
+        true
+    }
+
     /// A restart with carried state (a dev reload, a delivered update)
     /// replaces the tree. Focus follows the focused node's place in the
     /// runner's tree — its index among its siblings at each level, and its
@@ -41,7 +122,17 @@ impl<D: DataSource> Presenter<D> {
             }
             id.filter(|&id| kernel.node(id).is_some_and(|n| n.node_type == node_type))
         });
+        let previous = self.focus;
         self.focus = target.filter(|&id| self.focusable(id) && !self.host.route_visibility(id).1);
+        // The restored focus keeps the ring the one it stands for had, as
+        // `set_focus` carries it; the old tree's ids name nothing now.
+        let ringless = self.brush.ringless;
+        self.brush.ringless = if self.brush.keyless || (ringless.is_some() && ringless == previous)
+        {
+            self.focus.and_then(|id| self.unringed(id))
+        } else {
+            None
+        };
         self.focus_out = self
             .focus
             .map(|id| self.host.runner().focus_bubble(id, None, false))
@@ -56,7 +147,20 @@ impl<D: DataSource> Presenter<D> {
         let Some(id) = self.focus else {
             return (false, None);
         };
+        // A control a commit disabled loses the focus, except under a TV
+        // remote, where there is nowhere else for it until an arrow moves it
+        // (remote_tests.rs), and where its route hid it too: the route's path
+        // below keeps it to restore (`route_focus.inert`).
+        if !self.remote() && self.focus_fixup(id) && !self.host.route_visibility(id).1 {
+            return self.blur_disabled_focus(id);
+        }
         if self.host.kernel().node(id).is_some() && !self.host.route_visibility(id).1 {
+            self.focus_out = self.host.runner().focus_bubble(id, None, false);
+            return (false, None);
+        }
+        // A TV remote's focus on a bar's target: its node is inert under the
+        // route the bar lifted it from, and keeps the focus (LLP 1115.001.003 D4).
+        if self.host.kernel().node(id).is_some() && self.remote() && self.bar_node(id) {
             self.focus_out = self.host.runner().focus_bubble(id, None, false);
             return (false, None);
         }
@@ -76,6 +180,51 @@ impl<D: DataSource> Presenter<D> {
         }
         // Finish the outgoing path before a replacement can autofocus.
         // Inside service_commit: no recursive collection refinement.
+        if sent {
+            error = error.or(self.sync_commit());
+        }
+        (sent, error)
+    }
+
+    /// Whether `id` is a control HTML disables (`surfaces::controls`
+    /// `disabled_control`: a button, an input, a select; not a link) and is
+    /// disabled: the web's focus fixup drops its focus. A disabled box, a
+    /// control inside one or a progress (a `div` or a `progress` on the web)
+    /// keeps it there (host/web/glue.js).
+    pub(crate) fn focus_fixup(&self, id: ViewId) -> bool {
+        self.host.kernel().node(id).is_some_and(|node| {
+            crate::surfaces::controls::disabled_control(&node)
+                && !matches!(
+                    exact_kernel::ControlKind::of(node.node_type, node.props),
+                    Some(
+                        exact_kernel::ControlKind::Progress
+                            | exact_kernel::ControlKind::ProgressBar
+                    )
+                )
+        })
+    }
+
+    /// Between one press's events (a checkbox's click, input and change), a
+    /// focused control the last one disabled loses the focus before the next
+    /// runs, as the web's fixup runs at once; `clear_removed_focus` after the
+    /// commit is otherwise where it does.
+    pub(crate) fn blur_disabled_now(&mut self) -> Option<String> {
+        let id = self.focus?;
+        if self.remote() || !self.focus_fixup(id) || self.host.route_visibility(id).1 {
+            return None;
+        }
+        self.blur_disabled_focus(id).1
+    }
+
+    /// A focused control that a commit disabled loses the focus as a blur
+    /// does (`set_focus`: a typed field commits, then its `blur` and the
+    /// bubbling `focusout`, staged and serviced), as the web's focus fixup
+    /// drops it. It does not get the focus back when enabled again.
+    fn blur_disabled_focus(&mut self, id: ViewId) -> (bool, Option<String>) {
+        self.disabled_blur.push(id);
+        let now = self.host.now();
+        // Every event first, then one servicing, as a removed focus's path.
+        let (sent, mut error) = self.move_focus_serviced(None, now, false);
         if sent {
             error = error.or(self.sync_commit());
         }
@@ -126,37 +275,70 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// `focus(id)` from an action: the node whose `id` that is, when it is
-    /// focusable, as `element.focus()` takes it on the web; otherwise the
-    /// journal says why, as the web host's does (it had been an unknown
-    /// command here).
-    /// The node it focused, if it did.
-    /// Whether `id` is being rendered and focusable in the current tree,
-    /// which the last painted picture may not show yet: no ancestor up to
-    /// the presented alert (which paint draws from its own root) is
-    /// `display: none`, on a hidden or inert route, or a dialog, which paint
-    /// skips. A top-layer surface's rows are `surface_focus`'s.
-    fn rendered(&self, id: ViewId) -> bool {
+    /// Focus uses the current tree, without requiring a painted box. Region
+    /// pictures and window-backed surfaces have separate input boundaries.
+    pub(crate) fn focus_refusal(&self, id: ViewId) -> Option<&'static str> {
+        if self.top_open() && self.alert.is_none() {
+            return Some("page under surface is inert");
+        }
+        if !self.alert_allows(id) {
+            return Some("page under the open surface is inert");
+        }
         let kernel = self.host.kernel();
         let shown = self.alert_root();
+        let (hidden, inert) = self.host.route_visibility_to(id, shown);
+        if hidden || inert {
+            return Some("not rendered");
+        }
+        let region = self.host.content_region();
+        let content = region.map(|r| r.binding().content);
+        if self.brush.region_blocks_action(id) {
+            return Some("content region is not live");
+        }
+        // The successful presentation owns this boundary, including across a
+        // failed replacement or a picture awaiting display acknowledgement.
+        let skipped_pending = region
+            .filter(|r| matches!(self.brush.published_region(r), Ok(Some(_))))
+            .map(|r| r.binding().pending);
+        // Paint starts at an open alert's root, independently of its page
+        // ancestors. Every inherited eligibility check ends there too.
         let mut at = kernel.node(id);
         while let Some(node) = at {
-            let (hidden, inert) = self.host.route_visibility(node.id);
-            if node.style.display == exact_kernel::Display::None || hidden || inert {
-                return false;
+            if node.style.display == exact_kernel::Display::None
+                || matches!(
+                    self.brush.placements.get(&node.id),
+                    Some(crate::placement::Placement::Hidden)
+                )
+                || Some(node.key) == skipped_pending
+            {
+                return Some("not rendered");
+            }
+            if Some(node.key) == content {
+                // Pending content and newly inserted descendants have no
+                // retained-picture ID; current publications also replay.
+                return Some("content region is not live");
             }
             if Some(node.id) == shown {
-                return true;
+                return None;
             }
             if node.props.str(PropId::SemanticTag) == Some("dialog") {
-                return false;
+                return Some("not rendered");
             }
             at = node.parent.and_then(|parent| kernel.node(parent));
         }
-        true
+        None
     }
 
+    /// `focus(id)` selects a surface row or a live, eligible page node.
+    /// A refusal goes to the journal, as it does on the web host.
     pub(crate) fn focus_command(&mut self, args: &[exact_plan::Value]) -> Option<ViewId> {
+        // Bare `focus()` is the window's (LLP 1133.025 §8): this host brings
+        // none forward yet (LLP 1133.005 D10).
+        if args.is_empty() {
+            self.host
+                .log("focus window: unsupported: this host brings no window forward");
+            return None;
+        }
         let Some(name) = args.first().and_then(exact_plan::Value::as_str) else {
             eprintln!("exact: focus requires an element id");
             return None;
@@ -176,11 +358,11 @@ impl<D: DataSource> Presenter<D> {
             None => "no live node with that id",
             Some(id) if self.surface_focus(id) => return Some(id),
             Some(id) if !self.focusable(id) => "not focusable",
-            // As `HTMLElement.focus()` on an element that is not being
-            // rendered: a command queued by a handler can run after its
-            // dialog has closed.
-            Some(id) if !self.rendered(id) => "not rendered",
             Some(id) => {
+                if let Some(reason) = self.focus_refusal(id) {
+                    self.host.log(format!("focus \"{name}\" refused: {reason}"));
+                    return None;
+                }
                 if let Some(e) = self.set_focus(Some(id), self.host.now()) {
                     eprintln!("exact: {e}");
                 }
@@ -191,15 +373,54 @@ impl<D: DataSource> Presenter<D> {
         None
     }
 
+    /// `id` as the focus no ring marks, unless it is a text field, which
+    /// matches `:focus-visible` however it was focused.
+    pub(crate) fn unringed(&self, id: ViewId) -> Option<ViewId> {
+        let field =
+            (self.host.kernel().node(id)).is_some_and(|n| n.node_type == NodeType::TextInput);
+        (!field).then_some(id)
+    }
+
     /// Move the focus in DOM order, with both bubbling paths fixed before an
     /// action on either path can change the tree.
     pub(crate) fn set_focus(&mut self, next: Option<ViewId>, now_ms: f64) -> Option<String> {
+        self.move_focus_serviced(next, now_ms, true).1
+    }
+
+    /// [`Self::set_focus`]; `service` false leaves its handlers' commits to the
+    /// caller (inside `service_commit`: one `sync_commit` after the last
+    /// event, so no autofocus or route arrival runs between a blur and its
+    /// focusout). Whether a handler ran, and the first error.
+    fn move_focus_serviced(
+        &mut self,
+        next: Option<ViewId>,
+        now_ms: f64,
+        service: bool,
+    ) -> (bool, Option<String>) {
         if next.is_some_and(|id| !self.alert_allows(id)) {
-            return Some("focus refused: page under alert is inert".into());
+            return (
+                false,
+                Some("focus refused: page under the open surface is inert".into()),
+            );
         }
         let previous = self.focus;
         if previous == next {
-            return None;
+            return (false, None);
+        }
+        if next.is_some() {
+            self.focus_start = None;
+        }
+        // A focus the app or a route moves shows a ring only where the one it
+        // leaves did, as Chrome's `:focus-visible` has it for `focus()`: after
+        // a press, none. A press or a key says so itself, before or after.
+        // On Windows, none before the first key (`keyless`).
+        let ringless = self.brush.ringless;
+        if self.brush.keyless
+            || (ringless.is_some() && (ringless == previous || previous.is_none()))
+        {
+            if let Some(next) = next {
+                self.brush.ringless = self.unringed(next);
+            }
         }
         let out = previous
             .map(|id| self.host.runner().focus_bubble(id, next, false))
@@ -208,6 +429,10 @@ impl<D: DataSource> Presenter<D> {
             .map(|id| self.host.runner().focus_bubble(id, previous, true))
             .unwrap_or_default();
         self.focus = next;
+        self.field_reveal = true;
+        if next.is_some() {
+            self.pads_follow_focus();
+        }
         self.focus_out = next
             .map(|id| self.host.runner().focus_bubble(id, None, false))
             .unwrap_or_default();
@@ -278,19 +503,21 @@ impl<D: DataSource> Presenter<D> {
                 }
                 dispatched = true;
                 let stop = self.take_focus_commands();
-                error = error.or(self.after_commit());
+                if service {
+                    error = error.or(self.after_commit());
+                }
                 stopped = stop && (stage == 1 || stage == 3);
             }
         }
-        if dispatched {
+        if dispatched && service {
             error = error.or(self.after_commit());
         }
-        error
+        (dispatched, error)
     }
 
     /// A modifier key went down or up, by its code (`ShiftLeft`…): what
     /// the next key's event says is held.
-    pub(crate) fn hold_modifier(&mut self, code: &str, down: bool) {
+    pub fn hold_modifier(&mut self, code: &str, down: bool) {
         let bit = match code {
             "ShiftLeft" => 1,
             "ShiftRight" => 2,
@@ -319,7 +546,9 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// A key at the focused node, by the web's name, with its physical key
+    /// A key at the focused node, or at the session's first root when
+    /// nothing is focused (the DOM's `window` listeners hear a key whose
+    /// target is `<body>`), by the web's name, with its physical key
     /// (`code`, "" when unknown) and whether it is an auto-repeat: every
     /// `keycapture` hears a keydown outermost first, then each `key` handler
     /// (`kind`; `keyup` for a release, #140) at or above it hears it,
@@ -335,7 +564,10 @@ impl<D: DataSource> Presenter<D> {
         repeat: bool,
         now_ms: f64,
     ) -> (Option<String>, bool) {
-        let target = self.focus;
+        let target = self
+            .focus
+            .or_else(|| self.alert_root().filter(|_| self.alert_inert()))
+            .or_else(|| self.host.roots().first().copied());
         let mut path = Vec::new();
         let mut at = target.and_then(|id| self.handler_target(id, kind));
         while let Some(id) = at {
@@ -371,6 +603,8 @@ impl<D: DataSource> Presenter<D> {
                 key: name.to_owned(),
                 code: code.to_owned(),
                 repeat: repeat && kind == EventKind::Key,
+                // No input method composes text here (LLP 1005).
+                is_composing: false,
                 held: self.modifiers(),
             };
             let event = if phase == EventKind::Keycapture {
@@ -397,7 +631,7 @@ impl<D: DataSource> Presenter<D> {
         (error, prevented)
     }
 
-    /// A key's release at the focus: its `keyup` handlers (#140), by the
+    /// A key's release at the focus (or the root): its `keyup` handlers (#140), by the
     /// name its keydown had (`Space` is " "). A release has no default here.
     pub(crate) fn key_up(&mut self, key: &str, code: &str, now_ms: f64) {
         let name = match key {
@@ -437,7 +671,10 @@ impl<D: DataSource> Presenter<D> {
     pub(crate) fn hover_at(&mut self, at: Option<(f32, f32)>, now_ms: f64) -> Option<String> {
         self.hover_point = at;
         let mut under = Vec::new();
-        let mut node = at.and_then(|(x, y)| self.hit(x, y));
+        let hit = at.and_then(|(x, y)| self.hit(x, y));
+        // Its `:hover` looks follow the same point, a resting one's too (LLP 1121 D8).
+        self.refresh_looks(Some(hit));
+        let mut node = hit;
         while let Some(id) = node {
             if self
                 .host
@@ -473,6 +710,8 @@ impl<D: DataSource> Presenter<D> {
         {
             if self.host.kernel().node(id).is_some() {
                 error = error.or(self.host.dispatch_at(id, Event::Hover(over), now_ms));
+                // A focused control a hover disabled loses the focus before the next.
+                error = error.or(self.blur_disabled_now());
             }
         }
         error.or(self.after_commit())
@@ -486,10 +725,13 @@ impl<D: DataSource> Presenter<D> {
     /// contact is down. Never inside `frame()`: its pixels and witness are
     /// the tree it painted.
     pub fn follow_pointer(&mut self) {
+        let Some(at) = self.hover_point else { return };
         if self.contact.is_some() || self.pointer_held.is_some() || self.pointer_buttons != 0 {
+            // No hover event while held, but a `:hover` look follows the point (LLP 1121 D8).
+            let hit = self.hit(at.0, at.1);
+            self.refresh_looks(Some(hit));
             return;
         }
-        let Some(at) = self.hover_point else { return };
         if let Some(error) = self.hover_at(Some(at), self.host.now()) {
             self.host.log(error);
         }
@@ -665,6 +907,9 @@ impl<D: DataSource> Presenter<D> {
     }
 }
 
+#[cfg(test)]
+#[path = "focus_disabled_tests.rs"]
+mod focus_disabled_tests;
 #[cfg(test)]
 #[path = "focus_rendered_tests.rs"]
 mod focus_rendered_tests;

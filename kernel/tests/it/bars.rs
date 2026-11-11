@@ -17,6 +17,7 @@ fn ops(node: &Node, out: &mut Vec<Op>) {
     for (prop, value) in node.2 {
         let value = match (*prop, value.parse::<i64>()) {
             (PropId::AccessibilityHeadingLevel, Ok(level)) => PropValue::Int(level),
+            (PropId::Disabled, _) => PropValue::Bool(*value == "true"),
             _ => PropValue::Str((*value).into()),
         };
         out.push(Op::SetProp {
@@ -253,6 +254,71 @@ fn a_pressable_around_the_heading_is_the_title_and_a_tablist_its_segments() {
 }
 
 const MORE: &[(PropId, &str)] = &[(PropId::Id, "more"), (PropId::Popover, "auto")];
+const STATUS: &[(PropId, &str)] = &[(PropId::AccessibilityRole, "status")];
+
+/// A readout (`role="status"`, LLP 1075.003 §9.15) is an item on its side of
+/// the heading, in order among the buttons, and no button: nothing presses
+/// it, and what it holds (a dot, a text) is its face, never the subtitle's.
+#[test]
+fn a_readout_is_an_item_that_is_no_button() {
+    let header = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![
+                Node(70, NodeType::Text, STATUS, vec![]),
+                button(41, &[]),
+                text(12, HEADING),
+                button(42, &[]),
+                Node(
+                    71,
+                    NodeType::View,
+                    STATUS,
+                    vec![view(72, vec![]), text(73, &[])],
+                ),
+            ],
+        )],
+    ));
+    let shape = header.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!(shape.leading, vec![70, 41]);
+    assert_eq!(shape.trailing, vec![42, 71], "after the button, as written");
+    assert_eq!(shape.items, vec![41, 42], "nothing presses a readout");
+    // A status around the heading is no readout: its heading is the title.
+    let around = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![Node(71, NodeType::View, STATUS, vec![text(12, HEADING)])],
+        )],
+    ));
+    let shape = around.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!(shape.heading, 12);
+    assert!(shape.trailing.is_empty() && shape.leading.is_empty());
+    // A host's mirror: route > header > [heading, button, status > text].
+    let words = [
+        0,
+        1,
+        fact::HEADER,
+        3,
+        fact::HEADING,
+        0,
+        fact::PRESS,
+        0,
+        fact::STATUS,
+        1,
+        0,
+        0,
+    ];
+    // Two trailing items, the button and the readout; one button.
+    assert_eq!(
+        bars::header_shape_words(&words, 0),
+        Some(vec![1, 2, 2, 0, 0, 0, 0, 2, 1, 3, 4, 3])
+    );
+}
 
 type Props = &'static [(PropId, &'static str)];
 
@@ -315,6 +381,160 @@ fn a_header_button_is_a_menu_item_when_its_invocation_opens_a_popover() {
             "{why}"
         );
     }
+}
+
+#[test]
+fn a_menu_written_inside_the_header_is_its_buttons_menu_not_more_items() {
+    // header > [heading, button opening "more", menu "more" > [row, row]]:
+    // the euxy port's sort menu, whose rows had become bar buttons.
+    const OPENS: Props = &[(PropId::Popovertarget, "more")];
+    const MENU: Props = &[
+        (PropId::Id, "more"),
+        (PropId::Popover, "auto"),
+        (PropId::AccessibilityRole, "menu"),
+    ];
+    let tree = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![
+                text(12, H1),
+                button(50, OPENS),
+                Node(
+                    60,
+                    NodeType::View,
+                    MENU,
+                    vec![button(41, &[]), button(42, &[])],
+                ),
+            ],
+        )],
+    ));
+    let shape = tree.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!(shape.items, vec![50]);
+    assert_eq!(shape.trailing, vec![50]);
+    // A dialog written there is the top layer's too.
+    const DIALOG: Props = &[(PropId::SemanticTag, "dialog")];
+    let tree = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![
+                text(12, H1),
+                Node(60, NodeType::View, DIALOG, vec![button(41, &[])]),
+            ],
+        )],
+    ));
+    let shape = tree.header_shape(10, None, true, &pressed).unwrap();
+    assert!(shape.items.is_empty(), "{:?}", shape.items);
+}
+
+#[test]
+fn a_header_button_wrapping_a_popover_with_a_heading_is_an_item_not_the_titles_tap() {
+    // header > [heading "Library", button press=sort > popover > heading
+    // "Order"]: the popover's heading is the top layer's, so the button is
+    // a bar item, not the pressable around the title.
+    const POPOVER: Props = &[(PropId::Popover, "auto")];
+    let tree = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![
+                text(12, H1),
+                Node(
+                    41,
+                    NodeType::Pressable,
+                    &[],
+                    vec![Node(60, NodeType::View, POPOVER, vec![text(61, HEADING)])],
+                ),
+            ],
+        )],
+    ));
+    let shape = tree.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!(shape.heading, 12);
+    assert_eq!(shape.tap, None);
+    assert_eq!(shape.items, vec![41]);
+    assert_eq!(shape.trailing, vec![41]);
+    // A dialog wrapped the same way is the top layer's too.
+    const DIALOG: Props = &[(PropId::SemanticTag, "dialog")];
+    let tree = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![
+                text(12, H1),
+                Node(
+                    41,
+                    NodeType::Pressable,
+                    &[],
+                    vec![Node(60, NodeType::View, DIALOG, vec![text(61, HEADING)])],
+                ),
+            ],
+        )],
+    ));
+    let shape = tree.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!((shape.tap, shape.items), (None, vec![41]));
+}
+
+/// A disabled button is UIKit's disabled bar item, shown dimmed, whether or
+/// not anything would press it (the euxy port's "● Clock" as one); a button
+/// that presses nothing and is not disabled is still no item.
+#[test]
+fn a_disabled_header_button_is_an_item_though_nothing_presses_it() {
+    const NATIVE: Props = &[
+        (PropId::Type, "button"),
+        (PropId::AccessibilityRole, "button"),
+    ];
+    const DISABLED: Props = &[
+        (PropId::Type, "button"),
+        (PropId::AccessibilityRole, "button"),
+        (PropId::Disabled, "true"),
+    ];
+    const BARE: Props = &[
+        (PropId::AccessibilityRole, "button"),
+        (PropId::Disabled, "true"),
+    ];
+    const ENABLED: Props = &[
+        (PropId::Type, "button"),
+        (PropId::AccessibilityRole, "button"),
+        (PropId::Disabled, "false"),
+    ];
+    let tree = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![
+                text(12, H1),
+                Node(51, NodeType::Control, DISABLED, vec![]),
+                Node(52, NodeType::Control, NATIVE, vec![]),
+                Node(53, NodeType::Pressable, BARE, vec![]),
+                Node(54, NodeType::Control, ENABLED, vec![]),
+            ],
+        )],
+    ));
+    let shape = tree.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!((shape.items, shape.trailing), (vec![51, 53], vec![51, 53]));
+    // One around the heading is no item and no tap: the heading in it is the title.
+    let tree = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![Node(51, NodeType::Control, DISABLED, vec![text(12, H1)])],
+        )],
+    ));
+    let shape = tree.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!((shape.heading, shape.tap, shape.items), (12, None, vec![]));
 }
 
 #[test]

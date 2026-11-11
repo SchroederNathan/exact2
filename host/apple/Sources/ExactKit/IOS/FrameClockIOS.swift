@@ -8,7 +8,8 @@ import UIKit
 /// while no one asks, so an idle app gets no callbacks. Users: the session's
 /// motion, timers and canvases (`Frames`), a list's smooth correction
 /// (`OffsetDriver`), a navigation transition's reveal, the scroll pump's
-/// owed work, deferred heavy leaves, live SVG filters. Press feedback eases
+/// owed work, deferred heavy leaves, live SVG filters, a textarea's
+/// `resize` drag. Press feedback eases
 /// on the render server and needs none. A development session's
 /// `FrameSampler` (LLP 1079) keeps its own link: it measures the cadence
 /// the display delivers, which must not be the clock's own callbacks or
@@ -19,7 +20,7 @@ final class FrameClock: NSObject {
     static let shared = FrameClock()
 
     /// A correction moves the port before the reveal and the pump read it.
-    enum Order: Int { case session, offsetDriver, navigationReveal, scroll, heavyLeaves, svgFilter }
+    enum Order: Int { case session, offsetDriver, navigationReveal, scroll, heavyLeaves, svgFilter, resizeGrip }
 
     private struct User {
         weak var owner: AnyObject?
@@ -28,6 +29,9 @@ final class FrameClock: NSObject {
         var tick: (CADisplayLink) -> Void
     }
     private var users: [ObjectIdentifier: User] = [:]
+    /// The users' keys in tick order, made again only when one comes or goes:
+    /// sorting them every frame was an allocation sixty times a second.
+    private var order: [ObjectIdentifier]?
     private(set) var link: CADisplayLink?
     /// Links made over the clock's life: one.
     private(set) var linksMade = 0
@@ -40,11 +44,14 @@ final class FrameClock: NSObject {
     /// that may die off the main thread need not drop itself); asking again
     /// only changes its rate or tick.
     func want(_ owner: AnyObject, _ order: Order, rate: CAFrameRateRange = .default, tick: @escaping (CADisplayLink) -> Void) {
-        users[ObjectIdentifier(owner)] = User(owner: owner, order: order, rate: rate, tick: tick)
+        let key = ObjectIdentifier(owner)
+        if users[key]?.order != order { self.order = nil }
+        users[key] = User(owner: owner, order: order, rate: rate, tick: tick)
         update()
     }
     func drop(_ owner: AnyObject) {
         guard users.removeValue(forKey: ObjectIdentifier(owner)) != nil else { return }
+        order = nil
         update()
     }
 
@@ -70,7 +77,10 @@ final class FrameClock: NSObject {
     }
 
     private func update() {
-        users = users.filter { $0.value.owner != nil }
+        if users.values.contains(where: { $0.owner == nil }) {
+            users = users.filter { $0.value.owner != nil }
+            order = nil
+        }
         guard !users.isEmpty else { link?.isPaused = true; return }
         let l = link ?? make()
         let r = rate
@@ -90,7 +100,8 @@ final class FrameClock: NSObject {
     /// One frame: each user in order. A user may drop itself or another, or
     /// ask anew, during it; one dropped before its turn does not tick.
     func fire(_ link: CADisplayLink) {
-        let order = users.sorted { ($0.value.order.rawValue, $0.key.hashValue) < ($1.value.order.rawValue, $1.key.hashValue) }.map(\.key)
+        let order = self.order ?? users.sorted { ($0.value.order.rawValue, $0.key.hashValue) < ($1.value.order.rawValue, $1.key.hashValue) }.map(\.key)
+        self.order = order
         for key in order {
             guard let user = users[key], user.owner != nil else { continue }
             user.tick(link)

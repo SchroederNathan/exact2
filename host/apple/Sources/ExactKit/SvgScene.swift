@@ -88,19 +88,14 @@ private func circle(_ r: Double) -> CGPath {
 enum CssAnimations {
     /// Replace `layer`'s CSS animations with `specs`, keeping any whose spec
     /// is unchanged (a data tick must not restart a running pulse).
-    static func apply(_ specs: [[String: Any]], to layer: CALayer, clock: Double?, installed: inout [String: String], offscreen: CFTimeInterval? = nil) {
+    static func apply(_ specs: [CssAnimation], to layer: CALayer, clock: Double?, installed: inout [String: Int], offscreen: CFTimeInterval? = nil) {
         var keep: Set<String> = []
         for spec in specs {
-            guard let id = spec["id"] as? String else { continue }
+            let id = spec.id
             keep.insert(id)
-            let prepared = spec["#"] as? PreparedAnimation
-            let hash: Int
-            if let prepared { hash = prepared.signature } else {
-                var h = Hasher()
-                digest(spec, into: &h)
-                hash = h.finalize()
-            }
-            let signature = String(hash) + (clock.map { "@\($0)" } ?? "")
+            var h = Hasher()
+            h.combine(spec.signature); h.combine(clock)
+            let signature = h.finalize()
             if installed[id] == signature { continue }
             installed[id] = signature
             layer.removeAnimation(forKey: id)
@@ -160,24 +155,24 @@ enum CssAnimations {
     /// `offscreen`: for a tree `CARenderer` draws (a live filter picture) at
     /// that instant, which plays running animations but not one held at
     /// `speed` 0: a held one runs from where it is held at that instant.
-    static func make(_ spec: [String: Any], layer: CALayer, clock: Double?, offscreen: CFTimeInterval? = nil) -> CAAnimation? {
-        let key = spec["k"] as? String ?? ""
-        let (values, keyTimes, timing) = (spec["#"] as? PreparedAnimation).map { ($0.values, $0.keyTimes, $0.timing) } ?? lowered(spec)
-        let duration = num(spec["d"]), repeatCount = num(spec["n"])
+    static func make(_ spec: CssAnimation, layer: CALayer, clock: Double?, offscreen: CFTimeInterval? = nil) -> CAAnimation? {
+        let (key, values, keyTimes, timing) = (spec.key, spec.values, spec.keyTimes, spec.timing)
+        let duration = spec.duration, repeatCount = spec.repeatCount
         guard duration > 0, repeatCount != 0, keyTimes.count == values.count, keyTimes.count >= 2 else { return nil }
         let a = CAKeyframeAnimation(keyPath: key == "r" ? "path" : key)
         a.keyTimes = keyTimes
-        a.values = values
+        // Through KVC, so the shared array is kept rather than bridged anew.
+        a.setValue(values, forKey: "values")
         if let timing { a.timingFunctions = timing }
         a.calculationMode = .linear
         a.duration = duration
         a.repeatCount = repeatCount < 0 ? .infinity : Float(repeatCount)
-        let fill = Int(num(spec["fill"]))
+        let fill = spec.fill
         let backwards = fill == 2 || fill == 3, forwards = fill == 1 || fill == 3
         a.fillMode = [CAMediaTimingFillMode.removed, .forwards, .backwards, .both][min(max(fill, 0), 3)]
         a.isRemovedOnCompletion = false
-        let start = num(spec["s"]), delay = num(spec["dl"])
-        let held = (spec["h"] as? NSNumber)?.doubleValue ?? clock.map { $0 / 1000 - start }
+        let start = spec.start, delay = spec.delay
+        let held = spec.held ?? clock.map { $0 / 1000 - start }
         if let local = held {
             let active = local - delay
             if active < 0 && !backwards { return nil }
@@ -219,14 +214,14 @@ final class SvgScene {
     /// The transform pair around an element, by id.
     private var wrappers: [Int: (outer: CALayer, inner: CALayer)] = [:]
     /// The transform animations each wrapper plays, for the agent clock's re-seek.
-    private var wrapSpecs: [Int: [[String: Any]]] = [:]
-    private var wrapInstalled: [Int: [String: String]] = [:]
-    private var installed: [Int: [String: String]] = [:]
+    private var wrapSpecs: [Int: [CssAnimation]] = [:]
+    private var wrapInstalled: [Int: [String: Int]] = [:]
+    private var installed: [Int: [String: Int]] = [:]
     /// Each masked element's mask island, by the digest of what drew it.
     private var islands: [Int: (key: Int, layer: CALayer)] = [:]
     /// Each filtered element's picture, by the digest of what drew it.
     private var pictures: [Int: (key: Int, layer: CALayer)] = [:]
-    private var specs: [Int: [[String: Any]]] = [:]
+    private var specs: [Int: [CssAnimation]] = [:]
     /// The view's pixels per point, for gradients drawn as pixels.
     var scale: CGFloat = 2
     /// The presenter's fonts, for SVG text (LLP 1055.000 D11).
@@ -302,7 +297,10 @@ final class SvgScene {
     /// colour space (`color-interpolation-filters`) changes only how the
     /// element's antialiased edge blends over its own shadow.
     static func dropShadow(_ fl: [String: Any]) -> (region: CGRect, sigma: CGFloat, offset: CGSize, color: CGColor, opacity: Float)? {
-        let p = nums(fl["p"])
+        dropShadow(program: nums(fl["p"]))
+    }
+    /// The same of a chain's numbers (`Filter::encode`), a box's included.
+    static func dropShadow(program p: [Double]) -> (region: CGRect, sigma: CGFloat, offset: CGSize, color: CGColor, opacity: Float)? {
         // region (4), count, then code, in, in2, subregion (4), linear, σx, σy, dx, dy, rgba.
         guard p.count == 5 + 8 + 8, p[4] == 1, p[5] == 6, p[6] == -1, p[13] == p[14], p[13] >= 0,
               p[15].isFinite, p[16].isFinite else { return nil }
@@ -463,7 +461,7 @@ final class SvgScene {
         // The individual properties' lowered animations play on the outer
         // layer (LLP 1055.001, as a box's on iOS): each key path replaces
         // one component of its transform and keeps the others.
-        let list = tf["a"] as? [[String: Any]] ?? []
+        let list = CssAnimation.list(tf["a"])
         wrapSpecs[id] = list.isEmpty ? nil : list
         CssAnimations.apply(list, to: pair.outer, clock: clock, installed: &wrapInstalled[id, default: [:]], offscreen: offscreen)
         return pair.outer
@@ -585,7 +583,7 @@ final class SvgScene {
                 islands.removeValue(forKey: id)
             }
             node[ObjectIdentifier(layer)] = (id, UInt32(num(e["n"])))
-            let list = e["a"] as? [[String: Any]] ?? []
+            let list = CssAnimation.list(e["a"])
             specs[id] = list
             CssAnimations.apply(list, to: layer, clock: clock, installed: &installed[id, default: [:]], offscreen: offscreen)
             let placed = wrap(id, layer, e["tf"] as? [String: Any], clock: clock)
@@ -610,9 +608,13 @@ final class SvgHost {
     private var payloads: [UInt32: [String: Any]] = [:]
     /// The session's fonts, for SVG text: set by the presenter.
     var fonts: SvgText.Fonts?
-    private var boxSpecs: [UInt32: (layer: CALayer, specs: [[String: Any]])] = [:]
-    private var boxInstalled: [UInt32: [String: String]] = [:]
+    private var boxSpecs: [UInt32: (layer: CALayer, specs: [CssAnimation])] = [:]
+    private var boxInstalled: [UInt32: [String: Int]] = [:]
+    private var hiddenBoxes: Set<UInt32> = []
     private var seeked: Double?
+    /// How a box's background tracks grey now, by its id: on a dimmed control's face, as its fill
+    /// does (TintDimmingIOS.swift); nil where they keep their colours. Set by the presenter.
+    var boxGrey: ((UInt32) -> ((CGColor) -> CGColor)?)?
 
     /// A scene's root layer's name, by which its node re-asks its range (LLP 1100 D8).
     static let rootName = "exact-svg"
@@ -653,9 +655,27 @@ final class SvgHost {
 
     func animations(_ id: UInt32, _ payload: [String: Any], layer: CALayer?, clock: Double?) {
         guard let layer else { return }
-        let specs = payload["specs"] as? [[String: Any]] ?? []
+        let specs = CssAnimation.list(payload["specs"])
         boxSpecs[id] = specs.isEmpty ? nil : (layer, specs)
-        CssAnimations.apply(specs, to: layer, clock: clock, installed: &boxInstalled[id, default: [:]])
+        CssAnimations.apply(visibleBoxSpecs(id, specs), to: layer, clock: clock, installed: &boxInstalled[id, default: [:]])
+    }
+
+    private func visibleBoxSpecs(_ id: UInt32, _ specs: [CssAnimation]) -> [CssAnimation] {
+        let shown = hiddenBoxes.contains(id) ? specs.filter { $0.key != "backgroundColor" } : specs
+        guard let grey = boxGrey?(id) else { return shown }
+        return shown.map { $0.key == "backgroundColor" ? $0.greyed(grey) : $0 }
+    }
+
+    /// Installs `id`'s box animations again, as it shows or hides or as its colours grey with the
+    /// tint or come back, keeping their timing (`CssAnimations.make` sets their begin time)
+    func refreshBoxAnimations(_ id: UInt32, clock: Double?) {
+        guard let entry = boxSpecs[id] else { return }
+        CssAnimations.apply(visibleBoxSpecs(id, entry.specs), to: entry.layer, clock: clock, installed: &boxInstalled[id, default: [:]])
+    }
+
+    func boxVisibility(_ id: UInt32, hidden: Bool, clock: Double?) {
+        if hidden { hiddenBoxes.insert(id) } else { hiddenBoxes.remove(id) }
+        refreshBoxAnimations(id, clock: clock)
     }
 
     /// An agent moved the clock: every held animation shows the new instant.
@@ -663,17 +683,21 @@ final class SvgHost {
         guard clock != seeked else { return }
         seeked = clock
         for scene in scenes.values { scene.seek(clock: clock) }
-        for (id, entry) in boxSpecs { CssAnimations.apply(entry.specs, to: entry.layer, clock: clock, installed: &boxInstalled[id, default: [:]]) }
+        for (id, entry) in boxSpecs { CssAnimations.apply(visibleBoxSpecs(id, entry.specs), to: entry.layer, clock: clock, installed: &boxInstalled[id, default: [:]]) }
     }
 
     /// The SVG element a press at `point` (in `id`'s view) goes to, if any
     /// takes it (LLP 1055.000 D17).
     func target(_ id: UInt32, at point: CGPoint) -> UInt32? { scenes[id]?.target(at: point) }
 
+    /// Whether `id`'s view holds CSS animations, which are its layer's.
+    func animatesBox(_ id: UInt32) -> Bool { boxSpecs[id] != nil }
+
     func forget(_ id: UInt32) {
         if let scene = scenes.removeValue(forKey: id) { scene.reset(); scene.root.removeFromSuperlayer() }
         payloads.removeValue(forKey: id)
         if let entry = boxSpecs.removeValue(forKey: id) { CssAnimations.apply([], to: entry.layer, clock: nil, installed: &boxInstalled[id, default: [:]]) }
         boxInstalled.removeValue(forKey: id)
+        hiddenBoxes.remove(id)
     }
 }

@@ -11,7 +11,8 @@
 // under the other, its handle refused by name after. A control file
 // (EXACT_HOST_CONTROL=<path>, one command per appended line) stands in for
 // the native buttons a real host has: `destroy <label>`, `unmount <label>`,
-// `mount <label>`, `apply <plan path>`, `open <label> <url>`.
+// `mount <label>`, `apply <plan path>`, `open <label> <url>`,
+// `leave <label> <url>`.
 import AppKit
 import ExactKit
 import ExactComposition
@@ -130,6 +131,16 @@ final class HostDelegate: ExactSessionDelegate {
         log("host: \(session.label) is \(state)")
     }
 }
+/// The embedder's decision on leaving the app (LLP 1133.024 D22 item 7): a
+/// page or a hand-off by URL only to the host's own list.
+extension HostDelegate: ExactLeaveDelegate {
+    static let leaveList = ["https://www.caltrain.com/"]
+    func exactSession(_ session: ExactSession, shouldLeaveFor url: String, how: String) -> Bool {
+        let allowed = Self.leaveList.contains { url.hasPrefix($0) }
+        log("host: \(session.label) \(allowed ? "may leave" : "may not leave") for \(url) (\(how))")
+        return allowed
+    }
+}
 let delegate = HostDelegate()
 a.delegate = delegate
 b.delegate = delegate
@@ -162,6 +173,14 @@ func readControls() {
             if let v = views[arg] { v.removeFromSuperview(); log("host: unmounted \(arg)") }
         case "mount":
             if let v = views[arg], let pane = panes[arg] { v.frame = pane.bounds; pane.addSubview(v); log("host: mounted \(arg)") }
+        case "leave":
+            // A package's ask (`ExactPackageContext.leave`), as the module posts it for its session's view.
+            let target = arg.split(separator: " ", maxSplits: 1).map(String.init)
+            if target.count == 2, let view = views[target[0]] {
+                let ask = NSMutableDictionary(dictionary: ["url": target[1], "how": "browser", "view": view])
+                NotificationCenter.default.post(name: Notification.Name("exact.leave"), object: ask)
+                log("host: leave \(target[1]) from \(target[0]): \(ask["allow"] as? Bool ?? true ? "let go" : "refused")")
+            }
         case "apply":
             let bytes = FileManager.default.contents(atPath: arg) ?? Data()
             let ok = exact.apply(bytes, label: String(arg.split(separator: "/").last ?? "plan"))
@@ -193,19 +212,20 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         finishLaunching()
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-    /// A quit waits while a session's storage is still landing or its native
-    /// module's quit work runs, five seconds at most for all of it (LLP 1097
-    /// D10, LLP 1069.010 Q4); a repeated quit joins that hold.
+    /// A quit waits while a session's storage is still landing, a request
+    /// with effects is in flight or its native module's quit work runs, five
+    /// seconds at most for all of it (LLP 1097 D10, LLP 1146 D2, LLP 1069.010
+    /// Q4); a repeated quit joins that hold.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if quitting?.holding == true { return .terminateLater }
         for (_, s) in sessions { s.willQuit() }
-        let hold = StorageHold(bound: 5, pending: { sessions.contains { $0.1.storageOperations > 0 || $0.1.quitWorkPending } },
-                               begin: { _ in }, end: { NSApp.reply(toApplicationShouldTerminate: true) })
+        let hold = QuitHold(bound: 5, pending: { sessions.contains { $0.1.quitWorkPending || $0.1.mustFinish } },
+                            end: { NSApp.reply(toApplicationShouldTerminate: true) })
         guard hold.hold() else { return .terminateNow }
         quitting = hold
         return .terminateLater
     }
-    var quitting: StorageHold?
+    var quitting: QuitHold?
     /// The quit is decided and the hold, if any, has ended: each session goes,
     /// so its module's `destroy()` runs before the process does.
     func applicationWillTerminate(_ notification: Notification) {

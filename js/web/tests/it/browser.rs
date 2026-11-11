@@ -12,6 +12,14 @@ fn browser_fixture_serves_every_on_demand_host_module_without_chrome() {
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
         .output()
         .unwrap();
+    if let Some(why) = String::from_utf8_lossy(&result.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("missing chrome: "))
+        .map(str::to_owned)
+    {
+        missing("chrome", &why);
+        return;
+    }
     assert!(
         result.status.success(),
         "{}\n{}",
@@ -22,18 +30,11 @@ fn browser_fixture_serves_every_on_demand_host_module_without_chrome() {
 
 #[test]
 fn browser_modules_guard_their_own_builtins_and_refuse_bad_candidates() {
-    let chrome = std::env::var("CHROME")
-        .unwrap_or_else(|_| "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
-    if !Path::new(&chrome).exists() {
-        missing("chrome", "browser module sweep unavailable: set CHROME");
-        return;
-    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let ec_pair =
         exact_data::crypto::generate_p256(&exact_runner::Store::new("", []), true).unwrap();
     let result = Command::new(std::env::var_os("BUN").unwrap_or_else(|| "bun".into()))
         .args(["--input-type=module", "-e", PROBE])
-        .env("CHROME", chrome)
         .env(
             "EXACT_PARITY",
             serde_json::to_string(&caltrain::oracle()).unwrap(),
@@ -150,12 +151,15 @@ fn grant_sets() -> String {
         "net.fetch https://fixture.exact.test\n",
         "secret.keep dpop\n",
         "net.fetch https://api.castle.xyz\nsecret.keep castle.session\n",
-        "fs.read app:/data\nfs.write app:/data\nfs.read doc:/\nfs.write doc:/\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n",
+        // js/tests/fixtures/storage.ts's, as it declares them (its widget cache writes since 5363e50241).
+        "fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n",
         "fs.read app:/\nfs.write app:/\nsqlite.open app:/data",
         "fs.read app:/data/move\nfs.write app:/data/move",
         "fs.read app:/data",
         "sqlite.open app:/data/notes.db",
-        "sqlite.open app:/data/fieldnotes.db\nfs.read app:/data/backups\nfs.write app:/data/backups\nfs.read app:/tmp/picked\nsecret.keep fieldnotes.revision",
+        // apps/fieldnotes/app.ts's, as it declares them (its walk's motion since c6d72a0349, the shared file's read
+        // since 170f2c104a).
+        "sqlite.open app:/data/fieldnotes.db\nfs.read app:/data/backups\nfs.write app:/data/backups\nfs.read app:/tmp/picked\nfs.read app:/tmp/shared\nsecret.keep fieldnotes.revision\ndevice.motion walkPurpose",
     ];
     let sets = specs
         .into_iter()
@@ -174,6 +178,9 @@ fn grant_sets() -> String {
 
 const PROBE: &str = r#"
 import { Cdp } from './scripts/agent.mjs';
+import { chromium } from './scripts/agent-launch.mjs';
+const { executable: browserExecutable, unavailable: browserMissing } = chromium();
+if (browserMissing) { console.log(`missing chrome: ${browserMissing}`); process.exit(0); }
 import { webHostFiles } from './scripts/app.mjs';
 import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -270,7 +277,7 @@ fixtures.agentStream=process.env.EXACT_AGENT_STREAM;
 fixtures.ecJwk=process.env.EXACT_EC_JWK;
 fixtures.grantSets=JSON.parse(process.env.EXACT_GRANT_SETS);
 const profile = mkdtempSync(resolve(tmpdir(),'exact-module-browser-'));
-const child = spawn(process.env.CHROME, ['--headless=new','--no-sandbox','--remote-debugging-pipe','--no-first-run','--disable-background-networking','--host-resolver-rules=MAP lan.test 127.0.0.1',`--user-data-dir=${profile}`,'about:blank'],{detached:true,stdio:['ignore','ignore','ignore','pipe','pipe']});
+const child = spawn(browserExecutable, ['--headless=new','--no-sandbox','--remote-debugging-pipe','--no-first-run','--disable-background-networking','--host-resolver-rules=MAP lan.test 127.0.0.1',`--user-data-dir=${profile}`,'about:blank'],{detached:true,stdio:['ignore','ignore','ignore','pipe','pipe']});
 const cdp = new Cdp(child.stdio[3],child.stdio[4]);
 const exited = new Promise(r=>child.on('exit',()=>{cdp.fail('browser closed');r();}));
 try {
@@ -338,7 +345,8 @@ try {
     const answer=(source,args=[])=>call({op:'answer',id:module.id,source,args,store:[['token','old']],grants:['token']});
     const results=[];
     for(const name of ['alias','random','constructor','intl'])results.push(await checkpoint(answer(name)));
-    if(!results.every(r=>r.message?.includes('pass time or a random seed')))throw new Error(JSON.stringify(results));
+    // Each refused with its way out (Math.random's names crypto.getRandomValues since 24bf4fc341).
+    if(!results.every(r=>r.kind==='Unavailable'&&r.message?.includes('is unavailable in data sources')&&/pass (time or )?a (random )?seed/.test(r.message)))throw new Error(JSON.stringify(results));
     if((await checkpoint(answer('explicit',[0]))).value!==1970)throw new Error('explicit date arithmetic changed');
     const written=await checkpoint(answer('write'));
     if(written.value!=='old'||written.reads[0]!=='token'||written.writes[0][1]!=='next')throw new Error('store seam changed');
@@ -568,7 +576,7 @@ try {
     };
     // The fixture's own grants (js/tests/fixtures/storage.ts, js/tests/it/storage.rs GRANTS): its module declares
     // them, and admission refuses a module whose declaration differs from the admitted one.
-    const storageIdentity=admit({appId:'dev.exact.storage-test',grants:'fs.read app:/data\nfs.write app:/data\nfs.read doc:/\nfs.write doc:/\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n'});
+    const storageIdentity=admit({appId:'dev.exact.storage-test',grants:'fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n'});
     const beforeStorage=(await indexedDB.databases()).length;
     let storage=await prepare(await payload(fixtures.storage,storageIdentity),storageIdentity);
     if((await indexedDB.databases()).length!==beforeStorage)throw new Error('prepare opened storage');
@@ -675,7 +683,8 @@ try {
     performance.getEntriesByType=type=>type==='navigation'?[{name:location.origin+'/?agent=1'}]:navigationEntries.call(performance,type);
     try {
       storage=await prepare(await payload(fixtures.storage,storageIdentity),storageIdentity);
-      if(!(await storageCall('bake')).includes('unavailable in agent mode'))throw new Error('agent mode disk access');
+      // A drive that names no scratch store reads an empty one, never the app's disk (08f21295d1).
+      if(!/^Unavailable:ENOENT:.*names no scratch store/.test(await storageCall('bake')))throw new Error('agent mode disk access');
       storage.dispose();
     } finally {performance.getEntriesByType=navigationEntries;}
     const abandonedSource=`let invocation=0;globalThis.exact={abi:1,appId:'dev.exact.storage-test',grants:${JSON.stringify(storageIdentity.grants)},answer(source,args,store,storage){
@@ -909,7 +918,8 @@ try {
     train.dispose();
     return {ecdsa:globalThis.ecdsaResult,guards:forms.length,caltrain:fixtures.oracle.length,store:true,isolated:true,refusals:true,async:true,storage:true,sqliteReload:{coldMs,warmMs}};
   };
-  const result=await call('Runtime.evaluate',{expression:`(${probe.toString()})(${JSON.stringify(fixtures)})`,returnByValue:true,awaitPromise:true});
+  // Its busy-storage steps each wait out a lock's 10 s bound (storage-fs.js `lockPaths`, since 837ecf4360): past CDP's 15 s.
+  const result=await cdp.send('Runtime.evaluate',{expression:`(${probe.toString()})(${JSON.stringify(fixtures)})`,returnByValue:true,awaitPromise:true},sessionId,240000);
   assert.equal(result.exceptionDetails,undefined,JSON.stringify(result.exceptionDetails));
   console.log(JSON.stringify(result.result.value.sqliteReload));delete result.result.value.sqliteReload;
   console.log('ECDSA_RESULT '+JSON.stringify(result.result.value.ecdsa));delete result.result.value.ecdsa;
@@ -1064,19 +1074,20 @@ try {
 
 #[test]
 fn browser_portable_storage_shares_fieldnotes_data_and_enforces_scope() {
-    let chrome = std::env::var("CHROME")
-        .unwrap_or_else(|_| "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
-    if !Path::new(&chrome).exists() {
-        missing("chrome", "browser storage sweep unavailable: set CHROME");
-        return;
-    }
     let result = Command::new(std::env::var_os("BUN").unwrap_or_else(|| "bun".into()))
         .args(["--input-type=module", "-e", PROTOCOL_PROBE])
-        .env("CHROME", chrome)
         .env("EXACT_GRANT_SETS", grant_sets())
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
         .output()
         .unwrap();
+    if let Some(why) = String::from_utf8_lossy(&result.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("missing chrome: "))
+        .map(str::to_owned)
+    {
+        missing("chrome", &why);
+        return;
+    }
     eprintln!("{}", String::from_utf8_lossy(&result.stdout));
     assert!(
         result.status.success(),
@@ -1088,22 +1099,33 @@ fn browser_portable_storage_shares_fieldnotes_data_and_enforces_scope() {
 
 const PROTOCOL_PROBE: &str = r#"
 import { Cdp } from './scripts/agent.mjs';
+import { chromium } from './scripts/agent-launch.mjs';
+const { executable: browserExecutable, unavailable: browserMissing } = chromium();
+if (browserMissing) { console.log(`missing chrome: ${browserMissing}`); process.exit(0); }
 import { webHostFiles } from './scripts/app.mjs';
-import { spawn, execFileSync } from 'node:child_process';
+import { moduleBinding, moduleInterfaces } from './js/bake/src/typescript.mjs';
+import { rolldown } from 'rolldown';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
 const routes=Object.fromEntries(Object.entries(webHostFiles()).map(([name,source])=>['/'+name,source]));
-const app=execFileSync(process.execPath,['./node_modules/.bin/rolldown','apps/fieldnotes/app.ts','--format','iife','--name','fieldnotes'],{encoding:'utf8',stdio:['ignore','pipe','pipe']})+'\nglobalThis.exact={...fieldnotes,abi:1};';
+// Fieldnotes' `@exact/*` imports reach the bindings the bake generates from each interface's exact.json.
+const interfaces=new Map(moduleInterfaces(resolve('apps/fieldnotes')).map(i=>[i.name,i]));
+const bindings={name:'exact-modules',resolveId:id=>interfaces.has(id)?'\0exact-module:'+id:null,
+  load(id){const i=id.startsWith('\0exact-module:')&&interfaces.get(id.slice(14));return i?{code:moduleBinding(i.name,i.declaration,i.implementations.map(m=>m.json)),moduleType:'ts'}:null;}};
+const bundled=await rolldown({input:'apps/fieldnotes/app.ts',platform:'browser',plugins:[bindings]});
+const app=(await bundled.generate({format:'iife',name:'fieldnotes'})).output[0].code+'\nglobalThis.exact={...fieldnotes,abi:1};';
+await bundled.close();
 const server=createServer((req,res)=>{
   res.setHeader('content-type',req.url.endsWith('.wasm')?'application/wasm':routes[req.url]?'text/javascript':'text/html');
   res.end(routes[req.url]?readFileSync(routes[req.url]):'<main id="exact-root"></main>');
 });
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 const profile=mkdtempSync(resolve(tmpdir(),'exact-storage-protocol-'));
-const child=spawn(process.env.CHROME,['--headless=new','--no-sandbox','--remote-debugging-pipe','--no-first-run','--disable-background-networking',`--user-data-dir=${profile}`,'about:blank'],{detached:true,stdio:['ignore','ignore','ignore','pipe','pipe']});
+const child=spawn(browserExecutable,['--headless=new','--no-sandbox','--remote-debugging-pipe','--no-first-run','--disable-background-networking',`--user-data-dir=${profile}`,'about:blank'],{detached:true,stdio:['ignore','ignore','ignore','pipe','pipe']});
 const cdp=new Cdp(child.stdio[3],child.stdio[4]);
 const exited=new Promise(resolve=>child.on('exit',()=>{cdp.fail('browser closed');resolve();}));
 try {
@@ -1120,7 +1142,7 @@ try {
     const {createStorageRequests}=await import('/storage-request.js');
     const {createGrantSet,scopedGrantSet}=await import('/grant-admission.js');
     const encoder=new TextEncoder(),decoder=new TextDecoder();
-    const identity={appId:'com.exact.fieldnotes',grants:'sqlite.open app:/data/fieldnotes.db\nfs.read app:/data/backups\nfs.write app:/data/backups\nfs.read app:/tmp/picked\nsecret.keep fieldnotes.revision'};
+    const identity={appId:'com.exact.fieldnotes',grants:'sqlite.open app:/data/fieldnotes.db\nfs.read app:/data/backups\nfs.write app:/data/backups\nfs.read app:/tmp/picked\nfs.read app:/tmp/shared\nsecret.keep fieldnotes.revision\ndevice.motion walkPurpose'};
     identity.grantSet=createGrantSet(grantSets[identity.grants]);
     const script=encoder.encode(app);
     const sha256=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',script)),b=>b.toString(16).padStart(2,'0')).join('');
@@ -1166,6 +1188,9 @@ try {
     // the native fixture separately executes the Rust source through ABI2.
     const rows=await request('sqlite',{path:db,commands:[command('query','SELECT id,title,body,pinned FROM notes ORDER BY pinned DESC,id DESC')]});
     check(!rows.error,'portable SQL opens TS database: '+JSON.stringify(rows));
+    // Two at once take turns: a second open waiting in the worker's one queue for the first's lock would hold back the first's close until the lock's bound refused it EBUSY.
+    const both=await Promise.all([1,2].map(n=>request('sqlite',{path:db,commands:[command('query','SELECT ?',[{integer:String(n)}])]})));
+    check(both.every(r=>!r.error)&&both[1][0].rows[0][0].integer==='2','overlapping portable requests to one database both answer: '+JSON.stringify(both));
     const notes=rows[0].rows.map(r=>({id:r[0].integer,title:r[1],body:r[2],pinned:r[3].integer==='1'}));
     const text=JSON.stringify({version:1,notes},null,2);check(text===expected.backupText,'portable backup preserves exact TypeScript format');
     check(!(await request('fs.mkdir',{path:'app:/data/backups'}))?.error,'portable mkdir');

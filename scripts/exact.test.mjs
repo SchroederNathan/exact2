@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, relative, resolve } from 'node:path';
-import { codeDigest, signingOrder, signRelease, signedGpuProduct, assertArchiveFrameworks } from '../host/apple/assets.mjs';
+import { codeDigest, signingOrder, signRelease, signedGpuProduct, assertArchiveFrameworks, plistFile } from '../host/apple/assets.mjs';
 import { appleEmbedOnly, copyAppleGpuProducts, captureAppleProduct, stripForDistribution } from '../host/apple/build.mjs';
 import { assertLinkedSdk } from '../host/apple/link.mjs';
 
@@ -435,6 +435,12 @@ test('exact hatch writes each target\'s stub, wires it in, and declares the word
     hatch(['--window'], () => {});
     assert.ok(readFileSync(resolve(dir, 'modules/apple/Hatches.swift'), 'utf8').includes('        windowHatch(window)\n        // exact:window\n'));
     assert.ok(readFileSync(resolve(dir, 'modules/web/index.js'), 'utf8').includes('export function window(x) { windowHatch.built(x); }'));
+    // The app hatch reads the root's data-* words, which app.json `data` declares: the verb adds the list and names the accessor.
+    const app = [];
+    hatch(['--app'], line => app.push(line));
+    assert.deepEqual(JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8')).data, []);
+    assert.ok(app.some(line => line.includes('app.data[.booted]')), app.join('\n'));
+    assert.ok(readFileSync(resolve(dir, 'modules/apple/AppHatch.swift'), 'utf8').includes('app.data[.booted]'));
     assert.throws(() => hatch(['Not A Word'], () => {}), /name a word/);
     // A Linux crate gets one hatches file, each word an arm and its functions, and is told what its build.rs owes.
     mkdirSync(resolve(dir, 'linux'));
@@ -602,7 +608,14 @@ test('Apple asset catalogs select platform modules and invalidate native receipt
   assert.equal(appleAssetCatalogInventory(app, 'ios')[0].path, shared[0].path);
   rmSync(resolve(dir, 'modules/apple/Shared.xcassets'), { recursive: true });
   assert.deepEqual(pendingBuildInputs(build), ['Apple asset catalogs']);
-  assert.equal(appleRunBinary(launchApp), paths.binary);
+  assert.equal(appleRunBinary(launchApp), resolve(paths.bundle, 'Contents/MacOS', paths.executable));
+  launchApp.manifest.widgets = [{ kind: 'card', families: ['systemSmall'] }];
+  mkdirSync(paths.products, { recursive: true });
+  writeFileSync(resolve(paths.products, 'receipt.json'), JSON.stringify({ entitlements: null }));
+  assert.equal(appleRunBinary(launchApp), resolve(paths.bundle, 'Contents/MacOS', paths.executable), 'a widget declaration without an identity still launches the bundled app');
+  writeFileSync(resolve(paths.products, 'receipt.json'), JSON.stringify({ entitlements: plistFile({ 'com.apple.security.application-groups': ['TEAM.com.exact.catalog.widgets'] }) }));
+  assert.equal(appleRunBinary(launchApp), resolve(paths.bundle, 'Contents/MacOS', paths.executable));
+  assert.equal(appleRunBinary(launchApp, true), appleArtifacts(launchApp, { host: true }).binary);
   mkdirSync(resolve(dir, 'modules/apple/Linked.xcassets'));
   symlinkSync(resolve(dir, 'outside'), resolve(dir, 'modules/apple/Linked.xcassets/Contents.json'));
   assert.throws(() => appleAssetCatalogInventory(app, 'ios'), /symlinks/);
@@ -617,13 +630,13 @@ test.skipIf(process.platform !== 'darwin')('the iOS launch screen is the app\'s 
     const out = resolve(dir, `app${n++}.app`); mkdirSync(out);
     const keys = iosAssets({ dir, name: 'Launch', manifest }, out, false, options);
     const result = spawnSync('xcrun', ['assetutil', '--info', resolve(out, 'Assets.car')], { encoding: 'utf8' });
-    const colours = keys.UILaunchScreen ? JSON.parse(result.stdout).filter(asset => asset.Name === 'ExactLaunch')
+    const colours = keys.UILaunchScreen ? JSON.parse(result.stdout).filter(asset => asset.Name === keys.UILaunchScreen.UIColorName)
       .map(asset => [asset.Appearance ?? 'light', asset['Color components'].map(c => Math.round(c * 255))]) : [];
     return { keys, colours };
   };
   // Stopwatch, round 13: a first route on the grouped grey, whose launch screen was the system's white.
   const grouped = made({}, { launch: 'grouped' });
-  assert.equal(grouped.keys.UILaunchScreen.UIColorName, 'ExactLaunch');
+  assert.match(grouped.keys.UILaunchScreen.UIColorName, /^ExactLaunch-[0-9a-f]{8}$/);
   assert.deepEqual(grouped.colours, [['light', [242, 242, 247, 255]], ['UIAppearanceDark', [0, 0, 0, 255]]]);
   // A page of the platform's own stays the system's launch screen (`systemBackground`, light and dark).
   for (const options of [{ launch: 'system' }, {}]) assert.deepEqual(made({}, options).keys, {});
@@ -654,7 +667,8 @@ test.skipIf(process.platform !== 'darwin')('Apple asset catalogs retain named im
   const ios = resolve(dir, 'iOS.app'); mkdirSync(ios);
   const keys = iosAssets(app, ios, false, { catalog: true, kept: cache, expected: inventory });
   assert.equal(keys.CFBundleIcons.CFBundlePrimaryIcon.CFBundleIconName, 'AppIcon');
-  assert.equal(keys.UILaunchScreen.UIColorName, 'ExactLaunch');
+  const launch = keys.UILaunchScreen.UIColorName;
+  assert.match(launch, /^ExactLaunch-[0-9a-f]{8}$/);
   assert.equal(keys.NSAccentColorName, undefined, 'no AccentColor set, no accent named');
   const inspect = path => {
     const result = spawnSync('xcrun', ['assetutil', '--info', resolve(path, 'Assets.car')], { encoding: 'utf8' });
@@ -662,8 +676,8 @@ test.skipIf(process.platform !== 'darwin')('Apple asset catalogs retain named im
     return JSON.parse(result.stdout);
   };
   const first = inspect(ios);
-  for (const name of ['Badge', 'Ink', 'AppIcon', 'ExactLaunch']) assert.ok(first.some(asset => asset.Name === name), name);
-  assert.equal(first.filter(asset => asset.Name === 'ExactLaunch').length, 2);
+  for (const name of ['Badge', 'Ink', 'AppIcon', launch]) assert.ok(first.some(asset => asset.Name === name), name);
+  assert.equal(first.filter(asset => asset.Name === launch).length, 2);
   const held = readdirSync(cache.dir).find(name => name.startsWith('assets-ios-'));
   const before = statSync(resolve(cache.dir, held, 'Assets.car'), { bigint: true }).mtimeNs;
   const second = resolve(dir, 'Second.app'); mkdirSync(second);
@@ -703,17 +717,24 @@ test.skipIf(process.platform !== 'darwin')('Apple asset catalogs retain named im
 }), 60000);
 
 // LLP 1116.001 D4.5: `exact contract build` of an app's app.contract rewrites the types its app.ts imports
-// when a source's signature changed, and only then, saying so in one line on stderr; `contract types` agrees.
+// when a source's signature changed, and only then, saying so in one line on stderr (under `--json`, nothing on
+// stderr: the array is the whole reply); `contract types` agrees.
 test('contract build regenerates app.contract.d.ts when a signature changed, and only then', () => inDir(dir => {
   const contract = (shape) => `shape Greeting\n  text: string\n${shape}\ncomponent App\n  resource greeting = greeting("x") as shape Greeting\n  view\n    text greeting.text\n`;
   writeFileSync(resolve(dir, 'app.contract'), contract(''));
   writeFileSync(resolve(dir, 'app.ts'), "export const appId = 'com.example.types';\n");
   const exact = (...args) => spawnSync(process.execPath, [resolve(import.meta.dir, 'exact.mjs'), ...args], { cwd: dir, encoding: 'utf8', timeout: 600_000 });
-  const build = () => exact('contract', 'build', 'app.contract', '--json');
+  const build = () => exact('contract', 'build', 'app.contract');
+  const json = () => exact('contract', 'build', 'app.contract', '--json');
   const types = resolve(dir, 'app.contract.d.ts');
-  let r = build();
+  let r = json();
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout.trim(), '[]', 'the build\'s reply stays JSON');
+  assert.equal(r.stdout, '[]\n', 'the build\'s reply is one JSON value');
+  assert.equal(r.stderr, '', 'and the whole of it');
+  assert.ok(existsSync(resolve(dir, 'app.contract.d.ts')), 'written all the same');
+  rmSync(resolve(dir, 'app.contract.d.ts'));
+  r = build();
+  assert.equal(r.status, 0, r.stderr);
   assert.match(r.stderr, /^app\.contract\.d\.ts: written \(the types app\.ts imports\)$/m);
   assert.equal(readFileSync(types, 'utf8'), exact('contract', 'types', 'app.contract').stdout, 'what contract types prints');
   const written = statSync(types).mtimeMs;
@@ -730,4 +751,128 @@ test('contract build regenerates app.contract.d.ts when a signature changed, and
   assert.match(readFileSync(types, 'utf8'), /"count"/);
   writeFileSync(resolve(dir, 'other.contract'), contract(''));
   assert.doesNotMatch(exact('contract', 'build', 'other.contract').stderr, /app\.contract\.d\.ts/);
+  // In an app's directory (an app.json beside it) the build type-checks app.ts as every host's build does,
+  // its report on stderr, or under `--json` in the array; outside one (above) it does not.
+  writeFileSync(resolve(dir, 'app.contract'), contract(''));
+  writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Types', app: { id: 'com.example.types', name: 'Types' } }));
+  writeFileSync(resolve(dir, 'app.ts'), "export const appId: number = 'com.example.types';\n");
+  r = build();
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /app\.ts\(1,14\): error TS2322/);
+  r = json();
+  assert.equal(r.status, 1, r.stderr);
+  assert.equal(r.stderr, '');
+  // One diagnostic per TypeScript error (the fixture's app.ts also lacks the exports the entry reads).
+  const error = JSON.parse(r.stdout).find((d) => d.file === 'app.ts');
+  assert.deepEqual({ ...error, message: undefined }, { id: 'typescript-TS2322', severity: 'error', message: undefined, file: 'app.ts', line: 1, col: 14, end_col: 14, related: [] });
+  assert.match(error.message, /not assignable to type 'number'/);
 }), 600_000); // The first call may compile the compiler.
+
+// `exact.mjs docs <words>`: the section that holds the words as whole words, most densely, first; printed from its
+// heading when the heading is on the words, else from the paragraph that mentions them. A word may start with `-`.
+test('docs prints the section on its words first, matching whole words', () => {
+  const root = resolve(import.meta.dir, '..');
+  const first = (...words) => {
+    const r = spawnSync(process.execPath, [resolve(root, 'scripts/exact.mjs'), 'docs', ...words], { cwd: root, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    const [where, ...text] = r.stdout.split('\n');
+    return { where, text: text.slice(0, 40).join('\n') };
+  };
+  for (const [words, file, shows] of [
+    [['exit', 'animation'], 'docs/recipes/motion.md', /-exact-exit-animation/],
+    [['-exact-exit-animation'], 'docs/recipes/motion.md', /-exact-exit-animation/],
+    [['call'], 'docs/recipes/native-module.md', /func call/],
+    [['later'], 'docs/recipes/native-module.md', /func later/],
+    [['screenshot'], 'docs/recipes/ios-driving.md', /screenshot\s+\.exact\/x\.png compare/],
+    [['scheme', 'fixed'], 'docs/recipes/theme.md', /scheme=fixed/],
+    [['tabular', 'numbers'], 'docs/contract-for-agents.md', /^### Tabular numbers/],
+    [['grant'], 'docs/recipes/files-and-grants.md', /^# Recipe: files, SQLite and grants/],
+    [['sheet'], 'docs/recipes/navigation-stack.md', /Cancel\/Save sheet/],
+    [['sheets'], 'docs/recipes/navigation-stack.md', /Cancel\/Save sheet/],
+    // A whole word: `logs` is the driver's op, not "catalogs".
+    [['logs'], 'docs/contract-for-agents.md', /^The driver has ten operations[^]*`logs`/],
+    [['colours'], 'docs/recipes/theme.md', /^# Recipe: theme: colours/],
+    // A heading that alone holds the word prints from the heading.
+    [['accessibility'], 'docs/contract-for-agents.md', /^### Native views: accessibility\n+\S/],
+    [['optimistic'], 'docs/contract-for-agents.md', /^### Optimistic writes: the overlay\n+\S/],
+    // What an agent porting an iOS app types. A piece of a longer hyphenated name is not the word (`fonts` is not
+    // `font-variant-numeric`), a plural never stems onto a type keyword (`strings` is app.json's key, not `: string`),
+    // and a query's own section (TOPICS) comes first however it says the words ("dark mode": light and dark).
+    [['fonts'], 'docs/recipes/app-json.md', /a `font` block's/],
+    [['strings'], 'docs/recipes/app-json.md', /`strings` \(string\s+tables\)/],
+    [['push'], 'docs/recipes/navigation-stack.md', /^routes nav$/m],
+    [['deploy'], 'docs/recipes/porting-and-release.md', /Name the port when you make it/],
+    [['haptics'], 'docs/start-here.md', /haptic\("selection"\)/],
+    [['glass'], 'docs/contract-for-agents.md', /glass/],
+    [['detent'], 'docs/contract-for-agents.md', /detent/],
+    [['tab', 'bar'], 'docs/recipes/tabs.md', /tab bar/],
+    [['back', 'button'], 'docs/recipes/navigation-stack.md', /UIKit's Back/],
+    [['search'], 'docs/recipes/list-rows.md', /search/],
+    [['menu'], 'docs/recipes/list-rows.md', /menu/],
+    [['swipe'], 'docs/recipes/list-rows.md', /swipe/],
+    [['list'], 'docs/recipes/list-rows.md', /^# Recipe: list rows/],
+    [['safe', 'area'], 'docs/contract-grammar.md', /safe area/],
+    [['keyboard'], 'docs/recipes/keyboard-and-focus.md', /^# Recipe: the keyboard and focus/],
+    [['dark', 'mode'], 'docs/recipes/theme.md', /follows light, dark/],
+    [['image'], 'docs/recipes/app-json.md', /image "assets\/logo.png"/],
+    [['svg'], 'docs/recipes/symbols.md', /SVG/i],
+    [['animation'], 'docs/recipes/motion.md', /animation/],
+    [['transition'], 'docs/recipes/motion.md', /transition/],
+    [['timer'], 'docs/recipes/timers.md', /^# Recipe: timers/],
+    [['storage'], 'docs/recipes/files-and-grants.md', /storage/],
+    [['share'], 'docs/contract-grammar.md', /`share`/],
+    [['MIDI'], 'docs/contract-grammar.md', /exactMIDI/],
+    // A table of contents names every section's words and is no section's answer.
+    [['sound', 'midi', 'and', 'media'], 'docs/contract-for-agents.md', /^### Sound, MIDI and media/],
+    // A CSS name's words together are the phrase, though its pieces alone are not the words.
+    [['text', 'overflow'], 'docs/agent-pitfalls.md', /text-overflow/],
+    [['background', 'color'], 'docs/recipes/theme.md', /background-color/],
+  ]) {
+    const { where, text } = first(...words);
+    assert.ok(where.startsWith(`${file}:`), `docs ${words.join(' ')}: ${where}`);
+    assert.match(text, shows, `docs ${words.join(' ')} prints from the lines that hold them:\n${text}`);
+  }
+});
+
+
+test.skipIf(!tools)('release keeps Mac widget entitlements, including the provisioned app group (LLP 1126.001 WP16)', async () => {
+  const { macWidgetEntitlements } = await import('../host/apple/widgets.mjs');
+  inDir(dir => {
+    const bundle = resolve(dir, 'Widget.app'), extension = resolve(bundle, 'Contents/PlugIns/ExactWidgets.appex');
+    const app = { id: 'dev.exact.widget', manifest: {} }, team = '0123456789';
+    const run = (command, args, input) => { const r = spawnSync(command, args, { encoding: 'utf8', input }); assert.equal(r.status, 0, r.stderr); return r.stdout; };
+    writeFileSync(resolve(dir, 'main.c'), 'int main(void) { return 0; }');
+    for (const [path, id] of [[bundle, app.id], [extension, app.id + '.widgets']]) {
+      mkdirSync(resolve(path, 'Contents/MacOS'), { recursive: true });
+      run('clang', ['-O', resolve(dir, 'main.c'), '-o', resolve(path, 'Contents/MacOS/Fixture')]);
+      writeFileSync(resolve(path, 'Contents/Info.plist'), plistFile({ CFBundleIdentifier: id, CFBundleExecutable: 'Fixture', CFBundlePackageType: path === bundle ? 'APPL' : 'XPC!' }));
+    }
+    const dump = path => JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', '-'], run('codesign', ['-d', '--entitlements', '-', '--xml', path])));
+    for (const provisioned of [false, true]) {
+      const profiles = provisioned ? { app: { prefix: 'PREFIX' }, keychain: 'PREFIX.' + app.id } : null;
+      writeFileSync(resolve(bundle, 'Contents/Info.plist'), plistFile({ CFBundleIdentifier: app.id, CFBundleExecutable: 'Fixture', CFBundlePackageType: 'APPL',
+        ExactAppGroup: team + '.' + app.id + '.widgets', ...(profiles ? { ExactKeychainAccessGroup: profiles.keychain } : {}) }));
+      if (profiles) writeFileSync(resolve(bundle, 'Contents/embedded.provisionprofile'), 'profile presence: this fixture tests signing, not profile authorization');
+      const ent = resolve(dir, 'widget.plist'); writeFileSync(ent, macWidgetEntitlements({ app, team, profiles, extension: true }));
+      run('codesign', ['--force', '--sign', '-', '--entitlements', ent, extension]);
+      const before = dump(extension);
+      signRelease(bundle, { compat: { reach: { entitlements: ['com.apple.security.device.audio-input'] } }, manifest: {}, identity: '-', id: app.id, scratch: dir, timestamp: ['--timestamp=none'] });
+      assert.deepEqual(dump(extension), before);
+      const own = dump(bundle);
+      assert.deepEqual(own['com.apple.security.application-groups'], [team + '.' + app.id + '.widgets']);
+      assert.equal(own['com.apple.security.device.audio-input'], true);
+      assert.equal(own['com.apple.security.app-sandbox'], undefined);
+      assert.equal(own['com.apple.security.network.client'], undefined);
+      assert.equal(own['com.apple.application-identifier'], profiles?.keychain);
+      assert.deepEqual(own['keychain-access-groups'], profiles ? [profiles.keychain] : undefined);
+      run('codesign', ['--verify', '--deep', '--strict', bundle]);
+    }
+  });
+}, 60000);
+
+test('setup refuses the removed game warmup flag before provisioning', () => {
+  const result=spawnSync(process.execPath,[resolve(import.meta.dir,'exact.mjs'),'setup','--game'],{encoding:'utf8'});
+  assert.notEqual(result.status,0);
+  assert.match(result.stderr,/Usage: exact setup \[--check\]/);
+  assert.doesNotMatch(result.stdout,/warming|cargo fetch|rustup toolchain install/);
+});

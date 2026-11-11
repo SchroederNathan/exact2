@@ -1,32 +1,25 @@
 // Real DOM geometry and deterministic feedback admission; no app data/network.
 import { beforeAll, afterAll, test as bunTest, expect } from 'bun:test';
-import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { Cdp } from '../../scripts/agent.mjs';
-import { chromium } from '../../scripts/agent-launch.mjs';
+import { readFileSync } from 'node:fs';
+import { cdpBrowser, chromium } from '../../scripts/agent-launch.mjs';
 import { collectionBytes } from './collection-glue.js';
 import { motionBytes } from './motion-glue.js';
 import { need } from '../../scripts/coverage.mjs';
 
-const { executable: chrome, unavailable } = chromium();
+const { unavailable } = chromium();
 const test = need('chrome', unavailable, { test: bunTest });
-let server, child, cdp, evaluate, protocol, dir;
+let server, suite, cdp, evaluate, protocol;
 beforeAll(async () => {
   if (unavailable) return;
-  dir = mkdtempSync(join(tmpdir(), 'exact-collection-'));
   server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch(req) {
     const path = new URL(req.url).pathname;
     return new Response(['/collection-glue.js', '/motion-glue.js'].includes(path) ? readFileSync(new URL('.' + path, import.meta.url)) : '<!doctype html><body><main id="root"></main>', {
       headers: { 'content-type': new URL(req.url).pathname.endsWith('.js') ? 'text/javascript' : 'text/html' },
     });
   }});
-  child = spawn(chrome, ['--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--disable-background-networking', `--user-data-dir=${dir}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
-  cdp = new Cdp(child.stdio[3], child.stdio[4]);
-  child.on('exit', () => cdp.fail('Chrome closed'));
-  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
-  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+  suite = await cdpBrowser();
+  ({ cdp } = suite);
+  const { sessionId } = await suite.page();
   const call = (method, params) => cdp.send(method, params, sessionId);
   protocol = call;
   evaluate = async expression => {
@@ -39,9 +32,8 @@ beforeAll(async () => {
   await evaluate(`(${setup})()`);
 }, 60_000); // hang bounds: Chrome's launch and exit are awaited as events, and take longer than 5 s under load
 afterAll(async () => {
-  if (child && child.exitCode === null) { const exit = new Promise(r => child.once('exit', r)); child.kill(); await exit; }
+  await suite?.close();
   server?.stop(true);
-  if (dir) rmSync(dir, { recursive: true, force: true });
 }, 60_000);
 function setup() {
   globalThis.fixture = (options = {}) => {
@@ -1493,4 +1485,15 @@ test('Chrome: no inline-axis anchoring, a block-axis control anchors; a re-inser
     strip.scrollLeft=350; await ${frames(2)}; const parent=strip.parentNode, next=strip.nextSibling; strip.remove(); parent.insertBefore(strip,next);
     await ${frames(2)}; return {inline,block,reinserted:strip.scrollLeft}; })()`);
   expect(result).toEqual({ inline: 1000, block: 1300, reinserted: 0 });
+});
+test('a list offset the controller moves owes its scroll event until the browser fires it, and the agent\'s settle waits for it', async () => {
+  // A correction's offset (a landing at the end, as scroll-start="end" makes one); then a reader's handler that jumps again, whose scroll stays owed; then nothing.
+  // The reader's listener is the page's, there before the list's own (as an authored `scroll=` is).
+  const r = await evaluate(`(async () => { const f=fixture({own:true}); let armed=false, jumped=null, seen=0; f.port.addEventListener('scroll', () => { if (armed) seen++; if (armed && jumped === null) { f.controller.jump(1, 400, 'scrollTop'); jumped=f.controller.owedScrolls(); } });
+    f.controller.commit([f.snapshot()]); f.flush(); await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+    const idle=f.controller.owedScrolls(); f.controller.commit([f.snapshot('2',{correction:{scrollSequence:'0',offset:200}})]); const owed=f.controller.owedScrolls(), first=await f.controller.fireOwedScrolls();
+    armed=true; f.controller.jump(1, 300, 'scrollTop');
+    const second=await f.controller.fireOwedScrolls(); return {idle,owed,first,jumped,second,seen,none:await f.controller.fireOwedScrolls()}; })()`);
+  // Both events the reader is owed (300's, and its own jump's to 400) ran before the wait ended.
+  expect(r).toEqual({ idle: 0, owed: 1, first: { fired: true, owed: 0 }, jumped: 1, second: { fired: true, owed: 0 }, seen: 2, none: { fired: false, owed: 0 } });
 });

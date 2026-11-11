@@ -5,7 +5,7 @@
 **Systems:** Kernel (a top layer; the popover's box anchored to its invoker), Contract (HTML popover and dialog declarations), Web host (the Popover API by identity), Apple host (menu-shaped popovers presented as UIMenu/NSMenu), Linux host (a kernel-painted top layer), Agent API (no ninth operation), Weird Castle (the account switcher, first consumer)
 **Author:** Claude (Fable 5) for Charlie Cheever
 **Date:** 2026-08-30
-**Revision:** §5.1, 2026-10-05 (Claude, Opus 5.5): the long-press context menu earned back, with its preview and commit, for the Signal clone's chat list (Charlie's approval). §5.2, 2026-10-07 (Claude, Opus 5.5): submenus earned back for the T3 Code clone's row menus (#141), with `position-area="right span-bottom"`.
+**Revision:** §5.1, 2026-10-05 (Claude, Opus 5.5): the long-press context menu earned back, with its preview and commit, for the Signal clone's chat list (Charlie's approval). §5.2, 2026-10-07 (Claude, Opus 5.5): submenus earned back for the T3 Code clone's row menus (#141), with `position-area="right span-bottom"`. §5.3.1, 2026-10-22 (Claude, Opus 5.5): the menu bar's own items — app-wide enablement, `about` and `none`, eleven more removal ids, View's zoom — for the T3 Code clone's app-owned menu code. §5.3.2, 2026-10-23 (Claude, Opus 5.5): the declared menu bar on Windows, a painted Fluent row (Charlie's admission of Windows). D2, 2026-10-28 (Claude, Opus 5.5): a popover at its authored `left`/`top`, and the press's `clientX`/`clientY`, for the T3 Code clone's menus that open at the click ("At the press point", below). §5.3.3, 2026-10-28 (Claude, Opus 5.5): File ▸ Close Window's chord, `-exact-menu-keys`. §5.1, 2026-10-28 (Claude, Opus 5.5): a keyboard or VoiceOver menu request no node answers gets the menu a right-click there would show, on macOS.
 **Related:** LLP 1017 §8.1 (literal HTML/CSS names, no aliases — the rule that names every row here), LLP 1001 (where a deviation from the bare element is declared), LLP 1008 (host state that never enters the plan — scroll offset — and the native text field, the one native control so far), LLP 1012 (the eight operations; `tap` is a journal entry into the runner, never OS input), LLP 1014 (the canvas capture the top layer sits outside of), LLP 1018 (the `EXACT_AGENT` presentation-swap precedent: `MemoryStore` for the keychain), weird-castle e644c82 (the hand-rolled switcher overlay this replaces). Platform record: the HTML Popover API and invoker attributes; the WAI-ARIA menu pattern; Apple HIG "Menus" and "Pull-down buttons"; `UIMenu`/`UIButton.menu`/`showsMenuAsPrimaryAction` (iOS 14+), `NSMenu` (macOS).
 
 ## 1. Summary
@@ -119,7 +119,9 @@ and one tag join the table (LLP 1017 §8.1; every name is the HTML one):
 The kernel lays the popover subtree out on every commit regardless of
 visibility — a hidden layer, anchored: top-left at the invoker's
 bottom-left by default, sized by content. Authored `position-area` and
-`position-try-fallbacks` follow the placement amendment below. The host shows
+`position-try-fallbacks` follow the placement amendment below; an authored
+`left` or `top`, with no authored `position-area`, places the popover at that
+viewport point instead ("At the press point", below). The host shows
 and hides it; opening is **no relayout**, the instant-menu
 property, and the same discipline as scroll offset (LLP 1008: host state,
 never plan state). Light dismiss, the one-auto-popover rule, and Escape
@@ -155,6 +157,15 @@ Open state remains the host's;
 only a declared handler dispatches. There is no cancelable `beforetoggle`
 action or `interestfor` admission. Desktop/headless Linux still has no
 popover presentation; the windowed host uses LLP 1115.001 D10's shapes.
+
+**Removing the attribute (2026-10-19).** `popover` also takes an optional
+string, so `popover=(expanded ? some("manual") : none)` adds and removes the
+attribute on one mounted node. `none` clears the property through the
+runner's existing `ClearProp` lifecycle, as HTML's `removeAttribute("popover")`
+does: an open popover is hidden (HTML, "The popover attribute", attribute
+change steps) and the node returns to inline layout in its parent. Its subtree
+stays mounted, an iframe's document included. An empty string still declares
+a popover. No other property accepts an optional value.
 
 Declared deviation (LLP 1001's ledger): a bare `[popover]` on the web is
 a *centered* fixed box (`inset:0; margin:auto`). v1's popovers are
@@ -543,17 +554,30 @@ agent's taps need no host activation here. `ChooserMacTests` is the
 evidence; `<dialog>` stays the session's modal top layer on macOS.
 
 **Flip fallbacks (Charlie, 2026-10-08; implementation slice: Codex,
-2026-10-13).** This amends D2's unconditional clamp and §5's no-flip scope.
+2026-10-13; `flip-start` and the overflow shift: Claude, 2026-10-18).** This amends D2's unconditional clamp and §5's no-flip scope.
 Invoker popovers may name ordered CSS `position-try-fallbacks`: try the base
 area, then each fallback against the viewport; keep the current option when
 none fits (the base on a fresh opening).
 The author chooses the list. There is no unconditional clamp on an edge-aligned
 area. CSS's `anchor-center` still shifts a centred axis into the viewport.
 The margin box decides fit, and flips exchange the corresponding margins.
+When no option fits, the box is shifted into its overflow limit rect, the
+containing block together with the area it was given (CSS Anchor Positioning
+§4.1, CSS Box Alignment §4.4.1.2). A popover with no authored position is the
+UA's `position: fixed`, held in the window. An authored position computes to
+absolute in the top layer; its containing block is the page's scrollable one,
+which grows toward the end edges, so only the page's start edges hold it (top,
+and left, or right in a right-to-left document). Chrome 155 does both. A native
+menu's launch point is not shifted: AppKit fits the menu on screen.
 See [CSS Anchor Positioning §6.1 and §6.5](https://drafts.csswg.org/css-anchor-position-1/#position-try-fallbacks).
 
-The first slice implements `none`, `flip-block`, `flip-inline` and their
-combinations in a comma-separated list, on the web and painted Apple layers.
+The implementation admits `none`, `flip-block`, `flip-inline`, `flip-start`
+and their combinations in a comma-separated list, on the web and painted Apple
+layers. An attempt's flips apply in the order written, since `flip-start`
+(mirroring across the diagonal from the start-start corner, so top and left
+exchange places, as do bottom and right, in area and margins; top and right in
+a right-to-left document) does not commute with the others. CSS's `flip-start` also exchanges `width` and `height`; the native
+layers place the laid-out size, which agrees when the two are equal.
 These native layers use horizontal writing mode; physical top/bottom/left/right
 areas include the opposite-side spans and corners. An authored fallback row on
 a non-menu macOS popover selects the painted layer so AppKit cannot replace
@@ -562,9 +586,11 @@ switches presentation without closing the popover or losing its focused control
 and text selection. Native menus and confirmations retain
 the platform's placement. A fitting choice survives resize and invoker movement;
 changing the area, fallback list, margins or size clears it. An overflowing choice tries the list
-again, preserving the current option if none fits. `flip-start`, logical areas,
-area-dependent sizing,
-nonzero insets and non-default self-alignment, full scroll-offset bookkeeping,
+again, preserving the current option if none fits. Logical areas, `flip-x`,
+`flip-y`, area-dependent sizing,
+nonzero insets alongside an authored area (CSS lets the area win and the
+insets offset the box in its cell; without an area, an authored `left` or
+`top` places it: "At the press point", below) and non-default self-alignment, full scroll-offset bookkeeping,
 and general Linux popover presentation remain outside this slice. `anchor-name`,
 `position-anchor`, named `@position-try` rules and `position-visibility` are
 not admitted by this work.
@@ -643,6 +669,55 @@ with its bottom at the invoker's top, the menu, whose `margin-bottom=12`
 crosses the Apple encoder, 12 points above it (measured on iOS: bottom
 665, invoker top 677; in Chrome: 789 and 801; macOS was driven before the
 margin was added).
+
+**At the press point (2026-10-28).** A menu can open where it was clicked,
+as Electron's `Menu.popup({x, y})` opens one and as `NSMenu` pops one up at a
+point. The T3 Code clone needs it: its New thread button shows a project's
+members at the click, and a file link with no other action shows its menu
+there. A page without Electron writes this with the web's names: the press's
+`MouseEvent` gives the point, and the popover's `left` and `top` place it.
+
+```text
+action openMembers(e: MouseEvent)
+  pointed = e.clientX != 0 or e.clientY != 0
+  x = e.clientX
+  y = e.clientY
+  showPopover("members", source="new-thread")
+column id="members" popover="auto" role="menu" left=(pointed ? `${x}px` : "auto") top=(pointed ? `${y}px` : "auto") margin=0
+```
+
+A press's `MouseEvent` carries `clientX` and `clientY`, from the viewport's
+top-left in CSS px (`frame()`'s space, as a `PointerEvent`'s, LLP 1094 D11).
+A press from the keyboard or an assistive technology is at 0, 0, as the
+`click` Chrome dispatches for one is; a page tests for that and leaves the
+insets `auto`, so the menu opens at its invoker. A native button's click or
+tap carries its point as any node's does (on the Mac, the press AppKit's
+button tracked; on iOS, the touch that lifted). An agent's `tap` is a
+pointer's press at its point.
+
+A popover whose author wrote `left` or `top`, and no `position-area`, is placed
+by them, not by its invoker: its border box's top-left at the inset past its
+margin, as CSS places a fixed box; an axis with no inset is at its margin.
+Where its author also wrote a `position-area`, CSS lets the area win, the
+insets offsetting the box in its cell; every host then places it by the area
+against its invoker, as before. The press itself is the platform's
+presentation at a point (§5.1):
+
+| Host | placed |
+|---|---|
+| Web (both targets), neutral look | `position-area: none`; the base option is the authored insets, and where it does not fit it opens up or toward the start from the point (`--exact-inset-start`, `-up`, `-up-start`, as a context menu's fallbacks; `navigation.js` leaves the insets on it as `--exact-inset-x`, `-y` while open, and again as they change; insets written away while it is open, or a `position-area` added, return it to its invoker). An authored `position-try-fallbacks` replaces these flips, and `none` turns them off. An authored `right` or `bottom` leaves the popover to plain CSS: no point is kept. |
+| Web, the shell's look (LLP 1116 D1) | plain CSS: the user agent's `[popover] { inset: 0; margin: auto }` stays, so the author writes `margin=0` (and `right`, `bottom` `auto`) for the box to sit at the point, as on a page without Exact |
+| macOS, menu-shaped | an `NSMenu` popped up with its top-left at the point (`popUp(positioning:at:in:)`); AppKit keeps it on screen |
+| macOS, any other | AppKit's `NSPopover`, pointed at a 1×1 rectangle at the point in the window's content view (the viewport's point, wherever its invoker is or scrolls), as a hand-built app points one at a click; a key's press (no insets) points it at its invoker, the same popover. Only an authored `position-try-fallbacks` keeps it painted, as before; there, and under the agent's chrome, it goes to the point, the other way from it on an axis without room, held in the window where neither way fits (`PositionArea.at`) |
+| macOS, toolbar items, segments, sidebar rows | their presses carry no point (0, 0): a toolbar item's pull-down hangs from its item, as AppKit's does, and the others are controls AppKit tracks |
+| iOS, painted (the agent's lift) | as the Mac's painted layer |
+| iOS, `UIMenu` and sheets | declared: attached to the invoker. No public API presents a pull-down `UIMenu` at an arbitrary point (`UIEditMenuInteraction` presents the edit menu at one, which is another menu), and the HIG's pull-down buttons hang their menus from the button. |
+| Linux and Windows (windowed), Android | the context menu's path at the point: the shell menu hangs from it, the neutral surface is held in the window (`area::at_point`). Each pointer path (a click, a finger's activation, a row of the shell's menu) carries its own point; a header item the shell's bar draws carries none, its popover hanging from the item |
+| Terminal | at its insets, as every top-layer box there (`Kernel::top_layer_origin`) |
+
+The native hosts read a popover's `left` and `top` only; they ignore its
+`right` and `bottom`. The kernel lays the popover out in the viewport's
+block, as one with no area.
 
 **D3 — menu-shaped popovers may present natively.** A popover whose
 children are exclusively `button` rows (each with optional
@@ -932,6 +1007,17 @@ skipped. A Mac's context menu has no preview, and the HIG offers none. A
 picked item presses as the menu closes, once, by the button menu's rules (no
 invoker to recheck). `isMenuShaped` ignores the preview row.
 
+**Over an open popover (2026-10-22).** A node inside an open popover asks
+for its menu without closing that popover: the menu nests in it, as HTML's
+popover stack nests a popover shown with a source inside an open one (HTML,
+"topmost popover ancestor"). Chrome, Firefox and WebKit keep the outer
+popover open under the context menu and after it closes
+(`host/web/tests/context-popover.test.mjs`). macOS had closed every open
+popover before popping up the menu; it now closes only the auto popovers
+above the nearest one holding the node, leaving a manual one open as HTML
+does, and the agent's painted menu on iOS does the same. UIKit's own context menu closes nothing. Implementer: Claude,
+2026-10-22.
+
 **Web (both targets).** The node's `contextpopover` attribute is wired
 (`rt.js` `cp`, `glue.js`). Its `contextmenu` prevents the browser's menu,
 and after the node's own action the popover opens with
@@ -994,8 +1080,21 @@ on a preview as the commit, as QUEUE's reaction-picker note found, so
 the Signal message menu's reaction bar is not a preview, and stays
 authored (a reaction bar beside the menu is its own work). A preview for a node that does not name a
 popover. macOS's preview (none exists). Linux's popover presentation. The
-keyboard route to a context menu (Shift+F10, the context-menu key; QUEUE's
-"Keyboard access to a message's context menu"). Compile-time checks: a
+keyboard route to a context menu outside Apple hosts (Shift+F10, the
+context-menu key; QUEUE's "Keyboard access to a message's context menu").
+On macOS the key and VoiceOver's show menu take the authored path (#314,
+#486). Since 2026-10-28 (Claude, Opus 5.5) a request no node answers gets the
+menu a right-click at the same point would show, as Chrome's own menu follows
+a `contextmenu` nothing prevented: the menu of the view drawn there or of the
+first view above it with one (selected text's, which keeps its selection),
+else the session's view and the responders past it, which hear a secondary
+click's press and release. With nothing focused and text selected, the key
+opens at the left edge of the selection's first line, halfway down it, as
+Blink's `ShowNonLocatedContextMenu` places it. Show menu is offered where an
+authored node answers or a view there holds selected text or a menu; a node
+only a responder past the session's view answers is not offered, and AppKit's
+accessibility server performs show menu there all the same when another
+process asks (measured on macOS 27.2). Compile-time checks: a
 literal `contextPopover` naming no popover, or two `contextPreview` rows,
 is not refused by the compiler. iOS logs both at the press, macOS logs a
 missing popover, and the web logs neither.
@@ -1171,11 +1270,13 @@ This adds a presentation of the existing button, never a new action:
 `disabled`/inert disable it, hidden or removed buttons leave the menu, and
 the existing agent `tap` reaches its button. Standard menus and Develop in
 development builds remain. AppKit menu objects, not their titles, identify
-destinations, so changing the display language does not change placement.
+destinations, so changing the display language does not change placement. §5.3.1 adds `about` and `none`, app-wide enablement and
+more removal ids.
 
 Declared platform deviation: CSS/HTML have no application menu. Web (both
-targets), UIKit (including iPadOS), Linux, Windows, Android and the terminal
+targets), UIKit (including iPadOS), Linux, Android and the terminal
 ignore this presentation hint and keep the ordinary button and shortcuts.
+Windows presents it as a menu row (§5.3.2).
 No layout, visibility, keyboard or accessibility defaults change there.
 The web emits no DOM attributes for either menu hint.
 
@@ -1202,12 +1303,157 @@ values and declarations below a root fail with `lower-menu-remove`, naming the
 whole accepted set. The view has one root node, as elsewhere in Contract. This
 removes menu affordances, not window capabilities or app-declared buttons.
 There is no Format menu in this host's standard bar; no speculative Format ids
-are accepted. The other standard items, Help and development Develop remain.
+are accepted. The other standard items, Help and development Develop remain
+(§5.3.1 adds ids for Go ▸ Back, Develop, Edit's template items, Help's book
+item and View's zoom).
 
 AppKit identifies commands by their selectors and AutoFill by the installed
 item's identifier (`_NSMenuItemAutoFillIdentifier`, observed on macOS 27.0.1), never
 by localized titles. Selected items are hidden with hidden key equivalents
-disallowed, including items AppKit inserts after installation or on update.
+disallowed, including items AppKit inserts after installation or on update;
+since §5.3.1 the host's menus also take their chords out of the key lookup,
+because AppKit sends a hidden item's chord whatever that flag says.
 The host retains the objects so removing the declaration restores them; each
 window installs its own session's menu when it becomes key. Other hosts ignore
 this macOS-only presentation hint, just as they ignore `-exact-menu`.
+
+### 5.3.1 The menu bar's own items (2026-10-22)
+
+Implementer: Claude (Opus 5.5), 2026-10-22. Consumer: the T3 Code clone,
+whose `T3Menus.swift`, `T3MenuBar.swift` and `T3LatinChords.swift` laid these
+over the host's bar. Each is measured against a hand-built AppKit app and
+against T3 Code's own Electron bar (`DesktopApplicationMenu.ts`); every other
+host still ignores both hints.
+
+**App-wide items.** An item in the application menu or Help (`about`, `app`,
+`help`, and the ⌘, item filed as Settings…) is the app's, not its window's:
+it is enabled whatever window is key, with no window key at all, under a
+sheet, and under a Contract modal dialog (not inside a route behind a modal
+route, which is the route's own inertness; an app-modal panel, which
+`NSApp.runModal` shows, disables them as AppKit disables every item whose
+target does not work when modal), as a hand-built app's Settings… and
+Sparkle's Check for Updates… are, and as Electron's are. Its chord works then
+too. `disabled` and an authored `inert` still disable it; inertness that a
+modal dialog lends the rest of the page does not, as a page's modal never
+reaches a browser's menu. Every other item keeps the rule above: its window
+key, no sheet, nothing modal over it.
+
+**`about` and `none`.** `-exact-menu="about"` places the item directly under
+About, before its separator, where apps that update themselves put Check for
+Updates… (Sparkle's convention; T3 Code's darwin template). `app` keeps its
+place after that separator, with Settings…. `-exact-menu="none"` shows no item:
+the chord stays a shortcut, as a hidden key equivalent, and a host item with
+that chord keeps its place without it rather than stepping aside for an item
+nobody sees. This is the author's word for a shortcut the platform would
+otherwise list; author over platform (LLP 1115).
+
+**More removal ids.** `back` (Go ▸ Back; Go hides when it has nothing shown),
+`forward` (Go ▸ Forward, LLP 1115.000 D5.5, 2026-11-01),
+`develop` (the Develop menu of a development build), `paste-and-match-style`,
+`find`, `spelling-and-grammar`, `substitutions`, `transformations` (Edit's
+template items, LLP 1115 D8; a removed submenu's items are removed with it,
+and an app command that would stand in inside Find follows Select All), `app-help` (Help ▸ *App* Help; AppKit's search
+field stays), and `actual-size`, `zoom-in`, `zoom-out` below. The host finds
+its own submenus and Develop by item identifiers it sets, the rest by action,
+never by title. `develop` takes the menu off the bar and leaves its chords:
+Save Trace's ⌥⌘T is a Mac build's one way to write a trace (LLP 1079 D5), and
+an app command still claims any Develop chord it declares, as before.
+`NSMenu.performKeyEquivalent` sends a hidden item's chord whatever its
+`allowsKeyEquivalentWhenHidden` says, in a submenu or not (measured on macOS
+26.6), so the host's menus take every removed item's chord out of their
+lookup while they look a key up, the twelve ids of §5.3 included.
+
+**View's zoom.** View holds Actual Size ⌘0, Zoom In ⌘+ and Zoom Out ⌘-, above
+Show Sidebar and Enter Full Screen, as Safari's and Preview's View does and as
+Electron's default menu does. AppKit sends ⌘= and ⇧⌘= to the ⌘+ item itself
+(measured with posted HID events), so the ⌘+ item answers a keyboard's three;
+an event built without the layout's characters (the agent's) misses it, so a
+hidden ⌘= item answers that one. The steps are Safari's page zoom
+levels (50, 75, 85, 100, 115, 125, 150, 175, 200, 250, 300%); T3 Code's are
+Electron's half levels (1.2^0.5, about 110%), a difference of step only. The
+zoom is the main window's session's (the key window's, or the window under a
+key panel, as AppKit sends a nil-targeted action), kept across a reload and not across a
+launch, and the runner applies it last: the root font size, the app's own
+`setRootFontSize` included, times the zoom (`Runner::set_root_font_zoom`,
+`exact_set_root_font_zoom`), as a browser's page zoom is over an author's
+`html { font-size }`. Declared deviation: a browser's zoom scales `px`
+lengths too; this one scales what follows the root size and leaves `px`
+and the platform's controls. The items are in every Mac app's View, as in
+Safari's and Electron's; an app that sizes in `px` alone removes them. An
+app's own ⌘0, ⌘= or ⌘- command stands in for the host's item, as Edit's do.
+
+**Not built, because the platform already does it.** Standard items under a
+non-Latin input source: under Korean 2-Set a real ⌘ chord's `characters` is
+the key's Latin letter (`charactersIgnoringModifiers` alone is Hangul), and
+AppKit matches Quit, Copy, Minimize, ⌃⌘F and the rest by it in a hand-built
+app and in this host alike (measured on macOS 26.6.2 with posted HID events).
+The physical-key fallback of #110 stays for app commands, whose matching is
+the host's. A held ⌘Q: a root `key` handler that prevents ⌘Q's default hears
+its press, auto-repeats and `keyup` before the menu does, and `close()` ends a
+one-window app, so the hold is the app's, as Chrome's Warn Before Quitting is
+Chrome's; Quit chosen with the pointer stays immediate.
+
+### 5.3.2 The menu bar on Windows (2026-10-23)
+
+Charlie admitted it with Windows at full speed (`rules/DEFERRED.md`, 2026-10-23);
+LLP 1115.004 D10.6 is the Windows side and its stage after S1 builds it.
+Implementer: Claude (Opus 5.5). Not built yet.
+
+An app that declares at least one `-exact-menu` item gets a menu row under the
+title bar, painted as WinUI's `MenuBar`, as Windows 11's Notepad and Paint show
+File, Edit and View ([menus and menu bars](https://learn.microsoft.com/en-us/windows/apps/develop/ui/controls/menus)).
+Its menus are LLP 1115.004 D10.1's flyouts. Alt and F10 move focus into the row,
+Alt shows the access keys, the arrows move among menus and items, and Escape
+returns focus where it was; UI Automation sees a MenuBar. An app that declares
+none gets no row: Windows apps commonly have none, so nothing is synthesized.
+
+| `-exact-menu` | On Windows |
+|---|---|
+| `file`, `edit`, `view`, `go`, `help` | the menu of that name, in declaration order, with `disabled` and the removal ids where Windows has the item |
+| `app` | File, above Exit; Windows has no application menu |
+| `about` | Help, last |
+| `window` | Window, with the authored items only, and no menu when there are none: the caption buttons, Snap and the system menu (Alt+Space) carry the rest |
+| `none` | no item; the chord stays |
+
+File ends with Exit, which ends the app as Quit does on the Mac. The menus show
+the chords that work on Windows: an item's declared `Control` chord, never a
+`Meta` one, which on Windows is the Windows key (LLP 1115.004 D9.6). §5.3.1's
+app-wide items hold, except under a modal dialog, which disables the row as a
+Windows owner window's modality does.
+
+### 5.3.3 Close Window's chord (2026-10-28)
+
+Implementer: Claude (Opus 5.5), 2026-10-28. Consumer: the T3 Code clone. Its
+original's File ▸ Close Window (Electron's `close` role) has no accelerator on
+macOS, so ⌘W reaches the page, which closes a sidebar tab or does nothing
+(`apps/desktop/src/window/DesktopApplicationMenu.ts`, T3 Code `a86c05f977`).
+
+On a top-level root, `-exact-menu-keys` takes a whitespace-separated literal
+list of `id=chord` pairs. Its one id is `close-window`, File ▸ Close Window,
+built with ⌘W: `close-window=none` keeps the item in its place with no chord,
+and `close-window=Meta+Shift+W` gives it ⇧⌘W, as Safari and Chrome give it
+beside their ⌘W Close Tab. The chord is one `aria-keyshortcuts` chord. It
+must hold `Meta`: that is a choice, not AppKit's rule (AppKit accepts a key
+equivalent without ⌘), made because every chord in the host's bar holds ⌘ and a chord without ⌘
+would reach the menu before a field's typing. It may not be one of the host's
+own or the system's standard chords (⌘Q, ⌘W, ⌘H, ⌘M, ⌘-comma, Edit's, View's,
+Develop's, ⌘Tab, ⌘Space and the like), nor the same keystroke spelled with
+Shift (`Meta+Shift+;` is ⌘:), which would take that chord from its item or
+never reach the app. Function keys are spelled `F1` to
+`F35`, as the host's shortcuts parse them (`ShortcutsMac.swift`, `Shortcut`).
+Another id, an id named twice, a chord without `Meta`, a standard chord,
+expressions and non-root use fail with `lower-menu-keys`.
+
+An app command that declares the same chord still takes it from the item
+(§5.3), and the item gets the declared chord back once no command claims it;
+a command's ⌘W takes nothing from a Close Window declared `none`. Removing
+the declaration gives the item ⌘W again.
+
+With nothing holding ⌘W, AppKit's File ▸ Close All (⌥⌘W), which it adds
+itself as Close Window's alternate, no longer pairs with an item and shows as
+a row of its own. The original's File menu has no Close All, so an app that
+removes ⌘W should also declare `-exact-menu-remove="close-all"`, as the clone
+does; the host does not remove it on its own.
+
+Other hosts ignore the hint: the web has no menu bar, and Windows' row
+(§5.3.2) builds no Close Window.

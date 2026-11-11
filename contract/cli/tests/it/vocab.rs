@@ -17,6 +17,68 @@ fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
 
+/// An event record an arity refusal names (`ScrollEvent`) and a grammar word
+/// a recipe answers (`sequence`, `keyframes`) are one lookup each: euxy ports
+/// 19 and 20 grepped the guides for them.
+#[test]
+fn event_records_and_recipe_words_answer_in_one_lookup() {
+    let out = stdout(&vocab(&["ScrollEvent", "sequence", "keyframes"]));
+    assert!(
+        out.contains(
+            "ScrollEvent: an event record, its fields scrollLeft: number, scrollTop: number"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("\n  `scroll=act` calls `action act(scrollLeft: number, scrollTop: number)`"),
+        "{out}"
+    );
+    assert!(
+        out.contains("sequence: the recipe docs/recipes/sequencer.md"),
+        "{out}"
+    );
+    assert!(
+        out.contains("keyframes: the recipe docs/recipes/motion.md"),
+        "{out}"
+    );
+    let json: Value =
+        serde_json::from_str(&stdout(&vocab(&["--json", "MIDIMessageEvent"]))).unwrap();
+    assert_eq!(
+        json["event"]["handlers"][0]["name"], "midimessage",
+        "{json}"
+    );
+    assert_eq!(json["event"]["fields"][1]["name"], "data", "{json}");
+}
+
+/// A handler's entry leads with the action it calls (the euxy port guessed
+/// `scroll=` passed one `ScrollEvent`; `moved(x, y)` was a later bullet).
+#[test]
+fn a_handler_leads_with_the_action_it_calls() {
+    let out = stdout(&vocab(&["scroll"]));
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines.iter().position(|l| *l == "scroll: handler attribute");
+    let next = at.and_then(|i| lines.get(i + 1)).copied().unwrap_or("");
+    assert_eq!(
+        next,
+        "  `scroll=act` calls `action act(scrollLeft: number, scrollTop: number)`, or `action act(scrollLeft: number, scrollTop: number, event: ScrollEvent)` for its `ScrollEvent`",
+        "{out}"
+    );
+    let out = stdout(&vocab(&["press"]));
+    assert!(
+        out.contains("`press=act` calls `action act`, or `action act(event: MouseEvent)`"),
+        "{out}"
+    );
+    let json: Value = serde_json::from_str(&stdout(&vocab(&["--json", "scroll"]))).unwrap();
+    assert!(
+        json.to_string()
+            .contains("`scroll=act` calls `action act(scrollLeft: number, scrollTop: number)`"),
+        "{json}"
+    );
+    // A record that depends on the element (a field's `InputEvent`) is no one signature.
+    let out = stdout(&vocab(&["selectionchange"]));
+    assert!(!out.contains("`selectionchange=act` calls"), "{out}");
+}
+
 /// LLP 1116.009 D6: a builder guessed a colour role (tip-splitter), so a colour property's entry lists the roles it takes:
 /// Exact's, written `-exact-<role>`, and CSS's system colours by name; a property that is not a colour lists none.
 #[test]
@@ -77,6 +139,39 @@ fn appearance_vocab_explains_authored_bars() {
         .as_str()
         .unwrap()
         .contains("root tablist"));
+}
+
+/// `color-scheme` says what each value does and that the app's scheme is
+/// `setScheme`'s; `exactMIDI` that `sent` lists only what went out (both
+/// asked by the euxy port, 2026-10-20).
+#[test]
+fn color_scheme_and_exact_midi_say_what_a_port_asked() {
+    let out = stdout(&vocab(&["color-scheme"]));
+    assert!(
+        out.contains("`normal`, `light dark` and `only` are refused"),
+        "{out}"
+    );
+    assert!(
+        out.contains("setScheme(\"system\" | \"light\" | \"dark\")"),
+        "{out}"
+    );
+    let out = stdout(&vocab(&["exactMIDI"]));
+    assert!(out.contains("`sent` never lists it"), "{out}");
+    let out = stdout(&vocab(&["navigate"]));
+    assert!(out.contains("type <root> euxy://p/abc"), "{out}");
+}
+
+/// `range` is a standard function (2026-10-17) and, on the web, a slider's
+/// `type`: its entry says both.
+#[test]
+fn range_is_the_function_and_names_the_slider() {
+    let out = stdout(&vocab(&["range"]));
+    assert!(out.contains("range: standard function"), "{out}");
+    assert!(out.contains("`range(4)` is `[0, 1, 2, 3]`"), "{out}");
+    assert!(out.contains("a slider is `input type=\"range\""), "{out}");
+    let doc: Value = serde_json::from_str(&stdout(&vocab(&["--json", "range"]))).unwrap();
+    let means = doc["function"]["means"].as_str().unwrap_or_default();
+    assert!(means.contains("input type=\"range\""), "{doc}");
 }
 
 #[test]
@@ -239,6 +334,10 @@ fn json_lists_everything_and_one_entry() {
 #[test]
 fn contextual_attributes_are_refused_elsewhere() {
     let cases = [
+        ("datetime", "view", "datetime=0"),
+        ("format", "view", "format=\"relative\""),
+        ("start", "view", "start=0"),
+        ("end", "view", "end=1"),
         ("sandbox", "view", "sandbox=\"allow-scripts\""),
         ("src", "view", "src=\"https://example.com\""),
         ("load", "view", "load=done"),
@@ -247,7 +346,7 @@ fn contextual_attributes_are_refused_elsewhere() {
         ("reachstart", "view", "reachstart=done"),
         ("reachend", "view", "reachend=done"),
         ("text-transform", "input", "text-transform=\"uppercase\""),
-        ("transform", "view", "transform=\"scale(0.8)\""),
+        ("transform", "view", "transform=\"skewX(10deg)\""),
         ("selectionchange", "view", "selectionchange=done"),
         ("beforeinput", "view", "beforeinput=done"),
         ("name", "view", "name=\"station\""),
@@ -265,6 +364,33 @@ fn contextual_attributes_are_refused_elsewhere() {
         ("stop", "view", "stop=done"),
         ("seekbackwardOffset", "view", "seekbackwardOffset=15"),
         ("seekforwardOffset", "view", "seekforwardOffset=15"),
+        ("colspan", "view", "colspan=2"),
+        ("rowspan", "view", "rowspan=2"),
+        ("scope", "view", "scope=\"col\""),
+        ("partition", "view", "partition=\"persist:work\""),
+        ("zoom", "view", "zoom=1.5"),
+        ("currententrychange", "view", "currententrychange=done"),
+        ("navigatesuccess", "view", "navigatesuccess=done"),
+        ("navigateerror", "view", "navigateerror=done"),
+        ("newwindow", "view", "newwindow=done"),
+        ("download", "view", "download=done"),
+        ("capture", "view", "capture=done"),
+        ("userpromptopened", "view", "userpromptopened=done"),
+        (
+            "apple.allowsBackForwardNavigationGestures",
+            "view",
+            "apple.allowsBackForwardNavigationGestures=true",
+        ),
+        (
+            "apple.allowsMagnification",
+            "view",
+            "apple.allowsMagnification=true",
+        ),
+        (
+            "apple.inactiveSchedulingPolicy",
+            "view",
+            "apple.inactiveSchedulingPolicy=\"throttle\"",
+        ),
     ];
     let listed: Vec<&str> = contract_lower::vocab::CONTEXTUAL
         .iter()
@@ -388,8 +514,8 @@ fn a_name_that_is_an_attribute_and_a_function_shows_both() {
 #[test]
 fn a_function_the_web_has_and_contract_refuses_says_what_to_write() {
     for (name, says) in [
-        ("sort", "name the order where the view reads it"),
-        ("sortBy", "name the order where the view reads it"),
+        ("sort", "write `sortBy(xs, x => x.name)`"),
+        ("toSorted", "name the order where the view reads it"),
         ("pow", "`x * x` is a square"),
         ("now", "performanceNow()"),
         ("padStart", "pad in the data module"),
@@ -433,6 +559,11 @@ fn the_functions_are_listed_and_in_the_json() {
             .count(),
         count
     );
+    // `sortBy`'s roster row is its lowered call; vocab shows what an author writes.
+    let sort = "sortBy(list, (item, index) => key[, \"asc\" | \"desc\"]) -> list";
+    assert!(all.contains(&format!("  {sort}\n")), "{all}");
+    let one: Value = serde_json::from_str(&stdout(&vocab(&["--json", "sortBy"]))).unwrap();
+    assert_eq!(one["function"]["signature"], sort, "{one}");
     let one: Value = serde_json::from_str(&stdout(&vocab(&["--json", "formatDate"]))).unwrap();
     assert_eq!(one["function"]["kind"], "standard function");
     assert!(one["function"]["rules"][0]["example"]
@@ -594,7 +725,7 @@ fn no_name_prints_the_card_and_all_prints_every_table() {
         "persist",
         "negative `min` gives the pad its ± key",
         "symbol roles: back close",
-        "idioms, whole with their code",
+        "idioms with code",
     ] {
         assert!(card.contains(want), "{want} missing:\n{card}");
     }
@@ -706,11 +837,6 @@ fn every_content_part_ends_with_one_working_call() {
                     .map(|e| format!("{part}: [{}] {}", e.id, e.message)),
             );
         }
-        let warnings = if *part == "RoundButton" {
-            super::text_px_width::without_round_button_widths(warnings)
-        } else {
-            warnings
-        };
         failures.extend(
             warnings
                 .iter()
@@ -808,6 +934,7 @@ fn every_concepts_code_compiles_and_its_names_are_its_own() {
         "loading",
         "plural",
         "choice",
+        "select",
         "screen",
         "modal",
         "confirm",
@@ -830,6 +957,10 @@ fn every_concepts_code_compiles_and_its_names_are_its_own() {
         "menu",
         "menubar",
         "::placeholder",
+        "glass",
+        "haptics",
+        "toast",
+        "var",
     ] {
         let one: Value = serde_json::from_str(&stdout(&vocab(&["--json", name]))).unwrap();
         let blocks = one["concept"]["contract"].as_array().unwrap();
@@ -852,7 +983,7 @@ fn every_concepts_code_compiles_and_its_names_are_its_own() {
 
 #[test]
 fn menu_bar_attributes_explain_the_fixed_removal_ids() {
-    for name in ["-exact-menu", "-exact-menu-remove"] {
+    for name in ["-exact-menu", "-exact-menu-remove", "-exact-menu-keys"] {
         let out = stdout(&vocab(&[name]));
         for part in [
             "menubar (a concept)",
@@ -914,6 +1045,9 @@ fn text_width_vocabulary_names_the_accessibility_warning_and_rem_repair() {
         let out = stdout(&vocab(&[name]));
         assert!(
             out.contains("lower-text-px-width")
+                && out.contains("fixed ceiling")
+                && out.contains("max-width=\"3rem\"")
+                && out.contains("width and its bounds")
                 && out.contains("rem")
                 && out.contains("Apple")
                 && out.contains("web controls inherit")
@@ -939,7 +1073,272 @@ fn wakelock_says_its_two_words_and_where_it_holds() {
         "\"none\"",
         "display: none",
         "state.wakelock",
+        "expect wakelock held",
+        "expect wakelock released",
+        "not whether the OS or browser granted it",
     ] {
         assert!(text.contains(want), "{want}: {text}");
+    }
+}
+
+#[test]
+fn orientationlock_says_its_words_and_which_lock_holds() {
+    let out = vocab(&["orientationlock"]);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    for want in [
+        "prop",
+        "\"landscape-secondary\"",
+        "\"current\"",
+        "\"none\"",
+        "topmost sheet",
+        "manifest's `orientation`",
+        "state.orientationlock",
+    ] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+}
+
+/// LLP 1116.021 D1: a recipe's name answers with the whole recipe, in its
+/// place among the other names, so a screen's lookups are one call; a recipe
+/// two names reach prints once, and a pattern's name says what it has and
+/// how to write it.
+#[test]
+fn a_recipe_name_prints_the_recipe_in_its_place() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs");
+    let form = std::fs::read_to_string(format!("{root}/recipes/grouped-form.md")).unwrap();
+    let out = stdout(&vocab(&[
+        "swipe",
+        "grouped-form",
+        "persist",
+        "recipes/grouped-form.md",
+    ]));
+    let at = |needle: &str| {
+        out.find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing:\n{out}"))
+    };
+    assert!(at("swipe (a concept)") < at(&form) && at(&form) < at("persist (a concept)"));
+    assert_eq!(out.matches(form.as_str()).count(), 1, "{out}");
+    assert!(
+        out.contains("recipes/grouped-form.md: the recipe `grouped-form`, above"),
+        "{out}"
+    );
+    assert!(!out.contains("native module"), "{out}");
+    let out = stdout(&vocab(&["tabs"]));
+    assert!(
+        out.contains("# Recipe: tabs") && out.contains("bun exact.mjs pattern tabs"),
+        "{out}"
+    );
+    let docs: Value =
+        serde_json::from_str(&stdout(&vocab(&["--json", "grouped-form", "one-screen"]))).unwrap();
+    assert_eq!(docs[0]["recipe"]["text"], form.as_str());
+    assert_eq!(
+        docs[1]["pattern"]["write"],
+        "bun exact.mjs pattern one-screen"
+    );
+    let output = vocab(&["tabz"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("try `contract vocab tabs` (a recipe)"));
+}
+
+/// LLP 1116.021, round 20: a builder's missed lookup sent them to the long
+/// guides, so a miss names what it is written as and the recipes, patterns and
+/// concepts named like it, and the grammar's `state` and the segmented
+/// control's `segment` answer outright.
+#[test]
+fn a_miss_points_at_what_it_means() {
+    let refused = |name: &str| {
+        let output = vocab(&[name]);
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        String::from_utf8(output.stderr).unwrap()
+    };
+    let err = refused("shuffle");
+    assert!(
+        err.contains("try `contract vocab random-and-shuffle` (a recipe)"),
+        "{err}"
+    );
+    // `random` is a refused idiom, whose refusal names the recipe's section.
+    let err = refused("random");
+    assert!(err.contains("docs/recipes/random-rolls.md"), "{err}");
+    assert!(refused("dates").contains("`contract vocab date` (a concept)"));
+    assert!(refused("storage").contains("`contract vocab persist` (a concept)"));
+    assert!(refused("checkbox").contains("`input type=\"checkbox\""));
+    assert!(refused("strikethrough").contains("`text-decoration=\"line-through\"`"));
+    assert!(!refused("month").contains("try"));
+    assert!(stdout(&vocab(&["segment"])).contains("choice (a concept)"));
+    assert!(stdout(&vocab(&["state"])).contains("action (a concept)"));
+    // What a miss names is itself an answer.
+    let named = refused("checkbox") + &refused("strikethrough") + &refused("shuffle");
+    for name in ["input", "text-decoration", "random-and-shuffle"] {
+        assert!(named.contains(&format!("contract vocab {name}`")));
+        stdout(&vocab(&[name]));
+    }
+}
+
+/// LLP 1116.021 D3: a symbol the compiler refuses points to `contract vocab
+/// symbol`, which lists the roles.
+#[test]
+fn symbol_lists_the_roles() {
+    let out = stdout(&vocab(&["symbol"]));
+    assert!(
+        out.contains("symbol: tag")
+            && out.contains("`symbol:<role>`")
+            && out.contains("settings")
+            && out.contains("symbol:sf/<name>"),
+        "{out}"
+    );
+    let json: Value = serde_json::from_str(&stdout(&vocab(&["--json", "symbol"]))).unwrap();
+    assert!(json["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r == "settings"));
+    let refused = |source: &str| {
+        contract::compile(&format!("component App\n  view\n    image \"{source}\"\n"))
+            .unwrap_err()
+            .to_string()
+    };
+    let error = refused("symbol:gearsh");
+    assert!(
+        error.contains("symbol `gearsh` is not a role; `contract vocab symbol` lists the roles")
+            && !error.contains("microphone"),
+        "{error}"
+    );
+    let error = refused("symbol:settins");
+    assert!(error.contains("did you mean `symbol:settings`?"), "{error}");
+}
+
+/// An empty `symbol:` name is no symbol, as an empty `sf/` one is: a
+/// computed source whose caller passes "" under its own `if` builds, and
+/// draws only the other caller's (LLP 1121 stage 9 H, theme2 02:15).
+#[test]
+fn an_empty_symbol_name_is_no_symbol() {
+    struct NoData;
+    impl exact_runner::DataSource for NoData {
+        fn query(
+            &mut self,
+            source: &str,
+            _: &[exact_runner::Value],
+        ) -> Result<exact_runner::Value, exact_runner::DataError> {
+            Err(exact_runner::DataError::UnknownSource(source.into()))
+        }
+    }
+    let src = "component App\n  view\n    column testId=\"root\"\n      Row(symbol=\"\")\n      Row(symbol=\"close\")\n\ncomponent Row\n  props\n    symbol: string\n  view\n    row\n      if symbol != \"\"\n        image `symbol:${symbol}`\n      text \"a\"\n";
+    let plan = contract::compile(src).unwrap_or_else(|e| panic!("{e}"));
+    let plan = contract::bake(plan, NoData).unwrap();
+    let r = exact_runner::Runner::boot(
+        plan,
+        NoData,
+        exact_kernel::Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let k = r.kernel();
+    let (mut images, mut stack) = (
+        Vec::new(),
+        vec![k.node_by_key(k.find_by_test_id("root")[0]).unwrap().id],
+    );
+    while let Some(id) = stack.pop() {
+        let node = k.node(id).unwrap();
+        stack.extend(node.children());
+        if node.node_type == exact_kernel::NodeType::Image {
+            images.push(
+                node.props
+                    .str(exact_kernel::PropId::ImageSource)
+                    .unwrap_or("")
+                    .to_owned(),
+            );
+        }
+    }
+    assert_eq!(images, ["symbol:close"]);
+    // Written alone, it builds; the kernel gives it no Apple name and no
+    // path, as it gives an empty `sf/` one.
+    assert!(contract::compile("component App\n  view\n    image \"symbol:\"\n").is_ok());
+    assert_eq!(exact_kernel::apple_symbol_name(""), "");
+    assert!(exact_kernel::symbol_path("").is_none());
+    // A grouped row led by one is a standard cell with no symbol, as one led
+    // by an empty `sf/` is (Astra's and Grok's round 1).
+    let rows = |lead: &str| {
+        let src = format!("component App\n  action go\n  view\n    column testId=\"root\" width=402 height=874\n      list appearance=\"auto\" testId=\"list\" flex=1\n        section\n          button press=go\n            image \"{lead}\"\n            text \"Reply\"\n");
+        let plan = contract::bake(contract::compile(&src).unwrap(), NoData).unwrap();
+        let mut r = exact_runner::Runner::boot(
+            plan,
+            NoData,
+            exact_kernel::Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        let k = r.kernel_mut();
+        let root = k.node_by_key(k.find_by_test_id("root")[0]).unwrap().id;
+        k.compute_layout(root, exact_kernel::Offer::definite(402.0, 874.0))
+            .unwrap();
+        let k = r.kernel();
+        let list = k.node_by_key(k.find_by_test_id("list")[0]).unwrap().id;
+        let row = &k.grouped_list(list).unwrap().sections[0].rows[0];
+        (row.custom, row.symbol.clone(), row.title.clone())
+    };
+    assert_eq!(rows("symbol:"), rows("symbol:sf/"));
+    assert_eq!(
+        rows("symbol:"),
+        (false, Some(String::new()), Some("Reply".into()))
+    );
+}
+
+/// Every recipe and pattern under `docs/` answers by its name: the lists
+/// `contract vocab` embeds are the directories'.
+#[test]
+fn every_recipe_and_pattern_answers_by_name() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs");
+    let mut recipes = 0;
+    for entry in std::fs::read_dir(format!("{root}/recipes")).unwrap() {
+        let path = entry.unwrap().path();
+        let file = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let Some(name) = file.strip_suffix(".md") else {
+            continue;
+        };
+        let out = stdout(&vocab(&[name]));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains(&text), "{name}: add it to vocab/recipes.rs");
+        recipes += 1;
+    }
+    assert!(recipes > 20, "{recipes} recipes");
+    for entry in std::fs::read_dir(format!("{root}/patterns")).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        let out = stdout(&vocab(&[&name]));
+        assert!(
+            out.contains(&format!("`bun exact.mjs pattern {name}`")),
+            "{name}: add it to vocab/recipes.rs"
+        );
+    }
+}
+
+/// An `iframe`'s `name` is HTML's frame name (the design tool names its
+/// live copies by it, LLP 1122 T7), written as the frame's own prop; on the
+/// other tags this checks it is still refused (a native button, which
+/// returns earlier, predates this).
+#[test]
+fn an_iframe_takes_a_frame_name() {
+    let source = "component App\n  view\n    iframe name=\"exact-copy-1\" src=\"https://example.com\" sandbox=\"allow-scripts\"\n";
+    let plan = contract::compile(source).expect("an iframe's name compiles");
+    assert!(
+        format!("{plan:?}").contains("exact-copy-1"),
+        "the name is the frame's prop"
+    );
+    for refused in [
+        "text \"a\" name=\"x\"",
+        "view name=\"x\"",
+        "image src=\"a.png\" name=\"x\"",
+        "input type=\"checkbox\" name=\"x\"",
+    ] {
+        let error =
+            contract::compile(&format!("component App\n  view\n    {refused}\n")).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("lower-attr-tag"),
+            "{refused}: {error:?}"
+        );
     }
 }

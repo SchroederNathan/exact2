@@ -80,6 +80,9 @@ internal class Requests(private val activity: ExactActivity) {
                     KEEP_SCREEN_ON -> view?.keepScreenOn = words[body] != 0
                     PICK -> pick(id, words, body)
                     HATCH -> activity.hatches()?.told(words, body, i)
+                    MODULE -> Extensions.call(id, string(words, body).first)
+                    PRESENCE -> Presence.check(string(words, body).first)
+                    ORIENTATION -> orientation.told(words, body)
                 }
             } catch (e: RuntimeException) {
                 // The platform refused (no activity to start from, a full clipboard transaction): the app goes on.
@@ -88,6 +91,9 @@ internal class Requests(private val activity: ExactActivity) {
             }
         }
     }
+
+    /** The session's orientation lock (LLP 1133.029 D6), on this activity. */
+    private val orientation = Orientation(activity) { w, at -> string(w, at) }
 
     /** The string at [at]: its bytes' count, then UTF-8 padded to whole words. And the index after it. */
     private fun string(w: IntArray, at: Int): Pair<String, Int> {
@@ -143,6 +149,8 @@ internal class Requests(private val activity: ExactActivity) {
         val intent = when (uri.scheme?.lowercase()) {
             "mailto" -> Intent(Intent.ACTION_SENDTO, uri)
             "tel" -> Intent(Intent.ACTION_DIAL, uri)
+            // The app's page in Settings (LLP 1133.002 D11), where its permissions are.
+            "app-settings" -> Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", activity.packageName, null))
             else -> Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE)
         }
         try { activity.startActivity(intent) } catch (e: ActivityNotFoundException) { Log.w(TAG, "no app opens $url") }
@@ -167,8 +175,8 @@ internal class Requests(private val activity: ExactActivity) {
             3, 6 -> HapticFeedbackConstants.VIRTUAL_KEY
             4 -> HapticFeedbackConstants.LONG_PRESS
             5 -> HapticFeedbackConstants.TEXT_HANDLE_MOVE
-            7 -> HapticFeedbackConstants.CONFIRM
-            8, 9 -> HapticFeedbackConstants.REJECT
+            7 -> if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.CONFIRM else Legacy.haptic(kind)
+            8, 9 -> if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.REJECT else Legacy.haptic(kind)
             else -> return
         }
         val played = view?.performHapticFeedback(c)
@@ -239,6 +247,9 @@ internal class Requests(private val activity: ExactActivity) {
         const val KEEP_SCREEN_ON = 8
         const val PICK = 9
         const val HATCH = 10
+        const val MODULE = 11
+        const val PRESENCE = 12
+        const val ORIENTATION = 13
         /** How long after the activity is in front again a share sheet's choice is still waited for. */
         const val DISMISSED_MS = 500L
     }

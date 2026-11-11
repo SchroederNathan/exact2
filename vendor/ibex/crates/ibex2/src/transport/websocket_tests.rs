@@ -42,10 +42,20 @@ fn frame(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// One client frame, unmasked: (fin, opcode, payload), or `None` at the end.
-fn client_frame(s: &mut impl Read) -> Option<(bool, u8, Vec<u8>)> {
+/// One client frame, unmasked: (fin, opcode, payload), or `None` at a clean
+/// end of stream. Read failures remain errors so the peer can report whether a
+/// missing frame was an EOF, reset, or timeout.
+fn read_client_frame(s: &mut impl Read) -> std::io::Result<Option<(bool, u8, Vec<u8>)>> {
     let mut head = [0u8; 2];
-    s.read_exact(&mut head).ok()?;
+    loop {
+        match s.read(&mut head[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    s.read_exact(&mut head[1..])?;
     assert_eq!(head[0] & 0x70, 0, "client frames do not set RSV bits");
     assert!(head[1] & 0x80 != 0, "a client frame is masked");
     let fin = head[0] & 0x80 != 0;
@@ -58,21 +68,26 @@ fn client_frame(s: &mut impl Read) -> Option<(bool, u8, Vec<u8>)> {
     let len = match encoded_len {
         126 => {
             let mut bytes = [0u8; 2];
-            s.read_exact(&mut bytes).ok()?;
+            s.read_exact(&mut bytes)?;
             let len = u16::from_be_bytes(bytes) as usize;
             assert!(len >= 126, "client frame length is not minimally encoded");
             len
         }
         127 => {
             let mut bytes = [0u8; 8];
-            s.read_exact(&mut bytes).ok()?;
+            s.read_exact(&mut bytes)?;
             let len = u64::from_be_bytes(bytes);
             assert!(
                 len >= 65_536,
                 "client frame length is not minimally encoded"
             );
             assert_eq!(len >> 63, 0, "client frame length sets the reserved bit");
-            usize::try_from(len).ok()?
+            usize::try_from(len).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "client frame length exceeds usize",
+                )
+            })?
         }
         len => len as usize,
     };
@@ -85,13 +100,17 @@ fn client_frame(s: &mut impl Read) -> Option<(bool, u8, Vec<u8>)> {
         );
     }
     let mut mask = [0u8; 4];
-    s.read_exact(&mut mask).ok()?;
+    s.read_exact(&mut mask)?;
     let mut payload = vec![0u8; len];
-    s.read_exact(&mut payload).ok()?;
+    s.read_exact(&mut payload)?;
     for (i, b) in payload.iter_mut().enumerate() {
         *b ^= mask[i % 4];
     }
-    Some((fin, opcode, payload))
+    Ok(Some((fin, opcode, payload)))
+}
+
+fn client_frame(s: &mut impl Read) -> Option<(bool, u8, Vec<u8>)> {
+    read_client_frame(s).ok().flatten()
 }
 
 #[derive(Default)]
@@ -235,7 +254,16 @@ fn serve(mut s: TcpStream, saw: Sender<String>) {
         std::thread::sleep(Duration::from_millis(100));
     }
     let mut message: Option<(u8, Vec<u8>)> = None;
-    while let Some((fin, opcode, payload)) = client_frame(&mut s) {
+    let mut read_error = None;
+    loop {
+        let (fin, opcode, payload) = match read_client_frame(&mut s) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        };
         if matches!(opcode, 1 | 2) {
             message = Some((opcode, Vec::new()));
         }
@@ -280,6 +308,9 @@ fn serve(mut s: TcpStream, saw: Sender<String>) {
             }
             break;
         }
+    }
+    if let Some(error) = read_error {
+        let _ = saw.send(format!("{path} read-error {:?}: {error}", error.kind()));
     }
     let _ = saw.send(format!("{path} gone"));
 }
@@ -513,10 +544,11 @@ pub(crate) fn conversation(transport: &dyn SocketTransport) {
             reason
         } if reason.is_empty()
     ));
-    assert!(matches!(
-        wait(&seen).as_str(),
-        "/echo opcode 8" | "/echo close 1000 "
-    ));
+    let report = wait(&seen);
+    assert!(
+        matches!(report.as_str(), "/echo opcode 8" | "/echo close 1000 "),
+        "the peer observed {report:?} instead of the client's Close frame"
+    );
     assert_eq!(wait(&seen), "/echo gone");
 
     // Race sends with a peer-initiated close. Frames accepted before the peer
@@ -1353,7 +1385,16 @@ fn assert_stall_deadline(secure: bool, flood_pongs: bool) {
             &AbortSignal::default(),
         )
         .unwrap();
+    let sender = socket.sender().expect("the portable socket has a sender");
     socket.send_binary(&vec![5u8; LARGE_SEND]).unwrap();
+    if !flood_pongs {
+        wait_for_kernel_backpressure(&observer);
+        assert_eq!(
+            sender.buffered_messages(),
+            1,
+            "the active portable message remains counted until it reaches the network"
+        );
+    }
     let error = socket
         .next()
         .expect_err("the client's no-progress deadline must fail the socket");
@@ -1615,6 +1656,35 @@ fn an_idle_connection_blocks_without_periodic_wakeups() {
         "an idle pump returned from readiness without a command or socket event"
     );
     drop(socket);
+}
+
+#[test]
+fn an_idle_pending_receive_blocks_without_writable_wakeups() {
+    let (port, peer) = idle_peer_for_exit_test();
+    let observer = Arc::new(PumpObserver::default());
+    let transport = TcpSocketTransport::with_pump_observer(observer.clone());
+    let controller = AbortController::new();
+    let mut socket = open_on(&transport, port, "/idle-receive", &controller.signal()).unwrap();
+    let receive = std::thread::spawn(move || socket.next());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !observer.receiving.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    // A negative observation over an idle interval, as for the idle socket
+    // above, now with an outstanding receive and no peer traffic.
+    std::thread::sleep(Duration::from_millis(50));
+    let before = observer.returns.load(Ordering::Acquire);
+    std::thread::sleep(Duration::from_millis(150));
+    let after = observer.returns.load(Ordering::Acquire);
+    let receiving = observer.receiving.load(Ordering::Acquire);
+    controller.abort();
+    assert!(receive.join().unwrap().is_err());
+    peer.join().unwrap();
+    assert!(receiving, "the pump never accepted the receive");
+    assert_eq!(
+        after, before,
+        "an idle receive repeatedly woke on an empty write queue"
+    );
 }
 
 #[cfg(test)]
@@ -2103,4 +2173,41 @@ fn a_connect_answer_follows_the_http_1_grammar() {
             String::from_utf8_lossy(malformed)
         );
     }
+}
+
+#[test]
+fn an_abort_while_the_socket_name_is_still_resolving_returns_at_once() {
+    // As a hung resolver: the lookup is held, and the abort returns the
+    // connect without waiting for it (`lookup`).
+    use super::super::lookup::gate::Gate;
+    let controller = AbortController::new();
+    let signal = controller.signal();
+    let (gated, gate) = channel();
+    let (done, connected) = channel();
+    std::thread::spawn(move || {
+        gated.send(Gate::hold_here()).unwrap();
+        let url = url::Url::parse("ws://resolving.invalid/").unwrap();
+        let result = TcpSocketTransport::new()
+            .connect(&url, 1024, &signal)
+            .map(|_| ());
+        let _ = done.send(result);
+    });
+    let gate = super::super::lookup::gate::Opens(gate.recv().unwrap());
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while gate.0.waiting() == 0 {
+        assert!(std::time::Instant::now() < end, "the lookup never began");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let aborted = std::time::Instant::now();
+    controller.abort();
+    let result = connected
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("returned at the abort");
+    let error = result.unwrap_err().to_string();
+    assert!(
+        aborted.elapsed() < std::time::Duration::from_millis(500),
+        "returned at the abort"
+    );
+    assert!(error.contains("abort"), "{error}");
+    drop(gate);
 }

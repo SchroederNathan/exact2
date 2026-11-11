@@ -62,10 +62,17 @@ impl<D: DataSource> Runner<D> {
     /// reason: it keeps what it shows and is not asked again until `refresh`.
     pub(super) fn give_up(&mut self, owed: &[usize], why: &RunnerError) {
         for &i in owed {
+            self.inspect_request(i);
             self.failed_args[i] = self.resources[i].as_ref().map(|s| s.args.clone());
-            self.failed_why[i] = Some(Failure::error(format!(
+            let failure = Failure::error(format!(
                 "the commit that asked it again was refused: {why:?}"
-            )));
+            ));
+            self.count_failure(i);
+            self.alert(super::lines::failed_now(
+                self.plan.str(self.plan.resources[i].name),
+                &failure.message,
+            ));
+            self.failed_why[i] = Some(failure);
             self.awaiting[i] = false;
             self.refresh_next.retain(|r| *r != i);
             // An older ask still in flight would answer over the failure
@@ -84,7 +91,133 @@ impl<D: DataSource> Runner<D> {
             // completion, so its ticket is let go and, if ordered, the host's
             // fence lifts once it has (a host would otherwise wait on it).
             self.background.refusal = Some((ticket, reason, ordered));
+        } else if self.is_tool(ticket) {
+            self.refuse_tool(ticket, reason, ordered);
+        } else if self.is_module_work(ticket) {
+            self.refuse_module_work(ticket, reason, ordered);
         }
+    }
+
+    /// Hear the fetches the app aborted (after each module turn the runner
+    /// makes, and when a host collects them, [`Runner::collect_aborts`]), and
+    /// match each to the request it names.
+    pub(super) fn hear_aborted(&mut self) {
+        for fetch in self.data.take_aborted() {
+            self.heard_aborts.push((fetch, 0));
+        }
+        self.match_aborts();
+    }
+
+    /// Each heard abort, by the request it names: the pending one whose
+    /// fetch is that module ticket, so a later reply or re-ask of the same
+    /// target is another request; else one let go that may still run. One
+    /// that names neither yet waits for its request to be enqueued.
+    pub(super) fn match_aborts(&mut self) {
+        let pending = &self.pending;
+        let module_aborts = &mut self.module_aborts;
+        let retired = &mut self.retired_fetches;
+        let kept = &self.module_work.fetches;
+        self.heard_aborts.retain(|&(fetch, _)| {
+            let named = pending
+                .iter()
+                .find(|p| p.fetch == Some(fetch) && p.continuation.is_none() && p.stream.is_none());
+            // A request a newer send replaced still runs (a write is let
+            // run), so the host cancels it. Whether an answer is owed is the
+            // pump's to say (`take_aborted_answer`), from what is pending
+            // then: a refused commit may have put it back.
+            // A let-go write kept as module work (LLP 1146 D2) is named
+            // for as long as it runs, past the retired records' cap.
+            let ticket = match named {
+                Some(p) => p.ticket,
+                None => match kept.get(&fetch) {
+                    Some(&ticket) => ticket,
+                    None => match retired.iter().position(|r| r.0 == fetch) {
+                        Some(pos) => retired.remove(pos).1,
+                        None => return true,
+                    },
+                },
+            };
+            if !module_aborts.contains(&ticket) {
+                module_aborts.push(ticket);
+            }
+            false
+        });
+    }
+
+    /// Collect the module's aborted fetches now: a host calls this after the
+    /// turns it ran itself (a dispatched continuation, released work, a
+    /// let-go), then wakes a pump while [`Runner::has_module_aborts`]. A heard
+    /// abort whose request never comes is let go after 64 collections, and at
+    /// most 64 wait.
+    pub fn collect_aborts(&mut self) {
+        self.hear_aborted();
+        for heard in &mut self.heard_aborts {
+            heard.1 += 1;
+        }
+        self.heard_aborts.retain(|heard| heard.1 <= 64);
+        let over = self.heard_aborts.len().saturating_sub(64);
+        self.heard_aborts.drain(..over);
+    }
+
+    /// A request let go while it may still run (a newer send replaced it),
+    /// kept so the app's abort still cancels it, until its reply comes: at
+    /// most 256, the oldest let go first. Once each: a refused commit puts
+    /// the request back without undoing this, and may retire it again. (A
+    /// native host drops a let-go request's reply, so its record waits for
+    /// the cap; there the app's abort can only come in the turn that
+    /// replaced it, as the prelude settles a let-go call's fetches.)
+    pub(super) fn note_retired(&mut self, p: &super::PendingReq) {
+        let Some(fetch) = p.fetch else { return };
+        if self.retired_fetches.iter().any(|r| r.1 == p.ticket) {
+            return;
+        }
+        if self.retired_fetches.len() == 256 {
+            self.retired_fetches.remove(0);
+        }
+        self.retired_fetches.push((fetch, p.ticket));
+    }
+
+    /// [`Runner::collect_aborts`], then whether a pump is owed for them.
+    pub fn collected_aborts(&mut self) -> bool {
+        self.collect_aborts();
+        self.has_module_aborts()
+    }
+
+    /// Whether an aborted fetch's answer waits for the host's next pump.
+    pub fn has_module_aborts(&self) -> bool {
+        !self.module_aborts.is_empty()
+    }
+
+    /// The tickets answered aborted since the last take: the host cancels
+    /// each request, whatever its method (a running one's transport is
+    /// aborted, a queued one is dropped unsent), as a browser does.
+    pub fn take_explicit_aborts(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.explicit_aborts)
+    }
+
+    /// An aborted fetch's answer: its request, answered aborted now (a host
+    /// with no pump takes it directly, as the web's does). One no longer in
+    /// flight (answered, replaced or let go) has no answer to give, but its
+    /// request is still cancelled: a write the runner let go still runs.
+    pub fn take_aborted_answer(&mut self) -> Option<(u64, Outcome)> {
+        while !self.module_aborts.is_empty() {
+            let ticket = self.module_aborts.remove(0);
+            self.explicit_aborts.push(ticket);
+            // Kept module work is answered aborted too: its cancelled reply
+            // never comes, and the let-go answer's continuation hears this
+            // (LLP 1146 D2) as a browser's aborted fetch rejects.
+            if !self.pending.iter().any(|p| p.ticket == ticket) && !self.is_module_work(ticket) {
+                continue;
+            }
+            return Some((
+                ticket,
+                Outcome::Failed {
+                    kind: FailureKind::Aborted,
+                    message: "the app aborted the fetch".into(),
+                },
+            ));
+        }
+        None
     }
 
     /// Take one refusal for ordinary transactional parsing/settlement. A
@@ -96,6 +229,28 @@ impl<D: DataSource> Runner<D> {
         // reported by the host, rides the same path.
         if let Some(settled) = crate::auth::take_any_settled(self) {
             return Some(settled);
+        }
+        if let Some(aborted) = self.take_aborted_answer() {
+            return Some(aborted);
+        }
+        if let Some((ticket, reason)) = self.module_work_refusal(allow_ordered) {
+            return Some((
+                ticket,
+                Outcome::Failed {
+                    kind: FailureKind::Refused,
+                    message: reason.into(),
+                },
+            ));
+        }
+        if let Some((ticket, reason)) = self.tool_refusal(allow_ordered) {
+            let message = reason.into();
+            return Some((
+                ticket,
+                Outcome::Failed {
+                    kind: FailureKind::Refused,
+                    message,
+                },
+            ));
         }
         let at = self.pending.iter().position(|p| {
             p.refusal
@@ -140,11 +295,11 @@ impl<D: DataSource> Runner<D> {
         target: Target,
         why: Failure,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
-        let (failed_args, ask_again, write) = self
+        let (failed_args, ask_again, write, upload, sent) = self
             .pending
             .iter()
             .find(|p| p.ticket == ticket)
-            .map(|p| (Some(p.args.clone()), p.ask_again, p.write))
+            .map(|p| (Some(p.args.clone()), p.ask_again, p.write, p.upload, p.sent))
             .unwrap_or_default();
         self.pending.retain(|p| p.ticket != ticket);
         self.forgot = true;
@@ -158,8 +313,14 @@ impl<D: DataSource> Runner<D> {
             Target::Resource(i) => {
                 // Keep the standing answer's arguments. Failure suppresses
                 // another ask independently of that answer's store revision.
+                // An upload's failure is never asked again at its arguments,
+                // unless it never reached the network (D10).
+                if upload {
+                    self.upload_over(ticket, sent, super::UploadEnd::Failed(why.clone()));
+                }
                 self.failed_args[i] = failed_args;
                 self.failed_why[i] = Some(why);
+                self.count_failure(i);
                 // Unless a watched topic changed while it was in flight: the
                 // answer may differ now, so it is asked once more, forced
                 // (LLP 1016.002 D4).
@@ -177,7 +338,7 @@ impl<D: DataSource> Runner<D> {
         };
         let what =
             format!("request {ticket} ({name}) failed and is no longer pending: {next}: {reason}");
-        self.log(what.clone());
+        self.alert(what.clone());
         if ask_again {
             self.log(super::lines::asked_again(ticket, &name));
         }
@@ -186,9 +347,12 @@ impl<D: DataSource> Runner<D> {
 
     /// The host must keep later ordered admissions behind these refusals.
     pub fn has_ordered_request_refusals(&self) -> bool {
-        self.background
-            .refusal
-            .is_some_and(|(ticket, _, ordered)| ordered && self.is_background(ticket))
+        self.has_ordered_module_work_refusal()
+            || self.has_ordered_tool_refusal()
+            || self
+                .background
+                .refusal
+                .is_some_and(|(ticket, _, ordered)| ordered && self.is_background(ticket))
             || self
                 .pending
                 .iter()
@@ -197,7 +361,10 @@ impl<D: DataSource> Runner<D> {
 
     /// More refused admissions need a future host pump.
     pub fn has_request_refusals(&self, allow_ordered: bool) -> bool {
-        self.auth.has_settled_for(|t| self.holds(t))
+        !self.module_aborts.is_empty()
+            || self.auth.has_settled_for(|t| self.holds(t))
+            || self.has_module_work_refusal(allow_ordered)
+            || self.has_tool_refusal(allow_ordered)
             || self.background_refusal(allow_ordered).is_some()
             || self.pending.iter().any(|p| {
                 p.refusal
@@ -219,6 +386,7 @@ mod tests {
         deferred: bool,
         write_first: bool,
         shape_refusal: bool,
+        none_reply: bool,
         asks: usize,
         synchronous_effects: usize,
         delivered_writes: usize,
@@ -257,6 +425,7 @@ mod tests {
                     self.delivered_writes += 1;
                     Ok(Answer::Later(Request::get("https://example.test/read")))
                 }
+                Outcome::Response(_) if self.none_reply => Ok(Answer::Now(Value::NONE)),
                 Outcome::Response(_) => Ok(Answer::Now(Value::some(Value::str("fresh")))),
                 Outcome::Failed { .. } if self.shape_refusal => Ok(Answer::Now(Value::NONE)),
                 Outcome::Failed { kind, message } => Err(DataError::Failed(
@@ -311,6 +480,18 @@ mod tests {
         r.refuse_request(ticket, "native executor admission limit reached", true);
         assert!(r.take_request_refusal(false).is_none());
         let (refused, outcome) = r.take_request_refusal(true).unwrap();
+        assert_eq!(refused, ticket);
+        assert!(r.fulfill(ticket, outcome).unwrap().is_some());
+    }
+
+    /// An unordered request's refusal (an independent HTTP request the host would not run): taken in any turn.
+    fn refuse_unordered(r: &mut Runner<Source>, ticket: u64) {
+        r.refuse_request(
+            ticket,
+            "the app's grants do not reach https://example.test",
+            false,
+        );
+        let (refused, outcome) = r.take_request_refusal(false).unwrap();
         assert_eq!(refused, ticket);
         assert!(r.fulfill(ticket, outcome).unwrap().is_some());
     }
@@ -392,6 +573,34 @@ mod tests {
     }
 
     #[test]
+    fn an_unordered_refusal_that_traps_in_a_derive_releases_its_ticket_too() {
+        let mut r = boot(true);
+        r.data().shape_refusal = true;
+        let request = ask(&mut r);
+        // As the ordered one above: the host has no later reply for it, so the trapped commit lets it go rather
+        // than leaving it pending forever (and a clock or a `pending(…)` waiting on it).
+        refuse_unordered(&mut r, request.ticket);
+        assert!(!r.is_poisoned());
+        assert_failed_without_replay(&mut r, request.ticket);
+        let failure = r.failed_why[0].as_ref().unwrap();
+        assert!(failure.message.contains("UnwrapNone"), "{failure:?}");
+    }
+
+    #[test]
+    fn a_delivered_reply_that_traps_in_a_derive_releases_its_ticket() {
+        let mut r = boot(true);
+        r.data().none_reply = true;
+        let request = ask(&mut r);
+        // The host delivers its one reply; the source takes it (`none` conforms), and the derive's unwrap traps the
+        // commit. Nothing is left to answer it: it is let go, keeping the standing value, not pending forever.
+        assert!(r.fulfill(request.ticket, response(200)).unwrap().is_some());
+        assert!(!r.is_poisoned());
+        assert_failed_without_replay(&mut r, request.ticket);
+        let failure = r.failed_why[0].as_ref().unwrap();
+        assert!(failure.message.contains("UnwrapNone"), "{failure:?}");
+    }
+
+    #[test]
     fn a_topic_change_still_refreshes_once_after_a_refused_request() {
         let mut r = boot(false);
         let request = ask(&mut r);
@@ -409,5 +618,81 @@ mod tests {
         assert!(r.take_requests().is_empty());
         assert_eq!(r.resource("value"), Some(&Value::some(Value::str("fresh"))));
         assert!(r.failed_resources().is_empty());
+    }
+
+    /// LLP 1142 D4: each refused answer is counted while measuring, a
+    /// success does not reset the count, and each failure line reaches the
+    /// host once; a runner that measures nothing collects none of it.
+    #[test]
+    fn refused_answers_are_counted_and_alerted_once_while_measuring() {
+        let mut quiet = boot(false);
+        let request = ask(&mut quiet);
+        refuse(&mut quiet, request.ticket);
+        assert!(quiet.failure_counts().is_empty());
+        assert!(quiet.take_alerts().is_empty());
+
+        let mut r = boot(false);
+        r.measure(true, false);
+        for _ in 0..2 {
+            let request = ask(&mut r);
+            refuse(&mut r, request.ticket);
+        }
+        let next = ask(&mut r);
+        r.fulfill(next.ticket, response(200)).unwrap();
+        assert!(r.failed_resources().is_empty());
+        let request = ask(&mut r);
+        refuse(&mut r, request.ticket);
+        let counts = r.failure_counts();
+        assert_eq!(counts.len(), 1);
+        assert_eq!((counts[0].0, counts[0].1.count), ("value", 3));
+        let alerts = r.take_alerts();
+        assert_eq!(alerts.len(), 3, "{alerts:?}");
+        assert!(
+            alerts
+                .iter()
+                .all(|l| l.contains("(value) failed and is no longer pending")),
+            "{alerts:?}"
+        );
+        assert!(r.take_alerts().is_empty(), "each line is taken once");
+    }
+
+    /// The queue a host has not taken is bounded, and says what it dropped.
+    #[test]
+    fn untaken_alerts_are_bounded() {
+        let mut r = boot(false);
+        r.measure(true, false);
+        for i in 0..crate::perf::ALERTS + 6 {
+            r.alert(format!("line {i}"));
+        }
+        let alerts = r.take_alerts();
+        assert_eq!(alerts.len(), crate::perf::ALERTS + 1);
+        assert!(
+            alerts[0].starts_with("6 earlier alert lines were dropped"),
+            "{}",
+            alerts[0]
+        );
+        assert_eq!(alerts[1], "line 6");
+    }
+
+    /// LLP 1143 open question 1: while measuring, every other journal line
+    /// reaches the host once, apart from the alerts, and nothing is queued
+    /// for a runner that measures nothing.
+    #[test]
+    fn journal_lines_reach_the_host_once_apart_from_alerts() {
+        let mut quiet = boot(false);
+        quiet.log("unmeasured");
+        assert!(quiet.take_journal().is_empty());
+        let mut r = boot(false);
+        r.measure(true, false);
+        r.take_journal();
+        r.log("a line");
+        r.alert("a failure");
+        assert_eq!(r.take_journal(), ["a line"]);
+        assert_eq!(r.take_alerts(), ["a failure"]);
+        assert!(r.take_journal().is_empty(), "each line is taken once");
+        assert!(
+            r.journal().any(|l| l.ends_with("a line"))
+                && r.journal().any(|l| l.ends_with("a failure"))
+        );
     }
 }

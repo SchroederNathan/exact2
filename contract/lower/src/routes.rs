@@ -189,6 +189,9 @@ pub(crate) enum NavPlace {
     Outside,
     /// A root's child: the tags from the root down.
     RootChild(Vec<String>),
+    /// A child of a root that holds tabs, whose routes are its tabpanels'
+    /// children only (LLP 1075.003 §3.7).
+    TabbedRootChild(Vec<String>),
     /// A tabpanel's child, the panel in a root.
     PanelChild(Vec<String>),
     /// Deeper inside a root, behind a wrapper, outside any route.
@@ -237,16 +240,18 @@ impl NavPlace {
     }
 
     /// @ref LLP 1116.007 D5 — a route whose scroll is a grouped list is on
-    /// the grouped background, as a hand-built `UITableViewController`'s
-    /// screen is, bar to bottom edge: its unsaid `background-color` is the
-    /// role `-exact-grouped-background`, so what sits between the `header`
-    /// and the list (a segmented switcher, a summary) is on the list's grey,
-    /// not the page's white. The row is the compiler's, set and not written
-    /// (LLP 1115.000 D2), and pushed before the author's, so a
-    /// `background-color` on the route (or its class) wins; a box between the
-    /// header and the list paints its own, over it. Each host resolves the
-    /// role its own way (`systemGroupedBackground` on iOS). `None` where this
-    /// is no route, or the route's scroll is anything else or cannot be told.
+    /// the grouped page's ground (the metric `grouped-page-ground`), bar to
+    /// bottom edge: on iOS the role `-exact-grouped-background`, as a
+    /// hand-built `UITableViewController`'s screen is, so what sits between
+    /// the `header` and the list (a segmented switcher, a summary) is on the
+    /// list's grey, not the page's white; on the web the page's own ground,
+    /// on which the list's cards stand. The row is the compiler's, set and
+    /// not written (LLP 1115.000 D2), and pushed before the author's, so a
+    /// `background-color` on the route (or its class) wins; a box between
+    /// the header and the list paints its own, over it. Each host resolves
+    /// the role its own way (`systemGroupedBackground` on iOS). `None` where
+    /// this is no route, or the route's scroll is anything else or cannot be
+    /// told.
     pub(crate) fn grouped_page(
         &self,
         tag: &str,
@@ -255,15 +260,15 @@ impl NavPlace {
         span: Span,
     ) -> Option<Vec<Attr>> {
         let has = |name: &str| attrs.iter().any(|a| a.name == name);
-        let route = matches!(self, NavPlace::RootChild(_) | NavPlace::PanelChild(_))
-            && has("navigationKey")
-            && !has("navigationBack");
-        if !route || has("background-color") || !scrolls_a_grouped_list(tag, attrs, children) {
+        if !self.is_route(attrs)
+            || has("background-color")
+            || !scrolls_a_grouped_list(tag, attrs, children)
+        {
             return None;
         }
         let role = Attr {
             name: "background-color".into(),
-            value: Expr::Str("-exact-grouped-background".into(), span),
+            value: Expr::Str(crate::metrics::grouped("page-ground"), span),
             span,
             written: crate::IMPLIED,
         };
@@ -272,9 +277,10 @@ impl NavPlace {
 
     /// @ref LLP 1116.009 D3 — a sheet is never transparent: a route that
     /// `navigationPresentation="modal"` presents is on the page's own ground,
-    /// `-exact-background`, unless its author said otherwise. UIKit's sheet
-    /// has the system background under its content, and a hand-built one
-    /// never shows the screen it covers through itself; a web or Mac host
+    /// `-exact-background`, unless its author said otherwise. A hand-built
+    /// UIKit sheet is never see-through: it has the system background, or
+    /// below its large detent UIKit's glass, to which the iOS host leaves
+    /// this ground (LLP 1141.001 D3); a web or Mac host
     /// keeps the covered route in view, so a form whose author wrote no
     /// background was see-through there (the bake-off's habit-tracker, rounds
     /// 10 and 11). The row is the compiler's, set and not written (LLP
@@ -285,9 +291,7 @@ impl NavPlace {
     /// is not a sheet, or already says its ground.
     pub(crate) fn sheet_page(&self, attrs: &[Attr], span: Span) -> Option<Vec<Attr>> {
         let has = |name: &str| attrs.iter().any(|a| a.name == name);
-        let route = matches!(self, NavPlace::RootChild(_) | NavPlace::PanelChild(_))
-            && has("navigationKey")
-            && !has("navigationBack");
+        let route = self.is_route(attrs);
         let modal = attrs
             .iter()
             .rev()
@@ -305,6 +309,15 @@ impl NavPlace {
             written: crate::IMPLIED,
         };
         Some([&[role][..], attrs].concat())
+    }
+
+    /// Whether an element here with `attrs` is a route: a child of the
+    /// navigation root or of a `role="tabpanel"` in it, with a `navigationKey`.
+    fn is_route(&self, attrs: &[Attr]) -> bool {
+        let has = |name: &str| attrs.iter().any(|a| a.name == name);
+        matches!(self, NavPlace::RootChild(_) | NavPlace::PanelChild(_))
+            && has("navigationKey")
+            && !has("navigationBack")
     }
 
     /// The place of `tag`'s children, or the refusal of a route `tag` that
@@ -336,6 +349,71 @@ impl NavPlace {
                     .map_or(span, |a| a.span),
             );
         }
+        // Only a route is presented. gradebook (bake-off round 34) wrote
+        // `navigationPresentation="modal"` on the root of a form component
+        // its stack drew with no `navigationKey`: every host drew the form
+        // in place, and on iOS its header sat under the status bar, where
+        // Save and Cancel got no touches.
+        if let Some(a) = attrs
+            .iter()
+            .rev()
+            .find(|a| a.name == "navigationPresentation")
+            .filter(|a| {
+                !has("navigationKey") && !matches!(&a.value, Expr::Str(s, _) if s.is_empty())
+            })
+        {
+            return err(
+                "lower-route-place",
+                format!("`navigationPresentation` is on a `{tag}` with no `navigationKey`, which is no route, so no host presents it: it is drawn in place, and on iOS what it draws at the screen's top sits under the status bar, where its buttons get no touches. A sheet is a route: write `navigationKey` (the entry's id, `${{e.id}}`) and `navigationPresentation` on the stack's child that draws this; or pass the id into this component and write `navigationKey` here beside it (docs/recipes/edit-sheet.md)"),
+                a.span,
+            );
+        }
+        // A sheet opens at one of its own heights, which its route says; a
+        // list the compiler cannot read is given the benefit of the doubt
+        // (iOS journals a miss).
+        if let Some(a) = attrs
+            .iter()
+            .rev()
+            .find(|a| a.name == "navigationInitialDetent")
+        {
+            if !self.is_route(attrs) {
+                return err(
+                    "lower-attr-value",
+                    "`navigationInitialDetent` is read only on a route (an element with a `navigationKey`, a child of the navigation root or of a `role=\"tabpanel\"` in it), beside its `navigationDetent`: move both onto the sheet's route",
+                    a.span,
+                );
+            }
+            // Empty, as `navigationDetent=""` is, it is unsaid: the first.
+            if matches!(&a.value, Expr::Str(word, _) if !word.is_empty() && !crate::vocab::detent_word(word))
+            {
+                return err(
+                    "lower-attr-value",
+                    "`navigationInitialDetent` takes one word of the route's `navigationDetent`, the height its sheet opens at",
+                    a.span,
+                );
+            }
+            let detents = attrs.iter().rev().find(|a| a.name == "navigationDetent");
+            // The words, and whether the route wrote them.
+            let heights = match detents.map(|a| &a.value) {
+                Some(Expr::Str(s, _)) if !s.trim().is_empty() => Some((s.as_str(), true)),
+                Some(Expr::Str(..)) | None => Some(("large", false)),
+                Some(_) => None,
+            };
+            if let (Expr::Str(word, _), Some((heights, written))) = (&a.value, heights) {
+                if !word.is_empty() && !heights.split(' ').any(|w| w == word) {
+                    let said = if written {
+                        format!("`navigationDetent=\"{heights}\"`")
+                    } else {
+                        "`large` alone, as the route says no `navigationDetent`".into()
+                    };
+                    return err(
+                        "lower-attr-value",
+                        format!("`navigationInitialDetent=\"{word}\"` is not one of this sheet's heights, {said}; it names the one of them the sheet opens at"),
+                        a.span,
+                    );
+                }
+            }
+        }
         // @ref LLP 1116.006 D2 — the split's placeholder is a box in the root route; a route
         // marked so would never show.
         if let Some(a) = split_placeholder(attrs).filter(|_| has("navigationKey")) {
@@ -346,11 +424,32 @@ impl NavPlace {
             );
         }
         if has("navigationKey") && has("navigationBack") {
-            return Ok(NavPlace::RootChild(vec![tag.to_string()]));
+            let path = vec![tag.to_string()];
+            return Ok(if holds_tabs(children) {
+                NavPlace::TabbedRootChild(path)
+            } else {
+                NavPlace::RootChild(path)
+            });
         }
         if has("navigationKey") {
             let shown = match self {
                 NavPlace::InRoot(p) => p.join(" > "),
+                // @ref LLP 1116.020 D2 — round 18's contacts took its add sheet out of the tab's
+                // stack and drew it beside the tabs: no host presented it, and its header sat
+                // under the status bar with Save and Cancel dead.
+                NavPlace::TabbedRootChild(_) => {
+                    let modal = attrs.iter().rev().find(|a| a.name == "navigationPresentation");
+                    let sheet = if modal.is_some() {
+                        " (a `navigationPresentation=\"modal\"` here is no sheet: it is drawn over the page, its header under the status bar)"
+                    } else {
+                        ""
+                    };
+                    return err(
+                        "lower-route-place",
+                        format!("this `{tag}` has a `navigationKey` beside the root's tabpanels; with tabs every host finds routes only among a tabpanel's children, so this one is never a route{sheet}. Render it in the tab's stack, in the panel's `for e in t.stack` with the other routes and not filtered out of it: a modal route there is presented as a sheet over the tabs (docs/contract-for-agents.md, \"Tabs and stacks\")"),
+                        modal.map_or(span, |a| a.span),
+                    );
+                }
                 NavPlace::InRoute => {
                     return err(
                         "lower-route-place",
@@ -380,13 +479,57 @@ impl NavPlace {
                 _ => true,
             });
         Ok(match self {
-            NavPlace::RootChild(p) | NavPlace::InRoot(p) if panel => NavPlace::PanelChild(path(p)),
-            NavPlace::RootChild(p) | NavPlace::PanelChild(p) | NavPlace::InRoot(p) => {
-                NavPlace::InRoot(path(p))
+            NavPlace::RootChild(p) | NavPlace::TabbedRootChild(p) | NavPlace::InRoot(p)
+                if panel =>
+            {
+                NavPlace::PanelChild(path(p))
             }
+            NavPlace::RootChild(p)
+            | NavPlace::TabbedRootChild(p)
+            | NavPlace::PanelChild(p)
+            | NavPlace::InRoot(p) => NavPlace::InRoot(path(p)),
             other => other.clone(),
         })
     }
+}
+
+/// Whether a navigation root's own subtree, outside its routes, holds a
+/// literal `tablist` and `tabpanel`: its routes are then its tabpanels'
+/// children, never its own (`host/web/navigation.js` `stacksOf`, the iOS and
+/// Mac hosts' `NavigationTabs`, the runner's `tab_panels`). What the compiler
+/// cannot see (a computed role, a component's use) is not counted.
+fn holds_tabs(children: &[Node]) -> bool {
+    let (mut list, mut panel) = (false, false);
+    let mut stack: Vec<&Node> = children.iter().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Element {
+                attrs, children, ..
+            } => {
+                if attrs.iter().any(|a| a.name == "navigationKey") {
+                    continue;
+                }
+                match attrs
+                    .iter()
+                    .rev()
+                    .find(|a| a.name == "role")
+                    .map(|a| &a.value)
+                {
+                    Some(Expr::Str(r, _)) if r == "tablist" => list = true,
+                    Some(Expr::Str(r, _)) if r == "tabpanel" => panel = true,
+                    _ => {}
+                }
+                stack.extend(children);
+            }
+            Node::When {
+                then, otherwise, ..
+            } => stack.extend(then.iter().chain(otherwise)),
+            Node::Each { body, .. } => stack.extend(body),
+            Node::Match { some, none, .. } => stack.extend(some.1.iter().chain(none)),
+            Node::Use { .. } | Node::Children { .. } => {}
+        }
+    }
+    list && panel
 }
 
 /// A route's literal `navigationScroll` names its content scroller by HTML
@@ -475,34 +618,14 @@ fn still_on_y(tag: &str, attrs: &[Attr]) -> bool {
     if !scrolls && !PLAIN.contains(&tag) {
         return false;
     }
-    let (mut x, mut y) = ("visible", if scrolls { "scroll" } else { "visible" });
-    for a in attrs {
-        let name = a.name.as_str();
-        if matches!(name, "class" | "className" | "style") || name.starts_with("ua:") {
-            return false;
-        }
-        let (to_x, to_y) = match name {
-            "overflow" => (true, true),
-            "overflow-x" | "overflowX" => (true, false),
-            "overflow-y" | "overflowY" => (false, true),
-            _ => continue,
-        };
-        let Expr::Str(v, _) = &a.value else {
-            return false;
-        };
-        let v = match v.as_str() {
-            "visible" => "visible",
-            "hidden" | "clip" => "hidden",
-            _ => "scroll",
-        };
-        if to_x {
-            x = v;
-        }
-        if to_y {
-            y = v;
-        }
+    let doubt = |a: &Attr| {
+        matches!(a.name.as_str(), "class" | "className" | "style") || a.name.starts_with("ua:")
+    };
+    if attrs.iter().any(doubt) {
+        return false;
     }
-    y == "hidden" || (y == "visible" && x == "visible")
+    let y = if scrolls { "scroll" } else { "visible" };
+    crate::overflow::Overflow::of(attrs, y).scrolls_y() == Some(false)
 }
 
 /// Whether a route's content scroller is a grouped list (`list
@@ -603,18 +726,14 @@ fn scrolls_y(tag: &str, attrs: &[Attr]) -> Option<bool> {
     if !scroller && !PLAIN.contains(&tag) {
         return Some(false);
     }
-    let mut y = if scroller { "scroll" } else { "visible" };
     for a in attrs {
         match a.name.as_str() {
-            "class" | "style" | "overflow-x" | "overflowX" => return None,
+            "class" | "style" => return None,
             "flex-direction" if scroller => return None,
             name if name.starts_with("ua:") => return None,
-            "overflow" | "overflow-y" | "overflowY" => match &a.value {
-                Expr::Str(v, _) => y = v,
-                _ => return None,
-            },
             _ => {}
         }
     }
-    Some(!matches!(y, "visible" | "hidden" | "clip"))
+    let y = if scroller { "scroll" } else { "visible" };
+    crate::overflow::Overflow::of(attrs, y).scrolls_y()
 }

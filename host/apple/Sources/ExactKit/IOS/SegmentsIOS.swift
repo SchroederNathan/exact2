@@ -23,6 +23,26 @@ class LabelledSegmentedControl: UISegmentedControl {
         super.layoutSubviews()
         labelSegments()
     }
+    func labelSegments() {
+        let views = segmentViews
+        guard views.count == numberOfSegments else { return }
+        for (index, view) in views.enumerated() {
+            let label = segmentLabels.indices.contains(index) ? segmentLabels[index] : nil
+            let id = segmentIDs.indices.contains(index) ? segmentIDs[index] : nil
+            if view.accessibilityLabel != label { view.accessibilityLabel = label }
+            if view.accessibilityIdentifier != id { view.accessibilityIdentifier = id }
+            let unavailable = !isEnabled || !isEnabledForSegment(at: index) ||
+                (segmentUnavailable.indices.contains(index) && segmentUnavailable[index])
+            var traits = view.accessibilityTraits
+            if unavailable { traits.insert(.notEnabled) } else { traits.remove(.notEnabled) }
+            if index == selectedSegmentIndex { traits.insert(.selected) } else { traits.remove(.selected) }
+            // Avoid freezing UIKit's computed selection with an unchanged override.
+            if view.accessibilityTraits != traits { view.accessibilityTraits = traits }
+        }
+    }
+}
+
+extension UISegmentedControl {
     /// The segment views (`UISegment`, two containers down on iOS 27), in
     /// segment order: left to right, reversed right to left.
     var segmentViews: [UIView] {
@@ -39,24 +59,25 @@ class LabelledSegmentedControl: UISegmentedControl {
         }.map(\.element)
         return effectiveUserInterfaceLayoutDirection == .rightToLeft ? views.reversed() : views
     }
-    func labelSegments() {
-        let views = segmentViews
-        guard views.count == numberOfSegments else { return }
-        for (index, view) in views.enumerated() {
-            let label = segmentLabels.indices.contains(index) ? segmentLabels[index] : nil
-            let id = segmentIDs.indices.contains(index) ? segmentIDs[index] : nil
-            if view.accessibilityLabel != label { view.accessibilityLabel = label }
-            if view.accessibilityIdentifier != id { view.accessibilityIdentifier = id }
-            let unavailable = segmentUnavailable.indices.contains(index) && segmentUnavailable[index]
-            if unavailable { view.accessibilityTraits.insert(.notEnabled) }
-            else { view.accessibilityTraits.remove(.notEnabled) }
-        }
-    }
 }
 
 private final class ExactSegmentedControl: LabelledSegmentedControl {
     let ownerID: UInt32
-    var icons: [Int: (source: AnyObject, size: CGSize, label: String)] = [:]
+    /// Each image segment's: what it shows, its size and label, and the
+    /// image its picture was drawn from (a symbol's `faceImage`).
+    var icons: [Int: (source: AnyObject, size: CGSize, label: String, drawn: UIImage?, configuration: UIImage.SymbolConfiguration?)] = [:]
+    /// Its svg-only icons' paths drawn again at the body size its traits now
+    /// give (a text size change); nothing else is touched (stage 9 A2).
+    func redrawPaths() {
+        let points = UIFont.preferredFont(forTextStyle: .body, compatibleWith: traitCollection).pointSize
+        for (index, icon) in icons {
+            guard let name = icon.source as? String, FaceSymbol.isPath(name), icon.size.width != points,
+                  let image = FaceSymbol.image(name, points: points) else { continue }
+            image.accessibilityLabel = icon.label
+            setImage(image, forSegmentAt: index)
+            icons[index] = (icon.source, CGSize(width: points, height: points), icon.label, image, image.symbolConfiguration)
+        }
+    }
     /// The selection last reported or applied. A finger moves the selection
     /// before the change is reported (on iOS 26 after the lift, as the
     /// selection settles); until then the control keeps the newer choice.
@@ -71,8 +92,17 @@ private final class ExactSegmentedControl: LabelledSegmentedControl {
 private final class ExactTabBar: UITabBar {
     let ownerID: UInt32
     var onMeasure: (() -> Void)?
+    private var room: CGFloat = 0
     override func layoutSubviews() {
         super.layoutSubviews()
+        // UIKit sizes a tab button's label in the room the bar has when it first lays the
+        // button out (its height less its bottom inset), and again only for a new appearance
+        // or new traits, so a bar laid out before its box took its measured height kept its
+        // labels cut short. When the room grows, a new appearance has them sized again, a turn
+        // later: an appearance set during this layout sized them in the old room.
+        let room = bounds.height - safeAreaInsets.bottom
+        if room > self.room { DispatchQueue.main.async { [weak self] in if let self { standardAppearance = standardAppearance.copy() } } }
+        self.room = room
         onMeasure?()
     }
     init(ownerID: UInt32) {
@@ -84,6 +114,20 @@ private final class ExactTabBar: UITabBar {
 
 /// A tab bar item that remembers the symbol it was made with.
 private final class TabBarItem: UITabBarItem { var made = "" }
+private extension ExactTabBar {
+    /// Its items' svg-only icon paths drawn again at the size its idiom and
+    /// size class now give (`FaceSymbol.tabBarPoints`); nothing else is touched.
+    func redrawPaths() {
+        let points = FaceSymbol.tabBarPoints(traitCollection)
+        for case let item as TabBarItem in items ?? [] {
+            guard let bar = item.made.firstIndex(of: "|"), let was = Double(item.made[..<bar]), CGFloat(was) != points else { continue }
+            let symbol = String(item.made[item.made.index(after: bar)...])
+            guard FaceSymbol.isPath(symbol) else { continue }
+            item.image = FaceSymbol.image(symbol, points: points)
+            item.made = "\(points)|\(symbol)"
+        }
+    }
+}
 private extension UITabBarItem { var madeWith: String? { (self as? TabBarItem)?.made } }
 
 /// A tab a tab bar item can show: one symbol and one label, nothing else.
@@ -113,10 +157,10 @@ private struct TabBarFace: Equatable {
               image.props["imageSource"]?.hasPrefix("symbol:") == true,
               let label = children.first(where: { $0 !== image }), label.isParagraph,
               !label.accessibleText.isEmpty else { return nil }
-        self.symbol = image.props["symbolName"] ?? ""
+        self.symbol = image.faceSymbol ?? ""
         title = label.accessibleText
         self.label = tab.props["accessibilityLabel"] ?? title
-        tint = image.ownUIColor("tint_color")
+        tint = image.ownUIColor("text_color")
     }
 }
 
@@ -126,6 +170,11 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
     /// The segmented control a tablist or radio group projects to, if any:
     /// a hatched node's platform object (LLP 1075.003.000 §3.2).
     func control(of id: UInt32) -> UISegmentedControl? { controls[id] }
+    func bar(of id: UInt32) -> UITabBar? { bars[id] }
+    /// Whether `id` is drawn as UIKit's segmented control or tab bar, its own tabs hidden behind it.
+    func projects(_ id: UInt32) -> Bool { controls[id] != nil || bars[id] != nil }
+    /// The image segment `index` of `id`'s control was drawn from.
+    func drawn(of id: UInt32, segment index: Int) -> UIImage? { controls[id]?.icons[index]?.drawn }
     private var bars: [UInt32: ExactTabBar] = [:]
     private var sizes: [UInt32: CGSize] = [:]
     /// A segmented control's own size, with what it was measured from: its
@@ -134,14 +183,37 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
     private var naturals: [UInt32: (source: String, size: CGSize)] = [:]
     private var hidden: [UInt32: Bool] = [:]
     private var members: [UInt32: [UInt32]] = [:]
-    /// Tablists a tab container's bar has taken the place of, hidden here.
-    private var adoptedLists = Set<UInt32>()
+    /// The tablist a tab container's bar has taken the place of, hidden here.
+    private weak var adoptedList: NodeView?
     /// The last projection decision journaled per tablist, so each is said once.
     private var decisions: [UInt32: String] = [:]
-    /// LLP 1080.001 D3: the bar or control standing in for a tablist, and
-    /// the tabs and adopted lists hidden for it.
+    /// LLP 1080.001 D3: the bar or control standing in for a tablist, the
+    /// tabs hidden for it, and the tablist hidden for a tab container's bar.
     func inspectionOwns(_ view: UIView) -> Bool { bars.values.contains { $0 === view } || controls.values.contains { $0 === view } }
-    func hides(_ node: NodeView) -> Bool { members.values.contains { $0.contains(node.id) } || adoptedLists.contains(node.id) }
+    func hides(_ node: NodeView) -> Bool { members.values.contains { $0.contains(node.id) } || node === adoptedList }
+    #if EXACT_INSPECT && os(iOS)
+    /// The tab a point in `view` (a segmented control or tab bar standing in
+    /// for a tablist) is over: inspect mode selects it (InspectIOS.swift).
+    func tab(at point: CGPoint, in view: UIView) -> UInt32? {
+        let owner: UInt32? = (view as? ExactSegmentedControl)?.ownerID ?? (view as? ExactTabBar)?.ownerID
+        guard let owner, let ids = members[owner], !ids.isEmpty, view.bounds.width > 0, view.bounds.contains(point) else { return nil }
+        // A tab bar: the item's button under the point, a gap nothing.
+        if view is ExactTabBar {
+            let boxes = InspectHost.buttonBoxes(in: view) // (in item order, right to left too)
+            guard boxes.count == ids.count else { return nil }
+            return boxes.firstIndex { $0.contains(point) }.map { ids[$0] }
+        }
+        // A segmented control: its segments' own boxes (widths by content
+        // when squeezed; `segmentViews`, in segment order), else equal widths.
+        if let control = view as? ExactSegmentedControl {
+            let segments = control.segmentViews
+            if segments.count == ids.count { return segments.firstIndex { $0.convert($0.bounds, to: view).contains(point) }.map { ids[$0] } }
+        }
+        var index = Int(point.x / view.bounds.width * CGFloat(ids.count))
+        if view.effectiveUserInterfaceLayoutDirection == .rightToLeft { index = ids.count - 1 - index }
+        return ids.indices.contains(index) ? ids[index] : nil
+    }
+    #endif
 
     init(_ presenter: Presenter) { self.presenter = presenter; super.init() }
 
@@ -188,10 +260,14 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
         tab.props[tab.props["accessibilityRole"] == "radio" ? "accessibilityChecked" : "accessibilitySelected"] == "true"
     }
 
+    /// Whether the owner takes input. `visibility` is read on the owner
+    /// alone: its value is computed, and a box under a hidden one may set it
+    /// back to `visible`.
     private func available(_ owner: UIView) -> Bool {
+        if (owner as? NodeView)?.cssVisibilityHidden == true { return false }
         var ancestor: UIView? = owner
         while let view = ancestor {
-            if view.isHidden || view.alpha <= 0.01 || (view as? NodeView)?.props["inert"] == "true" { return false }
+            if view.isHidden || (view as? NodeView)?.props["inert"] == "true" { return false }
             ancestor = presenter.eventParent(of: view)
         }
         return owner.window != nil
@@ -207,10 +283,12 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
             let raster = icon.raster?.image.image
             // A transparent image carries the segment's accessible name when
             // the OS has no glyph; a nil image loses that native label.
-            let source = raster.map({ UIImage(cgImage: $0) }) ?? icon.image
-            let identity: AnyObject = raster.map { $0 as AnyObject } ?? source ?? icon
+            // A symbol in the control's tint, not the page's ink (`faceImage`).
+            let source = raster.map({ UIImage(cgImage: $0) }) ?? icon.faceImage
+            let identity: AnyObject = raster.map { $0 as AnyObject } ?? icon.image ?? icon
             let size = CGSize(width: max(1, icon.bounds.width), height: max(1, icon.bounds.height))
-            if let old = control.icons[index], old.source === identity, old.size == size, old.label == label { return }
+            if let old = control.icons[index], old.source === identity, old.size == size, old.label == label,
+               old.configuration == source?.symbolConfiguration { return }
             // An image segment shows no title (a title-only face had set one).
             if control.titleForSegment(at: index)?.isEmpty == false { control.setTitle(nil, forSegmentAt: index) }
             let image = UIGraphicsImageRenderer(size: size).image { _ in
@@ -221,16 +299,18 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
             }.withRenderingMode(.alwaysOriginal)
             image.accessibilityLabel = label
             control.setImage(image, forSegmentAt: index)
-            control.icons[index] = (identity, size, label)
+            control.icons[index] = (identity, size, label, source, source?.symbolConfiguration)
         } else if case .symbol(let name)? = tab.segmentFace {
             // A native tab's symbol, carrying its label (LLP 1069.011.000 D4).
-            let size = CGSize(width: -1, height: -1)
-            if let old = control.icons[index], (old.source as? NSString) == name as NSString, old.label == label { return }
-            let image = UIImage(systemName: name) ?? UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1)).image { _ in }
+            // A path is drawn at the control's body size, again as that changes (an SF Symbol follows it itself).
+            let points = UIFont.preferredFont(forTextStyle: .body, compatibleWith: control.traitCollection).pointSize
+            let size = FaceSymbol.isPath(name) ? CGSize(width: points, height: points) : CGSize(width: -1, height: -1)
+            if let old = control.icons[index], (old.source as? NSString) == name as NSString, old.size == size, old.label == label { return }
+            let image = FaceSymbol.image(name, points: points) ?? UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1)).image { _ in }
             if control.titleForSegment(at: index)?.isEmpty == false { control.setTitle(nil, forSegmentAt: index) }
             image.accessibilityLabel = label
             control.setImage(image, forSegmentAt: index)
-            control.icons[index] = (name as NSString, size, label)
+            control.icons[index] = (name as NSString, size, label, image, image.symbolConfiguration)
         } else if case .title(let title)? = tab.segmentFace {
             control.icons.removeValue(forKey: index)
             if control.imageForSegment(at: index) != nil { control.setImage(nil, forSegmentAt: index) }
@@ -250,7 +330,11 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
             if let child = presenter.views[childID] { child.isHidden = hidden.removeValue(forKey: childID) ?? false }
             else { hidden.removeValue(forKey: childID) }
         }
-        controls.removeValue(forKey: id)?.removeFromSuperview()
+        if let control = controls.removeValue(forKey: id) {
+            control.removeFromSuperview()
+            presenter.views[id]?.applyBoxLayer()
+            presenter.views[id]?.setNeedsDisplay()
+        }
         removeBar(owner: id)
         clearSize(owner: id)
     }
@@ -303,11 +387,12 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
             let natural = natural(owner.id, control as! UISegmentedControl)
             size = CGSize(width: 1, height: natural.height)
             // The padding and border around the content box layout sent
-            if owner.style["box_sizing"]?.string == "border-box" { size.height += owner.bounds.height - owner.contentBox().height }
+            if owner.style["box_sizing"]?.string == "border-box" { size.height += owner.layoutBounds.height - owner.contentBox().height }
         } else {
-            guard owner.bounds.width > 0 else { return }
+            let width = owner.contentBox().width
+            guard width > 0 else { return }
             // A tab bar lays its items out in any width: none is its narrowest.
-            size = CGSize(width: 1, height: control.sizeThatFits(CGSize(width: owner.bounds.width, height: 0)).height)
+            size = CGSize(width: 1, height: control.sizeThatFits(CGSize(width: width, height: 0)).height)
         }
         guard size.width.isFinite, size.height.isFinite, size.height > 0 else { return }
         guard sizes[owner.id] != size else { return }
@@ -332,27 +417,49 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
     /// are the authored ones — a selected symbol's and an unselected one's —
     /// so an app's accent is the tab bar's; unsaid, the platform's tint.
     private func project(_ owner: NodeView, _ tabs: [NodeView], _ faces: [TabBarFace]) {
-        controls.removeValue(forKey: owner.id)?.removeFromSuperview()
+        if let control = controls.removeValue(forKey: owner.id) {
+            control.removeFromSuperview()
+            owner.applyBoxLayer()
+            owner.setNeedsDisplay()
+        }
         adopt(owner, tabs)
+        // A bar new under its owner is made and placed with no animation inside one UIKit has open; one that showed moves with its owner
+        owner.moveOrPlace(new: bars[owner.id]?.superview !== owner) { placeBar(owner, tabs, faces) }
+    }
+
+    /// `owner`'s tab bar, made if it has none, for `tabs` and their faces: its items and its place.
+    private func placeBar(_ owner: NodeView, _ tabs: [NodeView], _ faces: [TabBarFace]) {
         let bar = bars[owner.id] ?? {
             let value = ExactTabBar(ownerID: owner.id)
             value.delegate = self
             value.onMeasure = { [weak self, weak owner, weak value] in
                 if let owner, let value { self?.measure(owner, value) }
             }
+            // A path's glyph is sized by the idiom and the size class (`FaceSymbol.tabBarPoints`): drawn again as either changes.
+            value.registerForTraitChanges([UITraitUserInterfaceIdiom.self, UITraitHorizontalSizeClass.self]) { (bar: ExactTabBar, _: UITraitCollection) in bar.redrawPaths() }
             owner.addSubview(value)
             bars[owner.id] = value
             return value
         }()
         if bar.superview !== owner { owner.addSubview(bar) }
-        if bar.frame != owner.bounds { bar.frame = owner.bounds }
+        // Across the content box, its edges on the pixel grid, the box's whole
+        // height: a tablist padded at a side keeps its tabs inside the padding,
+        // as the web lays them out.
+        let box = owner.contentBox(), origin = owner.grid?.origin ?? .zero, scale = presenter.gridScale(under: origin)
+        let left = PixelGrid.length(box.minX, from: origin, vertical: false, scale: scale), right = PixelGrid.length(box.maxX, from: origin, vertical: false, scale: scale)
+        let frame = CGRect(x: left, y: owner.bounds.minY, width: right - left, height: owner.bounds.height)
+        if bar.frame != frame { bar.frame = frame }
         assign(bar, \.isUserInteractionEnabled, available(owner))
         assign(bar, \.accessibilityLabel, owner.props["accessibilityLabel"])
         let current = bar.items ?? []
-        if current.count != faces.count || zip(current, faces).contains(where: { $0.title != $1.title || $0.madeWith != $1.symbol }) {
+        // Made with the symbol and, for a path, the size its glyph was drawn at.
+        let points = FaceSymbol.tabBarPoints(bar.traitCollection)
+        let made = { (symbol: String) in FaceSymbol.isPath(symbol) ? "\(points)|\(symbol)" : symbol }
+        if current.count != faces.count || zip(current, faces).contains(where: { $0.title != $1.title || $0.madeWith != made($1.symbol) }) {
             bar.setItems(faces.enumerated().map { index, face in
-                let item = TabBarItem(title: face.title, image: face.symbol.isEmpty ? nil : UIImage(systemName: face.symbol), tag: index)
-                item.made = face.symbol
+                let item = TabBarItem(title: face.title, image: FaceSymbol.image(face.symbol, points: points), tag: index)
+                item.selectedImage = TabFace.filled(TabFace.base(face.symbol))
+                item.made = made(face.symbol)
                 return item
             }, animated: false)
         }
@@ -388,19 +495,24 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
         // A tablist whose place a tab container's bar takes is the container's
         // (LLP 1075.003 §3.7): it is hidden, and projects nothing of its own.
         // A radio group of two or more radios is the same segmented control
-        // (LLP 1116.004 D5.2); it is never a tab bar.
+        // (LLP 1116.004 D5.2); it is never a tab bar. A written `appearance:
+        // none` keeps either one's authored tabs or radios.
         let owners = presenter.carrying("role:tablist").filter {
             $0.props["accessibilityRole"] == "tablist" &&
-                $0.props["accessibilityOrientation"] != "vertical" && !presenter.navigation.adopts(tablist: $0) &&
+                $0.props["accessibilityOrientation"] != "vertical" && !presenter.navigation.adopts(tablist: $0) && !presenter.navigation.scopes(tablist: $0) &&
                 !($0.wrote("appearance") && $0.style["appearance"]?.string == "none")
         } + presenter.carrying("role:radiogroup").filter {
-            $0.props["accessibilityRole"] == "radiogroup" && $0.props["accessibilityOrientation"] != "vertical"
+            $0.props["accessibilityRole"] == "radiogroup" && $0.props["accessibilityOrientation"] != "vertical" &&
+                !($0.wrote("appearance") && $0.style["appearance"]?.string == "none")
         }
-        for list in presenter.carrying("role:tablist") {
-            let adopted = presenter.navigation.adopts(tablist: list)
-            guard adopted != adoptedLists.contains(list.id) else { continue }
-            if adopted { adoptedLists.insert(list.id) } else { adoptedLists.remove(list.id) }
-            list.isHidden = adopted
+        // One tablist at most (`NavigationHost.adoptedTablist`), known by its view: after a restart the
+        // new tablist has the old one's id. The old one is shown again only while the presenter holds it:
+        // a leaving view keeps its look until its exit ends.
+        let adopted = presenter.carrying("role:tablist").first { presenter.navigation.adopts(tablist: $0) }
+        if adopted !== adoptedList {
+            if let old = adoptedList, presenter.views[old.id] === old { old.hiddenByHost = false }
+            adopted?.hiddenByHost = true
+            adoptedList = adopted
         }
         let live = Set(owners.map(\.id))
         for id in Array(controls.keys) + Array(bars.keys) where !live.contains(id) { restore(owner: id) }
@@ -429,48 +541,68 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
             owner.accessibilityTraits.remove(.tabBar)
             decide(owner, "projected to UISegmentedControl (\(tabs.count) segments)")
             adopt(owner, tabs)
-            let control = controls[owner.id] ?? {
-                let value = ExactSegmentedControl(ownerID: owner.id)
-                value.addTarget(self, action: #selector(changed(_:)), for: .valueChanged)
-                let context = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
-                context.delegate = self
-                value.addGestureRecognizer(context)
-                value.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-                owner.addSubview(value)
-                controls[owner.id] = value
-                return value
-            }()
-            if control.superview !== owner { owner.addSubview(control) }
-            let frame = owner.contentBox()
-            if control.frame != frame { control.frame = frame }
-            assign(control, \.isEnabled, available(owner))
-            control.accessibilityLabel = owner.props["accessibilityLabel"]
-            if control.numberOfSegments != tabs.count {
-                control.removeAllSegments()
-                control.icons.removeAll()
-                for index in tabs.indices { control.insertSegment(withTitle: "", at: index, animated: false) }
-            }
-            for (index, tab) in tabs.enumerated() {
-                content(tab, at: index, in: control)
-                control.setEnabled(!tab.disabled, forSegmentAt: index)
-            }
-            control.accessibilityIdentifier = owner.props["testId"]
-            control.segmentLabels = tabs.map(Self.segmentLabel)
-            control.segmentIDs = tabs.map { $0.props["testId"] }
-            control.segmentUnavailable = tabs.map { $0.disabled || $0.ariaUnavailable }
-            let selected = tabs.firstIndex(where: Self.chosen) ?? UISegmentedControl.noSegment
-            // A choice the finger made and the control has not reported yet
-            // stays; resetting it would make the report name the old segment.
-            let pending = control.isTracking || control.selectedSegmentIndex != control.settled
-            if control.selectedSegmentIndex != selected, !pending { control.selectedSegmentIndex = selected }
-            if control.selectedSegmentIndex == selected { control.settled = selected }
-            owner.bringSubviewToFront(control)
-            measure(owner, control)
-            // Equal segments where they fit; in a narrower box UIKit gives
-            // each segment its content's share, so "Temperature" keeps its
-            // letters beside "Length" (LLP 1116.004 D2).
-            assign(control, \.apportionsSegmentWidthsByContent, frame.width + 0.5 < natural(owner.id, control).width)
+            // A control new under its owner is made, titled, measured and placed with no animation inside one UIKit
+            // has open, as UIKit sizes it to fit while it is made and titled; one that showed moves with its owner
+            owner.moveOrPlace(new: controls[owner.id]?.superview !== owner) { segment(owner, tabs) }
         }
+    }
+
+    /// `owner`'s segmented control, made if it has none, for `tabs`: its segments, its state and its place.
+    private func segment(_ owner: NodeView, _ tabs: [NodeView]) {
+        let control = controls[owner.id] ?? {
+            let value = ExactSegmentedControl(ownerID: owner.id)
+            value.addTarget(self, action: #selector(changed(_:)), for: .valueChanged)
+            let context = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
+            context.delegate = self
+            value.addGestureRecognizer(context)
+            value.autoresizingMask = [.flexibleWidth, .flexibleTopMargin, .flexibleBottomMargin]
+            // A path segment is drawn at the body size: again as the text size changes.
+            value.registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (control: ExactSegmentedControl, _: UITraitCollection) in control.redrawPaths() }
+            owner.addSubview(value)
+            controls[owner.id] = value
+            return value
+        }()
+        if control.superview !== owner { owner.addSubview(control) }
+        assign(control, \.isEnabled, available(owner))
+        // The authored colour belongs to UIKit's control, within its native height and corners.
+        assign(control, \.backgroundColor, owner.undimmedChannels("background_color", dark: owner.drawsDark).map { TextEngine.color($0) })
+        owner.applyBoxLayer()
+        owner.setNeedsDisplay()
+        control.accessibilityLabel = owner.props["accessibilityLabel"]
+        if control.numberOfSegments != tabs.count {
+            control.removeAllSegments()
+            control.icons.removeAll()
+            for index in tabs.indices { control.insertSegment(withTitle: "", at: index, animated: false) }
+        }
+        for (index, tab) in tabs.enumerated() {
+            content(tab, at: index, in: control)
+            control.setEnabled(!tab.disabled, forSegmentAt: index)
+        }
+        control.accessibilityIdentifier = owner.props["testId"]
+        control.segmentLabels = tabs.map(Self.segmentLabel)
+        control.segmentIDs = tabs.map { $0.props["testId"] }
+        control.segmentUnavailable = tabs.map { $0.disabled || $0.ariaUnavailable }
+        let selected = tabs.firstIndex(where: Self.chosen) ?? UISegmentedControl.noSegment
+        // A choice the finger made and the control has not reported yet
+        // stays; resetting it would make the report name the old segment.
+        let pending = control.isTracking || control.selectedSegmentIndex != control.settled
+        if control.selectedSegmentIndex != selected, !pending { control.selectedSegmentIndex = selected }
+        if control.selectedSegmentIndex == selected { control.settled = selected }
+        // As wide as the content box and its own height, centred in it
+        // (LLP 1116.019 D1): a taller box (an authored height, a stretch)
+        // does not stretch UIKit's control, as a hand-built screen's
+        // never is.
+        let box = owner.contentBox()
+        let height = min(box.height, natural(owner.id, control).height)
+        let frame = CGRect(x: box.minX, y: box.midY - height / 2, width: box.width, height: height)
+        if control.frame != frame { control.frame = frame }
+        owner.bringSubviewToFront(control)
+        measure(owner, control)
+        // Equal segments where they fit; in a narrower box UIKit gives
+        // each segment its content's share, so "Temperature" keeps its
+        // letters beside "Length" (LLP 1116.004 D2).
+        assign(control, \.apportionsSegmentWidthsByContent, frame.width + 0.5 < natural(owner.id, control).width)
+        if !pending { control.layoutIfNeeded() }
     }
 
     /// A title segment's accessibility label: its tab's name where that is
@@ -489,9 +621,20 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
     }
 
     /// Agent activation names the authored tab even though UIKit owns its pixels.
-    func activate(_ node: NodeView) -> Bool? {
+    func activate(_ node: NodeView, before: (CGPoint?) -> Bool = { _ in true }) -> Bool? {
+        // A segment in the route's bar takes precedence over its hidden content control.
+        if let shown = presenter.navigation.barSegment(node) {
+            guard !node.disabled, !node.ariaUnavailable else { return false }
+            let point = shown.control.convert(CGPoint(x: shown.segment.midX, y: shown.segment.midY), to: nil)
+            guard before(point), !node.disabled, !node.inert, !node.ariaUnavailable, presenter.views[node.id] === node else { return false }
+            presenter.press(node.id)
+            return true
+        }
         guard let entry = members.first(where: { $0.value.contains(node.id) }) else { return nil }
         guard let owner = presenter.views[entry.key], available(owner), !node.disabled else { return false }
+        let drawn = drawn(node)
+        let point = drawn.map { $0.control.convert(CGPoint(x: $0.segment.midX, y: $0.segment.midY), to: nil) }
+        guard before(point), available(owner), !node.disabled, !node.inert, presenter.views[node.id] === node else { return false }
         presenter.press(node.id)
         return true
     }
@@ -501,6 +644,7 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
     /// box in it — its segment view's, else an equal share. Nil for a node no
     /// segmented control draws (a tab bar's items are UIKit's private views).
     func drawn(_ node: NodeView) -> (control: UIControl, segment: CGRect)? {
+        if let scope = presenter.navigation.barSegment(node) { return scope }
         guard let entry = members.first(where: { $0.value.contains(node.id) }), let control = controls[entry.key],
               let index = entry.value.firstIndex(of: node.id), control.numberOfSegments == entry.value.count else { return nil }
         let views = control.segmentViews
@@ -508,6 +652,18 @@ final class SegmentHost: NSObject, UIGestureRecognizerDelegate, UITabBarDelegate
         let share = control.bounds.width / CGFloat(entry.value.count)
         let slot = control.effectiveUserInterfaceLayoutDirection == .rightToLeft ? entry.value.count - 1 - index : index
         return (control, CGRect(x: share * CGFloat(slot), y: 0, width: share, height: control.bounds.height))
+    }
+
+    /// The tab bar a tablist is drawn as (`project`) and the item standing
+    /// for the tab `node` is (or is in), or nil.
+    func barItem(of node: NodeView) -> (bar: UITabBar, item: UITabBarItem)? {
+        for (owner, ids) in members {
+            guard let bar = bars[owner], let items = bar.items, items.count == ids.count,
+                  let index = ids.firstIndex(where: { id in id == node.id || presenter.views[id].map { node.isDescendant(of: $0) } == true })
+            else { continue }
+            return (bar, items[index])
+        }
+        return nil
     }
 
     func observation(_ node: NodeView) -> [String: Any]? {

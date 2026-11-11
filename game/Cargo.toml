@@ -51,6 +51,10 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.bcdec_rs]
 opt-level = 3
+# Build scripts and proc macros load as dylibs, which Xcode 27's strip leaves
+# unloadable ("mis-aligned LINKEDIT string pool"), as in ../Cargo.toml.
+[profile.release.build-override]
+strip = false
 
 [profile.web]
 inherits = "release"
@@ -96,7 +100,13 @@ panic = "abort"
 lto = false
 incremental = true
 
+# Xcode 27's strip and a build script or proc macro (release's, above); a
+# dependency's own under `package."*"`, which outranks the override.
+[profile.gpu-dev.build-override]
+strip = false
+
 [profile.gpu-dev.package."*"]
+strip = false
 opt-level = 3
 
 # The engine crates are workspace members here, so the wildcard excludes them.

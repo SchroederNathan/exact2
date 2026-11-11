@@ -29,11 +29,14 @@ fn incoming_notification_locations_use_the_route_corpus_through_the_web_abi() {
             };
             let count = bridge.input_write(href.as_bytes());
             let len = bridge.location_of(count);
-            assert_eq!(
-                std::str::from_utf8(bridge.output_bytes(len as usize)).unwrap(),
-                case["expected"].as_str().unwrap(),
-                "{href}"
-            );
+            let location = std::str::from_utf8(bridge.output_bytes(len as usize)).unwrap();
+            // A canonical case through a URL keeps its fragment (LLP 1153
+            // D5), which its canonical form drops.
+            let location = match section {
+                "canonical" => location.split('#').next().unwrap_or_default(),
+                _ => location,
+            };
+            assert_eq!(location, case["expected"].as_str().unwrap(), "{href}");
         }
     }
 }
@@ -54,15 +57,9 @@ fn browser_session_history_on_the_js_target() {
 
 fn sweep(js: bool) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let chrome = std::env::var("CHROME")
-        .unwrap_or_else(|_| "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
     let dist = std::env::var_os("EXACT_ROUTER_DIST")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| root.join("host/web/dist"));
-    assert!(
-        Path::new(&chrome).exists(),
-        "Chrome is required: set CHROME"
-    );
     assert!(
         js || dist.join("app.wasm").exists(),
         "build the web dist first"
@@ -171,6 +168,61 @@ fn sweep(js: bool) {
     )
     .unwrap();
     std::fs::write(dir.join("no-root.plan"), no_root.encode()).unwrap();
+    // A visit whose `#moves` and `#other` are far down its navigation root,
+    // which scrolls, beside a picture the server is slow to send, and a bar
+    // stuck at its top: links to its fragments, a `go` only computed, one
+    // in a commit that is refused, and the app's own `scrollIntoView` (LLP
+    // 1153 D5).
+    let rows = |from: usize| -> String {
+        (from..from + 20)
+            .map(|i| format!("            box id=\"row-{i}\" height=100\n"))
+            .collect()
+    };
+    let fragment = r##"routes nav
+  home "/"
+    item "/item/:id"
+
+component App
+  state peeked = ""
+  state blank = ""
+  action follow(url: string)
+    nav = go(nav, url)
+  action back
+    nav = back(nav)
+  action peek
+    peeked = fragment(top(go(nav, "/item/7#moves")))
+  action refused
+    nav = go(nav, "/item/7#moves")
+    nav = push(nav, path("item", blank))
+  action aim
+    scrollIntoView("row-3")
+  view
+    main navigationKey=`${top(nav).id}` navigationBack="back" navigate=follow testId="port" width="100%" height="100%" overflow-y="auto"
+      row position="sticky" top=0 height=40 gap=8 z-index=1 background-color="#ffffff"
+        link href="#moves" testId="to-moves"
+          text "Moves"
+        link href="#other" testId="to-other"
+          text "Other"
+        link href="#top" testId="to-top"
+          text "Top"
+        button press=peek testId="peek"
+          text "Peek"
+        button press=refused testId="refused"
+          text "Refused"
+        button press=aim testId="aim"
+          text "Aim"
+      for e in stack(nav) key=e.id
+        column navigationKey=`${e.id}`
+          if e.name == "item"
+            image "/__test-slow.png" id="first" width=10 height=10 display="block"
+ROWS0            box id="moves" height=100
+ROWS20            box id="other" height=100
+ROWS40"##
+        .replace("ROWS0", &rows(0))
+        .replace("ROWS20", &rows(20))
+        .replace("ROWS40", &rows(40));
+    let fragment = contract::bake(contract::compile(&fragment).unwrap(), Empty).unwrap();
+    std::fs::write(dir.join("fragment.plan"), fragment.encode()).unwrap();
     let accessibility = contract::compile(include_str!(
         "../../../../contract/corpus/accessibility.contract"
     ))
@@ -179,7 +231,6 @@ fn sweep(js: bool) {
     let output = Command::new(std::env::var_os("BUN").unwrap_or_else(|| "bun".into()))
         .arg("host/web/tests/navigation.mjs")
         .env("EXACT_ROUTER_DIST", dist)
-        .env("CHROME", chrome)
         .env("EXACT_ROUTER_TEST", &dir)
         .env("EXACT_ROUTER_TARGET", if js { "js" } else { "wasm" })
         .current_dir(root)

@@ -228,7 +228,7 @@ fn position_area_places_a_popover_in_the_admitted_subset_only() {
 
 #[test]
 fn popover_flip_fallbacks_compile_in_authored_order() {
-    let source = "component App\n  view\n    column popover=\"auto\" position-area=\"bottom span-right\" position-try-fallbacks=\"flip-block, flip-inline, flip-block flip-inline\"\n";
+    let source = "component App\n  view\n    column popover=\"auto\" position-area=\"bottom span-right\" position-try-fallbacks=\"flip-block, flip-inline, flip-start flip-block\"\n";
     let plan = contract::bake(contract::compile(source).unwrap(), NoData).unwrap();
     let runner = Runner::boot(
         plan,
@@ -241,19 +241,19 @@ fn popover_flip_fallbacks_compile_in_authored_order() {
     let node = runner.kernel().node(runner.roots()[0]).unwrap();
     assert_eq!(
         node.style.position_try_fallbacks.css(),
-        "flip-block, flip-inline, flip-block flip-inline"
+        "flip-block, flip-inline, flip-start flip-block"
     );
     for invalid in [
-        "flip-start",
+        "flip-x",
         "flip-block flip-block",
         "flip-inline,",
         "none, flip-block",
         "--custom",
     ] {
-        let bad = source.replace("flip-block, flip-inline, flip-block flip-inline", invalid);
+        let bad = source.replace("flip-block, flip-inline, flip-start flip-block", invalid);
         let error = contract::compile(&bad).unwrap_err().to_string();
         assert!(
-            error.contains("flip-block/flip-inline"),
+            error.contains("flip-block, flip-inline and flip-start"),
             "{invalid}: {error}"
         );
     }
@@ -376,7 +376,7 @@ component A
         ("unsaid", TextColor, implied, "the sheet's"),
         ("off", TextColor, implied, "the sheet's disabled grey"),
         ("icon", TintColor, implied, "the sheet's accent on a symbol"),
-        ("check", TintColor, implied, "and on a checkmark"),
+        ("check", TextColor, implied, "its ink on a checkmark"),
         ("tinted", TintColor, written, "the same accent, written"),
     ] {
         assert_eq!(row(&r, id, style), expected, "{id} {style:?}: {why}");
@@ -387,13 +387,14 @@ component A
     assert_eq!(row(&r, "bound", Width), written);
 }
 
-/// CSS `user-select` (LLP 1115.000 D11.6): `text` is honoured where a host
-/// has text selection (the web, macOS, iOS) and is on the node that says
-/// it, not inherited on the wire, since each host resolves `auto` from what
-/// is above. The two values no native presenter has are refused by name.
+/// CSS `user-select` (LLP 1115.000 D11.6): `text` and `all` are honoured
+/// where a host has text selection (the web, macOS, iOS) and are on the
+/// node that says them, not inherited on the wire, since each host resolves
+/// `auto` from what is above. `contain`, which no native presenter has, is
+/// refused by name.
 #[test]
-fn user_select_text_compiles_and_all_and_contain_are_refused_by_name() {
-    let source = "component App\n  view\n    column\n      column user-select=\"text\" testId=\"prose\"\n        text \"x\" testId=\"said\"\n      text \"y\" testId=\"unsaid\"\n";
+fn user_select_text_and_all_compile_and_contain_is_refused_by_name() {
+    let source = "component App\n  view\n    column\n      column user-select=\"text\" testId=\"prose\"\n        text \"x\" testId=\"said\"\n      text \"y\" testId=\"unsaid\"\n      text testId=\"para\"\n        text \"Folder: \"\n        text \"/tmp\" user-select=\"all\" testId=\"whole\"\n";
     let plan = contract::bake(contract::compile(source).unwrap(), NoData).unwrap();
     let runner = Runner::boot(
         plan,
@@ -410,14 +411,81 @@ fn user_select_text_compiles_and_all_and_contain_are_refused_by_name() {
     assert_eq!(select("prose"), exact_kernel::UserSelect::Text);
     assert_eq!(select("said"), exact_kernel::UserSelect::Auto);
     assert_eq!(select("unsaid"), exact_kernel::UserSelect::Auto);
-    for value in ["all", "contain"] {
-        let source = format!("component App\n  view\n    text \"x\" user-select=\"{value}\"\n");
-        let error = contract::compile(&source).unwrap_err().to_string();
-        assert!(
-            error.contains(&format!("`user-select=\"{value}\"`")),
-            "{error}"
-        );
-        assert!(error.contains("auto, none and text"), "{error}");
-        assert!(!error.contains("unknown attribute"), "{error}");
+    assert_eq!(select("whole"), exact_kernel::UserSelect::All);
+    assert_eq!(select("para"), exact_kernel::UserSelect::Auto);
+    let source = "component App\n  view\n    text \"x\" user-select=\"contain\"\n";
+    let error = contract::compile(source).unwrap_err().to_string();
+    assert!(error.contains("`user-select=\"contain\"`"), "{error}");
+    assert!(error.contains("auto, none, text and all"), "{error}");
+    assert!(!error.contains("unknown attribute"), "{error}");
+}
+
+/// @ref LLP 1053.000 D4 — every platform material by name, and `none`; others refused.
+#[test]
+fn a_material_is_a_name_in_the_table_or_none() {
+    for name in [
+        "ultra-thin",
+        "chrome-dark",
+        "prominent",
+        "sidebar",
+        "hud-window",
+        "glass-clear",
+    ] {
+        contract::compile(&format!(
+            "component App\n  view\n    box backgroundMaterial=\"{name}\"\n"
+        ))
+        .unwrap();
     }
+    let error =
+        contract::compile("component App\n  view\n    box backgroundMaterial=\"frosted\"\n")
+            .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("`backgroundMaterial=\"frosted\"` is not a material; materials: ultra-thin,"),
+        "{error}"
+    );
+    // `none` is no material, said or chosen (euxy's capsule); each string a
+    // computed value can take is checked, the arm's span named.
+    for value in [
+        "\"none\"",
+        "(on ? \"none\" : \"glass\")",
+        "(on ? \"thin\" : (on ? \"none\" : \"glass-clear\"))",
+    ] {
+        contract::compile(&format!(
+            "component App\n  state on = false\n  view\n    box backgroundMaterial={value}\n"
+        ))
+        .unwrap();
+    }
+    let error = contract::compile(
+        "component App\n  state on = false\n  view\n    box backgroundMaterial=(on ? \"glass\" : \"off\")\n",
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("`backgroundMaterial=\"off\"` is not a material")
+            && error.message.ends_with("or `none` for no material")
+            && error.span.col == 44,
+        "{error:?}"
+    );
+}
+
+#[test]
+fn calculated_grid_tracks_lower_in_attributes_and_styles() {
+    let value = "repeat(auto-fill, minmax(min(100%, 200px), 1fr))";
+    let src = format!(
+        "component App\n  view\n    view display=\"grid\" grid-template-columns=\"{value}\"\n"
+    );
+    contract::compile(&src).unwrap();
+    let src = format!("style Cards\n  grid-template-columns=\"{value}\"\ncomponent App\n  view\n    view class=Cards\n");
+    contract::compile(&src).unwrap();
+    let errors =
+        contract::compile("component App\n  view\n    view grid-template-columns=\"10em 1fr\"\n")
+            .unwrap_err();
+    let message = format!("{errors:?}");
+    assert!(
+        message.contains("calc()") && message.contains("min()"),
+        "{message}"
+    );
 }

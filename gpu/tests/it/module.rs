@@ -121,6 +121,73 @@ fn device_event_json_preserves_every_variant_and_refuses_fields_by_name() {
         parse_input(r#"{"t":"blur","at":5}"#).unwrap(),
         InputEvent::Blur { at_ms: 5.0 }
     );
+    // A pad's whole state, a list as a sensor's values are.
+    let mut buttons = [0.0; 17];
+    buttons[0] = 1.0;
+    buttons[7] = 0.5;
+    assert_eq!(
+        parse_input(r#"{"t":"pad","index":1,"connected":true,"standard":true,"buttons":[1,0,0,0,0,0,0,0.5,0,0,0,0,0,0,0,0,0],"axes":[0.25,-1,0,0],"at":6}"#).unwrap(),
+        InputEvent::Pad {
+            index: 1,
+            connected: true,
+            standard: true,
+            buttons,
+            axes: [0.25, -1.0, 0.0, 0.0],
+            at_ms: 6.0
+        }
+    );
+    for bad in [
+        r#"{"t":"pad","index":0,"connected":true,"standard":true,"buttons":[1],"axes":[0,0,0,0],"at":6}"#,
+        r#"{"t":"pad","index":0,"connected":true,"standard":true,"buttons":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2],"axes":[0,0,0,0],"at":6}"#,
+        r#"{"t":"key","code":["KeyW"],"key":"w","down":true,"repeat":false,"at":6}"#,
+        // A sensor's values are four finite numbers, its name one of seven.
+        r#"{"t":"sensor","sensor":"gravity","values":[0,0,9.8],"at":7}"#,
+        r#"{"t":"sensor","sensor":"gravity","values":[0,0,1e39,0],"at":7}"#,
+        r#"{"t":"sensor","sensor":"heading","values":[0,0,0,0],"at":7}"#,
+        r#"{"t":"sensorEnded","at":7}"#,
+    ] {
+        assert!(parse_input(bad).is_err(), "{bad}");
+    }
+    // A sensor's sample, `dropped` 0 when the host leaves it out (LLP 1133.013 D6).
+    use exact_gpu::SensorKind;
+    assert_eq!(
+        parse_input(
+            r#"{"t":"sensor","sensor":"gravity","values":[0,4.9,8.49,0],"dropped":3,"at":7}"#
+        )
+        .unwrap(),
+        InputEvent::Sensor {
+            sensor: SensorKind::Gravity,
+            values: [0., 4.9, 8.49, 0.],
+            dropped: 3,
+            at_ms: 7.
+        }
+    );
+    for kind in SensorKind::ALL {
+        let name = kind.name();
+        assert_eq!(SensorKind::from_name(name), Some(kind));
+        assert_eq!(
+            parse_input(&format!(
+                r#"{{"t":"sensor","sensor":"{name}","values":[1,2,3,4],"at":8}}"#
+            ))
+            .unwrap(),
+            InputEvent::Sensor {
+                sensor: kind,
+                values: [1., 2., 3., 4.],
+                dropped: 0,
+                at_ms: 8.
+            }
+        );
+        assert_eq!(
+            parse_input(&format!(
+                r#"{{"t":"sensorEnded","sensor":"{name}","at":9}}"#
+            ))
+            .unwrap(),
+            InputEvent::SensorEnded {
+                sensor: kind,
+                at_ms: 9.
+            }
+        );
+    }
     for (phase, expected) in [
         ("down", PointerPhase::Down),
         ("move", PointerPhase::Move),
@@ -181,8 +248,10 @@ fn device_event_json_preserves_every_variant_and_refuses_fields_by_name() {
 #[cfg(target_os = "macos")]
 mod seams {
     use exact_gpu::{wgpu, Frame, InputEvent, Registry, Surface, SurfaceError, Value};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     thread_local! { static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) }; }
+    /// `gpu_drew` after `fed`'s last render, before its flush
+    thread_local! { static DREW: Cell<u32> = const { Cell::new(0) }; }
     thread_local! { static BINDS: RefCell<Vec<Option<f64>>> = const { RefCell::new(Vec::new()) }; }
     /// A live-clock render once the canvas's drawable, acquired off this
     /// thread, has arrived: a starved render draws nothing and wants a frame.
@@ -190,7 +259,9 @@ mod seams {
         for _ in 0..400 {
             let r = gpu_render(id, w, h, scale, now);
             if gpu_starved(id) == 0 {
+                DREW.with(|d| d.set(gpu_drew(id)));
                 gpu_flush();
+                assert_eq!(gpu_drew(id), 0, "the flush submitted what the render drew");
                 return r;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -229,6 +300,9 @@ mod seams {
         }
         fn take_error(&mut self) -> Option<SurfaceError> {
             self.1.take()
+        }
+        fn opaque(&self) -> bool {
+            true
         }
         fn wants_input(&self) -> bool {
             true
@@ -311,6 +385,8 @@ mod seams {
         };
         assert_ne!(id, 0, "{}", exact_gpu::native::error());
         assert_eq!(gpu_wants_input(id), 1);
+        assert_eq!(gpu_presentation_flags(id), 3);
+        assert_eq!(gpu_presentation_flags(u32::MAX), 0);
         assert_eq!(exact_gpu::native::bind(id, "[]"), 0);
         assert_eq!(unsafe { gpu_bind_at(id, b"[]".as_ptr(), 2, 500.0) }, 0);
         BINDS.with(|b| assert_eq!(*b.borrow(), [None, Some(500.0)]));
@@ -365,6 +441,11 @@ mod seams {
         gpu_seekable(false);
         let result = fed(id, 4.0, 4.0, 1.0, 13.0);
         assert_eq!(result, 0, "{}", exact_gpu::native::error());
+        assert_eq!(
+            DREW.with(Cell::get),
+            1,
+            "a render that found its drawable drew"
+        );
         assert_eq!(
             exact_gpu::native::messages(id).as_deref(),
             Some(r#"["render"]"#)
@@ -628,6 +709,9 @@ fn assets_are_validated_drained_and_delivered_without_a_device() {
                 self.wanted.push("next.bin".into());
             }
         }
+        fn accepts_asset_update(&self, name: &str) -> bool {
+            name == "tables/lookup.bin"
+        }
         fn messages(&mut self) -> Vec<String> {
             std::mem::take(&mut self.delivered)
         }
@@ -673,6 +757,8 @@ fn assets_are_validated_drained_and_delivered_without_a_device() {
     );
     assert!(m.take_messages(id).is_empty());
     assert!(!m.asset(id, "next.bin", Err(exact_gpu::AssetError::Missing)));
+    assert!(m.asset(id, "tables/lookup.bin", Ok(&[4])));
+    assert_eq!(m.take_messages(id), ["tables/lookup.bin:Ok([4])"]);
 }
 
 #[test]
@@ -732,7 +818,7 @@ fn lifecycle_and_clock_reach_surfaces_without_a_device() {
     );
     m.set_seekable(false);
     assert!(m.agent(agent, "").unwrap().ends_with("clock:false"));
-    exact_gpu::native::load_headless(&REGISTRY);
+    exact_gpu::native::load_headless(&REGISTRY, "test-gpu");
     let id = exact_gpu::native::create_headless("probe");
     assert_eq!(exact_gpu::native::agent(id, ""), "clock:true");
     exact_gpu::native::unload();

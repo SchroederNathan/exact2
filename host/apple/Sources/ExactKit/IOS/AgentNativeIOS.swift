@@ -12,6 +12,90 @@
 import UIKit
 
 extension Agent {
+    func layout() -> [String: Any] {
+        let vp = presenter.viewport
+        var nodes: [[String: Any]] = []
+        for (id, v) in presenter.views.sorted(by: { $0.key < $1.key }) where v.window != nil {
+            if presenter.menus.ownsConfirmationNode(v) {
+                nodes.append(["id": Int(id), "presentation": "native-confirmation", "geometry": "unavailable"])
+                continue
+            }
+            let nativeAction = presenter.swipeActions.ownsAction(id)
+            let actionView = presenter.swipeActions.actionView(id)
+            // A bar's segment is where UIKit draws it.
+            let scope = (v as? NodeView).flatMap { presenter.navigation.barSegment($0) }.map { s in
+                s.control.convert(s.segment, to: vp).offsetBy(dx: -vp.pageOrigin.x, dy: -vp.pageOrigin.y)
+            }
+            let r = nativeAction ? actionView.map { box($0) } ?? .zero : scope ?? box(v)
+            var n: [String: Any] = ["id": Int(id), "x": Agent.r2(r.origin.x), "y": Agent.r2(r.origin.y), "w": Agent.r2(r.width), "h": Agent.r2(r.height)]
+            if !nativeAction, scope == nil {
+                n["radii"] = v.effectiveCornerSizes(in: v.bounds).map { [Double($0.width), Double($0.height)] }
+            }
+            if nativeAction { n["presentation"] = "native-swipe-action"; n["visible"] = actionView != nil }
+            // A waiting scroll (a closed swipe row's) is at its start, with no range until it scrolls.
+            if v.scrollDormant { n["sx"] = 0.0; n["sy"] = 0.0; n["rx"] = 0.0; n["ry"] = 0.0 }
+            if let sv = v.scrollView {
+                n["sx"] = Agent.r2(sv.contentOffset.x)
+                n["sy"] = Agent.r2(sv.contentOffset.y + v.scrollTopInset(sv))
+                n.merge(Agent.range(of: sv)) { _, new in new }
+                n["port"] = port(of: v, sv)
+                // How far past its own ends it sits: a stretched bounce is a
+                // state a driver cannot read from the offset alone.
+                let past = { (value: CGFloat, start: CGFloat, end: CGFloat) -> CGFloat in
+                    if value < start - 0.5 { return value - start }
+                    if value > end + 0.5 { return value - end }
+                    return 0
+                }
+                let i = sv.adjustedContentInset
+                let ox = past(sv.contentOffset.x, -i.left, max(-i.left, sv.contentSize.width + i.right - sv.bounds.width))
+                let oy = past(sv.contentOffset.y, -i.top, max(-i.top, sv.contentSize.height + i.bottom - sv.bounds.height))
+                if ox != 0 { n["ox"] = Agent.r2(ox) }
+                if oy != 0 { n["oy"] = Agent.r2(oy) }
+            }
+            nodes.append(n)
+        }
+        for (id, leaf) in presenter.flats.leaves.sorted(by: { $0.key < $1.key }) {
+            guard let host = presenter.flats.host(of: id), host.window != nil,
+                  let frame = presenter.flats.frameInHost(id) else { continue }
+            let r = box(host, region: frame)
+            let local = CGRect(origin: .zero, size: leaf.frame.size)
+            let corners = BorderPaint.reduced(BorderPaint.radii(leaf.style, in: local), in: local)
+            nodes.append(["id": Int(id), "x": Agent.r2(r.minX), "y": Agent.r2(r.minY),
+                          "w": Agent.r2(r.width), "h": Agent.r2(r.height),
+                          "radii": corners.map { [Double($0.width), Double($0.height)] }])
+        }
+        nodes.append(contentsOf: inlineLayout())
+        nodes.sort { ($0["id"] as? Int ?? 0) < ($1["id"] as? Int ?? 0) }
+        // The page's environment (LLP 1012 §1): the insets the kernel was
+        // given, and the keyboard's inset on the viewport, by the web's
+        // `env()` names.
+        let i = presenter.insets
+        let env: [String: Any] = ["safe-area-inset-top": Agent.r2(i.top), "safe-area-inset-right": Agent.r2(i.right), "safe-area-inset-bottom": Agent.r2(i.bottom), "safe-area-inset-left": Agent.r2(i.left), "keyboard-inset-height": Agent.r2(presenter.keyboardInset)].merging(presenter.fold.env) { a, _ in a }
+            .merging(LayoutRegions.env(presenter.regions, safe: (i.top, i.right, i.bottom, i.left), round: Agent.r2)) { a, _ in a }
+        var reply: [String: Any] = ["clock": session.now(), "viewport": ["w": Agent.r2(vp.pageSize.width), "h": Agent.r2(vp.pageSize.height)], "env": env, "nodes": nodes]
+        // A presentation the platform draws scaled (a floating sheet): its
+        // boxes above are the authored frames times `scale`, not the app's doing.
+        let scaled = presenter.modals.drawnScales.map { ["route": $0.route.props["navigationKey"] ?? "", "presentation": $0.kind, "scale": (Double($0.scale) * 1000).rounded() / 1000] as [String: Any] }
+        if !scaled.isEmpty { reply["scaled"] = scaled }
+        #if os(iOS)
+        // The status bar's style Exact asks for (LLP 1105 D7), and the node that decided it.
+        let bar = presenter.statusBar
+        reply["statusBar"] = ["style": bar.style == .lightContent ? "light-content" : bar.style == .darkContent ? "dark-content" : "default",
+                              "source": bar.source.map { Int($0) } ?? NSNull()] as [String: Any]
+        #endif
+        // The device's screen, where the viewport sits on it (LLP 1035.002
+        // D4's `screen` space) and the scene's interface orientation: what a
+        // real touch's aim is checked against (LLP 1080.000 D4).
+        if let w = vp.window, let container = vp.superview {
+            let screen = w.screen
+            let origin = container.convert(presenter.pageFrame.origin, to: screen.coordinateSpace) // the page's area (LLP 1130)
+            reply["screen"] = ["w": Agent.r2(screen.bounds.width), "h": Agent.r2(screen.bounds.height), "scale": Agent.r2(screen.scale),
+                               "x": Agent.r2(origin.x), "y": Agent.r2(origin.y), "orientation": Agent.orientation(w.windowScene)]
+        }
+        return reply
+    }
+
+
     // MARK: D1 — `layout <target> native`
 
     func nativeSubviews(_ id: UInt32, depth: Int, limit: Int, plan: Bool) -> [String: Any] {
@@ -27,7 +111,7 @@ extension Agent {
             if presenter.views[id] == nil { rootKind = "inline-owner" }
         } else {
             let vp = presenter.viewport
-            reply = ["clock": session.now(), "viewport": ["w": Agent.r2(vp.bounds.width), "h": Agent.r2(vp.bounds.height)], "node": runner]
+            reply = ["clock": session.now(), "viewport": ["w": Agent.r2(vp.pageSize.width), "h": Agent.r2(vp.pageSize.height)], "node": runner]
             if let parent = presenter.flats.inspectionParent(of: id), let pv = presenter.views[parent] {
                 root = pv; rootKind = "flat-run"; flatOnly = id
             } else {
@@ -52,13 +136,15 @@ extension Agent {
 
     func agreement(limit: Int) -> [String: Any] {
         let vp = presenter.viewport
-        var reply: [String: Any] = ["clock": session.now(), "viewport": ["w": Agent.r2(vp.bounds.width), "h": Agent.r2(vp.bounds.height)]]
+        var reply: [String: Any] = ["clock": session.now(), "viewport": ["w": Agent.r2(vp.pageSize.width), "h": Agent.r2(vp.pageSize.height)]]
         let scale = vp.window?.screen.scale ?? vp.traitCollection.displayScale
-        let report = AgreementReport(tolerance: 1 / max(scale, 1))
+        // A pixel, and the layout unit an edge is taken to before it is
+        // rounded to one (`PixelGridIOS.swift`).
+        let report = AgreementReport(tolerance: 1 / max(scale, 1) + 1.0 / 64)
         guard let kernel = kernelFrames() else { return ["error": "layout agree: the runner's frames are unreadable"] }
         guard let exactView = presenter.session?.view else { return ["error": "layout agree: the session has no view"] }
         if exactView.window == nil { report.incomplete("no-window") }
-        let roots = [(exactView as UIView, "ExactView")] + presenter.modals.inspectionRoots.map { ($0.view, $0.label) }
+        let roots = presenter.surfaces(includingRetiring: true).map { ($0.view, $0.label) }
         presenter.inspectAgreement(roots: roots, kernel: kernel, inFlight: nativeInFlight() || settle() != nil, report: report) { self.box($0) }
         if currentEpoch() != kernel.epoch { report.incomplete("spanned") }
         reply["agreement"] = report.json(limit: limit)
@@ -90,13 +176,13 @@ extension Presenter {
     /// for there is a stray. `owner` is the nearest node view at or above `v`.
     private func inspectionJudges(_ v: UIView, owner: NodeView?) -> Bool {
         if let n = liveView(v) { return !Self.platformKinds.contains(n.kind) && n.props["hatch"] == nil }
-        if v === viewport || v === root || v === session?.view { return true }
+        if v === viewport || v === documentMount || v === root || v === session?.view { return true }
         if let o = owner {
             let containers: [UIView?] = [o.clipBox, o.scroll, o.overlay, o.materialView?.contentView,
                                          o.glassGroupView?.contentView, o.glassSlot?.contentView]
             if containers.contains(where: { $0 === v }) { return true }
         }
-        return modals.inspectionRoots.contains { $0.view === v } || menus.inspectionOwns(v)
+        return surfaces(includingRetiring: true).contains { $0.view === v } || menus.inspectionOwns(v)
     }
 
     /// What accounts for `sub`, a subview of `parent` under node `owner`, by
@@ -118,12 +204,18 @@ extension Presenter {
             if Self.platformKinds.contains(o.kind) || o.props["hatch"] != nil { return ("platform", id) }
         }
         if menus.inspectionOwns(sub) { return ("menu", owner?.id) }
+        // A live flight's layer on the presentation it flies in, and the
+        // empty slot it holds open where its view lays out (FlightsIOS.swift).
+        if flights.values.contains(where: { $0.container === sub || $0.slot === sub }) { return ("flight", nil) }
         // A grouped list's background past the viewport's edge, beside it (LLP 1116.004 D2).
         if owner == nil, groupedLists?.inspectionOwns(sub) == true { return ("grouped-list", nil) }
         if sub === viewport { return ("viewport", nil) }
+        if sub === documentMount { return ("document mount", nil) }
         if sub === root { return ("document", nil) }
         if session?.view?.inspectionOwned.contains(where: { $0 === sub }) == true { return ("probe", nil) }
-        if modals.inspectionRoots.contains(where: { $0.owned.contains { $0 === sub } }) { return ("modal", nil) }
+        // The hidden view a mount reads its tint undimmed through (TintDimmingIOS.swift)
+        if sub is TintProbe { return ("tint probe", nil) }
+        if surfaces(includingRetiring: true).contains(where: { $0.owned.contains { $0 === sub } }) { return ("modal", nil) }
         // A controller's root view: navigation stacks, tabs, a modal's
         // covered owner. Its interior is UIKit's; nodes in it are matched.
         if sub.next is UIViewController { return ("controller", nil) }

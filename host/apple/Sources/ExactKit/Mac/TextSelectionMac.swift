@@ -113,22 +113,31 @@ package final class TextSelection {
     /// much as a paragraph (`refreshVisibleText`, X82).
     var shownParagraphs: [NodeView] {
         if let shown { return shown }
-        guard let presenter else { return [] }
         var result: [NodeView] = []
-        let tops: [NSView] = [presenter.root] + presenter.dialogs.presented + presenter.menus.presented
         for top in tops { texts(in: top) { result.append($0) } }
         shown = result
         return result
     }
 
+    /// The views the session's page is shown in: the root, then each subtree
+    /// the host moved out of it into a container of its own (a split's
+    /// detail pane, a sheet, a popover), then the dialogs and popovers
+    /// presented. A walk of the root alone misses a pane's text, which the
+    /// pump then never paints again: a rasterized heading there kept the
+    /// ink of the appearance it was first painted in.
+    private var tops: [NSView] {
+        guard let presenter else { return [] }
+        let presented = presenter.dialogs.presented + presenter.menus.presented
+        let moved = presenter.blocks.shown.filter { node in !presented.contains { $0 === node } }
+        return [presenter.root] + moved + presented
+    }
+
     var paragraphs: [NodeView] {
         if let ordered { return ordered.filter(selectable) }
-        guard let presenter else { return [] }
         var result: [NodeView] = []
-        let tops: [NSView] = [presenter.root] + presenter.dialogs.presented + presenter.menus.presented
         // Which text is hidden or inert is asked each time: `inert` changes
         // with a prop or a dialog, which leave this order as it is.
-        for top in tops { texts(in: top) { if $0.textSelectable { result.append($0) } } }
+        for top in tops { texts(in: top) { if $0.textSelectable || $0.inlineText.contains(where: \.selectsAll) { result.append($0) } } }
         ordered = result
         indices = Dictionary(uniqueKeysWithValues: result.enumerated().map { ($0.element.id, $0.offset) })
         return result.filter(selectable)
@@ -158,6 +167,16 @@ package final class TextSelection {
         report(next)
     }
 
+    /// The event parts whose exact geometry the reader worker must snapshot.
+    func rectangleRanges(_ node: NodeView) -> [NSRange] {
+        guard let selected = range(node), selected.length > 0 else { return [] }
+        var extents: [NSRange] = node.handlers.contains("selectionchange")
+            ? [NSRange(location: 0, length: (node.paragraphText as NSString).length)] : []
+        extents += node.inlineText.filter { $0.handlers.contains("selectionchange") }.map(\.range)
+        return extents.map { NSIntersectionRange(selected, $0) }.filter { $0.length > 0 }
+    }
+    func readerGeometryReady() { report(painted) }
+
     /// The web's `selectionchange` on a `text` (the reader diary): its part
     /// of the selection, in its source text's UTF-16 offsets, when that part
     /// changes; nothing selected there is "" at 0, 0, as on the web.
@@ -182,19 +201,60 @@ package final class TextSelection {
                 let part = NSIntersectionRange(source, extent)
                 let local = part.length > 0 ? NSRange(location: part.location - extent.location, length: part.length) : NSRange(location: 0, length: 0)
                 guard reported[id] ?? NSRange(location: 0, length: 0) != local else { continue }
-                reported[id] = local
                 let lo = node.readerParagraph == nil ? node.shapedOffset(part.location) : part.location
                 let hi = node.readerParagraph == nil ? node.shapedOffset(NSMaxRange(part)) : NSMaxRange(part)
-                let rects = part.length > 0 ? rectangles(node, range: NSRange(location: lo, length: hi - lo)) : []
+                let rects: [CGRect]
+                if part.length > 0 {
+                    guard let snapshot = rectangles(node, range: NSRange(location: lo, length: hi - lo)) else {
+                        node.readerParagraph?.update(node)
+                        continue
+                    }
+                    rects = snapshot
+                } else { rects = [] }
+                reported[id] = local
                 presenter.selectionChange(id, part.length > 0 ? text.substring(with: part) : "", local.location, NSMaxRange(local), rects: rects)
             }
         }
         reported = reported.filter { seen.contains($0.key) }
     }
 
-    private func rectangles(_ node: NodeView, range: NSRange?) -> [CGRect] {
-        guard let range, let presenter, let paragraph = node.paragraphLayout() else { return [] }
+    /// Where the ContextMenu key opens with nothing focused while text is
+    /// selected in `window`, as Blink's `ShowNonLocatedContextMenu` places
+    /// it: at the caret where the selection starts, halfway down its line;
+    /// the line's left edge, or its right edge in a right-to-left paragraph,
+    /// in the window; with the paragraph that holds it. Of the selected
+    /// lines, the first one part of which is drawn counts, clipped as
+    /// `Presenter.contextPoint` clips; nil when none is, and the key lands
+    /// at (1,1) as it does with nothing selected.
+    func keyboardMenuPoint(in window: NSWindow) -> (NodeView, NSPoint)? {
+        guard let presenter else { return nil }
+        for node in paragraphs where node.window === window {
+            guard let range = range(node), range.length > 0, let rects = rectangles(node, range: range, inWindow: true) else { continue }
+            let rtl = node.userInterfaceLayoutDirection == .rightToLeft
+            for rect in rects {
+                let shown = presenter.visiblePart(of: rect, in: node)
+                guard !shown.isEmpty else { continue }
+                // The right edge itself is outside the line (`NSPointInRect`).
+                return (node, NSPoint(x: rtl ? max(shown.minX, shown.maxX - 1) : shown.minX, y: shown.midY))
+            }
+        }
+        return nil
+    }
+
+    /// The selected lines of `range` in `node`, as drawn: in the page's
+    /// client space (the clip's, from its scroll origin), or in the window.
+    private func rectangles(_ node: NodeView, range: NSRange?, inWindow: Bool = false) -> [CGRect]? {
+        guard let range, let presenter else { return [] }
         let clip = presenter.viewport.contentView
+        let drawn = { (rect: CGRect) in
+            inWindow ? node.drawnRect(rect) : node.drawnRect(rect, in: clip).offsetBy(dx: -clip.bounds.minX, dy: -clip.bounds.minY)
+        }
+        if let reader = node.readerParagraph {
+            guard let rects = reader.selectionRects(range) else { return nil }
+            let origin = node.contentBox().origin
+            return rects.map { drawn($0.offsetBy(dx: origin.x, dy: origin.y)) }
+        }
+        guard let paragraph = node.paragraphLayout() else { return [] }
         let selected = paragraph.selectedLines(range, align: node.paragraphSpec().align, in: node.paragraphBox(), dirty: .infinite)
         let local: [CGRect]
         if let fragments = node.columnRecord?.fragments, !fragments.isEmpty {
@@ -205,7 +265,7 @@ package final class TextSelection {
                 }
             }
         } else { local = selected.map(\.rect) }
-        return local.map { node.drawnRect($0, in: clip).offsetBy(dx: -clip.bounds.minX, dy: -clip.bounds.minY) }
+        return local.map(drawn)
     }
 
     func set(_ node: NodeView, _ selection: FieldSelection) {
@@ -218,7 +278,7 @@ package final class TextSelection {
         let lo = shaped(selection.start), hi = shaped(selection.end)
         anchorIndex = selection.direction == "backward" ? hi : lo
         focusIndex = selection.direction == "backward" ? lo : hi
-        unit = .character; anchorUnit = NSRange(location: lo, length: hi - lo); dragged = hi > lo
+        unit = .character; anchorAtomic = false; anchorSpan = (Spot(node, lo), Spot(node, hi)); dragged = hi > lo
         if let (owner, start) = position(node, offset: anchorIndex), let (_, end) = position(node, offset: focusIndex) {
             var a = start, b = end
             a.offset = selection.direction == "backward" ? selection.end : selection.start
@@ -260,13 +320,16 @@ package final class TextSelection {
             if self.gesture == current, !(responder is NSWindow || responder === self.presenter?.viewport) { self.clear() }
         }
     }
-    /// A mouse-down on text a drag selects: the paragraph takes the focus
-    /// and the selection begins there or, with Shift, grows to there. The
+    /// A plain click keeps a field's editor. Other selection presses take
+    /// focus unless retainFocus applies. The
     /// focus moving between two paragraphs clears a selection; not one this
     /// click is about to extend.
     func press(_ node: NodeView, event: NSEvent) {
         holding = event.modifierFlags.contains(.shift) && anchor != nil
-        node.window?.makeFirstResponder(node)
+        let editing = (node.window?.firstResponder as? NSTextView)?.isEditable == true
+        if !node.retainsFocus && (!editing || holding || event.clickCount > 1 || atomic(node)) {
+            node.window?.makeFirstResponder(node)
+        }
         holding = false
         begin(node, event: event)
     }
@@ -287,10 +350,19 @@ package final class TextSelection {
     /// see it and reach it. As in Chrome, text that computes `visibility:
     /// hidden` (the stacked tab not shown, T3 F12-2) or is `inert` is
     /// neither highlighted nor copied, by ⌘A or a drag; a `display: none`
-    /// subtree is `isHidden`, which `texts(in:)` leaves out.
-    private func selectable(_ node: NodeView) -> Bool { !node.cssVisibilityHidden && node.textSelectable && !node.inert }
+    /// subtree is `isHidden`, which `texts(in:)` leaves out. Text that is not
+    /// selectable takes part for its `user-select: all` runs alone (`range`),
+    /// as on the web, where the run's own value stands.
+    private func selectable(_ node: NodeView) -> Bool {
+        !node.cssVisibilityHidden && !node.inert && (node.textSelectable || node.inlineText.contains(where: \.selectsAll))
+    }
+    /// Whether `node` holds or is in a `user-select: all` element.
+    private func atomic(_ node: NodeView) -> Bool { node.selectAllElement != nil || node.inlineText.contains(where: \.selectsAll) }
+    /// The paragraph the last press landed in: its release follows a link there.
+    private weak var pressed: NodeView?
     func begin(_ node: NodeView, event: NSEvent) {
         requested = nil
+        pressed = node
         guard selectable(node) else { clear(); return }
         let clicks = event.clickCount
         // A Shift-click extends what is selected, as in an `NSTextView`
@@ -364,7 +436,6 @@ package final class TextSelection {
         focusIndex = anchorIndex
         dragged = false
         unit = clicks >= 3 ? .paragraph : clicks == 2 ? .word : .character
-        defer { anchorUnit = NSRange(location: min(anchorIndex, focusIndex), length: abs(focusIndex - anchorIndex)) }
         if clicks >= 3 {
             anchorIndex = 0; focusIndex = length(node); dragged = true
         } else if clicks == 2 {
@@ -378,15 +449,75 @@ package final class TextSelection {
                 anchorIndex = word.location; focusIndex = NSMaxRange(word); dragged = true
             }
         }
-        if let (owner, start) = position(node, offset: anchorIndex), let (_, end) = position(node, offset: focusIndex) {
+        atomize(node, clicks: clicks, point: point, caret: index)
+        if let anchor, let focus, let (owner, start) = position(anchor, offset: anchorIndex), let (_, end) = position(focus, offset: focusIndex) {
             list = owner; logicalAnchor = start; logicalFocus = end
         }
         invalidate()
     }
 
+    /// CSS UI 4 `user-select: all`: a click's character, or the ends of a
+    /// double or triple click's unit, inside such an element take the whole
+    /// element. Its span is the anchor's from here, which a drag keeps
+    /// whole as it keeps a double click's word (`extend`).
+    private func atomize(_ node: NodeView, clicks: Int, point: NSPoint, caret: Int) {
+        var start = Spot(node, anchorIndex), end = Spot(node, focusIndex)
+        defer { anchorSpan = (start, end) }
+        guard atomic(node) else { anchorAtomic = false; return }
+        if clicks < 2 {
+            let text = node.paragraphSpec().runs.map(\.text).joined() as NSString
+            if text.length > 0, let found = atom(node, character: character(node, at: point, caret: caret, in: text)) { (start, end) = found }
+        } else {
+            if let found = atom(node, character: anchorIndex) { start = found.start }
+            if let found = atom(node, character: focusIndex - 1) { end = found.end }
+        }
+        anchorAtomic = start.node !== node || end.node !== node || start.index != anchorIndex || end.index != focusIndex
+        anchor = start.node ?? node; anchorIndex = start.index
+        focus = end.node ?? node; focusIndex = end.index
+    }
+
+    /// The `user-select: all` element (CSS UI 4 §6.1: its content is
+    /// selected atomically) that character `c` of `node` is in, as the
+    /// selection that takes it whole: an element around paragraphs from its
+    /// first one's start to its last one's end, an inline run its offsets in
+    /// its paragraph. An element inside another is part of the outer one.
+    /// Nil when there is none, and for a character `node` does not have.
+    private func atom(_ node: NodeView, character c: Int) -> (start: Spot, end: Spot)? {
+        guard atomic(node), c >= 0, c < length(node) else { return nil }
+        let outer = node.selectAllElement
+        if let outer, outer !== node {
+            var inside: [NodeView] = []
+            texts(in: outer) { if selectable($0) { inside.append($0) } }
+            if let first = inside.first, let last = inside.last, inside.contains(where: { $0 === node }) {
+                return (Spot(first, 0), Spot(last, length(last)))
+            }
+        }
+        if outer != nil { return (Spot(node, 0), Spot(node, length(node))) }
+        guard node.readerParagraph == nil, !node.inlineText.isEmpty else { return nil }
+        // The leaf run holding the character, then the runs around it.
+        let source = node.sourceOffset(c), runs = node.inlineText
+        var lo = 0, hi = runs.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if runs[mid].range.location <= source { lo = mid + 1 } else { hi = mid }
+        }
+        var run: InlineText? = lo > 0 ? runs[lo - 1] : nil, whole: NSRange?
+        while let current = run {
+            if current.selectsAll, NSLocationInRange(source, current.range) { whole = current.range }
+            run = presenter?.inlineText(current.parent)
+        }
+        guard let whole else { return nil }
+        return (Spot(node, node.shapedOffset(whole.location)), Spot(node, node.shapedOffset(NSMaxRange(whole))))
+    }
+
     func drag(_ event: NSEvent) {
         if pendingBegin { deferredDrag = event; return }
         guard anchor != nil || list != nil else { return }
+        if let anchor {
+            holding = true
+            anchor.window?.makeFirstResponder(anchor)
+            holding = false
+        }
         dragged = true
         let point = event.locationInWindow
         let nodes = paragraphs.filter { list == nil || $0.isDescendant(of: list!) }
@@ -407,21 +538,37 @@ package final class TextSelection {
     /// whole word or paragraph it is in, and the anchor's own stays whole
     /// whichever way the focus goes, as an `NSTextView`'s does (LLP 1115.000
     /// D7.9). A giant paragraph's text is its worker's, and grows by character.
-    private func extend(_ node: NodeView, event: NSEvent?, index: Int, point: NSPoint? = nil) {
+    /// A focus that lands in a `user-select: all` element takes the
+    /// element's far end (CSS UI 4 §6.1): the end a key moving it by `step`
+    /// heads for, else the end away from the anchor.
+    private func extend(_ node: NodeView, event: NSEvent?, index: Int, point: NSPoint? = nil, step: Int? = nil) {
         requested = nil
-        var index = index
-        if unit != .character, node.readerParagraph == nil, let anchor, let at = place(node, index),
-           let low = place(anchor, anchorUnit.location) {
-            let span = unitRange(node, index: index, point: point)
-            let forward = at >= low
-            anchorIndex = forward ? anchorUnit.location : NSMaxRange(anchorUnit)
-            index = forward ? NSMaxRange(span) : span.location
-            if node === anchor, forward { index = max(index, NSMaxRange(anchorUnit)) }
-            if let (_, value) = position(anchor, offset: anchorIndex), list != nil { logicalAnchor = value }
+        var index = index, target = node
+        var forward = step.map { $0 > 0 }
+        if unit != .character || anchorAtomic, let start = anchorSpan.start.node, let end = anchorSpan.end.node,
+           let at = place(node, index), let low = place(start, anchorSpan.start.index) {
+            let ahead = at >= low
+            forward = ahead
+            if unit != .character, node.readerParagraph == nil {
+                let span = unitRange(node, index: index, point: point)
+                index = ahead ? NSMaxRange(span) : span.location
+            }
+            anchor = ahead ? start : end
+            anchorIndex = ahead ? anchorSpan.start.index : anchorSpan.end.index
+            // Inside the anchor's own span the selection is that span.
+            if ahead, let high = place(end, anchorSpan.end.index), let now = place(node, index), now < high {
+                target = end; index = anchorSpan.end.index
+            }
+            if let anchor, let (_, value) = position(anchor, offset: anchorIndex), list != nil { logicalAnchor = value }
         }
-        focus = node
+        if forward == nil, let anchor, let low = place(anchor, anchorIndex), let at = place(target, index) { forward = at >= low }
+        if let found = atom(target, character: forward ?? true ? index - 1 : index) {
+            let edge = forward ?? true ? found.end : found.start
+            if let at = edge.node { target = at; index = edge.index }
+        }
+        focus = target
         focusIndex = index
-        if let (_, value) = position(node, offset: focusIndex), list != nil { logicalFocus = value }
+        if let (_, value) = position(target, offset: focusIndex), list != nil { logicalFocus = value }
         if let event { node.autoscroll(with: event) }
         invalidate()
     }
@@ -431,9 +578,18 @@ package final class TextSelection {
     /// word, a triple click's paragraph).
     private enum Unit { case character, word, paragraph }
     private var unit = Unit.character
-    /// The anchor's own unit, in its paragraph's shaped offsets: what a drag
-    /// after a double click keeps whole. A point after a Shift-click or a key.
-    private var anchorUnit = NSRange(location: 0, length: 0)
+    /// A paragraph and a shaped offset in it: an end of `anchorSpan`.
+    private struct Spot {
+        weak var node: NodeView?
+        var index: Int
+        init(_ node: NodeView?, _ index: Int) { self.node = node; self.index = index }
+    }
+    /// The anchor's own unit: what a drag after a double click keeps whole,
+    /// and the `user-select: all` element a click began in (`anchorAtomic`),
+    /// which may hold several paragraphs. A point after a Shift-click or a key.
+    private var anchorSpan = (start: Spot(nil, 0), end: Spot(nil, 0))
+    /// The click that began the selection took a `user-select: all` element.
+    private var anchorAtomic = false
 
     /// Where an offset of a paragraph stands in the selection's order: by row
     /// and paragraph in a list, whose rows come and go, and by the page's
@@ -476,13 +632,20 @@ package final class TextSelection {
             let other = anchor; anchor = focus; focus = other
         }
         if clicks >= 2 { unit = clicks >= 3 ? .paragraph : .word }
-        anchorUnit = NSRange(location: anchorIndex, length: 0)
+        anchorSpan = (Spot(anchor, anchorIndex), Spot(anchor, anchorIndex)); anchorAtomic = false
         allListText = false; dragged = true
         extend(node, event: nil, index: index, point: point)
     }
 
     /// Where a key command moves the selection's focus.
-    private enum Move { case character(Int), word(Int), lineEdge(Int), line(Int), paragraphEdge(Int), documentEdge(Int) }
+    private enum Move {
+        case character(Int), word(Int), lineEdge(Int), line(Int), paragraphEdge(Int), documentEdge(Int)
+        var step: Int {
+            switch self {
+            case .character(let n), .word(let n), .lineEdge(let n), .line(let n), .paragraphEdge(let n), .documentEdge(let n): return n
+            }
+        }
+    }
     private static let moves: [String: Move] = [
         "moveLeftAndModifySelection:": .character(-1), "moveBackwardAndModifySelection:": .character(-1),
         "moveRightAndModifySelection:": .character(1), "moveForwardAndModifySelection:": .character(1),
@@ -507,8 +670,8 @@ package final class TextSelection {
         guard let from = focus, anchor != nil, from.window != nil, from.readerParagraph == nil, place(from, focusIndex) != nil else { return true }
         let (node, index) = target(move, from: from, focusIndex)
         gesture += 1; pendingBegin = false; deferredDrag = nil; deferredEnd = nil
-        unit = .character; allListText = false; dragged = true
-        extend(node, event: nil, index: index)
+        unit = .character; anchorAtomic = false; allListText = false; dragged = true
+        extend(node, event: nil, index: index, step: move.step)
         if let paragraph = node.paragraphLayout() {
             let count = length(node), all = CGRect(x: -1e7, y: -1e7, width: 2e7, height: 2e7)
             let caret = NSRange(location: min(index, max(0, count - 1)), length: min(1, count))
@@ -568,17 +731,19 @@ package final class TextSelection {
 
     func end(_ node: NodeView, event: NSEvent) {
         if pendingBegin { deferredEnd = (node, event); return }
-        if !dragged, anchor === node, let reader = node.readerParagraph {
+        if !dragged, pressed === node, let reader = node.readerParagraph {
             let current = gesture
             reader.resolveOffset(at: node.local(event.locationInWindow), node: node) { [weak self] _, url in
                 // A route of this app navigates in it, as a short paragraph's
                 // link does (b6 review B5); the rest is the containing app's.
                 guard let self, self.gesture == current, let url, let session = self.presenter?.session else { return }
+                if node.pressReaderAtom(url) { return } // an inline atom's press (LLP 1045.000 D7)
                 session.follow(url)
             }
             return
         }
-        guard !dragged, anchor === node, let url = link(node, at: node.local(event.locationInWindow)) else { return }
+        guard !dragged, pressed === node, let url = link(node, at: node.local(event.locationInWindow)) else { return }
+        if node.pressReaderAtom(url) { return } // an inline atom's press (LLP 1045.000 D7)
         // A route of this app navigates in it; the containing app owns the
         // rest (local Markdown, anchors, browser URLs); no arbitrary URL
         // scheme is launched by the presenter.
@@ -618,7 +783,8 @@ package final class TextSelection {
         }
         let parts = paragraphs.compactMap { node -> String? in
             guard let range = range(node), range.length > 0 else { return nil }
-            return (node.paragraphSpec().runs.map(\.text).joined() as NSString).substring(with: range)
+            let source = node.paragraphSpec().runs.map(\.text).joined() as NSString
+            return node.copiedText(source.substring(with: range), from: range.location)
         }
         return parts.joined(separator: "\n\n")
     }
@@ -628,8 +794,22 @@ package final class TextSelection {
         return node.paragraphSpec().runs.reduce(0) { $0 + ($1.text as NSString).length }
     }
 
+    /// Text that is not selectable but holds `user-select: all` runs has
+    /// those runs alone: from the first the selection reaches to the last.
     func range(_ node: NodeView) -> NSRange? {
-        guard selectable(node) else { return nil }
+        guard !node.cssVisibilityHidden, !node.inert else { return nil }
+        if node.textSelectable { return spanned(node) }
+        let wholes = node.inlineText.filter(\.selectsAll)
+        guard !wholes.isEmpty, let found = spanned(node), found.length > 0 else { return nil }
+        var lo = Int.max, hi = Int.min
+        for run in wholes {
+            let start = node.shapedOffset(run.range.location), end = node.shapedOffset(NSMaxRange(run.range))
+            if start < NSMaxRange(found), end > found.location { lo = min(lo, start); hi = max(hi, end) }
+        }
+        return hi > lo ? NSRange(location: lo, length: hi - lo) : nil
+    }
+
+    private func spanned(_ node: NodeView) -> NSRange? {
         if let list {
             guard let (owner, p) = position(node, offset: 0), owner === list else { return nil }
             let count = length(node)
@@ -754,12 +934,66 @@ package final class TextSelection {
         let lines = paragraph.selectedLines(selection, align: spec.align, in: box, dirty: dirty)
         guard !lines.isEmpty else { return }
         let ink = Self.ink(focused: focused).cgColor, keepsFixed = Self.keepsFixedInk(dark: node.drawsDark)
+        var paint = spec, changed = false
+        for i in paint.runs.indices where !(keepsFixed && paint.runs[i].fixedInk) {
+            let run = paint.runs[i]
+            guard run.underlined || !run.decoration.isEmpty || run.underlineColor != nil || run.strikeColor != nil else { continue }
+            func opaque(_ color: [Double]?) -> [Double]? {
+                guard var color, color.count == 4, color[3] > 0, color[3] < 255 else { return color }
+                color[3] = 255; changed = true
+                return color
+            }
+            paint.runs[i].color = opaque(run.color ?? spec.color)
+            paint.runs[i].underlineColor = opaque(run.underlineColor)
+            paint.runs[i].strikeColor = opaque(run.strikeColor)
+        }
+        let indices = Set(lines.map(\.line))
+        var repainted: [Int: CTLine] = [:]
+        if changed, let engine = node.text {
+            // Change paint over the measured ranges. Rewrapping loses the
+            // exclusion intervals and column fragments that own these lines.
+            let ordered = indices.sorted()
+            let ranges = ordered.map { index -> CFRange in
+                if index == paragraph.lines.count - 1, let clamped = paragraph.clampedRange { return clamped }
+                if !paragraph.fragments.isEmpty {
+                    let fragment = paragraph.fragments[index]
+                    return CFRange(location: fragment.paint_start, length: fragment.paint_end - fragment.paint_start)
+                }
+                return CTLineGetStringRange(paragraph.lines[index])
+            }
+            let source: NSAttributedString, rebuilt: [CTLine]
+            if !paragraph.fragments.isEmpty, let flow = engine.paragraph(paint, width: .infinity).shape?.preparedFlow() {
+                source = flow.attributed
+                rebuilt = zip(ordered, ranges).map { index, range in
+                    let line = range.length > 0 ? CTTypesetterCreateLine(flow.typesetter, range)
+                        : CTLineCreateWithAttributedString(NSAttributedString(string: ""))
+                    return paragraph.fragments[index].hyphenated != 0
+                        ? TextEngine.inkedSoftHyphen(line, source: source, range: range) : line
+                }
+            } else {
+                (source, rebuilt) = engine.rasterLines(paint, ranges: ranges, width: box.width)
+            }
+            for (offset, index) in ordered.enumerated() where ranges[offset].length > 0 {
+                var line = rebuilt[offset]
+                let range = NSRange(location: ranges[offset].location, length: ranges[offset].length)
+                let fragment = paragraph.fragments.isEmpty ? nil : paragraph.fragments[index]
+                let width = fragment.map { Double($0.available) } ?? Double(box.width)
+                let flowClamped = fragment.map { $0.end < (paragraph.shape?.preparedFlow().utf8Count ?? source.string.utf8.count) && paint.lineClamp > 0 } ?? false
+                if index == paragraph.lines.count - 1, paragraph.clampedRange != nil || flowClamped {
+                    line = TextEngine.clampedLine(source, range: range, width: width) ?? line
+                } else if spec.ellipsis, CTLineGetTypographicBounds(line, nil, nil, nil) - CTLineGetTrailingWhitespaceWidth(line) > box.width + 0.5 {
+                    line = TextEngine.ellipsis(line, range: range, width: Double(box.width), source: source) ?? line
+                }
+                repainted[index] = line
+            }
+        }
         ctx.saveGState()
+        if spec.antialiased { ctx.setShouldSmoothFonts(false) }
         ctx.clip(to: lines.map(\.rect))
         ctx.setFillColor(Self.fill(focused: focused).cgColor)
         ctx.fill(lines.map(\.rect))
-        for index in Set(lines.map(\.line)) {
-            let line = spec.ellipsis ? paragraph.ellipsized(index, spec: spec, width: box.width) : paragraph.lines[index]
+        for index in indices {
+            let line = repainted[index] ?? (spec.ellipsis ? paragraph.ellipsized(index, spec: spec, width: box.width) : paragraph.lines[index])
             let origin = CGPoint(x: box.minX + paragraph.origin(index, align: spec.align, width: box.width),
                                  y: box.minY + paragraph.baselines[index].rounded())
             TextLinePaint.draw(line, at: origin, in: ctx, ink: ink, keepsFixed: keepsFixed, transparentInk: node.backgroundClip == "text")
@@ -788,7 +1022,7 @@ extension NodeView: NSServicesMenuRequestor {
     package override func menu(for event: NSEvent) -> NSMenu? {
         guard isParagraph, let selection = presenter?.selection, !contextMenuAuthored,
               inlineContextTarget(at: local(event.locationInWindow)) == nil else { return super.menu(for: event) }
-        if event.type == .rightMouseDown || (event.type == .leftMouseDown && event.modifierFlags.contains(.control)),
+        if !Self.keyboardMenuRequest, event.type == .rightMouseDown || (event.type == .leftMouseDown && event.modifierFlags.contains(.control)),
            !selection.secondaryClick(self, event: event, answered: {
                // The reader's worker placed the click: its menu opens on the
                // next turn, once the reader has taken the answer in.
@@ -801,6 +1035,11 @@ extension NodeView: NSServicesMenuRequestor {
         }
         return textMenu(event) ?? super.menu(for: event)
     }
+    /// A request from the keyboard is asking `menu(for:)` (the ContextMenu
+    /// key, VoiceOver's show menu: `Presenter.keyboardMenu`): no pointer
+    /// landed, so selectable text keeps its selection and a list's row
+    /// hears nothing.
+    static var keyboardMenuRequest = false
     /// AppKit's menu for the selection, with the Services that take its text.
     private func textMenu(_ event: NSEvent) -> NSMenu? {
         guard let menu = presenter?.selection.systemMenu(for: self, event: event) else { return nil }

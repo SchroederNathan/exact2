@@ -90,6 +90,7 @@ function apply() {
       was[j] = text;
     }
   }
+  globalThis.exact?.repaintPress?.(); // a held press eases over the tuples as they are now (input-glue.js)
 }
 const set = (e, k) => { if (e.getAttribute("data-x-modes") !== k) e.setAttribute("data-x-modes", k); };
 
@@ -167,6 +168,10 @@ const refused = pins => {
 
 // dev-only {: the live table's runtime, which a release build's copy leaves
 // out (build.mjs `withoutDev`).
+// The last scrub frame applied (`{id, rev}`), which an older one is not.
+let Scrubbed = null;
+// The runs a later run's frame has followed: theirs are older (a few kept).
+const Retired = [];
 /** The page's rule for each full tuple, by its key, and its accent
  * companions (`[data-x-accent]`, modes.rs `rules`), by key and property. */
 function tupleRules() {
@@ -205,10 +210,48 @@ const tupleKey = t => {
  * its base is not this page's design. */
 function design(frame) {
   if (frame.structure !== Structure) return { live: "structure" };
+  // A frame sent before the last applied is shown over already: one of a
+  // retired run, or one after a mark of its own run (with no
+  // run on either, its scrub) not above it; one with a run after a mark
+  // with none is a new run's.
+  const mark = frame.scrub;
+  const same = mark && Scrubbed && (mark.run != null && Scrubbed.run != null ? mark.run === Scrubbed.run : mark.run == null && Scrubbed.run == null && mark.id === Scrubbed.id);
+  const older = mark && (Retired.includes(mark.run) || (same && mark.rev <= Scrubbed.rev));
+  if (older) return { live: "applied" };
   if (frame.base != null && frame.base !== Design) return { live: "stale" };
+  if (mark) {
+    if (Scrubbed?.run != null && mark.run !== Scrubbed.run && !Retired.includes(Scrubbed.run)) { Retired.push(Scrubbed.run); if (Retired.length > 8) Retired.shift(); }
+    Scrubbed = mark;
+  }
   if (frame.design === Design || !frame.tokens?.length) return { live: "applied" };
+  return mark ? still(() => setTokens(frame)) : setTokens(frame);
+}
+/** A scrub's frame shows with no transition, as the tool drags it (LLP 1121
+ * D13): every transition off while its values are set and styled, then back
+ * on, with nothing left to move. */
+function still(apply) {
+  const root = document.documentElement;
+  if (!document.getElementById("x-scrub-still")) {
+    const sheet = document.createElement("style");
+    sheet.setAttribute("id", "x-scrub-still");
+    sheet.textContent = "[data-x-scrub],[data-x-scrub] *,[data-x-scrub] *::before,[data-x-scrub] *::after{transition:none!important}";
+    document.head.append(sheet);
+  }
+  // Off through the drag (one style change of the whole page as it starts
+  // and one as it rests, not two each frame), its last values styled before
+  // transitions come back.
+  if (!root.hasAttribute("data-x-scrub")) root.setAttribute("data-x-scrub", "");
+  try { return apply(); } finally {
+    clearTimeout(StillUntil);
+    StillUntil = setTimeout(() => { void root.offsetWidth; root.removeAttribute("data-x-scrub"); }, 150);
+  }
+}
+let StillUntil = null;
+/** Set a frame's tokens in every tuple's rule, in one style update. */
+function setTokens(frame) {
   const rules = tupleRules();
-  for (const t of frame.tokens) {
+  // A type token is a property a row it writes (`parts`, modes.rs `design`).
+  for (const t of frame.tokens.flatMap(t => t.parts ?? [t])) {
     if (!t.prop || !Array.isArray(t.css)) continue;
     // The tint's override: the theme's `:root` rule, under an authored
     // `accent-color`'s redeclaration (LLP 1121 stage 5).
@@ -222,6 +265,10 @@ function design(frame) {
     });
   }
   Design = (globalThis.exact ??= {}).designDigest = frame.design;
+  globalThis.exact.repaintPress?.(); // a held press eases over the new values (LLP 1121 D8, input-glue.js)
+  // A symbol sized by a type token's property redraws its mask, as the
+  // build channel's scheme pin asks it (symbols.js listens for a resize).
+  if (frame.tokens.some(t => t.parts) && typeof dispatchEvent === "function") dispatchEvent(new Event("resize"));
   return { live: "applied" };
 }
 // dev-only }
@@ -237,6 +284,9 @@ export function modes(axes, classes, texts, vars, accent, names, devDesign, devS
   Axes = axes; Classes = classes; Texts = texts; Vars = vars; Accent = accent; Names = names ?? {}; Win = axes.map(() => 0);
   // dev-only {
   if (devDesign != null && typeof document !== "undefined") { Design = devDesign; Structure = devStructure; Rules = null; Object.assign(globalThis.exact ??= {}, { design, designDigest: devDesign }); }
+  // A dev reload's checkpoint (dev.mjs `capture`) carries the window's modes the design still has.
+  const kept = JSON.parse(globalThis.document?.querySelector?.('script[type="application/vnd.exact.dev-checkpoint"]')?.textContent ?? "null")?.modes;
+  if (kept) Axes.forEach(([a, values], i) => { const j = values.indexOf(kept[a]); if (j >= 0) Win[i] = j; });
   // dev-only }
   After.push(() => rendering() ? typeof document !== "undefined" && apply() : schedule());
   PropHooks["data-x-pin"] = (e, v) => { if (v == null) e.removeAttribute("data-x-pin"); else e.setAttribute("data-x-pin", v); schedule(); return true; };
@@ -248,7 +298,8 @@ export function modes(axes, classes, texts, vars, accent, names, devDesign, devS
     // tokens `text` names, the tuple the element is in, and whether the
     // boundary wrote the row again. A token folded inline is not one.
     token: (e, prop, text) => {
-      const names = [...new Set([...String(text).matchAll(/var\((--x-[\w-]+)\)/g)].map(m => Names[m[1]]).filter(Boolean))];
+      // (Any property this table names: a token's `--x-…`, and a role's override, `--exact-canvas-text`.)
+      const names = [...new Set([...String(text).matchAll(/var\((--[\w-]+)\)/g)].map(m => Names[m[1]]).filter(Boolean))];
       if (!names.length) return undefined;
       const j = CH.indexOf(prop === "--exact-accent" ? "accent-color" : prop);
       let at = e;
@@ -266,7 +317,12 @@ export function modes(axes, classes, texts, vars, accent, names, devDesign, devS
     // The app's `setMode(axis, value)` (commands.js), as the runner takes it.
     command: args => {
       const [a, v] = args;
-      if (args.length === 2 && typeof a === "string" && typeof v === "string" && !refused([[a, v]])) return void globalThis.exact.modes.set([[a, v]]);
+      if (args.length === 2 && typeof a === "string" && typeof v === "string" && !refused([[a, v]])) {
+        // (A development page may hold the axis over the app's own, LLP 1122 T7: kept as asked, applied when handed back.)
+        const x = globalThis.exact, apply = () => x.modes.set([[a, v]]);
+        (x.asked ??= {})[`mode:${a}`] = { value: v, apply };
+        return void (x.held?.[`mode:${a}`] ? x.onAsked?.() : apply());
+      }
       say(`setMode(${args.map(x => JSON.stringify(x)).join(", ")}) refused: an axis of the app's design and one of its values`);
     },
   };

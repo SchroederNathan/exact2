@@ -10,16 +10,23 @@ use crate::Span;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// Status intrinsics resolve their target before looking up a function.
+pub const STATUS_CALLS: &[&str] = &["pending", "failed", "failure"];
+
 /// The namespaces a top-level name lives in. Shapes and `fn`s share one:
 /// both are called as `Name(…)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
     /// `component`.
     Component,
-    /// `shape` and `fn`.
+    /// `shape`, `fn`, and a native module's sources and sends.
     Call,
     /// `style`.
     Style,
+    /// `decoration`.
+    Decoration,
+    /// `atom` (LLP 1045.000).
+    Atom,
     /// `keyframes`.
     Keyframes,
     /// `timeline`.
@@ -33,6 +40,8 @@ impl Kind {
             Kind::Component => "component",
             Kind::Call => "shape or function",
             Kind::Style => "style",
+            Kind::Decoration => "decoration",
+            Kind::Atom => "atom",
             Kind::Keyframes => "keyframes",
             Kind::Timeline => "timeline",
         }
@@ -96,6 +105,10 @@ pub struct Scope {
     /// a written type of one of these names is refused even when this file
     /// has a `fn` of the name, which is no type.
     pub foreign_shapes: std::collections::HashMap<String, String>,
+    /// The program-unique names that are native modules' sources and sends
+    /// (LLP 1133.001): a resource or a `send` naming one in scope takes its
+    /// name, where a data source's name is left as written.
+    pub modules: std::collections::HashSet<String>,
 }
 
 impl Scope {
@@ -119,6 +132,17 @@ impl Scope {
             });
         }
         Ok(None)
+    }
+
+    /// A resource's or a `send`'s source: a module name in scope takes its
+    /// program-unique name; any other is the data seam's, left as written.
+    fn rename_source(&self, name: &mut String) {
+        if let Some(to) = self
+            .get(Kind::Call, name)
+            .filter(|to| self.modules.contains(*to))
+        {
+            *name = to.to_owned();
+        }
     }
 
     fn rename(&self, kind: Kind, name: &mut String, span: Span) -> Result<(), SyntaxError> {
@@ -159,11 +183,19 @@ pub fn calls(file: &mut File) -> std::collections::HashSet<String> {
     seen.called
 }
 
+/// Every named type referenced by annotations in `file`.
+pub fn type_names(file: &mut File) -> std::collections::HashSet<String> {
+    let mut seen = Seen::default();
+    walk(file, &Scope::default(), Some(&mut seen)).expect("an empty scope refuses nothing");
+    seen.typed
+}
+
 /// What a collecting walk records.
 #[derive(Default)]
 struct Seen {
     bound: std::collections::HashSet<String>,
     called: std::collections::HashSet<String>,
+    typed: std::collections::HashSet<String>,
 }
 
 fn walk(file: &mut File, scope: &Scope, seen: Option<&mut Seen>) -> Result<(), SyntaxError> {
@@ -181,6 +213,10 @@ fn walk(file: &mut File, scope: &Scope, seen: Option<&mut Seen>) -> Result<(), S
         sounds: _,
         shapes,
         styles,
+        decorations,
+        decoration_scopes: _,
+        atoms,
+        atom_scopes: _,
         keyframes,
         timelines,
         // A `@color-profile`'s dashed name is global, as in CSS.
@@ -188,11 +224,29 @@ fn walk(file: &mut File, scope: &Scope, seen: Option<&mut Seen>) -> Result<(), S
         // The theme's names are the app's, as roles are (LLP 1095 D4).
         theme: _,
         design: _,
+        package_designs: _,
+        library: _,
+        library_packages: _,
         fns,
+        modules,
         tests,
+        properties: _,
         launch: _,
         components,
+        members,
+        // Decided by the loader once the component is whole.
+        deferred: _,
     } = file;
+    for m in modules {
+        r.scope.rename(Kind::Call, &mut m.name, m.span)?;
+        let words = m.words.iter_mut().flat_map(|w| &mut w.words);
+        for field in m.options.iter_mut().chain(words) {
+            r.ty(&mut field.ty)?;
+        }
+        for ty in m.answers.iter_mut().chain(&mut m.args) {
+            r.ty(ty)?;
+        }
+    }
     for shape in shapes {
         r.scope.rename(Kind::Call, &mut shape.name, shape.span)?;
         for field in &mut shape.fields {
@@ -202,6 +256,15 @@ fn walk(file: &mut File, scope: &Scope, seen: Option<&mut Seen>) -> Result<(), S
     for style in styles {
         r.scope.rename(Kind::Style, &mut style.name, style.span)?;
         r.attrs(&mut style.attrs)?;
+    }
+    for decoration in decorations {
+        r.scope
+            .rename(Kind::Decoration, &mut decoration.name, decoration.span)?;
+        r.attrs(&mut decoration.attrs)?;
+    }
+    for atom in atoms {
+        r.scope.rename(Kind::Atom, &mut atom.name, atom.span)?;
+        r.attrs(&mut atom.attrs)?;
     }
     for k in keyframes {
         r.scope.rename(Kind::Keyframes, &mut k.name, k.span)?;
@@ -240,7 +303,12 @@ fn walk(file: &mut File, scope: &Scope, seen: Option<&mut Seen>) -> Result<(), S
         }
     }
     for c in components {
-        r.component(c)?;
+        r.component(c, true)?;
+    }
+    // A members block's name is the component's that lists it, not a
+    // declaration of this file's.
+    if let Some(block) = members {
+        r.component(block, false)?;
     }
     Ok(())
 }
@@ -265,7 +333,7 @@ const PRIMITIVES: [&str; 4] = ["number", "string", "bool", "unit"];
 type R = Result<(), SyntaxError>;
 
 impl Rewriter<'_> {
-    fn component(&mut self, c: &mut Component) -> R {
+    fn component(&mut self, c: &mut Component, declared: bool) -> R {
         let Component {
             name,
             props,
@@ -280,18 +348,31 @@ impl Rewriter<'_> {
             actions,
             tasks,
             sequences,
+            tools: _,
             view,
+            params: _,
+            anatomy: _,
+            members,
             span,
         } = c;
-        self.scope.rename(Kind::Component, name, *span)?;
+        if declared {
+            self.scope.rename(Kind::Component, name, *span)?;
+        }
         // In the order the type checker brings them into scope: props and
-        // injects; each state, seen by those after it; then the rest.
-        let mark = self.bind_callable(props.iter().chain(injects.iter()).map(|p| p.name.clone()));
+        // injects (a members block's are its component's); each state, seen
+        // by those after it; the members the component's other files
+        // declare (LLP 1091.002 D5); then the rest.
+        let mark = self.locals.len();
+        self.bind_callable(members.props.iter().cloned());
+        self.bind_callable(props.iter().chain(injects.iter()).map(|p| p.name.clone()));
         self.params(props)?;
         self.params(injects)?;
         for b in states.iter_mut() {
             self.expr(&mut b.expr)?;
             self.bind([b.name.clone()]);
+        }
+        for (name, callable) in &members.outer {
+            self.bind_as([name.clone()], *callable);
         }
         self.bind(
             derives
@@ -305,6 +386,7 @@ impl Rewriter<'_> {
             self.expr(&mut b.expr)?;
         }
         for res in resources {
+            self.scope.rename_source(&mut res.source);
             self.exprs(&mut res.args)?;
             self.ty(&mut res.shape)?;
             if let Some(p) = &mut res.placeholder {
@@ -390,6 +472,11 @@ impl Rewriter<'_> {
     }
 
     fn ty(&mut self, ty: &mut TypeExpr) -> R {
+        if let TypeExpr::Named(name, _) = ty {
+            if let Some(seen) = self.seen.as_deref_mut() {
+                seen.typed.insert(name.clone());
+            }
+        }
         match ty {
             TypeExpr::Named(name, _) if PRIMITIVES.contains(&name.as_str()) => Ok(()),
             // A type is a shape, never a `fn`: a shape this file sees, else
@@ -432,7 +519,15 @@ impl Rewriter<'_> {
                     self.bind([name.clone()]);
                 }
                 Stmt::Assign { expr, .. } => self.expr(expr)?,
-                Stmt::Command { args, .. } | Stmt::Send { args, .. } => self.exprs(args)?,
+                // A send that answers nothing is a statement (LLP 1133.004 D5).
+                Stmt::Command { name, args, .. } => {
+                    self.scope.rename_source(name);
+                    self.exprs(args)?
+                }
+                Stmt::Send { source, args, .. } => {
+                    self.scope.rename_source(source);
+                    self.exprs(args)?
+                }
                 Stmt::Refresh { .. } => {}
                 Stmt::If {
                     cond,
@@ -826,7 +921,7 @@ impl Rewriter<'_> {
                 // program (this file's, renamed with it) or an action, prop or
                 // inject of the name is the innermost binding.
                 let intrinsic = routing
-                    || matches!(name.as_str(), "pending" | "failed" | "failure")
+                    || STATUS_CALLS.contains(&name.as_str())
                     || (name == "t" && !declared && !self.callable_t());
                 if !intrinsic && (declared || !(self.local(name) || roster)) {
                     self.scope.rename(Kind::Call, name, *span)?;

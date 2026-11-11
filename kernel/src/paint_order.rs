@@ -24,8 +24,9 @@ use crate::generated::{Display, Isolation, MixBlendMode, NodeType, PositionType,
 use crate::id::ViewId;
 use crate::kernel::Kernel;
 
-/// Authored `z-index` is clamped to this, and the two values above it are
-/// the exit ghost's and the Arrange lift's on every host (§3.7).
+/// Authored `z-index` is clamped to this. The values above it are reserved
+/// for the host: the Arrange lift on every host and, on the web, the
+/// development tools (§3.7).
 pub const Z_MAX: i32 = i32::MAX - 2;
 
 /// A node's paint facts of its own (§2.1).
@@ -223,7 +224,8 @@ pub fn own_from(f: Facts<'_>) -> Own {
         || kind.is_metadata()
         || props.str(PropId::SemanticTag) == Some("dialog")
         || props.str(PropId::Popover).is_some();
-    let positioned = s.position_type != PositionType::Static || f.root;
+    let position = crate::style::top_layer::of(s, props);
+    let positioned = position != PositionType::Static || f.root;
     let item = matches!(f.parent_display, Some(Display::Flex | Display::Grid));
     let z =
         (m.has(StyleId::ZIndex) && (positioned || item)).then(|| s.z_index.clamp(-Z_MAX, Z_MAX));
@@ -241,7 +243,7 @@ pub fn own_from(f: Facts<'_>) -> Own {
         || (m.has(StyleId::Perspective) && s.perspective > 0.0)
         || s.mix_blend_mode != MixBlendMode::Normal
         || s.isolation == Isolation::Isolate
-        || s.position_type == PositionType::Sticky
+        || position == PositionType::Sticky
         || z.is_some();
     // Host policy (D2): what the hosts paint as a stacking context of their own.
     let button = kind == NodeType::Control && props.str(PropId::Type) == Some("button");

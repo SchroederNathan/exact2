@@ -5,7 +5,8 @@
 
 use super::Presenter;
 use crate::host::HostError;
-use exact_runner::DataSource;
+use exact_plan::EventKind;
+use exact_runner::{DataSource, Event};
 
 impl<D: DataSource> Presenter<D> {
     /// Run the last commits' commands (LLP 1005 §3): delivery belongs to the
@@ -15,6 +16,8 @@ impl<D: DataSource> Presenter<D> {
         // Every loop runs this each turn, and a reader's shell is served
         // before its first: whether a shell keeps the screen on is known.
         self.wakelock_unavailable();
+        self.orientation_unavailable();
+        self.package_turn();
         self.run_queued_commands();
         if self.pending_update {
             self.pending_update = false;
@@ -27,9 +30,37 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
+    /// The packages' part of a turn: the pads' effects due by now start or
+    /// end (`pads.rs`), then the module calls queued since are handed out.
+    /// The agent runs it too while it waits for replies.
+    pub(crate) fn package_turn(&mut self) {
+        crate::pads::tick(self.host.now());
+        for line in crate::pads::take_recorded() {
+            self.host.log(line);
+        }
+        // A hot key's press, the host's to raise (LLP 1133.025 D11 item 3).
+        crate::desktop::raise(self.host.runner_mut());
+        self.modules_in();
+    }
+
+    /// `postMessage(text, name)` into the named surface's canvas, stamped now
+    /// and held until one is live; the driver's `post` too (LLP 1139.004 D1).
+    pub(crate) fn post_message(&mut self, name: &str, text: &str) -> Result<(), String> {
+        let event = serde_json::json!({"t":"message","text":text,"at":self.host.now()});
+        if self.surfaces.post(name, event) {
+            Ok(())
+        } else {
+            Err(format!(
+                "postMessage: dropped: {} posts already wait for surface \"{name}\"",
+                crate::surfaces::POST_BOUND
+            ))
+        }
+    }
+
     /// [`Presenter::run_commands`] but for activating a staged update, which
     /// waits for the next full run: it needs a data source.
     pub(super) fn run_queued_commands(&mut self) {
+        let mut floats = Vec::new();
         for c in std::mem::take(&mut self.commands) {
             match c.name.as_str() {
                 "deliveryCheck" => {
@@ -68,9 +99,6 @@ impl<D: DataSource> Presenter<D> {
                 // The shell's share sheet; with no shell, refused into the
                 // journal. Held for the agent like every host (LLP 1069.003 D6).
                 "share" => self.share(&c.args, c.source),
-                // No request carries a notification yet: refused, or listed
-                // for the agent.
-                "showNotification" | "closeNotification" => self.notify(&c.name, &c.args),
                 "blur" => self.blur_command(&c.args),
                 "focus" => {
                     self.focus_command(&c.args);
@@ -82,6 +110,8 @@ impl<D: DataSource> Presenter<D> {
                 "setRangeText" => self.set_range_text(&c.args),
                 // An element's, by its id (minesweeper F3); a row's is the runner's.
                 "scrollIntoView" => self.scroll_element_into_view(&c.args),
+                // The runner's own, once a fragment's route has its content (LLP 1153 D5).
+                "scrollToFragment" => self.scroll_to_fragment(&c.args),
                 // `Element.scrollBy(x, y)`, by its id.
                 "scrollBy" => self.scroll_element_by(&c.args),
                 // The inverse of `message=`: text into the named surface's
@@ -89,12 +119,12 @@ impl<D: DataSource> Presenter<D> {
                 "postMessage" => {
                     let arg = |i: usize| c.args.get(i).and_then(exact_plan::Value::as_str);
                     let (text, name) = (arg(0).unwrap_or_default(), arg(1).unwrap_or_default());
-                    let event = serde_json::json!({"t":"message","text":text,"at":self.host.now()});
-                    if !self.surfaces.post(name, event) {
-                        self.host.log(format!(
-                            "postMessage: dropped: {} posts already wait for surface \"{name}\"",
-                            crate::surfaces::POST_BOUND
-                        ));
+                    if arg(2) == Some("iframe") {
+                        self.host.log("postMessage: iframe replies are unavailable on Linux");
+                        continue;
+                    }
+                    if let Err(refused) = self.post_message(name, text) {
+                        self.host.log(refused);
                     }
                 }
                 // @ref LLP 1069.002 D8 — refused with `cancel`; the agent's
@@ -111,6 +141,8 @@ impl<D: DataSource> Presenter<D> {
                 name @ ("showOpenFilePicker" | "showDirectoryPicker" | "showSaveFilePicker") => {
                     self.document_picker(name, &c.args)
                 }
+                // @ref LLP 1069.010.000 D7 — answered here, as every native host does.
+                "requestPermission" => self.request_permission(&c.args),
                 // The top layer, where a shell presents one (LLP 1115 D6;
                 // LLP 1115.001 D10): a confirmation by its `id`, and its
                 // close. With no windows, the journal names the refusal.
@@ -126,20 +158,64 @@ impl<D: DataSource> Presenter<D> {
                     .host
                     .log("close refused: dialogs unsupported on the headless/DRM host"),
                 // The shell's clipboard, and its browser, mail app and dialer.
-                "copyText" if self.has_shell() => self.copy_text(&c.args),
-                "openURL" if self.has_shell() => self.open_url(&c.args),
+                "copyText" if self.clipboard.is_some() || self.has_shell() => self.copy_text(&c.args),
+                "openURL" if self.has_shell() || self.url_opener.is_some() => self.open_url(&c.args),
                 // With no shell there is no clipboard or browser; and no
                 // editor, dev menu or window to close on any Linux host, and
-                // no media player (LLP 1042 §8): known, and named so.
+                // no media player (LLP 1042 §8) or floating window (§9): known, and named so.
                 name @ ("copyText" | "openURL" | "format" | "reload" | "close" | "fastSeek"
-                | "load") => {
+                | "load" | "exitPictureInPicture") => {
                     eprintln!("exact: {name} unsupported on the headless/DRM host")
                 }
+                // The image hears the refusal too, once the commands have run (LLP 1042 §9).
+                "requestPictureInPicture" => {
+                    eprintln!("exact: requestPictureInPicture unsupported on the headless/DRM host");
+                    floats.extend(c.args.first().and_then(exact_plan::Value::as_str).map(str::to_owned));
+                }
+                // Recording a trace is the Apple hosts'
+                name @ ("startTrace_EXPERIMENTAL" | "stopTrace_EXPERIMENTAL") => self
+                    .host
+                    .log(format!("{name} refused: trace recording is on Apple hosts only")),
                 other => eprintln!("exact: unknown command {other}"),
             }
+        }
+        for id in floats {
+            self.refuse_picture_in_picture(&id);
         }
         // Selection events are queued tasks: the input's commands run first.
         self.drain_field_select_tasks();
         self.dispatch_toggles();
     }
 }
+
+impl<D: DataSource> Presenter<D> {
+    /// `requestPictureInPicture(id)` refused: the image's `pictureinpictureerror`, with the reason.
+    fn refuse_picture_in_picture(&mut self, id: &str) {
+        const WHY: &str = "picture in picture is unsupported on the headless/DRM host";
+        let kernel = self.host.kernel();
+        let Some(view) = kernel
+            .find_by_id(id)
+            .into_iter()
+            .find_map(|key| kernel.node_by_key(key).map(|n| n.id))
+        else {
+            return;
+        };
+        if !self
+            .host
+            .runner()
+            .handlers_of(view)
+            .contains(&EventKind::Pictureinpictureerror)
+        {
+            return;
+        }
+        let event = Event::Media(EventKind::Pictureinpictureerror, WHY.into());
+        let sent = self.host.dispatch_now(view, event);
+        if let Some(error) = sent.or(self.after_commit()) {
+            self.host.log(error);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "commands_tests.rs"]
+mod tests;

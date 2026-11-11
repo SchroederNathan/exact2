@@ -235,7 +235,8 @@ internal class Layers(
             if (r.ox != l.ox || r.oy != l.oy) { r.ox = l.ox; r.oy = l.oy; r.matrix.setValues(r.values); r.matrix.postTranslate(-l.ox, -l.oy) }
             c.setMatrix(r.matrix)
             runPaint.textSize = r.size; runPaint.textSkewX = r.skew
-            c.drawGlyphs(r.ids, 0, r.positions, 0, r.ids.size, r.font, runPaint)
+            if (android.os.Build.VERSION.SDK_INT >= 31) c.drawGlyphs(r.ids, 0, r.positions, 0, r.ids.size, r.font, runPaint)
+            else LegacyGlyphs.draw(c, r.ids, r.positions, r.ids.size, r.font, runPaint)
         }
         l.node.endRecording()
     }
@@ -282,8 +283,9 @@ internal class Layers(
     /** Op 32: freed with the next stream (a row recorded before may still draw it this frame). */
     fun free(id: Int) { freeing.add(id) }
 
-    fun flush() {
-        for (id in freeing) layers.remove(id)?.node?.discardDisplayList()?.also { snapshot = null }
+    /** The layers freed in the last stream go, each told to [freed]. */
+    fun flush(freed: (Int) -> Unit) {
+        for (id in freeing) layers.remove(id)?.node?.discardDisplayList()?.also { snapshot = null; freed(id) }
         freeing.clear()
     }
 

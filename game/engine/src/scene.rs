@@ -115,6 +115,9 @@ pub struct Camera {
     pub projection: Projection,
     /// Vertical field of view in degrees.
     pub fov_y_degrees: f32,
+    /// Optional perspective field of view for entities marked [`ViewModel`].
+    /// `None` keeps viewmodel geometry on the camera projection.
+    pub viewmodel_fov_y_degrees: Option<f32>,
     /// Near clipping distance.
     pub near: f32,
     /// Far clipping distance.
@@ -127,6 +130,7 @@ impl Default for Camera {
         Self {
             projection: Projection::Perspective,
             fov_y_degrees: 60.0,
+            viewmodel_fov_y_degrees: None,
             near: 0.1,
             far: 1000.0,
             active: true,
@@ -190,6 +194,9 @@ impl Camera {
             && self.far.is_finite()
             && self.near > 0.
             && self.far > self.near
+            && self
+                .viewmodel_fov_y_degrees
+                .is_none_or(|fov| fov.is_finite() && fov > 0. && fov < 180.)
             && match self.projection {
                 Projection::Perspective => self.fov_y_degrees > 0. && self.fov_y_degrees < 180.,
                 Projection::Orthographic { height, .. } => height.is_finite() && height > 0.,
@@ -236,6 +243,21 @@ impl Camera {
             }
         }
     }
+
+    /// Projection used by entities marked [`ViewModel`], when opted in.
+    /// Orthographic cameras keep their authored projection because an FOV
+    /// override only has meaning for perspective views.
+    pub fn viewmodel_matrix(self, size: crate::Vec2) -> Option<glam::Mat4> {
+        let fov = self.viewmodel_fov_y_degrees?;
+        (self.projection == Projection::Perspective).then(|| {
+            glam::camera::rh::proj::directx::perspective(
+                fov.to_radians(),
+                size.x / size.y,
+                self.near,
+                self.far,
+            )
+        })
+    }
 }
 
 /// Dimensioned geometry. Metres, Y up, centred on the origin; capsules and
@@ -276,6 +298,27 @@ pub enum Mesh {
     },
     /// A baked asset's stable name.
     Asset(String),
+    /// Flat annulus in XZ, facing +Y.
+    Ring {
+        /// Hole radius in metres; zero makes a disc.
+        inner: f32,
+        /// Outside radius in metres; greater than inner.
+        outer: f32,
+    },
+    /// Doughnut around Y, centred on the XZ plane.
+    Torus {
+        /// Distance from the origin to the tube centre, in metres.
+        radius: f32,
+        /// Tube radius in metres; smaller than radius.
+        tube: f32,
+    },
+    /// Capped cone along Y, tip at +height/2.
+    Cone {
+        /// Base radius in metres.
+        radius: f32,
+        /// Total height in metres.
+        height: f32,
+    },
 }
 impl Default for Mesh {
     fn default() -> Self {
@@ -307,6 +350,18 @@ impl Mesh {
     pub fn plane(width: f32, depth: f32) -> Self {
         Self::Plane { width, depth }
     }
+    /// Flat annulus in XZ, facing +Y; radii are in metres.
+    pub fn ring(inner: f32, outer: f32) -> Self {
+        Self::Ring { inner, outer }
+    }
+    /// Doughnut around Y; radius names the tube centre, tube its cross-section radius.
+    pub fn torus(radius: f32, tube: f32) -> Self {
+        Self::Torus { radius, tube }
+    }
+    /// Capped Y-axis cone with its tip at +height/2, in metres.
+    pub fn cone(radius: f32, height: f32) -> Self {
+        Self::Cone { radius, height }
+    }
     /// Baked model by name.
     pub fn asset(name: impl Into<String>) -> Self {
         Self::Asset(name.into())
@@ -325,6 +380,15 @@ impl Mesh {
                 ("Cylinder", positive(*radius) && positive(*height))
             }
             Self::Plane { width, depth } => ("Plane", positive(*width) && positive(*depth)),
+            Self::Ring { inner, outer } => (
+                "Ring",
+                inner.is_finite() && *inner >= 0.0 && positive(*outer) && inner < outer,
+            ),
+            Self::Torus { radius, tube } => (
+                "Torus",
+                positive(*radius) && positive(*tube) && tube < radius,
+            ),
+            Self::Cone { radius, height } => ("Cone", positive(*radius) && positive(*height)),
             Self::Asset(_) => return Ok(()),
         };
         if valid {
@@ -384,23 +448,44 @@ impl Default for Material {
 }
 
 impl Material {
-    /// Opaque linear RGB with the default surface properties.
+    /// Opaque base colour written as CSS, the documented way to colour a
+    /// surface: `Material::hex("#527b65")`, `Material::hex("forestgreen")`.
+    /// Decoded to linear light ([`crate::Color::hex`]); a hex alpha is kept.
+    pub fn hex(css: &str) -> Self {
+        Self {
+            color: crate::Color::hex(css).0,
+            ..Self::default()
+        }
+    }
+    /// Opaque base colour from sRGB-encoded channels in 0–1, as a colour picker
+    /// shows them.
+    pub fn srgb(r: f32, g: f32, b: f32) -> Self {
+        Self {
+            color: crate::Color::srgb(r, g, b).0,
+            ..Self::default()
+        }
+    }
+    /// Opaque base colour in linear light, the renderer's own space: 0.5 is
+    /// half the light, not mid-grey on screen (that is `srgb(0.5, …)`, linear
+    /// 0.214). Prefer [`Material::hex`] for colours chosen by eye.
     pub fn rgb(r: f32, g: f32, b: f32) -> Self {
         Self {
             color: [r, g, b, 1.0],
             ..Self::default()
         }
     }
-    /// A world-space grid on any surface; colour is the base, spacing is in metres.
-    /// Lines use screen-space derivatives and fade to their average below a pixel.
-    pub fn grid(color: [f32; 3], spacing: f32) -> Self {
+    /// A world-space grid on any surface: `Material::grid(Color::hex("#708587"), 1.0)`.
+    /// The colour is the base, spacing is in metres. Lines use screen-space
+    /// derivatives and fade to their average below a pixel.
+    pub fn grid(color: impl Into<crate::Color<3>>, spacing: f32) -> Self {
         assert!(
             spacing.is_finite() && spacing > 0.0,
             "grid spacing must be positive and finite"
         );
+        let [r, g, b] = color.into().0;
         Self {
             grid_spacing: spacing,
-            ..Self::rgb(color[0], color[1], color[2])
+            ..Self::rgb(r, g, b)
         }
     }
     /// Emissive black surface. HDR values bloom with the default Environment;
@@ -412,6 +497,16 @@ impl Material {
     /// Set linear RGB emitted light.
     pub fn emissive(mut self, r: f32, g: f32, b: f32) -> Self {
         self.emissive = [r, g, b];
+        self
+    }
+    /// Set straight alpha in [0, 1]. Translucent primitives join the depth-sorted
+    /// quad batch, depth-tested without depth writes or refraction.
+    pub fn alpha(mut self, alpha: f32) -> Self {
+        assert!(
+            alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+            "Material::alpha requires a finite value in [0, 1]"
+        );
+        self.color[3] = alpha;
         self
     }
     /// Set the metal fraction.
@@ -604,21 +699,21 @@ impl Default for Opacity {
     }
 }
 
-/// A primitive's drawn look on top of its `Material`: linear RGBA multiplying
+/// A primitive's drawn look on top of its `Material`: a colour multiplying
 /// its base colour and linear emission added, for this entity only (not
 /// inherited). A hit flash, a team tint, a pulse. Presentation state, written
 /// by `Game::present`; never saved or hashed. Models use `NodeMaterials`.
 #[derive(Clone, Copy, Debug, PartialEq, crate::Presentation)]
 pub struct Tint {
-    /// Linear RGBA multiplying the base colour.
-    pub color: [f32; 4],
+    /// RGBA multiplying the base colour: `Color::hex("#ff000080")`.
+    pub color: crate::Color,
     /// Linear emission added.
     pub emissive: [f32; 3],
 }
 impl Default for Tint {
     fn default() -> Self {
         Self {
-            color: [1.0; 4],
+            color: crate::Color::default(),
             emissive: [0.0; 3],
         }
     }
@@ -848,8 +943,19 @@ impl World {
         }
         None // A runtime cycle has not yet been repaired by propagate.
     }
+    /// Set a discontinuous local pose with a distinct interpolation start.
+    /// For a landing followed by movement within one tick, `previous` is the
+    /// landing and `current` includes that movement. Descendants inherit the
+    /// start through their current local poses. History is not saved or hashed.
+    pub fn teleport_from(&mut self, e: Entity, previous: Transform, current: Transform) {
+        self.teleport(e, current);
+        if self.contains(e) {
+            self.interpolation_origins.insert(e, previous);
+        }
+    }
     /// Set a local pose, refresh parented globals and mark this entity fresh.
     pub fn teleport(&mut self, e: Entity, transform: Transform) {
+        self.interpolation_origins.remove(&e);
         if self.insert(e, transform) {
             self.mark_fresh(e);
             for (_, follow) in self.query::<&mut Follow>().iter() {
@@ -865,6 +971,8 @@ impl World {
 mod globals;
 pub use globals::Globals;
 mod hierarchy;
+mod register;
+pub(crate) use register::register;
 mod visibility;
 pub(crate) use hierarchy::Hierarchy;
 pub use visibility::{opacity, Drawn};
@@ -1169,6 +1277,7 @@ impl Follow {
 /// so both translation and rotation stop exactly. Missing targets leave the pose alone.
 #[track_caller]
 pub fn follow(world: &World) {
+    let _span = world.span("scene::follow");
     if world.in_tick && world.followed.replace(true) {
         return;
     }
@@ -1258,6 +1367,25 @@ fn follow_inner(world: &World, placement_only: bool) {
 #[cfg(test)]
 mod camera_patch_regression {
     use super::*;
+    #[test]
+    fn viewmodel_projection_is_opt_in_and_perspective_only() {
+        let size = crate::Vec2::new(320., 200.);
+        let mut camera = Camera {
+            fov_y_degrees: 30.,
+            viewmodel_fov_y_degrees: Some(70.),
+            ..Default::default()
+        };
+        assert!(camera.valid());
+        assert_ne!(camera.viewmodel_matrix(size).unwrap(), camera.matrix(size));
+        camera.projection = Projection::Orthographic {
+            height: 4.,
+            integer_scale: false,
+        };
+        assert!(camera.viewmodel_matrix(size).is_none());
+        camera.viewmodel_fov_y_degrees = Some(180.);
+        assert!(!camera.valid());
+    }
+
     #[test]
     fn perspective_patch_replaces_orthographic_projection() {
         let mut camera = Camera::orthographic(180.).integer_scale();

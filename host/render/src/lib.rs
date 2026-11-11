@@ -18,6 +18,7 @@
 
 #![deny(missing_docs)]
 
+mod activation;
 mod compare;
 mod direct;
 mod encode;
@@ -26,7 +27,9 @@ mod files;
 mod generations;
 mod linger;
 mod page;
+mod page_style;
 mod pages;
+mod requests;
 mod serve;
 mod source;
 mod stream;
@@ -34,13 +37,14 @@ mod viewport;
 
 pub use direct::boot_swap_js;
 pub use executor::Executor;
-pub use page::{capture, capture_js, page, scroll_document_js};
+pub use page::{capture, capture_js, page, page_with_rules, scroll_document_js};
 pub use pages::pages;
-pub use serve::{Serve, Server, Stopper};
+pub use serve::{expire_renders, Serve, Server, Stopper};
 pub use source::Anonymous;
 
 // The render never lays out (the projection is style rows, not boxes): its
 // kernels keep no layout engine tree unless something asks for a layout.
+pub(crate) use activation::{activation, inference};
 use exact_kernel::Kernel;
 use exact_plan::{Plan, RenderPolicy};
 use exact_runner::{
@@ -109,6 +113,10 @@ pub struct Rendered {
     pub settled: Settled,
     /// When the document asks for its client runtime.
     pub activate: exact_plan::ActivatePolicy,
+    /// For a page that waits for the reader, the viewport comparisons it
+    /// was laid out by and their answers, which the capture script checks
+    /// (`[[query, holds], …]`, LLP 1048.007 D2); empty otherwise.
+    pub wake: String,
     /// The document's root is already as the JavaScript runtime adopts it
     /// (written so without a kernel, LLP 1048.004): the page doesn't
     /// rewrite it (`page::for_runtime`), and the digest is over this form.
@@ -141,6 +149,17 @@ pub enum Ids {
     /// when it is provably the checkpoint boot's ([`projects_as_booted`]),
     /// saving the second tree (~1.4 ms of RealWorld's ~4.5 ms CPU a page).
     Any,
+}
+
+/// The document writer for the runtime that adopts the page: JavaScript
+/// uses conditional CSS fills; wasm uses the kernel's resolved rows.
+fn project_for<D: DataSource>(
+    ids: Ids,
+) -> fn(&Runner<D>) -> Result<Document, exact_web::document::DocumentError> {
+    match ids {
+        Ids::Runtime => project,
+        Ids::Any => exact_web::document::project_for_js,
+    }
 }
 
 /// Whether the tree a runner settles to projects as the tree one booted from
@@ -273,7 +292,7 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
     now_ms: f64,
 ) -> Result<Rendered, String> {
     let direct = direct_for(plan, ids, projection)?;
-    let page = settle_at(
+    let mut page = settle_at(
         plan, data, viewport, location, deadline, direct, now_ms, None,
     )?;
     let settled_tree = if direct {
@@ -288,7 +307,7 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
             // would have refused: the page renders again, with a kernel,
             // which writes it or reports the refusal as ever.
             Err(why) if projection == Projection::Auto => {
-                println!("render {location}: with a kernel ({why})");
+                crate::log(format_args!("render {location}: with a kernel ({why})"));
                 retire(page, data);
                 return render_with_at(
                     plan,
@@ -309,13 +328,13 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
         }
     } else if ids == Ids::Any && projects_as_booted(plan) {
         Some((
-            project(&page.runner).map_err(|e| e.to_string())?,
+            project_for(ids)(&page.runner).map_err(|e| e.to_string())?,
             page.runner.handlers(),
         ))
     } else {
         None
     };
-    let (checkpoint, settled) = (page.checkpoint.clone(), page.settled);
+    let (checkpoint, settled, clocked) = (page.checkpoint.clone(), page.settled, page.clocked);
     retire(page, data);
     // @ref LLP 1048.000 D6 — the document is the checkpoint's projection,
     // from a runner booted from the page's checkpoint with a fresh source,
@@ -343,13 +362,16 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
                 .build_every_tab()
                 .map_err(|e| format!("boot from the checkpoint: {e:?}"))?;
             (
-                project(&booted).map_err(|e| e.to_string())?,
+                project_for(ids)(&booted).map_err(|e| e.to_string())?,
                 booted.handlers(),
             )
         }
     };
+    // Only the JavaScript runtime's pages, whose document carries no view
+    // ids, infer an activation (LLP 1048.007 D1).
+    let clocked = clocked || ids != Ids::Any;
     finish(
-        plan, site, location, document, handlers, checkpoint, state, settled,
+        plan, site, location, document, handlers, checkpoint, state, settled, clocked, viewport,
     )
 }
 
@@ -359,6 +381,9 @@ pub(crate) struct Settling<D: DataSource> {
     pub(crate) runner: Runner<Anonymous<D>>,
     pub(crate) settled: Settled,
     pub(crate) checkpoint: String,
+    /// Something was still due on its clock when it settled: a timer, a
+    /// frame task (LLP 1048.007 D1).
+    pub(crate) clocked: bool,
 }
 
 /// Boot a fresh runner at `location` with a fresh source (LLP 1048.000 D10)
@@ -374,7 +399,7 @@ fn render_time() -> f64 {
 
 /// What sees a render's runner as it boots, before its first answer (a
 /// route's boot document, LLP 1048.005).
-pub(crate) type OnBoot<'a, D> = &'a mut dyn FnMut(&Runner<Anonymous<D>>);
+pub(crate) type OnBoot<'a, D> = &'a mut dyn FnMut(&mut Runner<Anonymous<D>>);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
@@ -451,6 +476,8 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
         ),
         Err(e) => return Err(format!("boot: {e:?}")),
     };
+    // The page is the web's: its packages answer as there, not as on this machine.
+    runner.set_module_target("web");
     // A rendered page holds every tab panel, which the JS target adopts at
     // boot, building every one (LLP 1075.003 §9.14).
     runner
@@ -459,7 +486,7 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
     // The boot document, before any answer: a route's `paint=boot`
     // (LLP 1048.005).
     if let Some(on_boot) = on_boot {
-        on_boot(&runner);
+        on_boot(&mut runner);
     }
     let settled = match if booted_late {
         Ok(Settled::Deadline)
@@ -484,10 +511,12 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
         EXECUTORS.with(|pool| pool.borrow_mut().push((grants, executor)));
     }
     let checkpoint = checkpoint(&runner, location);
+    let clocked = runner.timer_due_ms().is_some() || runner.wants_frames();
     Ok(Settling {
         runner,
         settled,
         checkpoint,
+        clocked,
     })
 }
 
@@ -519,12 +548,14 @@ pub(crate) fn finish(
     checkpoint: String,
     state: exact_runner::Checkpoint,
     settled: Settled,
+    clocked: bool,
+    viewport: exact_runner::Viewport,
 ) -> Result<Rendered, String> {
     let head = document
         .page_head(plan, site, location)
         .map_err(|e| e.to_string())?;
     let digest = digest(&encoded(plan), location, &checkpoint, &document.root);
-    let activation = activation(plan, location, &state, &handlers);
+    let (activation, wake) = activation(plan, location, &state, &handlers, clocked, &viewport);
     Ok(Rendered {
         document,
         head,
@@ -532,43 +563,10 @@ pub(crate) fn finish(
         digest,
         state,
         settled,
+        wake,
         activate: activation,
         runtime_form: false,
     })
-}
-
-/// The page's activation (LLP 1071 D6): the route's, unless a partial
-/// document or a continuous handler needs the host's ordinary boot.
-pub(crate) fn activation(
-    plan: &Plan,
-    location: &str,
-    state: &exact_runner::Checkpoint,
-    handlers: &exact_kernel::SortedMap<exact_kernel::ViewId, Vec<exact_plan::EventKind>>,
-) -> exact_plan::ActivatePolicy {
-    let mut activation = route_at(plan, location)
-        .map_or(exact_plan::ActivatePolicy::Inferred, |route| route.activate);
-    // A partial document needs to finish without waiting for an action. Gesture,
-    // media and other continuous handlers likewise need the host's ordinary
-    // boot (undeclared: idle on the wasm host, eager on the JavaScript one);
-    // interaction activation only replays discrete form and press semantics.
-    if activation == exact_plan::ActivatePolicy::Interaction
-        && (!state.pending.is_empty()
-            || handlers.values().flatten().any(|kind| {
-                !matches!(
-                    kind,
-                    exact_plan::EventKind::Press
-                        | exact_plan::EventKind::Change
-                        | exact_plan::EventKind::Focus
-                        | exact_plan::EventKind::Blur
-                        | exact_plan::EventKind::Key
-                        | exact_plan::EventKind::Submit
-                        | exact_plan::EventKind::Navigate
-                )
-            }))
-    {
-        activation = exact_plan::ActivatePolicy::Inferred;
-    }
-    activation
 }
 
 /// `plan`'s bytes, for the digest: encoded once per plan a process renders,
@@ -778,7 +776,10 @@ pub fn settle<D: DataSource>(
 ) -> Result<Settled, RunnerError> {
     let mut held = Held::default();
     loop {
-        hand_out(runner, executor, &mut held);
+        requests::hand_out(runner, executor, &mut held);
+        if requests::settle_aborts(runner, executor)? {
+            continue;
+        }
         let outcomes = executor.drain();
         if !outcomes.is_empty() {
             for (ticket, outcome, elapsed_ms) in outcomes {
@@ -806,7 +807,11 @@ pub fn settle<D: DataSource>(
         if runner
             .pending()
             .iter()
-            .all(|(_, t)| held.refused.contains(t) || held.busy.contains(t))
+            // A re-ask's wait is the runner's, never the executor's: no timer
+            // fires here, and the checkpoint lists it for the client to ask.
+            .all(|(_, t)| {
+                held.refused.contains(t) || held.busy.contains(t) || runner.is_reask_wait(*t)
+            })
         {
             return Ok(if held.busy.is_empty() {
                 Settled::Complete
@@ -833,32 +838,6 @@ struct Held {
     refused: BTreeSet<u64>,
     /// Turned away at the executor's limits: the render is busy.
     busy: BTreeSet<u64>,
-}
-
-fn hand_out<D: DataSource>(runner: &mut Runner<D>, executor: &Executor, held: &mut Held) {
-    executor.forget(|ticket| runner.holds(ticket));
-    lift(executor, held);
-    for r in runner.take_requests() {
-        // Device capabilities: the environment has none.
-        if r.request.surface.is_some() || r.request.storage.is_some() {
-            held.refused.insert(r.ticket);
-            continue;
-        }
-        let dispatch = match r.request.continuation {
-            Some(token) => runner.dispatch_work(token),
-            None if r.request.is_native() => runner.native_work(&r.request),
-            None => Dispatch::Missing,
-        };
-        run(executor, held, r, dispatch);
-    }
-    for (token, dispatch) in runner.release_work() {
-        if let Some(r) = held.parked.remove(&token) {
-            run(executor, held, r, dispatch);
-        }
-    }
-    // Again for what this batch put behind a refusal with nothing earlier
-    // in flight: no completion would come to lift it.
-    lift(executor, held);
 }
 
 /// The runner holds no refusals in a render, so the ordered fence lifts once
@@ -937,7 +916,7 @@ pub fn main<D: DataSource + 'static>(baked: &[u8], data: fn() -> D) -> std::proc
     let mut build = false;
     let mut compare = false;
     let mut deadline = DEADLINE;
-    let mut shell = None::<String>;
+    let (mut shell, mut rules) = (None::<String>, None::<String>);
     let (mut serve, mut planned) = (None::<std::path::PathBuf>, false);
     let mut generations = None::<std::path::PathBuf>;
     let (mut port, mut renders, mut queue, mut lifetime) = (0u16, 4usize, 32usize, 60u64);
@@ -980,7 +959,12 @@ pub fn main<D: DataSource + 'static>(baked: &[u8], data: fn() -> D) -> std::proc
                 Some(ms) => deadline = Duration::from_millis(ms),
                 None => return usage(),
             },
-            "--shell" => match args.next().map(std::fs::read_to_string) {
+            "--shell" => match args.next().map(|path| {
+                // The build's analyzed sheet beside it (LLP 1048.007 D4).
+                let beside = std::path::Path::new(&path).with_file_name(".gen/page-style.json");
+                rules = std::fs::read_to_string(beside).ok();
+                std::fs::read_to_string(path)
+            }) {
                 Some(Ok(text)) => shell = Some(text),
                 Some(Err(e)) => {
                     eprintln!("render: --shell: {e}");
@@ -1050,19 +1034,7 @@ pub fn main<D: DataSource + 'static>(baked: &[u8], data: fn() -> D) -> std::proc
                 return ExitCode::FAILURE;
             }
         };
-        println!("serving http://{}/", server.addr());
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        drain_on_signal(server.stopper());
-        return match server.run(data) {
-            Ok(()) => {
-                println!("drained");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("render: serve: {e}");
-                ExitCode::FAILURE
-            }
-        };
+        return run_server(server, data);
     }
     if build {
         match build_locations(&decoded) {
@@ -1114,14 +1086,31 @@ pub fn main<D: DataSource + 'static>(baked: &[u8], data: fn() -> D) -> std::proc
             println!("{line}");
             continue;
         }
-        let rendered =
-            render(&decoded, data, viewport, location, &site, deadline).and_then(|rendered| {
-                let page = shell
-                    .as_deref()
-                    .map(|shell| page(shell, &rendered))
-                    .transpose()?;
-                Ok((rendered, page))
-            });
+        let ids = if shell.as_deref().is_some_and(page::is_js) {
+            Ids::Any
+        } else {
+            Ids::Runtime
+        };
+        let rendered = render_with(
+            &decoded,
+            &data,
+            viewport,
+            location,
+            &site,
+            deadline,
+            ids,
+            Projection::Kernel,
+        )
+        .and_then(|rendered| {
+            let page = shell
+                .as_deref()
+                .map(|shell| match &rules {
+                    Some(rules) => page_with_rules(shell, rules, &rendered),
+                    None => page(shell, &rendered),
+                })
+                .transpose()?;
+            Ok((rendered, page))
+        });
         match rendered {
             Ok((rendered, page)) => {
                 let settled = rendered.settled == Settled::Complete;
@@ -1164,6 +1153,33 @@ pub fn main<D: DataSource + 'static>(baked: &[u8], data: fn() -> D) -> std::proc
     }
 }
 
+// Losing the log reader must not interrupt a response or SIGTERM's drain.
+fn log(line: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+fn run_server<D: DataSource + 'static>(server: Server, data: fn() -> D) -> std::process::ExitCode {
+    use std::process::ExitCode;
+    log(format_args!("serving http://{}/", server.addr()));
+    drain_on_signal(server.stopper());
+    match server.run(data) {
+        Ok(()) => {
+            log(format_args!("drained"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("render: serve: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stdout_tests;
+
 /// SIGTERM or SIGINT drains the server (D10): a restart loses no render
 /// in flight.
 fn drain_on_signal(stopper: Stopper) {
@@ -1183,8 +1199,7 @@ fn drain_on_signal(stopper: Stopper) {
             while !SIGNALLED.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            println!("draining");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            log(format_args!("draining"));
             stopper.stop();
         });
 }

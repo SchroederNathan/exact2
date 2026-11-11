@@ -37,6 +37,7 @@
 
 pub mod abi;
 pub mod app_module;
+pub mod baked;
 pub mod batch;
 mod button;
 pub mod calc;
@@ -45,24 +46,34 @@ pub mod collapse;
 pub mod content_region;
 pub mod control_text;
 pub mod corner;
+pub mod decorations;
 #[cfg(target_vendor = "apple")]
 mod defaults;
 pub mod delivery;
 mod doc_watch;
+pub mod documents;
 pub mod executor;
+pub mod frame_health;
 pub mod geometry;
 pub mod gradient;
 pub mod host;
+mod icon_path;
 pub mod link;
+mod looks;
 pub mod markup;
 pub mod material;
 pub mod measure;
 pub mod pan_velocity;
 pub mod picker;
+mod plan_bytes;
+pub mod presence_secrets;
 pub mod raster;
 mod raster_exports;
 pub mod store;
 pub mod style;
+pub mod svg_image;
 pub mod textflow;
 
 pub use host::{Host, HostError};
+
+pub mod time;

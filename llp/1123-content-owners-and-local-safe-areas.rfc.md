@@ -1,10 +1,10 @@
 # LLP 1123: Content owners — one viewport per session, local geometry and safe areas per native container
 
 **Type:** RFC
-**Status:** Review (revised on LLP 1115.002 D8.2's host blocks)
+**Status:** Review (revised on LLP 1115.002 D8.2's host blocks); stage 2 (D3, D4, D9) accepted (Charlie, 2026-10-18); D7's `navigationSizing` `page` and `form` accepted ahead of stage 6 (Charlie, 2026-10-23, #854)
 **Systems:** Kernel (what a host block gains for an owner: local insets, the primary scroller; clearance inside the block; rendering ancestry for public geometry; `var(--exact-safe-area-inset-*)` as a term of a calculation tree); Runner (`client_rect`, `elementFromPoint`, `exactSurface` `container:` records); Apple host (iOS, iPadOS, tvOS: `ExactViewIOS.fit`, `ModalHost`, `NavigationHost`, `NavigationBarIOS.reportCovers`, keyboard ownership; macOS windows and dialogs); Web host and JS target (owners for emulated chrome, `nav-chrome.js`; registered custom properties in `index.html`); Linux, Windows (flat hosts); Contract (`-exact-safe-area`, `navigationSizing`, `keyboardAvoidance`, `--exact-safe-area-inset-*`, the layout regions' `env(-exact-<region>-inset-*)`); Agent (coordinates, hit testing, screenshots of presented content)
 **Author:** Claude (Opus 5.5) for ide
-**Implementer:** to be assigned on acceptance
+**Implementer:** stage 2: Krzysztof Magiera, from 2026-10-18, reworking #618 into D4's `-exact-safe-area` with the top and bottom executors first; D7's `page` and `form`: Nathan Schroeder, from 2026-10-23; the rest to be assigned on acceptance
 **Date:** 2026-10-08
 **Revised:** 2026-10-13
 **Related:**
@@ -17,7 +17,7 @@
   - [CSS Position 4](https://drafts.csswg.org/css-position-4/#top-layer): the top layer. [HTML modal dialogs and inert subtrees](https://html.spec.whatwg.org/multipage/interaction.html#modal-dialogs-and-inert-subtrees).
   - [CSS Viewport 1](https://drafts.csswg.org/css-viewport/#interactive-widget-section): `interactive-widget`. [Virtual Keyboard API](https://www.w3.org/TR/virtual-keyboard/).
   - [WebKit, "Designing websites for iPhone X"](https://webkit.org/blog/7929/designing-websites-for-iphone-x/).
-- **Apple documentation.** Linked where each API is discussed in §"Apple's APIs and the HIG". iPhone Duo and iOS 27.1 material is beta-SDK evidence, not hardware verification.
+- **Apple documentation.** Linked where each API is discussed in §"Apple's APIs and the HIG". iPhone Duo and iOS 27.1 material is iOS 27.1 SDK and simulator evidence, not hardware verification.
 - **Lab.** Each stage is verified on the iPhone Duo (open and closed) and an iPhone simulator, natively and in Safari, with a lab app outside the repository that has a screen per case in §"Cases" it covers. `apps/duo-lab` stays LLP 1078's fixture.
 
 ## Summary
@@ -74,7 +74,7 @@ Every case below is one the HIG or Apple's APIs define. Each row gives the behav
 | C11b | A bottom toolbar projected from authored content | LLP 1075.003 §3.5 | The toolbar is bar chrome: it enters `local` through `safeAreaInsets`, like the navigation bar. | D3 | `nav-inline` with a toolbar |
 | C12 | A header lifted into the bar | LLP 1035.001 D9 | The lifted header is `display: none` and neither clears nor is credited; the route's top clearance is its whole local top inset. | D3 | `nav-inline` |
 
-### iPhone Duo (iOS 27.1 beta SDK)
+### iPhone Duo (iOS 27.1 SDK)
 
 | # | Case | Source | Required behavior | By | Lab screen |
 |---|---|---|---|---|---|
@@ -82,7 +82,7 @@ Every case below is one the HIG or Apple's APIs define. Each row gives the behav
 | C14 | Open: the inner screen's bars | [Tech Talk: Raise the bar with iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111462/), [Tech Talk: Design for iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111466/) | In landscape the bars are a side strip, as C13. In portrait, in a sheet centred on the inner screen, and in an app that opts out of side bars, the bars are horizontal (top and bottom); a sheet placed at the side of the inner screen, and sheets on the cover screen, can carry a side bar. In every arrangement clearance follows `safeAreaInsets`; nothing in Exact assumes which edge carries the bars. | D3 | `strip`, open, both orientations |
 | C14a | The inner front-facing camera while it is active | [HIG: Designing for iPhone Duo](https://developer.apple.com/design/human-interface-guidelines/designing-for-iphone-duo), [`UIView.ReservedRegion`](https://developer.apple.com/documentation/uikit/uiview/reservedregion) | While the camera is active, UIKit reports an occlusion region. Exact clears what `safeAreaInsets` reports; whether the region enters `safeAreaInsets` is to be confirmed on the iOS 27.1 simulator. A rectangle that does not enter them is deferred with a consumer (D6). | D3, D6 | `strip` with the camera active |
 | C15 | Open in a book pose: the fold | [`UIView.ReservedRegion`](https://developer.apple.com/documentation/uikit/uiview/reservedregion), LLP 1078 | The document reports two segments and `folded`; content uses `env(viewport-segment-*)`. Automatic clearance does not protect an interior fold. | LLP 1078, D6 (deferred) | `segments` |
-| C16 | A sheet on a partially open fold | [Tech Talk: Design for iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111466/) | UIKit moves the sheet off the fold; the sheet's owner follows its new allocation. | D2 | `sheet-page` in a book pose |
+| C16 | A sheet on a partially open fold | [Tech Talk: Design for iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111466/) | On a book fold UIKit moves the sheet onto one segment; the sheet's owner follows its new allocation. | D2 | `sheet-page` in a book pose |
 
 ### Presentations
 
@@ -106,7 +106,7 @@ Every case below is one the HIG or Apple's APIs define. Each row gives the behav
 | C26 | Keyboard over a medium sheet | As C25 | UIKit grows the sheet; only the residual overlap after that is accommodated. | D7 | `sheet-detents` with a field |
 | C27 | Floating or split keyboard (iPad) | [`followsUndockedKeyboard`](https://developer.apple.com/documentation/uikit/uikeyboardlayoutguide/followsundockedkeyboard) | The keyboard is a rectangle: the caret is revealed, no bottom inset is added. | D7 | `keyboard` on iPad |
 | C28 | Hardware keyboard with the shortcuts bar | As C25 | Only the bar's overlap counts; a dismissed keyboard counts as zero. | D7 | `keyboard` |
-| C29 | `interactive-widget="resizes-content"` | [CSS Viewport 1](https://drafts.csswg.org/css-viewport/#interactive-widget-section) | The document viewport shrinks, as in a browser; owners follow. | D1, D7 | `keyboard-resize` |
+| C29 | `interactive-widget="resizes-content"` | [CSS Viewport 1](https://drafts.csswg.org/css-viewport/#interactive-widget-section) | The editing native route's layout block shrinks; the document and UIKit container stay full size. An ordinary page resizes its document viewport. | D1, D7 | `keyboard-resize` |
 
 ### Content and authoring
 
@@ -132,7 +132,7 @@ Every case below is one the HIG or Apple's APIs define. Each row gives the behav
 
 ## Apple's APIs and the HIG, and how Exact maps each
 
-Exact follows CSS where CSS has a word, follows UIKit where only UIKit does, and declares each deviation. The tables say, per API, what it does and what Exact does with it: **follows**, **deviates** (with the reason), or **defers** (until a consumer). iPhone Duo rows are iOS 27.1 beta-SDK evidence.
+Exact follows CSS where CSS has a word, follows UIKit where only UIKit does, and declares each deviation. The tables say, per API, what it does and what Exact does with it: **follows**, **deviates** (with the reason), or **defers** (until a consumer). iPhone Duo rows are iOS 27.1 SDK evidence.
 
 ### A view's size and traits
 
@@ -188,14 +188,14 @@ Exact follows CSS where CSS has a word, follows UIKit where only UIKit does, and
 | [`UIWindowScene.effectiveGeometry`](https://developer.apple.com/documentation/uikit/uiwindowscene/effectivegeometry) | The scene's coordinate space, system frame, orientation and interactive-resizing state. | Follows upstream: the scene's size is not the session's. A session is sized by its own `ExactView`; an embedded session in a sheet takes the sheet's size as its document size (D1). |
 | [Multitasking on iPad, Mac and Apple Vision Pro](https://developer.apple.com/documentation/uikit/multitasking-on-ipad-mac-and-apple-vision-pro) | Split View, Slide Over and Stage Manager resize windows continuously; no width table applies. | Follows: a window resize is a real resize of the session root (document facts change, LLP 1039 D2) and of every owner (D2). Only transforms are excluded. |
 
-### iPhone Duo (iOS 27.1 beta SDK)
+### iPhone Duo (iOS 27.1 SDK)
 
 | API | What it does | Exact |
 |---|---|---|
-| [`UIView.ReservedRegion`](https://developer.apple.com/documentation/uikit/uiview/reservedregion), [`frame`](https://developer.apple.com/documentation/uikit/uiview/reservedregion/frame) | Division (fold) and occlusion regions, local to the queried view, with identity and an active state. A region's frame is in that view's coordinates and already includes the interaction margins. | Follows for the document: LLP 1078 D5 maps the session view's active divisions to viewport segments, margins included (its Q5 ruling). Owner-local segments are deferred (D6): they need ordered rectangles, not four insets, and join the `container:` record with a consumer. Occlusion regions (the inner camera while active) are reported as regions; Exact clears only what `safeAreaInsets` includes, and whether they are included is beta behavior to confirm (C14a). LLP 1078 D5's sentence that they "stay what they already are, the safe-area insets" is amended to match. |
+| [`UIView.ReservedRegion`](https://developer.apple.com/documentation/uikit/uiview/reservedregion), [`frame`](https://developer.apple.com/documentation/uikit/uiview/reservedregion/frame) | Division (fold) and occlusion regions, local to the queried view, with identity and an active state. A region's frame is in that view's coordinates and already includes the interaction margins. | Follows for the document: LLP 1078 D5 maps the session view's active divisions to viewport segments, margins included (its Q5 ruling). Owner-local segments are deferred (D6): they need ordered rectangles, not four insets, and join the `container:` record with a consumer. Occlusion regions (the inner camera while active) are reported as regions; Exact clears only what `safeAreaInsets` includes, and whether they are included is still to confirm (C14a). LLP 1078 D5's sentence that they "stay what they already are, the safe-area insets" is amended to match. |
 | [`UIHingeInteraction`](https://developer.apple.com/documentation/uikit/uihingeinteraction) | Hinge status and angle, observed on a view hierarchy; a fold from flat to a book angle changes region activity without changing bounds. | Follows (LLP 1078 D5): posture comes from the hinge; a status change relayouts. A fold without a bounds change invalidates every owner's snapshot (D2). |
-| `ArrangementView`, `UIArrangementViewController` ([Tech Talk: Strike a pose with adaptive layouts on iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111463/)) | Split or overlay arrangement of panes within given bounds; layout, not navigation. Named in Apple's Tech Talks; their documentation pages are beta and not linked here. | Defers: `navigationArrangement` waits for an app (D7). A pane an arrangement gives Exact is an app-owned container, so it is an owner. |
-| Standard sheets on a partial fold ([Tech Talk: Design for iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111466/)) | UIKit moves a standard sheet off a partially open fold and adapts its controls. | Follows: Exact's page sheet is a standard sheet, so UIKit moves it; the sheet owner's allocation follows the move (D2). Beta evidence. |
+| `ArrangementView`, `UIArrangementViewController` ([Tech Talk: Strike a pose with adaptive layouts on iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111463/)) | Split or overlay arrangement of panes within given bounds; layout, not navigation. Named in Apple's Tech Talks; their documentation pages are not linked here. | Defers: `navigationArrangement` waits for an app (D7). A pane an arrangement gives Exact is an app-owned container, so it is an owner. |
+| Standard sheets on a partial fold ([Tech Talk: Design for iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111466/)) | Apple's talk: UIKit moves a standard sheet off a partially open fold and adapts its controls. On the iOS 27.1 simulator a book fold moves a page or form sheet to the left segment, its edge about 12 points into the band, and a laptop fold leaves it across the fold. | Follows: Exact's page sheet is a standard sheet, so UIKit moves it; the sheet owner's allocation follows the move (D2). |
 
 ### tvOS
 
@@ -237,7 +237,7 @@ Exact follows CSS where CSS has a word, follows UIKit where only UIKit does, and
 - **Root fitting** has three rules. They depend on the root's `viewport-fit` and on whether the primary screen is a native container (a navigation stack or tab container projected from the root's routes). They never depend on whether a bar is visible at the moment, and never on a presentation.
   - `viewport-fit="cover"`: the document covers the session view. `env(safe-area-inset-*)` is the view's safe-area insets.
   - `viewport-fit="auto"` with no native primary container: the document is fitted inside the view's safe area on all four edges, so no obstruction overlaps it and `env()` is 0 (LLP 1008 §9). Safari's `auto` fits less: unfolded on the iPhone Duo it leaves the bottom edge under the home indicator and reports it (§"Evidence"). Exact's web host reports what the browser reports (C38).
-  - `viewport-fit="auto"` with a native primary container: the document covers the session view, so the container's bars reach under the status bar. `env()` is 0, as under the second rule; covering the view while `env()` is 0 is a native deviation, declared in LLP 1001. Authored content is inside owners, which clear (D3).
+  - `viewport-fit="auto"` with a native primary container: the document covers the session view, so the container's bars reach under the status bar. `env()` is 0, as under the second rule; covering the view while `env()` is 0 is a native deviation, declared in LLP 1001. Authored content is inside owners, which clear (D3). No gesture scrolls the document as a page then; its routes scroll their own content. On iOS the host mounts it outside the viewport's scroll view, because a scroll view above a container changes where UIKit places its bars: inside one, an active bar search field stays in its column behind the keys (iOS 27.1, measured). The viewport stays the document's coordinate space (`DocumentMountIOS.swift`).
   - The fitting reads one rule, "a native primary container exists", for the viewport and the window alike (`NavigationHost.wantsWholeView` and `rootWantsWholeView` become one). Hiding a primary route's header and its bar does not change the fitting or `exactViewport()`.
 - No presentation, route or controller changes these facts. `viewport-fit` or `interactive-widget` written inside an owner's content is ignored: only the first root's props are policy (`PresenterIOS.viewportFit`).
 - A sheet is like a modal `<dialog>` in the top layer: the same document, laid out in its own box, with the background inert. It is never an iframe with its own viewport.
@@ -298,6 +298,8 @@ The block is the owner's untransformed bounds; in what follows, the owner's **al
 - **An ordinary owner** (a route in a stack, a tab panel, a split's pane) keeps its place among its siblings: a toast written after the routes is above them, in UIKit and to the runner alike. Its host reports a **placement**, the block's rectangle where it shows it, in the local coordinates of an ancestor that holds the block in the host's hierarchy as in the document: the ancestor's border box before its own transform. That is the root's parent when the host shows the block in it; UIKit's tab container holds a tab's route beside its panel, so on iOS it is the routes' owner, which holds the native container, and the rectangle is UIKit's conversion into the owner's view. That conversion crosses only UIKit's containers, which neither turn nor skew what they hold, so the rectangle is exact, where one converted into a turned panel would be its bounding box. The runner keeps the root in its ordinary walk and steps from the root through the placement instead of the root's frame, straight to that ancestor, leaving out the boxes between, which move nothing the host shows, as the host's own hierarchy does: `client_rect` maps the subtree through it, the transform and scrolling of that ancestor and of every box above it applied once, and `elementFromPoint` reaches the root in its tree and rank order and tests its subtree there. The placement rides the block's own entry in `exact_host_covers` and is sent when it changes. Only the runner reads it; it is never a layout input. A block with no placement is mapped at its block's origin.
 
 In both, the root sits in its block by its own frame (its margins, a width narrower than the block), and a rectangle of another size than the block's used size is a scale: the host's own transform (a sheet scaled at a lower detent), never the difference between the block and the root. A route under another route of its stack, or under a modal one, is inactive to the runner's walk (`head::inactive`), so hit testing passes it, as UIKit does. The agent's coordinates, taps and screenshots follow the same mapping.
+
+On iOS, an unpresented route under native chrome has a document viewport only under `resizes-visual`. Its placement identifies that scrollport and carries its offset in block points, including zero: the root and its descendants move while the allocation's clip stays fixed. Ordinary routes use authored scrollers. Their placements, like fixed panes', have no content offset. This scrolling changes no session viewport facts or layout allocation. A kernel-implied popover block supplies layout space and adds no clip.
 
 **What an owner's block carries beyond D8.2.** Two facts the kernel lays out with, published in the same commit as the block:
 
@@ -517,7 +519,7 @@ Once stage 1 proves it, these are deleted:
 - holding the background's geometry while a sheet is up (`ModalHost.deferGeometry` and its replay): the background is laid out at its own size throughout;
 - the dismissal-width cover guard in `NavigationBarIOS.reportCovers`;
 - side covers (`HostCover::Edges` right and left) and the `header_inset` transfer (`kernel/src/kernel/cover.rs`);
-- the app-side workaround in Lexy that holds its layout wide across a sheet's dismissal.
+- an app-side workaround that holds an app's layout wide across a sheet's dismissal.
 
 The provisional-title sampling (`scrollOriginProvisional`) goes only if the publication rule covers its case. The matching `QUEUE.md` entries go too.
 
@@ -560,7 +562,7 @@ Each stage builds on LLP 1115.002 D8.2's host block, which the kernel and the Ma
 5. **Keyboard per owner (D7).** Stage 1's containing-block resize of a sheet's route gives way to D7's single executor, which must answer the keyboard design review of stage 1 (2026-10-13):
    - The owner's physical allocation stays separate from keyboard accommodation: a bottom-reaching primary scroller takes an inset, and only otherwise does the wrapper shorten, so percentage content and rows do not reflow for scrolling clearance.
    - Occupancy is owner-local. Focus reveal, geometry-change reveal and the keyboard toolbar read the consuming owner's occupancy, never the document's `keyboardInset`, which a sheet's keyboard need not change.
-   - Policy precedence: whether a sheet's keyboard leaves the document's viewport alone (as UIKit leaves the presenting screen) applies to the implicit native default only; an explicit root `interactive-widget` and an owner's `keyboardAvoidance="none"` are honored. Stage 1 keeps the document resizing as before under every policy.
+   - Native policy scope (2026-10-24): a root's `interactive-widget` applies to the editing route's local layout or scrollport, including an explicit `resizes-content`. The document and UIKit container keep their allocation so returning screens remain full size. An ordinary page keeps the document-level policy. The future owner-level `keyboardAvoidance="none"` remains an opt-out from that owner's accommodation.
    - An undocked, floating or split keyboard, or a hardware keyboard's assistant bar, is a rectangle: the caret is revealed against it in the owner's coordinates on both axes, with no bottom padding or shortening; a notification's frame is converted only from its own screen.
    - Reveal covers every editor: a fixed-position field with no scrolling ancestor, a native module's editor, and a caret inside a large text area under a floating keyboard.
    - Keyboard insets compose with the keyboard toolbar's lift and `PinnedRoom`'s saved baseline per scroll backend, each removing only its own contribution.

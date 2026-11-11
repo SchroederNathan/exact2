@@ -133,7 +133,7 @@ const CASES: &[Case] = &[
     Case {
         wrote: ("", "button press=go buttonStyle=\"filled\"\n  row\n    text \"a\"\n    text \"b\""),
         id: "lower-button-style",
-        leads: "a native button shows `text`s and a symbol `image`, not a `row`",
+        leads: "a native button shows `text`s and one `image`, not a `row`",
         fixed: &[
             ("", "button press=go buttonStyle=\"filled\"\n  text \"a\""),
             ("", "button press=go\n  row\n    text \"a\"\n    text \"b\""),
@@ -196,6 +196,25 @@ const CASES: &[Case] = &[
         leads: "put the `role` on a node beside the button",
         fixed: &[("", "text \"Card\" role=\"heading\" aria-level=2\nbutton press=go buttonStyle=\"bordered\" aria-label=\"Front\"\n  text \"Front\"")],
     },
+    // The Pokédex benchmark's type badge and hand-bulleted list (LLP 1048.007).
+    Case {
+        wrote: ("", "row gap=4\n  text \"Fire\" display=\"inline-block\" padding=\"0 8px\""),
+        id: "lower-attr-value",
+        leads: "`display=\"inline-block\"` is not a `display` here",
+        fixed: &[("", "row gap=4\n  text \"Fire\" padding=\"0 8px\"")],
+    },
+    Case {
+        wrote: ("", "view role=\"list\"\n  text role=\"listitem\" display=\"list-item\" \"a\""),
+        id: "lower-attr-value",
+        leads: "`display=\"list-item\"` is not a `display` here",
+        fixed: &[("", "view role=\"list\"\n  row role=\"listitem\" gap=4\n    text \"•\"\n    text \"a\"")],
+    },
+    Case {
+        wrote: ("", "view role=\"list\" list-style-type=\"disc\"\n  text role=\"listitem\" \"a\""),
+        id: "lower-unknown-attr",
+        leads: "`view` has no attribute `list-style-type`; a list here draws no marker",
+        fixed: &[("", "view role=\"list\"\n  text role=\"listitem\" \"a\"")],
+    },
 ];
 
 #[test]
@@ -223,6 +242,25 @@ fn what_builders_wrote_is_refused_with_the_edit_leading_and_the_edit_builds() {
     }
 }
 
+/// A list draws no marker, so the reset a stylesheet writes on a `ul`, `list-style: none`, is taken on a node and
+/// in a style, and compiles to what writing nothing does.
+#[test]
+fn a_list_style_of_none_is_taken_and_writes_nothing() {
+    let plan = |style: &str, list: &str| {
+        let source = format!(
+            "style Bare\n  margin=0{style}\n\n{}",
+            app(
+                "",
+                &format!("view role=\"list\" class=Bare{list}\n  text role=\"listitem\" \"a\"")
+            )
+        );
+        contract::compile(&source).unwrap_or_else(|e| panic!("{} ({})\n{source}", e.message, e.id))
+    };
+    let bare = plan("", "");
+    assert_eq!(plan("\n  list-style=\"none\"", ""), bare);
+    assert_eq!(plan("", " list-style-type=\"none\""), bare);
+}
+
 /// A message that names an edit never edits what is not wrong: a role that is
 /// valid, a `-exact-` word that is no colour, and a colour nothing is near
 /// keep their messages.
@@ -239,9 +277,12 @@ fn a_value_nothing_names_an_edit_for_keeps_its_rule() {
         bleu.starts_with("`color=\"bleu\"` is not a valid `color`: a color is a CSS colour"),
         "{bleu}"
     );
-    // A quoted word is not a number to unquote.
+    // A quoted word is not a number to unquote; CSS's two weight keywords
+    // are named by their numbers.
+    let heavy = message("text \"a\" font-weight=\"heavy\"");
+    assert!(heavy.ends_with("expected integer"), "{heavy}");
     let bold = message("text \"a\" font-weight=\"bold\"");
-    assert!(bold.ends_with("expected integer"), "{bold}");
+    assert!(bold.starts_with("write `font-weight=700`"), "{bold}");
     // A value the row refuses even as a number is not told to be one.
     let negative = message("text \"a\" line-clamp=\"-1\"");
     assert!(negative.ends_with("expected integer"), "{negative}");

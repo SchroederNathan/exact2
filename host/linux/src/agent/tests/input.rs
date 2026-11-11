@@ -39,6 +39,36 @@ fn the_clipboard_events_reach_the_nearest_handler() {
         &format!(r#"{{"op":"type","id":{log},"clipboard":"cut"}}"#),
     );
     assert!(reply.contains("no cut handler"), "{reply}");
+    // This host pastes text only and takes no drag from outside: both
+    // are refused by name, and neither presses nor pastes.
+    let reply = handle(
+        &mut p,
+        &format!(
+            r#"{{"op":"type","id":{cell},"clipboard":"paste","text":"","files":["/tmp/a.png"]}}"#
+        ),
+    );
+    assert!(
+        reply.contains(&format!(
+            "unsupported: the {HOST_NAME} host pastes text only"
+        )),
+        "{reply}"
+    );
+    for form in [
+        r#""drop":["/tmp/a.png"]"#,
+        r#""dragenter":["/tmp/a.png"]"#,
+        r#""dragleave":true"#,
+    ] {
+        let reply = handle(&mut p, &format!(r#"{{"op":"tap","id":{cell},{form}}}"#));
+        assert!(
+            reply.contains(&format!("unsupported: the {HOST_NAME} host takes no drag")),
+            "{reply}"
+        );
+    }
+    let k = p.host().kernel();
+    assert_eq!(
+        k.node(log).unwrap().props.str(exact_kernel::PropId::Text),
+        Some("grid:a\tb;copy;")
+    );
 }
 
 /// A paste is Ctrl+V first. A `key` handler that `preventDefault()`s that
@@ -751,7 +781,15 @@ fn a_named_tap_never_toggles_focuses_or_follows_what_is_inside_it() {
     assert_eq!(text(&p), "row;field-row;");
     // An inline run's link at the box's middle: refused, not followed.
     let reply = tap(&mut p, "link-box");
-    assert!(reply.contains("would press a link in #"), "{reply}");
+    assert!(
+        reply.contains(&format!("would press #{} inside it", id(&p, "guide"))),
+        "{reply}"
+    );
+    assert!(!p
+        .host()
+        .runner()
+        .journal()
+        .any(|line| line.contains("openURL")));
     // A disabled row: nothing, not the Like at its middle.
     let reply = tap(&mut p, "off-row");
     assert!(!reply.contains("error"), "{reply}");
@@ -763,6 +801,62 @@ fn a_named_tap_never_toggles_focuses_or_follows_what_is_inside_it() {
         &format!(r#"{{"op":"tap","id":{row},"at":[149,14]}}"#),
     );
     assert!(!reply.contains("error") && on(&p), "{reply}");
+}
+
+/// A checkbox's own `press` runs before its `change`, as HTML's `click`
+/// precedes them; an ancestor's does not, the control taking the tap.
+#[test]
+fn a_checkbox_runs_its_own_press_before_its_change() {
+    let plan = contract::compile(concat!(
+        "component App\n  state log = \"\"\n  state on = false\n",
+        "  action hit(what: string)\n    log = `${log}${what};`\n",
+        "  action set(value: bool)\n    on = value\n    log = `${log}change;`\n",
+        "  view\n    column width=300 press=hit(\"column\")\n",
+        "      input type=\"checkbox\" checked=on press=hit(\"box\") change=set testId=\"box\"\n",
+        "      text log testId=\"log\" height=20\n",
+    ))
+    .unwrap();
+    let (mut p, boot_error) = Presenter::boot_with(
+        &plan.encode(),
+        (),
+        (300.0, 300.0),
+        1.0,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(boot_error.is_none(), "{boot_error:?}");
+    let k = p.host().kernel();
+    let id = k.node_by_key(k.find_by_test_id("box")[0]).unwrap().id;
+    let log = |p: &Presenter<()>| {
+        let k = p.host().kernel();
+        let log = k.find_by_test_id("log")[0];
+        k.node_by_key(log)
+            .unwrap()
+            .props
+            .str(exact_kernel::PropId::Text)
+            .unwrap_or("")
+            .to_string()
+    };
+    let on = |p: &Presenter<()>| p.host().runner().slot("on") == Some(&Value::Bool(true));
+    let reply = handle(&mut p, &format!(r#"{{"op":"tap","id":{id}}}"#));
+    assert!(!reply.contains("error"), "{reply}");
+    assert_eq!(
+        (log(&p), on(&p)),
+        ("box;change;".to_string(), true),
+        "{reply}"
+    );
+    // The agent's `type`, a click on the web (`typeControl`).
+    let reply = handle(
+        &mut p,
+        &format!(r#"{{"op":"type","id":{id},"text":"false"}}"#),
+    );
+    assert!(!reply.contains("error"), "{reply}");
+    assert_eq!(
+        (log(&p), on(&p)),
+        ("box;change;box;change;".to_string(), false),
+        "{reply}"
+    );
 }
 
 #[test]
@@ -837,4 +931,249 @@ fn into_alignment_is_malformed_before_any_delivery() {
     let state: serde_json::Value =
         serde_json::from_str(&handle(&mut p, r#"{"op":"state"}"#)).unwrap();
     assert_eq!(state["slots"]["n"], 0, "{state}");
+}
+
+/// The driver's `post` (LLP 1139.004 D1) is the page's `postMessage`: held per
+/// surface until a canvas of it is live, at most POST_BOUND, refused by name past it.
+#[test]
+fn a_post_is_held_for_its_surface_and_refused_past_the_bound() {
+    let plan =
+        contract::compile("component App\n  view\n    text \"title\" testId=\"title\"\n").unwrap();
+    let (mut p, _) = Presenter::boot_with(
+        &plan.encode(),
+        (),
+        (300.0, 300.0),
+        1.0,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    let reply = handle(&mut p, r#"{"op":"type","message":"spawn"}"#);
+    assert!(reply.contains("no world is live"), "{reply}");
+    for _ in 0..crate::surfaces::POST_BOUND {
+        let reply = handle(
+            &mut p,
+            r#"{"op":"type","message":"spawn","surface":"world"}"#,
+        );
+        assert!(
+            reply.contains(r#""posted":"world""#) && reply.contains(r#""held":true"#),
+            "{reply}"
+        );
+    }
+    let reply = handle(
+        &mut p,
+        r#"{"op":"type","message":"spawn","surface":"world"}"#,
+    );
+    assert!(
+        reply.contains(
+            r#"post refused: postMessage: dropped: 64 posts already wait for surface \"world\""#
+        ),
+        "{reply}"
+    );
+    let title = p.host().kernel().find_by_test_id("title")[0];
+    let id = p.host().kernel().node_by_key(title).unwrap().id;
+    let reply = handle(
+        &mut p,
+        &format!(r#"{{"op":"type","message":"spawn","id":{id}}}"#),
+    );
+    assert!(
+        reply.contains(&format!("view {id} has no world")),
+        "{reply}"
+    );
+}
+
+/// `item()` asks `/changes`, which the server holds until released, as a long
+/// poll does: marked held (LLP 1016.000 D9) or not. Its reply asks `/detail`
+/// (unmarked), which the server answers 1.5 s on: the answer's work after
+/// its held reply.
+#[derive(Default)]
+struct Polled {
+    origin: String,
+    grants: String,
+    held: bool,
+}
+impl DataSource for Polled {
+    fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
+        Err(DataError::UnknownSource(source.into()))
+    }
+    fn answer(
+        &mut self,
+        _: &mut exact_runner::Store,
+        _: &str,
+        _: &[Value],
+    ) -> Result<exact_runner::Answer, DataError> {
+        let request = exact_runner::Request::get(&format!("{}/changes", self.origin));
+        Ok(exact_runner::Answer::Later(if self.held {
+            request.held()
+        } else {
+            request
+        }))
+    }
+    fn parse(
+        &mut self,
+        _: &mut exact_runner::Store,
+        _: &str,
+        _: &[Value],
+        outcome: exact_runner::Outcome,
+    ) -> Result<exact_runner::Answer, DataError> {
+        match outcome {
+            exact_runner::Outcome::Response(r) if r.body == b"changes" => {
+                Ok(exact_runner::Answer::Later(exact_runner::Request::get(
+                    &format!("{}/detail", self.origin),
+                )))
+            }
+            exact_runner::Outcome::Response(r) => Ok(exact_runner::Answer::Now(Value::Number(
+                r.body.len() as f64,
+            ))),
+            _ => Ok(exact_runner::Answer::Now(Value::Number(-1.0))),
+        }
+    }
+    fn grants(&self) -> &str {
+        &self.grants
+    }
+}
+
+/// A server that holds each `/changes` until the sender is dropped (or sent
+/// to), and answers each `/detail` 1.5 s on.
+fn holding(held: bool) -> (Polled, std::sync::mpsc::Sender<()>) {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Arc::new(std::sync::Mutex::new(released));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(8).flatten() {
+            let released = released.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut head = String::new();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                while reader.read_line(&mut head).is_ok_and(|n| n > 2)
+                    && !head.ends_with("\r\n\r\n")
+                {}
+                let body = if head.starts_with("GET /changes") {
+                    let _ = released
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(60));
+                    "changes"
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    "detail"
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    (
+        Polled {
+            grants: format!("net.fetch {origin}"),
+            origin,
+            held,
+        },
+        release,
+    )
+}
+
+/// A timer every 50 ms beside the held ask: each jump crosses timers.
+const POLLED: &str = "component App\n  state n = 0\n  resource item = item() as shape number\n  task tick when n < 1000 key=n\n    after(50, bump)\n  action bump\n    n = n + 1\n  view\n    text `${n}` testId=\"log\"\n";
+
+fn boot_polled(data: Polled) -> Presenter<Polled> {
+    let plan = contract::compile(POLLED).unwrap();
+    let (p, boot_error) = Presenter::boot_with(
+        &plan.encode(),
+        data,
+        (300.0, 300.0),
+        1.0,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(boot_error.is_none(), "{boot_error:?}");
+    p
+}
+
+/// A held ask is not waited on: a jump across timers goes on at once, and
+/// it, `clock data` and `clock settle` each name it (LLP 1016.000 D9).
+/// Released, the answer's next ask (unmarked, 1.5 s) is waited on before
+/// the next timer, and its value lands.
+#[test]
+fn a_jump_does_not_wait_on_a_held_request_and_names_it() {
+    let (data, release) = holding(true);
+    let mut p = boot_polled(data);
+    let json = |s: String| -> serde_json::Value { serde_json::from_str(&s).unwrap() };
+    let quick = std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    let reply = json(handle(&mut p, r#"{"op":"clock","to":1000}"#));
+    assert!(started.elapsed() < quick, "{:?}", started.elapsed());
+    assert_eq!(reply["clock"], 1000, "{reply}");
+    assert_eq!(reply["held"], 1, "{reply}");
+    assert_eq!(reply["heldTargets"], serde_json::json!(["item"]), "{reply}");
+    assert!(reply.get("inflight").is_none(), "{reply}");
+    for line in [
+        r#"{"op":"clock","data":true}"#,
+        r#"{"op":"clock","settle":true}"#,
+    ] {
+        let started = std::time::Instant::now();
+        let reply = json(handle(&mut p, line));
+        assert!(started.elapsed() < quick, "{line}: {:?}", started.elapsed());
+        assert_eq!(reply["settled"], true, "{line}: {reply}");
+        assert_eq!(reply["held"], 1, "{line}: {reply}");
+        assert_eq!(
+            reply["heldTargets"],
+            serde_json::json!(["item"]),
+            "{line}: {reply}"
+        );
+    }
+    let state = json(handle(&mut p, r#"{"op":"state"}"#));
+    assert_eq!(state["pending"][0]["held"], true, "{state}");
+    // The tree names it too, for a missed target's note (agent-held.mjs `inFlightNote`).
+    let tree = json(handle(&mut p, r#"{"op":"tree"}"#));
+    assert_eq!(
+        tree["pending"],
+        serde_json::json!([{"name": "item", "ticket": 1, "held": true}]),
+        "{}",
+        tree["pending"]
+    );
+    // Released: the reply lands on real time, and the answer asks `/detail`.
+    release.send(()).unwrap();
+    let asked = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while json(handle(&mut p, r#"{"op":"state"}"#))["pending"][0]["held"] == true {
+        assert!(
+            std::time::Instant::now() < asked,
+            "the held reply never landed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        handle(&mut p, r#"{"op":"clock","to":1000}"#);
+    }
+    let started = std::time::Instant::now();
+    let reply = json(handle(&mut p, r#"{"op":"clock","to":1400}"#));
+    assert!(
+        started.elapsed() > std::time::Duration::from_millis(500),
+        "the work after the held reply is waited on: {:?}",
+        started.elapsed()
+    );
+    assert!(reply.get("held").is_none(), "{reply}");
+    let state = json(handle(&mut p, r#"{"op":"state"}"#));
+    assert_eq!(state["resources"]["item"], 6, "{state}");
+}
+
+/// The same ask unmarked is waited on before each due timer (calendar F10),
+/// to the call's bound.
+#[test]
+fn an_unmarked_long_hold_is_waited_on_before_a_timer() {
+    let (data, _release) = holding(false);
+    let mut p = boot_polled(data);
+    let json = |s: String| -> serde_json::Value { serde_json::from_str(&s).unwrap() };
+    let bound = std::time::Duration::from_secs(2);
+    let started = std::time::Instant::now();
+    let reply = json(clock_within(&mut p, r#"{"op":"clock","to":1000}"#, bound));
+    assert!(started.elapsed() >= bound, "{:?}", started.elapsed());
+    assert_eq!(reply["inflight"], 1, "{reply}");
+    assert!(reply.get("held").is_none(), "{reply}");
 }

@@ -1,8 +1,8 @@
 //! `contract lean --components`: the file *before* component expansion, as
 //! a `Contract.Components.CProgram` (`semantics/Contract/Components.lean`):
 //! every component with its props, injects, `provide` section, `slot`,
-//! states, derives and actions, and a view whose uses are still uses. Its
-//! meaning is `semantics/Contract/CompSem.lean`; `Contract.Expand` mirrors
+//! states, derives, resources and actions, and a view whose uses are still uses.
+//! Its meaning is `semantics/Contract/CompSem.lean`; `Contract.Expand` mirrors
 //! the expander that turns it into what [`super::lean`] emits.
 //!
 //! The root's own declarations carry the expanded root's checked types
@@ -19,7 +19,8 @@ use std::path::Path;
 /// Compile one source text and emit `def <name> : Contract.Components.CProgram`.
 pub fn lean_components(src: &str, name: &str) -> Result<String, CompileError> {
     crate::compile(src)?;
-    let file = contract_syntax::parse(src)?;
+    let mut file = contract_syntax::parse(src)?;
+    crate::params(&mut file)?;
     emit_file(&file, name, None)
 }
 
@@ -132,14 +133,11 @@ impl Emitter<'_> {
         }
         let mut ids = 0usize;
         let view = self.cnodes(&c.view, &mut ids)?;
-        let (resources, mutations, tasks) = if k == 0 {
-            (
-                self.resources_list(c, ct)?,
-                self.mutations_list(c, ct),
-                self.tasks_list(c)?,
-            )
+        let resources = self.resources_list(c, ct)?;
+        let (mutations, tasks) = if k == 0 {
+            (self.mutations_list(c, ct), self.tasks_list(c)?)
         } else {
-            ("[]".into(), "[]".into(), "[]".into())
+            ("[]".into(), "[]".into())
         };
         Ok(format!(
             "{{\n      name := {}, props := [{}], injects := [{}], provides := [{}], slot := {},\n      \

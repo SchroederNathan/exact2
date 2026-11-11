@@ -9,7 +9,11 @@
 //! trusted. There is no closure, no heap of the VM's own, no ambient read that
 //! is not an operand: `performanceNow()` reads the clock the runner passes in.
 
+mod decoded;
+mod list_call;
 mod prepared;
+use decoded::Decoded;
+use list_call::list_call;
 pub(crate) use prepared::Prepared;
 
 use crate::machine::{self, Host, Kind, Machine, Num, Val};
@@ -91,11 +95,8 @@ impl Frame {
 pub struct Env<'a> {
     /// The plan the code belongs to.
     pub plan: &'a Plan,
-    /// The plan's string pool, interned once per runner ([`intern`]) as
-    /// values: a string literal is inline text or one shared allocation,
-    /// never a fresh one, and two evaluations of one literal are the same
-    /// object.
-    pub strings: &'a [Value],
+    /// The plan's strings as values ([`Strings`]), made as they are read.
+    pub strings: &'a Strings,
     /// Checked route table and shapes; present only for a plan with a router.
     /// @ref LLP 1038 D3/D9 — the same table across all calls in this runner.
     pub router: Option<&'a dyn crate::runner::Routing>,
@@ -143,72 +144,6 @@ fn step(steps: &mut u32, n: usize, pc: usize) -> Result<(), Trap> {
     Ok(())
 }
 
-/// `concat`, `split`, and `slice`, `includes` and `indexOf` over a list
-/// (LLP 1088 §9.1), on this evaluation's budget as `join` is: the list steps
-/// first — one per item `concat`, `slice` and `split` keep, one per item
-/// `includes` and `indexOf` scan up to the match — then a list they build
-/// measured as `Opcode::List` measures one (LLP 1090 D3). `None` for
-/// `slice`, `includes` and `indexOf` over text.
-fn list_call(
-    f: Stdlib,
-    args: &[Value],
-    steps: &mut u32,
-    extents: &mut Extents,
-    pc: usize,
-) -> Result<Option<Value>, Trap> {
-    let mismatch = Trap::TypeMismatch {
-        pc,
-        op: Opcode::Call,
-    };
-    if f == Stdlib::Split {
-        let (Some(s), Some(sep)) = (args[0].as_str(), args[1].as_str()) else {
-            return Err(mismatch);
-        };
-        step(steps, crate::strings::pieces(s, sep), pc)?;
-        let built: Vec<Value> = (crate::strings::split(s, sep).iter())
-            .map(|p| Value::str(p))
-            .collect();
-        let e = extents.built(&built, pc)?;
-        let v = Value::list(built);
-        extents.remember(&v, e);
-        return Ok(Some(v));
-    }
-    let items = match (f, args.first()) {
-        (
-            Stdlib::Concat | Stdlib::Slice | Stdlib::Includes | Stdlib::IndexOf,
-            Some(Value::List(items)),
-        ) => items,
-        (Stdlib::Concat, _) => return Err(mismatch),
-        _ => return Ok(None),
-    };
-    let built = match (f, args.get(1), args.get(2)) {
-        (Stdlib::Concat, Some(Value::List(more)), _) => {
-            step(steps, items.len() + more.len(), pc)?;
-            crate::lists::concat(items, more)
-        }
-        (Stdlib::Slice, Some(Value::Number(a)), Some(Value::Number(b))) => {
-            let kept = crate::lists::slice(items, *a, *b);
-            step(steps, kept.len(), pc)?;
-            kept.to_vec()
-        }
-        (Stdlib::Includes, Some(x), _) => {
-            let at = crate::lists::position(items, x);
-            step(steps, at.map_or(items.len(), |i| i + 1), pc)?;
-            return Ok(Some(Value::Bool(at.is_some())));
-        }
-        (Stdlib::IndexOf, Some(x), _) => {
-            let at = crate::lists::index_of(items, x);
-            step(steps, at.map_or(items.len(), |i| i + 1), pc)?;
-            return Ok(Some(Value::Number(at.map_or(-1.0, |i| i as f64))));
-        }
-        _ => return Err(mismatch),
-    };
-    let e = extents.built(&built, pc)?;
-    let v = Value::list(built);
-    extents.remember(&v, e);
-    Ok(Some(v))
-}
-
 /// A value's expanded extent: its values (a shared one counted once per
 /// place), their string bytes, and how deep below it they nest.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -224,7 +159,7 @@ impl Extent {
             Value::List(_) | Value::Record(_) | Value::Option(Some(_)) => None,
             v if v.is_str() => Some(Extent {
                 nodes: 1,
-                bytes: v.as_str().unwrap_or_default().len() as u64,
+                bytes: v.text_len() as u64,
                 depth: 0,
             }),
             _ => Some(Extent {
@@ -319,7 +254,7 @@ fn measure(v: &Value, depth: u32, total: &mut Extent, pc: usize) -> Result<(), T
     }
     total.nodes += 1;
     match v {
-        v if v.is_str() => total.bytes += v.as_str().unwrap_or_default().len() as u64,
+        v if v.is_str() => total.bytes += v.text_len() as u64,
         Value::List(items) | Value::Record(items) => {
             total.check(pc)?;
             for item in items.iter() {
@@ -351,12 +286,52 @@ pub struct Outcome {
     pub store_dependent: bool,
 }
 
-/// The plan's string pool as values, for [`Env::strings`].
-pub fn intern(plan: &Plan) -> Vec<Value> {
-    plan.strings
-        .iter()
-        .map(|s| Value::str(s.as_str()))
-        .collect()
+/// The plan's strings as values (`Env::strings`), each made when first read:
+/// a plan has a thousand strings and a screen's bindings read a hundred of
+/// them. A string read twice is the same object, inline text or one shared
+/// allocation, never a fresh one.
+pub struct Strings {
+    cells: Vec<std::cell::OnceCell<Value>>,
+}
+
+impl Strings {
+    /// The table `plan`'s strings fill as they are read.
+    pub fn new(plan: &Plan) -> Strings {
+        let cells = (0..plan.strings.len()).map(|_| std::cell::OnceCell::new());
+        Strings {
+            cells: cells.collect(),
+        }
+    }
+
+    /// A table holding `values` already (a test's: shorter than the plan's,
+    /// or holding what is not text).
+    pub fn of(values: impl IntoIterator<Item = Value>) -> Strings {
+        Strings {
+            cells: values.into_iter().map(std::cell::OnceCell::from).collect(),
+        }
+    }
+
+    /// The string with id `id`, as a value; `plan` is the plan the table was
+    /// made for.
+    pub fn get(&self, plan: &Plan, id: usize) -> Option<&Value> {
+        let cell = self.cells.get(id)?;
+        Some(cell.get_or_init(|| Value::str(&plan.strings[id])))
+    }
+
+    /// How many strings the table covers.
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// Whether it covers none.
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+}
+
+/// The plan's strings as values, for [`Env::strings`].
+pub fn intern(plan: &Plan) -> Strings {
+    Strings::new(plan)
 }
 
 /// Decode the instruction at `r`: the one decoder the VM, the dependency
@@ -436,6 +411,7 @@ pub fn eval(code: &[u8], env: &Env<'_>, allowed_writes: &[u32]) -> Result<Outcom
 pub(crate) struct Scratch {
     machine: Machine<Value, Extent>,
     extents: Extents,
+    decoded: Decoded,
 }
 
 impl Default for Scratch {
@@ -445,6 +421,7 @@ impl Default for Scratch {
         Self {
             machine,
             extents: Extents::default(),
+            decoded: Decoded::default(),
         }
     }
 }
@@ -508,12 +485,12 @@ fn projected_string_default(code: &[u8], env: &Env<'_>, value: &Value) -> Option
     }
     let (literal, replacement) = prepared::string_default(code)?;
     let literal = literal as usize;
-    let literal = env.strings.get(literal)?;
+    let literal = env.strings.get(env.plan, literal)?;
     if !literal.is_str() {
         return None;
     }
     if value == literal {
-        env.strings.get(replacement as usize).cloned()
+        env.strings.get(env.plan, replacement as usize).cloned()
     } else {
         Some(value.clone())
     }
@@ -533,6 +510,7 @@ fn eval_machine(
         cursor: Reader::new(code),
         out: Outcome::default(),
         extents: std::mem::take(&mut scratch.extents),
+        decoded: std::mem::take(&mut scratch.decoded),
         steps: 0,
     };
     let value = machine::run(&mut run, &mut scratch.machine);
@@ -542,6 +520,8 @@ fn eval_machine(
     scratch.machine.callbacks.clear();
     run.extents.0.clear();
     scratch.extents = run.extents;
+    run.decoded.clear();
+    scratch.decoded = run.decoded;
     run.out.value = value?;
     Ok(run.out)
 }
@@ -700,6 +680,7 @@ struct Run<'e, 'a> {
     cursor: Reader<'e>,
     out: Outcome,
     extents: Extents,
+    decoded: Decoded,
     steps: u32,
 }
 
@@ -711,6 +692,9 @@ impl Host<Value> for Run<'_, '_> {
         if pos >= self.code.len() {
             return Ok(None);
         }
+        if let Some(kept) = self.decoded.get(pos) {
+            return Ok(Some(kept));
+        }
         // Straight-line code reads on from the last instruction; a jump or a
         // callback's next item moves the cursor.
         if self.cursor.position() != pos {
@@ -720,7 +704,9 @@ impl Host<Value> for Run<'_, '_> {
                 .map_err(|_| Trap::Malformed { pc: pos })?;
         }
         let ins = decode(&mut self.cursor)?;
-        Ok(Some((ins, self.cursor.position())))
+        let next = self.cursor.position();
+        self.decoded.keep(pos, ins, next);
+        Ok(Some((ins, next)))
     }
 
     #[inline]
@@ -731,7 +717,7 @@ impl Host<Value> for Run<'_, '_> {
     fn string(&self, i: u64, pc: usize) -> Result<Value, Trap> {
         self.env
             .strings
-            .get(i as usize)
+            .get(self.env.plan, i as usize)
             .cloned()
             .ok_or(Trap::Malformed { pc })
     }
@@ -960,6 +946,12 @@ impl Host<Value> for Run<'_, '_> {
             env.geometry,
         )
         .map_err(|error| match error {
+            stdlib::CallError::TypeMismatch
+                if f == Stdlib::EncodeRouteSegment
+                    && call_args.first().is_some_and(Value::is_str) =>
+            {
+                Trap::PathParameter { pc }
+            }
             stdlib::CallError::TypeMismatch => Trap::TypeMismatch { pc, op },
             stdlib::CallError::StringTooLong => Trap::StringTooLong { pc },
         })
@@ -1016,8 +1008,11 @@ impl Host<Value> for Run<'_, '_> {
         self.out.refreshes.push(r as u32);
     }
 
+    /// Called as each callback item begins: from the first, instructions
+    /// are kept decoded.
     #[inline]
     fn steps(&mut self, n: usize, pc: usize) -> Result<(), Trap> {
+        self.decoded.start(self.code.len());
         step(&mut self.steps, n, pc)
     }
 
@@ -1053,7 +1048,7 @@ mod tests {
     use exact_plan::asm::Asm;
     use exact_plan::builder::PlanBuilder;
 
-    fn run(body: Asm) -> Result<Outcome, Trap> {
+    pub(super) fn run(body: Asm) -> Result<Outcome, Trap> {
         run_reusing(body, &mut Scratch::default())
     }
 

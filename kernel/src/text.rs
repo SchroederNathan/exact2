@@ -20,6 +20,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 pub(crate) mod case;
+pub mod decorations;
+pub mod inline_box;
 
 /// A payload-free lifetime namespace. Allocation identity is valid only while
 /// retained: it is never a wire id, address handle, or serialized cache key.
@@ -99,6 +101,12 @@ pub struct TextStyle {
     pub font_weight: u16,
     /// Normal or italic.
     pub font_style: FontStyle,
+    /// CSS `font-stretch`, percent of normal width (100).
+    pub font_stretch: f32,
+    /// CSS `font-variation-settings`, set after weight, width and size.
+    pub font_variations: crate::style::FontVariations,
+    /// CSS `font-optical-sizing`: `auto` sets a face's `opsz` to the size.
+    pub font_optical_sizing: crate::FontOpticalSizing,
     /// Index into the host's font registry (0 = system default).
     pub font_family: u16,
     /// Resolved logical length, or natural metrics. Zero remains explicit.
@@ -107,18 +115,29 @@ pub struct TextStyle {
     pub letter_spacing: f32,
     /// OpenType numeric-feature bitmask.
     pub font_variant_numeric: u8,
+    /// CSS `font-variant-ligatures` as [`crate::FontVariantLigatures`]'
+    /// bits: which OpenType ligature features are turned on or off.
+    pub font_variant_ligatures: u8,
+    /// Bold Text weights this run's font (LLP 1115.000 D12.3): its weight is
+    /// stepped already, and a weight a host gives a piece of it itself (a
+    /// Markdown piece's bold) takes the same step ([`crate::bolder`]).
+    pub bold_text: bool,
 }
 
 impl TextStyle {
     /// The rows [`TextStyle::from_style`] reads.
-    pub const ROWS: [StyleId; 7] = [
+    pub const ROWS: [StyleId; 11] = [
         StyleId::FontSize,
         StyleId::FontWeight,
         StyleId::FontStyle,
+        StyleId::FontStretch,
+        StyleId::FontVariationSettings,
+        StyleId::FontOpticalSizing,
         StyleId::FontFamily,
         StyleId::LineHeight,
         StyleId::LetterSpacing,
         StyleId::FontVariantNumeric,
+        StyleId::FontVariantLigatures,
     ];
 
     /// [`TextStyle::from_style`] of a computed style read row by row: the
@@ -152,10 +171,15 @@ impl TextStyle {
             font_size: s.font_size,
             font_weight: s.font_weight,
             font_style: s.font_style,
+            font_stretch: s.font_stretch,
+            font_variations: s.font_variation_settings,
+            font_optical_sizing: s.font_optical_sizing,
             font_family: s.font_family,
             line_height: s.line_height.resolve(s.font_size),
             letter_spacing: s.letter_spacing,
             font_variant_numeric: s.font_variant_numeric,
+            font_variant_ligatures: s.font_variant_ligatures,
+            bold_text: false,
         }
     }
 }
@@ -312,6 +336,20 @@ pub struct TextRun<'a> {
     pub text: Cow<'a, str>,
     /// Its style.
     pub style: TextStyle,
+    /// An image in the paragraph (LLP 1011.002): the box a measurer reserves
+    /// in place of this run's text, which is [`inline_box::INLINE_BOX_TEXT`].
+    pub inline: Option<inline_box::InlineBox>,
+}
+
+impl<'a> TextRun<'a> {
+    /// A run of text in `style`.
+    pub fn new(text: impl Into<Cow<'a, str>>, style: TextStyle) -> Self {
+        TextRun {
+            text: text.into(),
+            style,
+            inline: None,
+        }
+    }
 }
 
 impl AsRef<str> for TextRun<'_> {
@@ -334,6 +372,20 @@ pub struct TextMeasureRequest<'a> {
     /// Resolved exclusions in content coordinates; empty during box layout.
     /// @ref LLP 1043.000 §3 D5 — hosts answer from their flowed layout.
     pub exclusions: &'a [exact_textflow::FlowShape],
+    /// A Markdown paragraph's inline atoms (LLP 1045.000 D2): its `atoms`
+    /// and `atomFaces`, which a label's width depends on; empty otherwise.
+    pub atoms: MarkupAtoms<'a>,
+}
+
+/// A Markdown node's `atoms` and `atomFaces` JSON, as the kernel holds them
+/// (LLP 1045.000 D3): a host that draws atoms expands the source with them,
+/// for measure and paint alike. Empty strings are none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MarkupAtoms<'a> {
+    /// The compiled kinds (`atoms`).
+    pub kinds: &'a str,
+    /// The app's faces (`atomFaces`).
+    pub faces: &'a str,
 }
 
 /// A measurement.
@@ -488,6 +540,11 @@ pub struct SymbolRequest<'a> {
 
 /// A host's text engine, injected per kernel.
 pub trait TextMeasurer {
+    /// The platform formats an instant on the runner clock (LLP 1126 D6).
+    fn format_time(&mut self, request: &crate::time::TimeRequest<'_>) -> Option<String> {
+        crate::time::english(request)
+    }
+
     /// Revision of host measuring traits (scale, content size, legibility,
     /// appearance). A change invalidates native button offers even if fonts
     /// and the tree stay the same. Hosts without changing traits return zero.
@@ -537,6 +594,11 @@ pub trait TextMeasurer {
     /// Size a paragraph under an offer.
     fn measure(&mut self, request: &TextMeasureRequest<'_>) -> TextMetrics;
 
+    /// Size presentation-only width candidates without retaining a paragraph artifact.
+    fn measure_reservation(&mut self, request: &TextMeasureRequest<'_>) -> Option<TextMetrics> {
+        Some(self.measure(request))
+    }
+
     /// Size a kernel-identified paragraph. Existing measurers use the ordinary
     /// synchronous path; callers constructing requests still need no stamp.
     /// The stamp identifies exactly this owner's canonical runs, not a subset
@@ -581,6 +643,20 @@ pub trait TextMeasurer {
         _bottoms: &mut Vec<f32>,
     ) {
     }
+
+    /// @ref LLP 1011.002 D2 — where the paragraph the last measure of
+    /// `request` built put each inline box (a run whose `inline` is set):
+    /// its margin box's top left in content coordinates, one pair per box in
+    /// run order, non-finite for a box on no line (one `line-clamp` cut).
+    /// A measurer that answers nothing leaves each at the content box's
+    /// origin.
+    fn inline_boxes(
+        &mut self,
+        _stamp: &ParagraphStamp,
+        _request: &TextMeasureRequest<'_>,
+        _origins: &mut Vec<(f32, f32)>,
+    ) {
+    }
 }
 
 /// Deterministic reference measurer: every glyph advances `advance_em` ems
@@ -623,6 +699,7 @@ enum Token {
     Word { glyphs: Vec<f32> },
     Space { width: f32 },
     Break,
+    Box { width: f32, above: f32, below: f32 },
 }
 
 impl crate::WhiteSpace {
@@ -729,6 +806,17 @@ impl TextMeasurer for MonospaceMeasurer {
             }
         }
     }
+
+    fn inline_boxes(
+        &mut self,
+        _stamp: &ParagraphStamp,
+        request: &TextMeasureRequest<'_>,
+        origins: &mut Vec<(f32, f32)>,
+    ) {
+        if request.exclusions.is_empty() {
+            self.box_origins(request, origins);
+        }
+    }
 }
 
 impl MonospaceMeasurer {
@@ -768,6 +856,28 @@ impl MonospaceMeasurer {
     }
 }
 
+/// One line of the reference measurer's layout: its width, and how far its
+/// box reaches above and below its baseline.
+#[derive(Debug, Clone, Copy)]
+struct MonoLine {
+    width: f32,
+    above: f32,
+    below: f32,
+}
+
+/// The reference measurer's lines, and where each inline box went: its line
+/// and its x there, with its height above the baseline.
+struct MonoLayout {
+    lines: Vec<MonoLine>,
+    /// Each box's line (past the last when `line-clamp` cut it), x and
+    /// height above the baseline.
+    boxes: Vec<(usize, f32, f32)>,
+    /// Each line's bottom: whole line heights, so a paragraph without a box
+    /// measures as one line height times its lines, plus what each box
+    /// added to its line.
+    bottoms: Vec<f32>,
+}
+
 impl MonospaceMeasurer {
     fn measure_lines(&mut self, request: &TextMeasureRequest<'_>) -> TextMetrics {
         if let AxisOffer::Definite(width) = request.width {
@@ -775,6 +885,30 @@ impl MonospaceMeasurer {
                 return self.flow(request, width);
             }
         }
+        let Some(laid) = self.lay_out(request) else {
+            return TextMetrics::default();
+        };
+        // Lines never exceed the limit except for a single unbreakable word,
+        // which legitimately overflows — so the widest line is the width.
+        TextMetrics {
+            width: laid.lines.iter().map(|l| l.width).fold(0f32, f32::max),
+            height: laid.bottoms.last().copied().unwrap_or(0.0),
+            first_baseline: laid.lines.first().map(|l| l.above),
+        }
+    }
+
+    /// The reference face's edges at `style` (LLP 1011.002): its ascent and
+    /// descent split its line height at the baseline, its x-height half an em.
+    fn edges(&self, style: &TextStyle) -> inline_box::FontEdges {
+        let line = self.line_height(style);
+        inline_box::FontEdges {
+            ascent: line * self.baseline_frac,
+            descent: line * (1.0 - self.baseline_frac),
+            x_height: style.font_size * 0.5,
+        }
+    }
+
+    fn lay_out(&mut self, request: &TextMeasureRequest<'_>) -> Option<MonoLayout> {
         let white_space = request.paragraph.white_space.model();
         // CSS collapsing first, as every native engine now does (LLP 1053 G5).
         let collapsed = exact_textflow::collapse(request.runs, white_space);
@@ -783,7 +917,25 @@ impl MonospaceMeasurer {
         let mut line_height = self.line_height(&request.paragraph.strut);
         let mut pending_word: Vec<f32> = Vec::new();
         let mut any_text = false;
+        let mut boxes = 0;
         for (index, run) in request.runs.iter().enumerate() {
+            if let Some(b) = run.inline {
+                // An inline box is a word of its own: lines break around it.
+                any_text = true;
+                if !pending_word.is_empty() {
+                    tokens.push(Token::Word {
+                        glyphs: std::mem::take(&mut pending_word),
+                    });
+                }
+                let above = b.ascent(self.edges(&run.style));
+                tokens.push(Token::Box {
+                    width: b.width,
+                    above,
+                    below: b.height - above,
+                });
+                boxes += 1;
+                continue;
+            }
             line_height = line_height.max(self.line_height(&run.style));
             let advance = self.advance(&run.style);
             let text = collapsed
@@ -816,7 +968,7 @@ impl MonospaceMeasurer {
             });
         }
         if !any_text {
-            return TextMetrics::default();
+            return None;
         }
 
         // Lay lines out under the offer.
@@ -829,81 +981,134 @@ impl MonospaceMeasurer {
         let breaks_words = request.paragraph.overflow_wrap != OverflowWrap::Normal
             && (!matches!(request.width, AxisOffer::MinContent)
                 || request.paragraph.overflow_wrap == OverflowWrap::Anywhere);
-        let mut lines: Vec<f32> = vec![0.0];
+        let empty = MonoLine {
+            width: 0.0,
+            above: line_height * self.baseline_frac,
+            below: line_height * (1.0 - self.baseline_frac),
+        };
+        let mut lines: Vec<MonoLine> = vec![empty];
+        let mut placed = Vec::with_capacity(boxes);
         let mut trailing_space = 0f32;
         for token in tokens {
             match token {
                 Token::Break => {
-                    lines.push(0.0);
+                    lines.push(empty);
                     trailing_space = 0.0;
                 }
                 Token::Space { width } => {
                     if let Some(current) = lines.last_mut() {
-                        if *current > 0.0 {
-                            *current += width;
+                        if current.width > 0.0 {
+                            current.width += width;
                             trailing_space += width;
                         }
                     }
                 }
+                Token::Box {
+                    width,
+                    above,
+                    below,
+                } => {
+                    let current = lines.last_mut().expect("one line exists");
+                    if limit.is_some_and(|max| current.width > 0.0 && current.width + width > max) {
+                        current.width -= trailing_space;
+                        lines.push(empty);
+                    }
+                    trailing_space = 0.0;
+                    let at = lines.len() - 1;
+                    let current = &mut lines[at];
+                    placed.push((at, current.width, above));
+                    current.width += width;
+                    current.above = current.above.max(above);
+                    current.below = current.below.max(below);
+                }
                 Token::Word { glyphs } => {
                     let width: f32 = glyphs.iter().sum();
                     let current = lines.last_mut().expect("one line exists");
-                    if limit.is_some_and(|max| *current > 0.0 && *current + width > max) {
-                        *current -= trailing_space;
-                        lines.push(0.0);
+                    if limit.is_some_and(|max| current.width > 0.0 && current.width + width > max) {
+                        current.width -= trailing_space;
+                        lines.push(empty);
                     }
                     trailing_space = 0.0;
                     if breaks_words && limit.is_some_and(|max| width > max) {
                         for advance in glyphs {
                             let current = lines.last_mut().expect("one line exists");
-                            if limit.is_some_and(|max| *current > 0.0 && *current + advance > max) {
-                                lines.push(advance);
+                            if limit.is_some_and(|max| {
+                                current.width > 0.0 && current.width + advance > max
+                            }) {
+                                lines.push(MonoLine {
+                                    width: advance,
+                                    ..empty
+                                });
                             } else {
-                                *current += advance;
+                                current.width += advance;
                             }
                         }
                     } else {
-                        *lines.last_mut().expect("one line exists") += width;
+                        lines.last_mut().expect("one line exists").width += width;
                     }
                 }
             }
         }
         if let Some(last) = lines.last_mut() {
-            *last -= trailing_space;
+            last.width -= trailing_space;
         }
         let max_lines = request.paragraph.line_clamp;
         if max_lines > 0 && lines.len() > max_lines as usize {
             lines.truncate(max_lines as usize);
         }
-        // Lines never exceed the limit except for a single unbreakable word,
-        // which legitimately overflows — so the widest line is the width.
-        let width = lines.iter().copied().fold(0f32, f32::max);
-        let height = line_height * lines.len() as f32;
-        TextMetrics {
-            width,
-            height,
-            first_baseline: Some(line_height * self.baseline_frac),
-        }
+        let mut grown = 0.0;
+        let bottoms = (lines.iter().enumerate())
+            .map(|(i, l)| {
+                grown += (l.above - empty.above) + (l.below - empty.below);
+                line_height * (i + 1) as f32 + grown
+            })
+            .collect();
+        Some(MonoLayout {
+            lines,
+            boxes: placed,
+            bottoms,
+        })
     }
 }
 
 impl MonospaceMeasurer {
-    /// Every line is one line height, so each bottom is a multiple of it.
+    /// Each line's bottom, from the lines the measure laid out.
     fn line_bottoms(
         &mut self,
         _stamp: &ParagraphStamp,
         request: &TextMeasureRequest<'_>,
         bottoms: &mut Vec<f32>,
     ) {
-        let height = self.measure_lines(request).height;
-        let line_height = request
-            .runs
-            .iter()
-            .map(|run| self.line_height(&run.style))
-            .fold(self.line_height(&request.paragraph.strut), f32::max);
-        if line_height > 0.0 {
-            let count = (height / line_height).round() as usize;
-            bottoms.extend((1..=count).map(|i| line_height * i as f32));
+        if !request.exclusions.is_empty() {
+            // Flowed lines are each one line height.
+            let height = self.measure_lines(request).height;
+            let line_height = request
+                .runs
+                .iter()
+                .map(|run| self.line_height(&run.style))
+                .fold(self.line_height(&request.paragraph.strut), f32::max);
+            if line_height > 0.0 {
+                let count = (height / line_height).round() as usize;
+                bottoms.extend((1..=count).map(|i| line_height * i as f32));
+            }
+        } else if let Some(laid) = self.lay_out(request) {
+            bottoms.extend(laid.bottoms);
+        }
+    }
+
+    /// Each inline box's top left, as [`TextMeasurer::inline_boxes`] asks.
+    fn box_origins(&mut self, request: &TextMeasureRequest<'_>, origins: &mut Vec<(f32, f32)>) {
+        let Some(laid) = self.lay_out(request) else {
+            return;
+        };
+        let measured = self.measure_lines(request);
+        let (top, _) = self.trim(request, measured);
+        for &(index, x, above) in &laid.boxes {
+            let Some(line) = laid.lines.get(index) else {
+                origins.push((f32::NAN, f32::NAN));
+                continue;
+            };
+            origins.push((x, laid.bottoms[index] - line.below - above - top));
         }
     }
 }
@@ -914,10 +1119,14 @@ struct TextRows {
     font_size: f32,
     font_weight: u16,
     font_style: crate::FontStyle,
+    font_stretch: f32,
+    font_variations: crate::style::FontVariations,
+    font_optical_sizing: crate::FontOpticalSizing,
     font_family: u16,
     line_height: crate::LineHeight,
     letter_spacing: f32,
     font_variant_numeric: u8,
+    font_variant_ligatures: u8,
 }
 
 impl TextRows {
@@ -926,10 +1135,14 @@ impl TextRows {
             font_size: s.font_size,
             font_weight: s.font_weight,
             font_style: s.font_style,
+            font_stretch: s.font_stretch,
+            font_variations: s.font_variation_settings,
+            font_optical_sizing: s.font_optical_sizing,
             font_family: s.font_family,
             line_height: s.line_height,
             letter_spacing: s.letter_spacing,
             font_variant_numeric: s.font_variant_numeric,
+            font_variant_ligatures: s.font_variant_ligatures,
         }
     }
     fn take(&mut self, s: &StyleProps, mask: StyleMask) {
@@ -941,6 +1154,15 @@ impl TextRows {
         }
         if mask.has(StyleId::FontStyle) {
             self.font_style = s.font_style;
+        }
+        if mask.has(StyleId::FontStretch) {
+            self.font_stretch = s.font_stretch;
+        }
+        if mask.has(StyleId::FontVariationSettings) {
+            self.font_variations = s.font_variation_settings;
+        }
+        if mask.has(StyleId::FontOpticalSizing) {
+            self.font_optical_sizing = s.font_optical_sizing;
         }
         if mask.has(StyleId::FontFamily) {
             self.font_family = s.font_family;
@@ -954,16 +1176,24 @@ impl TextRows {
         if mask.has(StyleId::FontVariantNumeric) {
             self.font_variant_numeric = s.font_variant_numeric;
         }
+        if mask.has(StyleId::FontVariantLigatures) {
+            self.font_variant_ligatures = s.font_variant_ligatures;
+        }
     }
     fn style(&self) -> TextStyle {
         TextStyle {
             font_size: self.font_size,
             font_weight: self.font_weight,
             font_style: self.font_style,
+            font_stretch: self.font_stretch,
+            font_variations: self.font_variations,
+            font_optical_sizing: self.font_optical_sizing,
             font_family: self.font_family,
             line_height: self.line_height.resolve(self.font_size),
             letter_spacing: self.letter_spacing,
             font_variant_numeric: self.font_variant_numeric,
+            font_variant_ligatures: self.font_variant_ligatures,
+            bold_text: false,
         }
     }
 }
@@ -1009,6 +1239,19 @@ impl RunRows {
         // exactly as computed_style does (including arena-only test styles).
         self.take(own, own.mask.union(StyleMask::INHERITED.minus(self.mask)));
         self.mask = self.mask.union(own.mask);
+        self
+    }
+
+    /// The rows set at or above this run.
+    pub fn said(&self) -> StyleMask {
+        self.mask
+    }
+
+    /// `from`'s rows in `mask` taken, as a text style gives them (LLP
+    /// 1115.000 D12.2), and marked set for the runs inside.
+    pub fn fill(mut self, from: &StyleProps, mask: StyleMask) -> Self {
+        self.take(from, mask);
+        self.mask = self.mask.union(mask);
         self
     }
 
@@ -1110,339 +1353,4 @@ impl ParagraphRows {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn style(font_size: f32) -> TextStyle {
-        TextStyle {
-            font_size,
-            font_weight: 400,
-            font_style: FontStyle::Normal,
-            font_family: 0,
-            line_height: None,
-            letter_spacing: 0.0,
-            font_variant_numeric: 0,
-        }
-    }
-
-    #[test]
-    fn start_and_end_follow_the_paragraph_direction() {
-        use crate::{StyleId, StyleValue};
-        let mut s = StyleProps::default();
-        assert_eq!(s.text_align, TextAlign::Start, "CSS's initial value");
-        assert_eq!(Paragraph::from_style(&s).text_align, TextAlign::Left);
-        s.set_dynamic(StyleId::Direction, &StyleValue::Text("rtl".into()))
-            .unwrap();
-        assert_eq!(Paragraph::from_style(&s).text_align, TextAlign::Right);
-        s.set_dynamic(StyleId::TextAlign, &StyleValue::Text("end".into()))
-            .unwrap();
-        assert_eq!(Paragraph::from_style(&s).text_align, TextAlign::Left);
-        for physical in [
-            TextAlign::Left,
-            TextAlign::Center,
-            TextAlign::Right,
-            TextAlign::Justify,
-        ] {
-            for d in [Direction::Ltr, Direction::Rtl] {
-                assert_eq!(physical.physical(d), physical);
-            }
-        }
-    }
-
-    fn paragraph() -> Paragraph {
-        Paragraph {
-            markup: Markup::None,
-            strut: style(10.0),
-            direction: Direction::Ltr,
-            text_align: TextAlign::Left,
-            line_clamp: 0,
-            text_overflow: TextOverflow::Clip,
-            overflow_wrap: OverflowWrap::Normal,
-            white_space: crate::WhiteSpace::Normal,
-            text_wrap_style: crate::TextWrapStyle::Auto,
-            text_indent: 0.0,
-            hyphens: crate::Hyphens::Manual,
-            text_box_trim: crate::TextBoxTrim::None,
-            text_box_edge: crate::TextBoxEdge::Auto,
-        }
-    }
-
-    /// `text-box: trim-both cap alphabetic` cuts a line to its cap height:
-    /// the reference face's cap is 0.7 em above a baseline 0.8 down a 1.2 em
-    /// line, so 10 pt text keeps 7 pt, its baseline at the bottom.
-    #[test]
-    fn text_box_trim_cuts_to_the_cap_height_and_baseline() {
-        let runs = [TextRun {
-            text: "Ab".into(),
-            style: style(10.0),
-        }];
-        let mut p = paragraph();
-        let mut m = MonospaceMeasurer::default();
-        let plain = m.measure(&TextMeasureRequest {
-            runs: &runs,
-            paragraph: p,
-            width: AxisOffer::MaxContent,
-            height: AxisOffer::MaxContent,
-            exclusions: &[],
-        });
-        assert_eq!((plain.height, plain.first_baseline), (12.0, Some(9.6)));
-        p.text_box_trim = crate::TextBoxTrim::TrimBoth;
-        p.text_box_edge = crate::TextBoxEdge::CapAlphabetic;
-        let cut = m.measure(&TextMeasureRequest {
-            runs: &runs,
-            paragraph: p,
-            width: AxisOffer::MaxContent,
-            height: AxisOffer::MaxContent,
-            exclusions: &[],
-        });
-        assert!((cut.height - 7.0).abs() < 1e-4, "{cut:?}");
-        assert!((cut.first_baseline.unwrap() - 7.0).abs() < 1e-4, "{cut:?}");
-        p.text_box_trim = crate::TextBoxTrim::TrimStart;
-        let start = m.measure(&TextMeasureRequest {
-            runs: &runs,
-            paragraph: p,
-            width: AxisOffer::MaxContent,
-            height: AxisOffer::MaxContent,
-            exclusions: &[],
-        });
-        assert!((start.height - 9.4).abs() < 1e-4, "only the top: {start:?}");
-    }
-
-    /// A line shorter than its glyphs is cut by negative amounts, so the
-    /// paragraph grows; its last line still ends where the measurement does.
-    /// Empty text has no line to cut and stays empty.
-    #[test]
-    fn a_trimmed_paragraphs_last_line_ends_at_its_height() {
-        let mut short = style(10.0);
-        short.line_height = Some(4.0);
-        let runs = [TextRun {
-            text: "Ab\nAb".into(),
-            style: short,
-        }];
-        let mut p = paragraph();
-        p.strut = short;
-        p.white_space = crate::WhiteSpace::PreLine;
-        p.text_box_trim = crate::TextBoxTrim::TrimBoth;
-        p.text_box_edge = crate::TextBoxEdge::CapAlphabetic;
-        let request = TextMeasureRequest {
-            runs: &runs,
-            paragraph: p,
-            width: AxisOffer::MaxContent,
-            height: AxisOffer::MaxContent,
-            exclusions: &[],
-        };
-        let mut m = MonospaceMeasurer::default();
-        let measured = m.measure(&request);
-        assert!(measured.height > 8.0, "the cuts are negative: {measured:?}");
-        let stamp = ParagraphStamp {
-            domain: TextDomain::default(),
-            owner: crate::NodeKey {
-                index: 0,
-                generation: 0,
-            },
-            view: 0,
-            metrics: 0,
-            paint_source: 0,
-        };
-        let mut bottoms = Vec::new();
-        m.lines(&stamp, &request, &mut bottoms);
-        assert_eq!(bottoms.len(), 2);
-        assert_eq!(bottoms.last(), Some(&measured.height));
-
-        let empty = [TextRun {
-            text: "".into(),
-            style: style(20.0),
-        }];
-        let empty = m.measure(&TextMeasureRequest {
-            runs: &empty,
-            ..request
-        });
-        assert_eq!(empty.height, 0.0, "{empty:?}");
-    }
-
-    fn measure(text: &str, width: AxisOffer, lines: u32) -> TextMetrics {
-        let runs = [TextRun {
-            text: text.into(),
-            style: style(10.0),
-        }];
-        let mut p = paragraph();
-        p.line_clamp = lines;
-        MonospaceMeasurer::default().measure(&TextMeasureRequest {
-            exclusions: &[],
-            runs: &runs,
-            paragraph: p,
-            width,
-            height: AxisOffer::MaxContent,
-        })
-    }
-
-    #[test]
-    fn single_line_max_content() {
-        let m = measure("hello", AxisOffer::MaxContent, 0);
-        assert_eq!(m.width, 30.0);
-        assert_eq!(m.height, 12.0);
-        assert_eq!(m.first_baseline, Some(9.6));
-    }
-
-    #[test]
-    fn wraps_at_whitespace_under_a_definite_width() {
-        // "hello world" = 11 chars = 66pt; at 40pt it wraps into two lines of 30.
-        let m = measure("hello world", AxisOffer::Definite(40.0), 0);
-        assert_eq!(m.width, 30.0);
-        assert_eq!(m.height, 24.0);
-    }
-
-    #[test]
-    fn number_of_lines_caps_height() {
-        let m = measure("a b c d e f", AxisOffer::Definite(6.0), 2);
-        assert_eq!(m.height, 24.0);
-    }
-
-    #[test]
-    fn min_content_is_the_longest_word() {
-        let m = measure("ab cdef g", AxisOffer::MinContent, 0);
-        assert_eq!(m.width, 24.0);
-        assert_eq!(m.height, 36.0);
-    }
-
-    fn measure_in(text: &str, width: AxisOffer, white_space: crate::WhiteSpace) -> TextMetrics {
-        let runs = [TextRun {
-            text: text.into(),
-            style: style(10.0),
-        }];
-        let mut p = paragraph();
-        p.white_space = white_space;
-        MonospaceMeasurer::default().measure(&TextMeasureRequest {
-            exclusions: &[],
-            runs: &runs,
-            paragraph: p,
-            width,
-            height: AxisOffer::MaxContent,
-        })
-    }
-
-    #[test]
-    fn explicit_newlines_break_only_preserved_lines() {
-        let m = measure_in(
-            "a\nbb\nccc",
-            AxisOffer::MaxContent,
-            crate::WhiteSpace::PreWrap,
-        );
-        assert_eq!(m.width, 18.0);
-        assert_eq!(m.height, 36.0);
-        // `normal` collapses segment breaks to spaces, as the browser does.
-        let m = measure_in(
-            "a\nbb\nccc",
-            AxisOffer::MaxContent,
-            crate::WhiteSpace::Normal,
-        );
-        assert_eq!(m.width, 48.0);
-        assert_eq!(m.height, 12.0);
-        let m = measure_in(
-            "  a \t b  ",
-            AxisOffer::MaxContent,
-            crate::WhiteSpace::Normal,
-        );
-        assert_eq!(m.width, 18.0);
-    }
-
-    #[test]
-    fn pre_line_breaks_at_line_feeds_and_collapses_the_rest() {
-        // @ref LLP 1053 §0 G5 — max-content is the longest forced line,
-        // min-content the longest word.
-        let text = "  one   two  \n  three";
-        let m = measure_in(text, AxisOffer::MaxContent, crate::WhiteSpace::PreLine);
-        assert_eq!((m.width, m.height), (42.0, 24.0));
-        let m = measure_in(text, AxisOffer::MinContent, crate::WhiteSpace::PreLine);
-        assert_eq!((m.width, m.height), (30.0, 36.0));
-        let m = measure_in("a\n\nb", AxisOffer::MaxContent, crate::WhiteSpace::PreLine);
-        assert_eq!((m.width, m.height), (6.0, 36.0));
-    }
-
-    #[test]
-    fn nowrap_min_content_is_the_unwrapped_line() {
-        // @ref LLP 1053 §0 G5
-        for width in [
-            AxisOffer::MinContent,
-            AxisOffer::Definite(10.0),
-            AxisOffer::MaxContent,
-        ] {
-            let m = measure_in("ab  cdef\ng", width, crate::WhiteSpace::Nowrap);
-            assert_eq!((m.width, m.height), (54.0, 12.0));
-        }
-    }
-
-    #[test]
-    fn pre_keeps_spaces_and_breaks_only_at_line_feeds() {
-        // @ref LLP 1053 G5 — preserve × nowrap: min-content is max-content.
-        for width in [
-            AxisOffer::MinContent,
-            AxisOffer::Definite(10.0),
-            AxisOffer::MaxContent,
-        ] {
-            let m = measure_in("ab  cdef\n g", width, crate::WhiteSpace::Pre);
-            assert_eq!((m.width, m.height), (48.0, 24.0));
-        }
-    }
-
-    #[test]
-    fn empty_text_measures_zero() {
-        let m = measure("", AxisOffer::MaxContent, 0);
-        assert_eq!(m, TextMetrics::default());
-    }
-
-    #[test]
-    fn runs_take_the_tallest_line_height() {
-        let runs = [
-            TextRun {
-                text: "ab".into(),
-                style: style(10.0),
-            },
-            TextRun {
-                text: "cd".into(),
-                style: style(20.0),
-            },
-        ];
-        let m = MonospaceMeasurer::default().measure(&TextMeasureRequest {
-            exclusions: &[],
-            runs: &runs,
-            paragraph: paragraph(),
-            width: AxisOffer::MaxContent,
-            height: AxisOffer::MaxContent,
-        });
-        assert_eq!(m.width, 12.0 + 24.0);
-        assert_eq!(m.height, 24.0);
-    }
-
-    #[test]
-    fn overflow_wrap_changes_emergency_breaks_and_only_anywhere_changes_min_content() {
-        let runs = [TextRun {
-            text: "abcdefghijklmnopqrst".into(),
-            style: style(10.0),
-        }];
-        let mut request = TextMeasureRequest {
-            exclusions: &[],
-            runs: &runs,
-            paragraph: paragraph(),
-            width: AxisOffer::Definite(30.0),
-            height: AxisOffer::MaxContent,
-        };
-        let mut measurer = MonospaceMeasurer::default();
-        assert_eq!(measurer.measure(&request).height, 12.0);
-        for mode in [OverflowWrap::BreakWord, OverflowWrap::Anywhere] {
-            request.paragraph.overflow_wrap = mode;
-            request.width = AxisOffer::Definite(30.0);
-            assert_eq!(measurer.measure(&request).height, 48.0);
-            assert_eq!(measurer.measure(&request).width, 30.0);
-            request.width = AxisOffer::MinContent;
-            assert_eq!(
-                measurer.measure(&request).width,
-                if mode == OverflowWrap::Anywhere {
-                    6.0
-                } else {
-                    120.0
-                }
-            );
-        }
-    }
-}
+mod tests;

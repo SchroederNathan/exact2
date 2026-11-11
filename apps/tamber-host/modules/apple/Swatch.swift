@@ -1,9 +1,14 @@
 // The Tamber binding's sample module (LLP 1121 D12, stage 5): `exact-swatch`
 // fills itself with the design's `swatch.fill` through `ExactTamber`, and
-// says each colour it applies as a `message` (`swatch #rrggbbaa`), so a drive
-// reads what it follows: a mode, a pin above it, the root font size (Dynamic
-// Type), a live edit. It asks once it is in a window, where its place is
-// known, and again when its observation fires or its appearance changes.
+// since stage 6 G sets a label in `type.label` inset by `swatch.inset`, and
+// says each colour, inset and font it applies as a `message` (`swatch
+// #rrggbbaa inset 16 font 17 <face>`), so a drive reads what it follows: a
+// mode, a pin above it, the root font size (Dynamic Type), Bold Text, a
+// live edit. It asks once it is in a window, where its place is known, and
+// again when its observation fires or its appearance changes. Since stage 7
+// D it draws a ring in its own params (`component Swatch` in the design),
+// named by the generated bindings (`.swatchRing`, `.swatchRingWidth`), and
+// says it last (`ring #rrggbbaa 4`).
 import Foundation
 #if os(macOS)
 import AppKit
@@ -32,26 +37,71 @@ final class SwatchView: ExactNativeView {
     var said: ((String) -> Void)?
     private var observation: ExactTamberObservation?
     private var applied = false
+    #if os(macOS)
+    private let label = NSTextField(labelWithString: "Aa")
+    #else
+    private let label = UILabel()
+    #endif
 
     func apply() {
-        let fill = ExactTamber(self).color(ExactTamberToken("swatch.fill"))
+        let tamber = ExactTamber(self)
+        let fill = tamber.color(ExactTamberToken("swatch.fill"))
+        let inset = tamber.length(ExactTamberToken("swatch.inset"), fallback: 0)
+        let ring = tamber.color(.swatchRing)
+        let ringWidth = tamber.length(.swatchRingWidth, fallback: 0)
+        #if os(macOS)
+        let font = tamber.font(ExactTamberToken("type.label"), fallback: .systemFont(ofSize: 9))
+        if label.superview == nil { addSubview(label) }
+        label.font = font
+        label.frame = NSRect(x: inset, y: inset, width: max(0, bounds.width - 2 * inset), height: font.pointSize * 1.4)
+        #else
+        let font = tamber.font(ExactTamberToken("type.label"), fallback: .systemFont(ofSize: 9))
+        if label.superview == nil { label.text = "Aa"; addSubview(label) }
+        label.font = font
+        label.frame = CGRect(x: inset, y: inset, width: max(0, bounds.width - 2 * inset), height: font.lineHeight)
+        #endif
         #if os(macOS)
         wantsLayer = true
         var cg: CGColor?
         effectiveAppearance.performAsCurrentDrawingAppearance { cg = fill.cgColor }
         layer?.backgroundColor = cg
+        var ringCG: CGColor?
+        effectiveAppearance.performAsCurrentDrawingAppearance { ringCG = ring.cgColor }
+        layer?.borderColor = ringCG
+        layer?.borderWidth = ringWidth
+        let ringParts = ringCG.flatMap { NSColor(cgColor: $0)?.usingColorSpace(.sRGB) }.map { [$0.redComponent, $0.greenComponent, $0.blueComponent, $0.alphaComponent] } ?? []
         let rgba = cg.flatMap { NSColor(cgColor: $0)?.usingColorSpace(.sRGB) }
         let parts = rgba.map { [$0.redComponent, $0.greenComponent, $0.blueComponent, $0.alphaComponent] } ?? []
         #else
         let resolved = fill.resolvedColor(with: traitCollection)
         layer.backgroundColor = resolved.cgColor
+        let ringResolved = ring.resolvedColor(with: traitCollection)
+        layer.borderColor = ringResolved.cgColor
+        layer.borderWidth = ringWidth
+        var rr: CGFloat = 0, rg: CGFloat = 0, rb: CGFloat = 0, ra: CGFloat = 0
+        ringResolved.getRed(&rr, green: &rg, blue: &rb, alpha: &ra)
+        let ringParts = [rr, rg, rb, ra]
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
         resolved.getRed(&r, green: &g, blue: &b, alpha: &a)
         let parts = [r, g, b, a]
         #endif
         applied = true
         // Said each time it applies: a moved input that keeps the colour shows too.
-        said?("#" + parts.map { String(format: "%02x", Int(($0 * 255).rounded())) }.joined())
+        let hexOf = { (parts: [CGFloat]) in "#" + parts.map { String(format: "%02x", Int(($0 * 255).rounded())) }.joined() }
+        let hex = hexOf(parts)
+        #if os(macOS)
+        let weight = NSFontManager.shared.weight(of: font)
+        #else
+        let weight = Int(((font.fontDescriptor.object(forKey: .traits) as? [UIFontDescriptor.TraitKey: Any])?[.weight] as? CGFloat ?? 0) * 1000)
+        #endif
+        // A system stack's design (`ui-monospace`) is the module library's to keep.
+        let code = tamber.font(ExactTamberToken("type.code"), fallback: .systemFont(ofSize: 9))
+        #if os(macOS)
+        let fixed = code.isFixedPitch
+        #else
+        let fixed = code.fontDescriptor.symbolicTraits.contains(.traitMonoSpace)
+        #endif
+        said?("\(hex) inset \(Int(inset.rounded())) font \(Int(font.pointSize.rounded())) \(font.fontName) w\(weight) code \(fixed ? "fixed" : "proportional") ring \(hexOf(ringParts)) \(Int(ringWidth.rounded()))")
     }
 
     private func start() {

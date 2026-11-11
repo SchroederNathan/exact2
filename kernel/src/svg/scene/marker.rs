@@ -213,10 +213,16 @@ impl Resolver<'_, '_> {
             }
             _ => return Vec::new(),
         };
+        if !self.budget.cost(ends.len() as u64) {
+            return Vec::new();
+        }
         let vertices = vertices(path, &ends);
         let last = vertices.len().saturating_sub(1);
         let mut out = Vec::new();
         for (i, v) in vertices.iter().enumerate() {
+            if self.budget.over().is_some() {
+                break;
+            }
             let which = if i == 0 {
                 0
             } else if i == last {
@@ -301,7 +307,12 @@ impl Resolver<'_, '_> {
         if self.uses.contains(&(marker.id as u64)) || self.uses.len() > 16 {
             return None;
         }
-        let inherited = marker.computed_style(StyleMask::INHERITED);
+        if !self.budget.cost(super::budget::ITEM) {
+            return None;
+        }
+        let inherited = marker
+            .arena
+            .computed_rows(marker.slot, StyleMask::INHERITED);
         let mut mstyle = marker.style.clone();
         mstyle.copy_rows(&inherited, StyleMask::INHERITED.minus(marker.style.mask));
         let clip = mstyle.overflow_x != Overflow::Visible || mstyle.overflow_y != Overflow::Visible;

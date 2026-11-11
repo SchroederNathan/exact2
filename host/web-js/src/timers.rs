@@ -4,7 +4,8 @@
 //! the commit's gate step calls (schedule.js). Each carries the task's name
 //! for the agent's `state.tasks`. Then each `sequence` (LLP 1125 D2), its
 //! gate, key and `play` arguments compiled to functions transport.js's
-//! gate step calls, after the `exactTransport` readers' fields.
+//! gate step calls. The `exactMIDI` and `exactTransport` readers are
+//! installed before the plan's resources, which ask them at boot.
 
 use super::Em;
 use crate::code::{self, Scope};
@@ -13,6 +14,10 @@ use std::fmt::Write as _;
 pub(super) fn timers(em: &mut Em<'_>, body: &mut String) -> Result<(), String> {
     let plan = em.plan;
     let top = Scope::default();
+    if plan.timers.iter().any(|t| t.wait != 0) {
+        let install = em.uses.rt("timerWaits");
+        let _ = write!(body, "{install}();");
+    }
     for t in plan.timers.iter() {
         let name = serde_json::to_string(plan.str(t.name)).unwrap();
         if t.gated || t.keyed {
@@ -26,8 +31,14 @@ pub(super) fn timers(em: &mut Em<'_>, body: &mut String) -> Result<(), String> {
             let gated = em.uses.rt("gated");
             let _ = write!(
                 body,
-                "{gated}({},a_{},{},{},()=>{gate},{key},{name});",
-                t.interval_ms, t.action.0, t.once as u8, t.frame as u8
+                "{gated}({},a_{},{},{},()=>{gate},{key},{name},{},{},{});",
+                t.interval_ms,
+                t.action.0,
+                t.once as u8,
+                t.frame as u8,
+                t.wait,
+                t.max_ms,
+                t.tolerance_ms
             );
             continue;
         }
@@ -40,18 +51,18 @@ pub(super) fn timers(em: &mut Em<'_>, body: &mut String) -> Result<(), String> {
         let every = em.uses.rt("every");
         let _ = write!(
             body,
-            "{every}({},a_{},{},{name});",
-            t.interval_ms, t.action.0, t.once as u8
+            "{every}({},a_{},{},{name},{},{},{});",
+            t.interval_ms, t.action.0, t.once as u8, t.wait, t.max_ms, t.tolerance_ms
         );
     }
     Ok(())
 }
 
 /// The `exactMIDI` readers, each its fields and a port list's port fields,
-/// and whether the plan uses MIDI, for midi.js (LLP 1125 D6), ahead of the
-/// sequences whose notes go on its queue; whether the module imports it.
+/// and whether the plan uses MIDI, for midi.js (LLP 1125 D6); whether the
+/// module imports it.
 pub(super) fn midi(em: &mut Em<'_>, body: &mut String) -> Result<bool, String> {
-    use exact_runner::midi::{FIELDS, PORT_FIELDS, SOURCE};
+    use exact_runner::midi::{FIELDS, PORT_FIELDS, SENT_FIELDS, SOURCE};
     let plan = em.plan;
     if !exact_runner::uses::keeps_midi(plan) {
         return Ok(false);
@@ -82,7 +93,10 @@ pub(super) fn midi(em: &mut Em<'_>, body: &mut String) -> Result<bool, String> {
                     .fields
                     .iter()
                     .map(|p| plan.str(plan.fields[p.0 as usize].name))
-                    .filter(|p| PORT_FIELDS.contains(p))
+                    .filter(|p| match fname {
+                        "sent" => SENT_FIELDS.contains(p),
+                        _ => PORT_FIELDS.contains(p),
+                    })
                     .map(name)
                     .collect();
                 ports.push(format!("{}:[{}]", name(fname), keys.join(",")));
@@ -100,9 +114,9 @@ pub(super) fn midi(em: &mut Em<'_>, body: &mut String) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The `exactTransport` readers and every sequence, for transport.js;
-/// whether the module imports it.
-pub(super) fn sequences(em: &mut Em<'_>, body: &mut String) -> Result<bool, String> {
+/// The `exactTransport` readers, for transport.js; whether the module
+/// imports it (a plan that reads the transport or declares a sequence).
+pub(super) fn transport(em: &mut Em<'_>, body: &mut String) -> Result<bool, String> {
     use exact_runner::transport::{FIELDS, SOURCE};
     let plan = em.plan;
     let mut readers = Vec::new();
@@ -134,6 +148,12 @@ pub(super) fn sequences(em: &mut Em<'_>, body: &mut String) -> Result<bool, Stri
         return Ok(false);
     }
     let _ = write!(body, "$transport({{{}}});", readers.join(","));
+    Ok(true)
+}
+
+/// Every sequence, for transport.js, armed after mount as the runner's boot arms them.
+pub(super) fn sequences(em: &mut Em<'_>, body: &mut String) -> Result<(), String> {
+    let plan = em.plan;
     let top = Scope::default();
     // One call for them all: transport.js reads every gate before it arms any.
     let mut entries = Vec::new();
@@ -162,5 +182,5 @@ pub(super) fn sequences(em: &mut Em<'_>, body: &mut String) -> Result<bool, Stri
     if !entries.is_empty() {
         let _ = write!(body, "$sequence([{}]);", entries.join(","));
     }
-    Ok(true)
+    Ok(())
 }

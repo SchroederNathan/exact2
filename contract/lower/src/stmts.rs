@@ -17,12 +17,13 @@ use std::collections::BTreeSet;
 impl Lowerer<'_> {
     /// The slot a state's or a mutation's name writes.
     pub(crate) fn slot_named(&self, name: &str) -> exact_plan::SlotsId {
-        match self.root.states.iter().position(|s| s.name == name) {
-            Some(si) => self.slots[si],
-            None => {
-                let mi = self.root.mutations.iter().position(|m| m.name == name);
-                self.mutation_slots[mi.expect("the type pass resolved it")]
-            }
+        match self
+            .slot_names
+            .get(name)
+            .expect("the type pass resolved it")
+        {
+            Ok(si) => self.slots[*si],
+            Err(mi) => self.mutation_slots[*mi],
         }
     }
 
@@ -76,16 +77,25 @@ impl Lowerer<'_> {
                 args,
                 ..
             } => {
-                for arg in args {
-                    expr::compile(self, asm, arg, scope, locals)?;
+                let activity = matches!(
+                    source.as_str(),
+                    "startActivity" | "updateActivity" | "endActivity"
+                );
+                let mut types = Vec::new();
+                for (i, arg) in args.iter().enumerate() {
+                    let ty = expr::compile(self, asm, arg, scope, locals)?;
+                    if activity {
+                        let ty = contract_types::activity_option_type(source, i).unwrap_or(ty);
+                        types.push(self.ty_id(&ty)?.0.to_string());
+                    }
                 }
-                let m = self.mutations[root
-                    .mutations
-                    .iter()
-                    .position(|m| &m.name == target)
-                    .unwrap()];
+                if activity {
+                    let descriptor = self.b.str(&types.join(","));
+                    asm.str(descriptor);
+                }
+                let m = self.mutations[self.mutation_names[target.as_str()]];
                 let source = self.b.str(source);
-                asm.send(m, source, args.len() as u16);
+                asm.send(m, source, args.len() as u16 + u16::from(activity));
             }
             Stmt::Refresh { target, .. } => {
                 let r = self.resources[root
@@ -100,18 +110,35 @@ impl Lowerer<'_> {
             // the next statement. No call opcode: the plan never sees one.
             Stmt::Call { body, .. } => self.block(asm, body, scope, locals)?,
             Stmt::Command { name, args, span } => {
+                // Said beside the rest, not in their place: a design's own
+                // refusal (an axis declared twice) comes first.
                 if name == "setMode" {
-                    crate::theme::set_mode_args(args, *span)?;
+                    if let Err(e) = crate::theme::set_mode_args(args, *span) {
+                        self.push(e);
+                    }
                 }
                 if name == "share" {
                     share_pictures(&self.root.view, args)?;
                 }
+                crate::frames::check_command(&self.root.view, name, args)?;
+                let iframe = name == "postMessage"
+                    && !matches!(args.get(1), Some(Expr::Str(target, _)) if self.canvas_targets.contains(target));
                 let args = expr::command_args(name, args);
                 for arg in &args {
                     expr::compile_or_none(self, asm, *arg, scope, locals)?;
                 }
+                // An absent iframe must drop, never enter the canvas's pending queue.
+                if iframe {
+                    expr::compile_or_none(
+                        self,
+                        asm,
+                        Some(&Expr::Str("iframe".into(), *span)),
+                        scope,
+                        locals,
+                    )?;
+                }
                 let name = self.b.str(name);
-                asm.command(name, args.len() as u16);
+                asm.command(name, args.len() as u16 + u16::from(iframe));
             }
             Stmt::If {
                 cond,
@@ -229,4 +256,41 @@ fn share_pictures(view: &[Node], args: &[Expr]) -> Result<(), LowerError> {
         ),
         None => Ok(()),
     }
+}
+
+pub(crate) fn canvas_targets(nodes: &[Node]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for node in nodes {
+        match node {
+            Node::Element {
+                tag,
+                attrs,
+                children,
+                ..
+            } => {
+                if tag == "canvas" {
+                    for a in attrs.iter().filter(|a| a.name == "surface") {
+                        if let Expr::Ident(name, _) | Expr::Call(name, _, _) = &a.value {
+                            out.insert(name.clone());
+                        }
+                    }
+                }
+                out.extend(canvas_targets(children));
+            }
+            Node::Use { children, .. } => out.extend(canvas_targets(children)),
+            Node::When {
+                then, otherwise, ..
+            } => {
+                out.extend(canvas_targets(then));
+                out.extend(canvas_targets(otherwise));
+            }
+            Node::Each { body, .. } => out.extend(canvas_targets(body)),
+            Node::Match { some, none, .. } => {
+                out.extend(canvas_targets(&some.1));
+                out.extend(canvas_targets(none));
+            }
+            Node::Children { .. } => {}
+        }
+    }
+    out
 }

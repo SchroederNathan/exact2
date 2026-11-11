@@ -37,6 +37,17 @@ pub fn command_args<'e>(name: &str, args: &'e [Expr]) -> Vec<Option<&'e Expr>> {
         }
         return out;
     }
+    // @ref LLP 1020.002 D3 — a frame's `reload(id, ignoreCache=)`: the id,
+    // then the flag (`none` for a plain reload). Bare `reload()` stays empty.
+    if name == "reload" && !args.is_empty() {
+        return vec![args.first(), named("ignoreCache")];
+    }
+    // @ref LLP 1020.002 D7 — the id, the `app:/` path, then the clip (`none`
+    // for the whole viewport).
+    if name == "captureScreenshot" {
+        let mut positional = args.iter().filter(|a| !matches!(a, Expr::NamedArg(..)));
+        return vec![positional.next(), positional.next(), named("clip")];
+    }
     if matches!(name, "showPopover" | "togglePopover") {
         return vec![args.first(), named("source")];
     }
@@ -59,12 +70,10 @@ pub fn command_args<'e>(name: &str, args: &'e [Expr]) -> Vec<Option<&'e Expr>> {
         let mut positional = args.iter().filter(|a| !matches!(a, Expr::NamedArg(..)));
         return vec![positional.next(), positional.next(), named("at")];
     }
-    // The Web Share API's members, the Notification API's title and
-    // options, and `stopSounds`' group, in a fixed order, `none` where the
-    // author gave none.
+    // The Web Share API's members and `stopSounds`' group, in a fixed
+    // order, `none` where the author gave none.
     let order: &[&str] = match name {
         "share" => &["title", "text", "url", "files"],
-        "showNotification" => &["title", "body", "tag", "showTrigger", "navigate"],
         "stopSounds" => &["group"],
         _ => return args.iter().map(Some).collect(),
     };
@@ -252,10 +261,10 @@ pub(crate) fn compile(
         },
         Expr::Member(obj, field, span) => {
             let t = compile(l, asm, obj, scope, locals)?;
-            let Ty::Record(shape) = t else {
-                return err("lower-not-a-record", format!("`{t}` has no fields"), *span);
-            };
-            let Some((index, ty)) = l.types.shapes.field(&shape, field) else {
+            let Some((index, ty)) = l.types.shapes.member(&t, field) else {
+                let Ty::Record(shape) = t else {
+                    return err("lower-not-a-record", format!("`{t}` has no fields"), *span);
+                };
                 return err(
                     "lower-unknown-field",
                     format!("`{shape}` has no field `{field}`"),
@@ -367,6 +376,11 @@ pub(crate) fn compile(
             {
                 return callback_call(l, asm, f, list, callback, scope, locals);
             }
+            if let (Some(Stdlib::SortBy), [list, callback, rest @ ..]) =
+                (Stdlib::from_name(name), args.as_slice())
+            {
+                return sort_by(l, asm, list, callback, rest, scope, locals);
+            }
             let Some(f) = Stdlib::from_name(name) else {
                 return err(
                     "lower-unknown-function",
@@ -374,6 +388,21 @@ pub(crate) fn compile(
                     *span,
                 );
             };
+            // `x.length` of a record reads its `length` field, as the checker
+            // resolved it (contract_types `infer_length`).
+            if let (Stdlib::Length, [obj]) = (f, args.as_slice()) {
+                let t = compile(l, asm, obj, scope, locals)?;
+                if let Ty::Record(shape) = &t {
+                    let Some((index, ty)) = l.types.shapes.field(shape, "length") else {
+                        return err("lower-unknown-field", format!("`{shape}` has no field `length`"), *span);
+                    };
+                    let ty = ty.clone();
+                    asm.field(index as u16);
+                    return Ok(ty);
+                }
+                asm.call(f);
+                return Ok(Ty::Number);
+            }
             let mut given = Vec::with_capacity(args.len());
             for a in args {
                 given.push(compile(l, asm, a, scope, locals)?);
@@ -399,7 +428,11 @@ pub(crate) fn compile(
                 (Stdlib::Concat, Some(a), Some(b)) => a.unify(b).unwrap_or(Ty::Unknown),
                 (Stdlib::Slice, Some(Ty::Enum(_)), _) => Ty::String,
                 (Stdlib::Slice, Some(t @ (Ty::String | Ty::List(_))), _) => t.clone(),
-                (Stdlib::Concat | Stdlib::Slice, ..) => Ty::Unknown,
+                (Stdlib::Flat, Some(Ty::List(item)), _) => match &**item {
+                    Ty::List(_) => (**item).clone(),
+                    _ => Ty::List(Box::new(Ty::Unknown)),
+                },
+                (Stdlib::Concat | Stdlib::Slice | Stdlib::Flat, ..) => Ty::Unknown,
                 _ => Ty::from_roster(f.returns()),
             }
         }
@@ -527,7 +560,7 @@ pub(crate) fn compile(
             let index = *locals;
             *locals += 1;
             let mut inner = scope.clone();
-            inner.push(vec![(name.clone(), Ref::Local(index as u32), ty)]);
+            inner.push_let(name, index as u32, ty);
             let ty = compile(l, asm, body, &inner, locals)?;
             *locals -= 1;
             asm.drop_local();
@@ -608,6 +641,53 @@ fn record(
     Ok(ty)
 }
 
+/// `sortBy(list, callback, direction?)` (@ref LLP 1116.016 §5): the list
+/// bound as the next local, then the roster's `sortBy` on that list, its keys
+/// (a `Map` of the callback over it) and whether it is descending:
+///
+/// ```text
+/// <list> BindLocal; LoadLocal n; LoadLocal n; Map end <key> end:
+/// Bool desc; Call sortBy; DropLocal
+/// ```
+///
+/// So each key is computed once, on the `Map`'s list step, and the call
+/// orders the items without running code.
+fn sort_by(
+    l: &mut Lowerer<'_>,
+    asm: &mut Asm,
+    list: &Expr,
+    callback: &Expr,
+    rest: &[Expr],
+    scope: &Scope,
+    locals: &mut u16,
+) -> Result<Ty, LowerError> {
+    let descending = match rest {
+        [] => false,
+        [Expr::Str(d, _)] if d == "asc" => false,
+        [Expr::Str(d, _)] if d == "desc" => true,
+        _ => {
+            return err(
+                "lower-sort-direction",
+                "the direction of `sortBy` is `\"asc\"` or `\"desc\"`",
+                callback.span(),
+            )
+        }
+    };
+    let listed = compile(l, asm, list, scope, locals)?;
+    asm.bind_local();
+    let at = *locals;
+    *locals += 1;
+    asm.load_local(at);
+    asm.load_local(at);
+    let keys = callback_body(l, asm, Opcode::Map, listed.clone(), callback, scope, locals);
+    *locals -= 1;
+    keys?;
+    asm.bool(descending);
+    asm.call(Stdlib::SortBy);
+    asm.drop_local();
+    Ok(listed)
+}
+
 /// `map(list, callback)` or `filter(list, callback)` (LLP 1017.003 D5):
 /// the list, then `Map`/`Filter` with the callback's body inline, the item
 /// and its index the next two locals, which the VM binds for each run.
@@ -621,10 +701,34 @@ fn callback_call(
     locals: &mut u16,
 ) -> Result<Ty, LowerError> {
     let listed = compile(l, asm, list, scope, locals)?;
+    let op = if f == Stdlib::Map {
+        Opcode::Map
+    } else {
+        Opcode::Filter
+    };
+    let result = callback_body(l, asm, op, listed.clone(), callback, scope, locals)?;
+    Ok(if f == Stdlib::Map {
+        Ty::List(Box::new(result))
+    } else {
+        listed
+    })
+}
+
+/// `op` (`Map` or `Filter`) over the list on the stack, of type `listed`,
+/// with `callback`'s body inline: the type of what the body leaves.
+fn callback_body(
+    l: &mut Lowerer<'_>,
+    asm: &mut Asm,
+    op: Opcode,
+    listed: Ty,
+    callback: &Expr,
+    scope: &Scope,
+    locals: &mut u16,
+) -> Result<Ty, LowerError> {
     let Expr::Arrow { params, body, span } = callback else {
         return err(
             "lower-arrow-position",
-            format!("the argument of `.{}(…)` is an arrow function", f.name()),
+            "a callback is an arrow function",
             callback.span(),
         );
     };
@@ -640,14 +744,7 @@ fn callback_call(
         );
     }
     let end = asm.label();
-    asm.each_item(
-        if f == Stdlib::Map {
-            Opcode::Map
-        } else {
-            Opcode::Filter
-        },
-        end,
-    );
+    asm.each_item(op, end);
     let base = *locals;
     *locals += 2;
     let mut inner = scope.clone();
@@ -663,9 +760,5 @@ fn callback_call(
     *locals -= 2;
     let result = result?;
     asm.place(end);
-    Ok(if f == Stdlib::Map {
-        Ty::List(Box::new(result))
-    } else {
-        listed
-    })
+    Ok(result)
 }

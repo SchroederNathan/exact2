@@ -96,6 +96,7 @@ fn boot_source(
         crate::host::PlanBytes::Copied(&plan),
         NoData,
         Box::new(measurer),
+        crate::host::LaunchLayout::NONE,
         exact_runner::Viewport::sized(400.0, 800.0),
         None,
         Vec::new(),
@@ -262,12 +263,12 @@ fn running_session_chrome_failure_keeps_updates_but_withholds_staged_geometry() 
         super::layout::published_content_box(&kernel.node(id).unwrap(), kernel)
     };
     let guessed = published(&host, native);
-    host.mirror.get_mut(&native).unwrap().field_content = guessed;
+    host.mirror.get_mut(&native).unwrap().field_content = guessed.map(Box::new);
     // As may an ordinary box's content box, which only layout resolves
     let padded = field(&host, "padded");
     let content = published(&host, padded);
     assert_eq!(content.map(|c| c.rect.x), Some(20.));
-    host.mirror.get_mut(&padded).unwrap().field_content = content;
+    host.mirror.get_mut(&padded).unwrap().field_content = content.map(Box::new);
     failure.set(false);
     let settled: serde_json::Value = serde_json::from_str(&host.resize(400., 800.)).unwrap();
     assert!(settled["error"].is_null(), "{settled}");
@@ -399,6 +400,7 @@ fn control_size_fonts_feed_em_resolution_and_the_shared_face_payload() {
         crate::host::PlanBytes::Copied(&plan),
         NoData,
         Box::new(MonospaceMeasurer::default()),
+        crate::host::LaunchLayout::NONE,
         exact_runner::Viewport::sized(400., 800.),
         None,
         Vec::new(),

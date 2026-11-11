@@ -1,13 +1,13 @@
 import { admitsSecret, createRequestExecutor, fetchHostAsset, sameGrantDeclaration, setAppGrantSet } from './admission.js';
 import { rustGrantSet, tsGrantSet } from './admission-data.js';
-import { boundedHttpBody, streamed } from './http-body.js';
-// A Rust data module on the JS runtime (LLP 1029.000's seam, ABI 3,
+import { boundedHttpBody, longPollRefusal, streamed } from './http-body.js';
+// A Rust data module on the JS runtime (LLP 1029.000's seam, ABI 4,
 // `logic/abi/src/lib.rs`): the app's importless module wasm and its plan's
 // declarations (`app.bind.plan`, the plan without the bake's answers),
 // fetched after first pixel; once bound and activated, every answer is a
 // synchronous call, as the runner's `DataSource::answer` is. Until then the
 // runtime keeps each resource's compiled value and asks again at `ready`.
-const ABI = 3, utf8 = new TextEncoder(), text = new TextDecoder();
+const ABI = 4, utf8 = new TextEncoder(), text = new TextDecoder();
 
 function writer() {
   let buf = new Uint8Array(256), at = 0;
@@ -93,13 +93,18 @@ export async function install(data, sources, load = p => fetchHostAsset(p).then(
     // A call the seam could not carry (`call` above) is the resource's
     // failure instead (LLP 1071 §7).
     if (tag >= 2 && tag <= 4) throw Object.assign(new Error(r.str()), { unknown: tag === 2, refuse: true });
-    if (tag === 1 || tag === 6 || tag === 9) {
+    if (tag === 1 || tag === 6 || tag === 9 || tag === 10) {
       const http = tag === 1 ? 'ordered' : `independent:${r.u32()}`;
       const scoped = r.u8() === 1, scope = r.str();
       const method = r.str(), url = r.str(), headers = [];
       for (let n = r.u32(); n--;) headers.push([r.str(), r.str()]);
       const n = r.u32(), body = r.bytes(n);
-      return { req: { method, url, headers, body: text.decode(body), raw: body, http, maxResponseBytes: http === 'ordered' ? undefined : Number(http.split(':')[1]), scope: scoped ? scope : null, stream: tag === 9 } };
+      // A long poll (tag 10, LLP 1016.000 D8): its terms after the body, checked as the stream opens (http-body.js).
+      const longPoll = tag === 10 ? { cursor: r.str(), from: r.str(), sameCursorEvent: [false, true][r.u8()] ?? (() => { throw new Error('invalid long poll terms'); })() } : undefined;
+      // (refused as the native seam refuses it: before the turn's writes apply)
+      const pollRefusal = longPoll && longPollRefusal({ url, longPoll, stream: true }, method, n ? 'x' : '');
+      if (pollRefusal) throw new Error(pollRefusal);
+      return { req: { method, url, headers, body: text.decode(body), raw: body, http, maxResponseBytes: http === 'ordered' ? undefined : Number(http.split(':')[1]), scope: scoped ? scope : null, stream: tag >= 9, longPoll } };
     }
     // Storage work (LLP 1027.001 D2): a portable request the host runs
     // through the web host's own `storage-request.js`, under its scope.
@@ -113,7 +118,10 @@ export async function install(data, sources, load = p => fetchHostAsset(p).then(
   r = op(2); r.u8(); result(r);
   // One call (`call_request`): source, arguments by type, the store's
   // snapshot; its reply (`call_reply`): a store read, writes, the result.
+  // Whether the module's last call read the store before it failed: its resource is a store reader (LLP 1146 §2.3).
+  let threwRead = false;
   const callWith = (code, source, args, store, outcome) => {
+    threwRead = false;
     const r = op(code, w => {
       w.str(source); w.u8(6); w.u32(args.length);
       const t = (sources[source] ?? '').split('|')[0]; let i = 0; for (const a of args) i = encode(w, a, t, i);
@@ -132,12 +140,13 @@ export async function install(data, sources, load = p => fetchHostAsset(p).then(
     const writes = [];
     for (let n = r.u32(); n--;) { const k = r.str(); const v = r.u8() ? r.str() : null; if (!admitsSecret(rustGrantSet, k)) throw new Error(`secret ${k} is not granted`); writes.push([k, v]); }
     let out;
-    try { out = result(r); } catch (error) { if (error.refuse) for (const [k, v] of writes) store.set(k, v); throw error; }
+    try { out = result(r); } catch (error) { threwRead = observed; if (error.refuse) for (const [k, v] of writes) store.set(k, v); throw error; }
     for (const [k, v] of writes) store.set(k, v);
     if (observed) out.store = true;
     return out;
   };
-  const rust = (source, args, store) => callWith(3, source, args, store), ts = data.ts;
+  const rust = (source, args, store) => callWith(3, source, args, store), ts = data.ts, tsThrewRead = data.threwRead;
+  data.threwRead = () => { const read = [threwRead, !!tsThrewRead?.()]; threwRead = false; return read[0] || read[1]; };
   data.answer = ts ? (source, args, store, target, mutation) => { try { return rust(source, args, store); } catch (e) { if (e.unknown) return ts(source, args, store, target, mutation); throw e; } } : rust;
   data.parse = (source, args, outcome, store) => callWith(4, source, args, store, outcome);
   // An overlay (`overlay_request`): what a resource shows while writes affect it; none from the Rust module asks

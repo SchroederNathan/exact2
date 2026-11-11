@@ -40,6 +40,26 @@ test('layout joins a bare reason only to the matching plan site on every carrier
   }
 });
 
+test('an `:active` row lowered to the press paint carries its part and where it is written (LLP 1121 D8)', () => {
+  const digest = 'c'.repeat(64), reader = sourceMapReader(null);
+  const part = { file: '/app/app.contract', line: 6, col: 9, end_col: 20 };
+  reader.add({ digest, nodes: [{ file: '/app/app.contract', line: 4, col: 5, end_col: 11, component: 'App', chain: [],
+    bindings: [{ row: 'press_background_color', states: [{ state: 'active', origin: 'own', at: part }] }, { row: 'background_color', origin: 'own' }] }] });
+  const node = { id: 1, type: 'Pressable', site: 0, planDigest: digest, props: {}, style: {
+    press_background_color: { value: '#00f', source: 'authored' }, background_color: { value: '#fff', source: 'authored' } } };
+  reader.attach(node);
+  expect(node.style.press_background_color).toMatchObject({ origin: 'own', state: 'active', at: part });
+  expect(node.style.background_color.state).toBeUndefined();
+  // A conditional class's part says no place (either style's): its state still, and no `at`.
+  const either = 'd'.repeat(64);
+  reader.add({ digest: either, nodes: [{ file: '/app/app.contract', line: 4, col: 5, end_col: 11, component: 'App', chain: [],
+    bindings: [{ row: 'press_background_color', states: [{ state: 'active', origin: 'class:A/B' }] }] }] });
+  const other = { id: 2, type: 'Pressable', site: 0, planDigest: either, props: {}, style: { press_background_color: { value: '#00f', source: 'authored' } } };
+  reader.attach(other);
+  expect(other.style.press_background_color).toMatchObject({ origin: 'class:A/B', state: 'active' });
+  expect(other.style.press_background_color.at).toBeUndefined();
+});
+
 test('malformed bare metadata cannot supply a reason', () => {
   const digest = 'a'.repeat(64), reader = sourceMapReader(null);
   const at = { file: '/app/app.contract', line: 4, col: 5, end_col: 11, component: 'App', chain: [], bindings: [] };
@@ -68,7 +88,8 @@ test("a listing does not attach the next settlement's reason to old geometry", (
 });
 
 test('driver deadlines release their timer on success, rejection and timeout', async () => {
-  const driver = readFileSync(new URL('../../scripts/agent.mjs', import.meta.url), 'utf8');
+  // (The driver's carrier, scripts/agent-wire.mjs since 416f51f1f4.)
+  const driver = readFileSync(new URL('../../scripts/agent-wire.mjs', import.meta.url), 'utf8');
   const implementation = driver.match(/async function waitAtMost\([^]*?\n\}/)[0];
   const timers = new Set();
   const wait = vm.runInNewContext(`(${implementation})`, {
@@ -101,12 +122,12 @@ test('the wasm agent loads its input helpers once and keeps settled reads synchr
   const context = vm.createContext({
     stageLoaded: () => true, agentMode: false, agentNow: request => ({ op: request.op }),
     loadAfterPaint: (file, exported) => {
-      expect([file, exported]).toEqual(['./input-glue.js', 'agentInput']);
+      expect([file, exported]).toEqual(['./agent-input.js', 'agentInput']);
       loads++;
       return new Promise(resolve => { finish = resolve; });
     },
   });
-  vm.runInContext(`let guestOutline, guestTap, guestType, reveal, viewBox, layoutBoxes, agentInputLoading;
+  vm.runInContext(`let guestOutline, guestTap, guestType, reveal, backButton, viewBox, layoutBoxes, scrollRange, agentInputLoading;
 ${declaration('agentInputReady')}
 ${declaration('agent')}
 this.agent = agent; this.ready = agentInputReady;`, context);

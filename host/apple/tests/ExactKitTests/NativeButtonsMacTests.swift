@@ -144,6 +144,42 @@ final class NativeButtonsMacTests: XCTestCase {
         XCTAssertEqual(pressed, [2, 3])
     }
 
+    func testNativeButtonBubblesOutOfPresentationsAndKeepsModalInvocationsInside() throws {
+        let p = presenter(box(1) + box(2, handlers: ["press"]) + box(3, ["id": "pop", "popover": "manual"])
+                          + box(4, ["id": "form", "semanticTag": "dialog"]) + native(5, handlers: []) + native(6, handlers: [])
+                          + box(7, ["id": "outside", "popover": "manual"]) + [
+                            ["op": "children", "id": 1, "ids": [2, 7]],
+                            ["op": "children", "id": 2, "ids": [3, 4]],
+                            ["op": "children", "id": 3, "ids": [5]],
+                            ["op": "children", "id": 4, "ids": [6]],
+                            ["op": "roots", "ids": [1]],
+                            ["op": "frame", "id": 1, "x": 0, "y": 0, "w": 400, "h": 400],
+                            ["op": "frame", "id": 2, "x": 0, "y": 0, "w": 40, "h": 30],
+                            ["op": "frame", "id": 3, "x": 0, "y": 0, "w": 240, "h": 100],
+                            ["op": "frame", "id": 4, "x": 0, "y": 0, "w": 240, "h": 100],
+                          ], faces: [5: face("Popover"), 6: face("Dialog")])
+        p.menus.painted = true; p.dialogs.painted = true
+        defer { p.menus.reset(); p.dialogs.reset() }
+        let ancestor = try XCTUnwrap(p.views[2]), pop = try XCTUnwrap(p.views[3])
+        let dialog = try XCTUnwrap(p.views[4]), outside = try XCTUnwrap(p.views[7])
+        var pressed: [UInt32] = []
+        p.onPress = { pressed.append($0) }
+        p.menus.action("showPopover", ["pop"])
+        XCTAssertTrue(p.menus.isOpen(pop))
+        try XCTUnwrap(p.controls.controls[5] as? NSButton).performClick(nil)
+        XCTAssertEqual(pressed, [2], "a native action reaches the lifted popover's authored ancestor once")
+        p.menus.close(pop)
+        p.dialogCommand("showModal", "form")
+        XCTAssertTrue(p.dialogs.active === dialog)
+        XCTAssertTrue(ancestor.inert)
+        ancestor.props["popovertarget"] = "outside"
+        ancestor.props["popovertargetaction"] = "show"
+        try XCTUnwrap(p.controls.controls[6] as? NSButton).performClick(nil)
+        XCTAssertEqual(pressed, [2, 2], "modal inertness does not suppress the ancestor's handler")
+        XCTAssertFalse(p.menus.isOpen(outside), "a bubbled native action cannot invoke a target outside the modal")
+        XCTAssertTrue(p.dialogs.active === dialog)
+    }
+
     func testItIsAppKitsButtonPressingOnce() throws {
         let p = presenter(box(1, handlers: ["press"]) + native(2, ["testId": "go"]) + native(3, handlers: []) + native(4, ["disabled": "true"])
                           + [["op": "children", "id": 1, "ids": [2, 3, 4]], ["op": "roots", "ids": [1]]],
@@ -288,6 +324,32 @@ final class NativeButtonsMacTests: XCTestCase {
             XCTAssertEqual(checked, [true], kind)
         }
     }
+    /// A checkbox's or switch's own `press` runs before its `change`, as
+    /// HTML's `click` precedes them; an ancestor's does not.
+    func testACheckboxsOwnPressRunsBeforeItsChange() throws {
+        for kind in ["checkbox", "switch"] {
+            let props = ["type": "checkbox", "accessibilityRole": kind]
+            let p = presenter(box(1, handlers: ["press"]) + [["op": "create", "id": 2, "kind": "control", "props": props, "handlers": ["press", "change"], "style": [:]],
+                                                             ["op": "frame", "id": 2, "x": 0.0, "y": 0.0, "w": 140.0, "h": 30.0],
+                                                             ["op": "children", "id": 1, "ids": [2]], ["op": "roots", "ids": [1]]], faces: [:])
+            var heard: [String] = []
+            p.onPress = { heard.append("press \($0)") }
+            p.onChecked = { id, on in heard.append("checked \(id) \(on)") }
+            try XCTUnwrap(p.controls.controls[2], kind).performClick(nil)
+            XCTAssertEqual(heard, ["press 2", "checked 2 true"], kind)
+            p.views[2]?.handlers = ["change"]
+            try XCTUnwrap(p.controls.controls[2], kind).performClick(nil)
+            XCTAssertEqual(heard, ["press 2", "checked 2 true", "checked 2 false"], "\(kind): no press of its own, none bubbles")
+            // Bound and unchanged, its press's batch syncs the control back:
+            // the toggle reported is still the one the click made.
+            p.apply(wireBatch([["op": "props", "id": 2, "set": ["checked": "false"]]]))
+            p.views[2]?.handlers = ["press", "change"]
+            p.onPress = { heard.append("press \($0)"); p.apply(wireBatch([["op": "props", "id": 2, "set": ["checked": "false"]]])) }
+            try XCTUnwrap(p.controls.controls[2], kind).performClick(nil)
+            XCTAssertEqual(heard.suffix(2), ["press 2", "checked 2 true"], "\(kind): bound")
+            window.close()
+        }
+    }
     /// Runs the main queue past what is on it now.
     private func drain() {
         var drained = false
@@ -357,5 +419,92 @@ final class NativeButtonsMacTests: XCTestCase {
         XCTAssertNil(node.glassIsolation)
         XCTAssertTrue(fade.superview === node)
     }
+    func testAHandlerlessInvokerPressesItsAncestorBeforeOpeningItsOwnPopover() throws {
+        let p = presenter(box(1, handlers: ["press"]) + native(2, ["popovertarget": "choices"], handlers: [])
+            + box(4, ["id": "choices", "popover": "manual", "accessibilityRole": "dialog"]) + [
+                ["op": "children", "id": 1, "ids": [2, 4]], ["op": "roots", "ids": [1]]], faces: [2: face("Open")])
+        let pop = try XCTUnwrap(p.views[4])
+        var pressed: [UInt32] = []
+        p.onPress = { id in
+            XCTAssertFalse(p.menus.isOpen(pop), "the handler precedes the button's activation")
+            pressed.append(id)
+        }
+        p.menus.painted = true
+        defer { p.menus.reset() }
+        try XCTUnwrap(p.controls.controls[2] as? NSButton).performClick(nil)
+        XCTAssertEqual(pressed, [1])
+        XCTAssertTrue(p.menus.isOpen(pop))
+    }
+
+    func testAnAncestorCanRetargetAHandlerlessInvokerBetweenPopoverAndDialog() throws {
+        for startsWithPopover in [true, false] {
+            let initial = startsWithPopover ? ["popovertarget": "choices"] : ["command": "show-modal", "commandfor": "form"]
+            let p = presenter(box(1, handlers: ["press"]) + native(2, initial, handlers: [])
+                + box(4, ["id": "choices", "popover": "manual"])
+                + box(5, ["id": "form", "semanticTag": "dialog"]) + [
+                    ["op": "children", "id": 1, "ids": [2, 4, 5]], ["op": "roots", "ids": [1]]], faces: [2: face("Open")])
+            p.menus.painted = true; p.dialogs.painted = true
+            defer { p.menus.reset(); p.dialogs.reset() }
+            var pressed: [UInt32] = []
+            p.onPress = { id in
+                pressed.append(id)
+                let replacement = startsWithPopover ? ["command": "show-modal", "commandfor": "form"] : ["popovertarget": "choices"]
+                let cleared = startsWithPopover ? ["popovertarget"] : ["command", "commandfor"]
+                p.apply(wireBatch([["op": "props", "id": 2, "set": replacement, "clear": cleared]]))
+            }
+            try XCTUnwrap(p.controls.controls[2] as? NSButton).performClick(nil)
+            XCTAssertEqual(pressed, [1])
+            XCTAssertEqual(p.dialogs.active === p.views[5], startsWithPopover)
+            XCTAssertEqual(p.menus.isOpen(try XCTUnwrap(p.views[4])), !startsWithPopover)
+        }
+    }
+
+    func testACustomInvokerAlsoPressesItsAncestorAndAMissingTargetIsNotPressable() throws {
+        let p = presenter(box(1, handlers: ["press"]) + [
+            ["op": "create", "id": 2, "kind": "button", "props": ["popovertarget": "choices"]],
+            ["op": "frame", "id": 2, "x": 0, "y": 0, "w": 120, "h": 24],
+        ] + box(4, ["id": "choices", "popover": "manual"]) + [
+            ["op": "children", "id": 1, "ids": [2, 4]], ["op": "roots", "ids": [1]]], faces: [:])
+        p.menus.painted = true
+        defer { p.menus.reset() }
+        var pressed: [UInt32] = []
+        p.onPress = { pressed.append($0) }
+        p.press(2)
+        XCTAssertEqual(pressed, [1])
+        XCTAssertTrue(p.menus.isOpen(try XCTUnwrap(p.views[4])))
+        let pop = try XCTUnwrap(p.views[4])
+        p.menus.close(pop)
+        p.apply(wireBatch([["op": "frame", "id": 2, "x": 320, "y": 0, "w": 60, "h": 24]]))
+        pressed.removeAll()
+        let click = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseUp, location: NSPoint(x: 350, y: 12), modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 0))
+        p.press(2, click: click)
+        XCTAssertTrue(pressed.isEmpty, "the pointer is outside the listener's bounds")
+        p.menus.close(pop)
+        p.press(2)
+        XCTAssertEqual(pressed, [1], "a key's activation has no pointer bounds")
+        p.apply(wireBatch([["op": "props", "id": 2, "set": ["popovertarget": "missing", "accessibilityKeyShortcuts": "Meta+c"]]]))
+        XCTAssertFalse(try XCTUnwrap(p.views[2]).pressable)
+        let copy = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: "c", charactersIgnoringModifiers: "c", isARepeat: false, keyCode: 8))
+        XCTAssertFalse(p.shortcuts.perform(copy), "a missing target must leave Copy available")
+    }
+
+    func testClearingAnInvokersTargetDuringEditCommitStillPressesItsListener() throws {
+        let p = presenter(box(1, handlers: ["press"]) + [
+            ["op": "create", "id": 2, "kind": "button", "props": ["popovertarget": "choices"]],
+            ["op": "frame", "id": 2, "x": 0, "y": 0, "w": 120, "h": 24],
+            ["op": "create", "id": 3, "kind": "input", "props": ["value": "draft"], "handlers": ["change"]],
+        ] + box(4, ["id": "choices", "popover": "manual"]) + [
+            ["op": "children", "id": 1, "ids": [2, 3, 4]], ["op": "roots", "ids": [1]]], faces: [:])
+        p.edited = 3
+        p.onChange = { _, _ in p.apply(wireBatch([["op": "props", "id": 2, "clear": ["popovertarget"]]])) }
+        var pressed: [UInt32] = []
+        p.onPress = { pressed.append($0) }
+        p.press(2)
+        XCTAssertNil(p.invocation(of: try XCTUnwrap(p.views[2])))
+        XCTAssertEqual(pressed, [1])
+    }
+
 }
 #endif

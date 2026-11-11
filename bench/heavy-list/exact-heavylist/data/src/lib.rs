@@ -5,7 +5,7 @@
 //!
 //! - `messages()` answers the feed (baked into the plan at build);
 //! - `react(id, emoji)` adds one to that message's reaction and answers the feed;
-//! - `config()` answers `{ live }` from the launch environment;
+//! - `config()` answers `{ live, motion }` from the launch environment;
 //! - `tick()` (live mode) inserts message `live-k` at the top — the content of
 //!   message `(k*37) % 10000`, `minutesAgo` 0 — bumps one reaction on message
 //!   `(k*101) % 10000` (the first at or after it that has reactions), and
@@ -311,6 +311,12 @@ impl Heavy {
 }
 
 impl DataSource for Heavy {
+    fn bind(&mut self, _plan: &exact_plan::Plan) {
+        // This source uses baked values and has no binding work.
+        #[cfg(target_os = "macos")]
+        exact_ink::device::apple::trace_mark(c"boot data bound", || 0.);
+    }
+
     fn app_id(&self) -> &str {
         "dev.exact.heavybench.exact"
     }
@@ -328,11 +334,15 @@ impl DataSource for Heavy {
             }
             ("config", []) => {
                 let live = std::env::var("BENCH_LIVE").is_ok_and(|v| v == "1");
+                let motion = std::env::var("BENCH_MOTION").unwrap_or_default();
+                if !matches!(motion.as_str(), "" | "bar" | "caret") {
+                    return Err(DataError::BadArguments("BENCH_MOTION must be bar or caret".into()));
+                }
                 if live {
                     // Parse now, not on the first live tick.
                     self.feed();
                 }
-                Ok(Value::record(vec![Value::Bool(live)]))
+                Ok(Value::record(vec![Value::Bool(live), Value::str(&motion)]))
             }
             ("tick", []) => {
                 let feed = self.feed();

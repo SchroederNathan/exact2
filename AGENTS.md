@@ -1,14 +1,15 @@
 # Agent instructions
 
-**Building an app with Exact rather than working on it?** Make it with `bun scripts/exact.mjs
-new <path>` and read `docs/start-here.md`: it is the only required reading (LLP 1115 D7). The
-rest (`docs/contract-for-agents.md`, `docs/agent-pitfalls.md`, `docs/contract-grammar.md`,
+**Building an app with Exact rather than working on it?** This checkout is the version to use:
+Exact has no releases, tags or npm package, and an app uses the checkout by path. Make it with
+`bun scripts/exact.mjs new <path>` and read `docs/start-here.md`: it is the only required
+reading (LLP 1115 D7). The rest (`docs/contract-for-agents.md`, `docs/agent-pitfalls.md`, `docs/contract-grammar.md`,
 `docs/reference.md`) is lookup only, by the section its table names: do not read the long
 guides front to back. `docs/recipes/` answers the common questions in one short file each,
 `contract vocab <name>` answers for any tag or property, every `bun exact.mjs <verb>
 --help` names its flags, and `apps/shelf` is a whole app to grep.
 
-Read `rules/RULES.md` and `rules/DEFERRED.md` first; they bind and this file does not.
+Working on exact2 itself: read `rules/RULES.md` and `rules/DEFERRED.md` first; they bind and this file does not.
 `llp/1000-exact2-root.explainer.md` is the map. `docs/agent-pitfalls.md` lists verified
 footguns in writing apps here; add to it when you hit one. Design documents under `llp/research/`
 are the predecessor's — research, never authority.
@@ -36,9 +37,17 @@ platform's: a `color` a bar button only inherits from the page leaves UIKit's ti
 writing apps should therefore say less — structure (a header's heading and buttons, a
 `tablist`, an `alertdialog`) and leave colours, fonts and metrics to the platform.
 
+## Numeric typography
+
+On graphical hosts, use tabular digits for numeric columns and values that change
+in place. Use default spacing for prose, ordinary labels and static standalone
+statistics. Apply it to numeric text, keeping the platform font. See the
+[guidance and limits](docs/contract-for-agents.md#tabular-numbers).
+
 ## Writing
 
-For all prose: comments, commit messages, guides, LLPs, issues and PR text.
+For all prose, always: comments, commit messages, guides, LLPs, issues and PR text. This
+section binds (`rules/RULES.md`, "Agents").
 
 - Write with clarity of mind. A reader should understand it on first reading and find
   nothing ambiguous.
@@ -51,6 +60,8 @@ For all prose: comments, commit messages, guides, LLPs, issues and PR text.
   Judiciously omit or remove comments or parts of comments that do not clearly explain
   anything that is not already communicated by the code, though take care not to delete
   comments with meaningful marginal value.
+- Before opening a PR or pushing to main, do an editing pass: reread the prose you added
+  or changed as a reader new to the work would, and hold each line to the points above.
 
 ## Working here
 
@@ -84,11 +95,13 @@ For all prose: comments, commit messages, guides, LLPs, issues and PR text.
   the web JS target's conformance run (`host/web-js/conform.mjs --strict`) and its
   Chrome-oracle Firefox/WebKit steps (`conform-firefox`, `conform-webkit`),
   the separate game workspace's locked tests, the UIKit XCTests, touch smoke and
-  the tvOS compile
+  the tvOS and watchOS compiles
   when a coalesced range changes anything outside `llp/`, `issues/`, `rules/`,
   `docs/`, `QUEUE.md`, and `*.md` paths
   (`build.mjs --test --ios`; `build.mjs --tvos --no-install`, which builds and signs
-  the Apple TV bundle and asks for no simulator), the
+  the Apple TV bundle and asks for no simulator; `build.mjs --watchos --no-install`,
+  which builds and signs Caltrain's watch bundle with the pinned nightly and
+  `rust-src`, and asks for no simulator), the
   Contract semantics (`semantics/README.md`: the Lean proofs, the extracted VM's, and
   `contract-difftest` running the runner and the web JS target against the Lean
   semantics; each skipped when its inputs are those of a run that passed,
@@ -96,8 +109,10 @@ For all prose: comments, commit messages, guides, LLPs, issues and PR text.
   the platforms that ride on another host's code: tvOS on the UIKit presenter
   (installed on an Apple TV simulator, which that machine must have),
   plus cross-target Cargo checks of the Linux host with every Linux app (`-p '*-linux'`)
-  and the Windows host with Windows Desk. Tier 2 needs both Rust cross targets,
-  Zig (C and C++) and the pinned Linux Hermes bundle on this Mac. These checks qualify
+  and the Windows host with Windows Desk (x64 and ARM64), and Weatherlight's Android APK (its Rust
+  for `aarch64-linux-android` and the reader's and its module's Kotlin). Tier 2 needs the three Rust cross targets,
+  Zig (C and C++) and the pinned Linux Hermes bundle on this Mac, and for Android the SDK
+  with platform 37.2, an NDK, a JDK 17 or newer and the `aarch64-linux-android` target and Hermes bundle. These checks qualify
   compilation, not native window, KMS, or input behavior. Building
   `--all-targets` resolves features as `cargo test` does, so the two share artifacts.
 - A green `--workspace` build proves the apps compile, not that they work: their Apple
@@ -160,8 +175,10 @@ For all prose: comments, commit messages, guides, LLPs, issues and PR text.
   "tap change-station" "type station-search Palo" "clock +60000" state logs "screenshot
   out.png"` — the ten operations of LLP 1012 and LLP 1079 (`perf`: a subtree's work by
   plan site, `perf <target> during "<op>" …` for the difference a drive made, and
-  `perf frames`, `perf frames live <ms>` for a game's frame pacing; a development build's ⌥⇧T, Save Trace or `SIGUSR1` writes a trace
-  that `bun scripts/agent.mjs trace <file>` reads, `trace --phone` a phone's), the same on every host, with the clock
+  `perf frames`, `perf frames live <ms>` for a game's frame pacing; a development build writes a trace on ⌥⌘T
+  (macOS), ⌥⇧T (web), the dev menu's Save Trace (iOS) or `SIGUSR1` (macOS, the iOS simulator, Linux), which `bun
+  scripts/agent.mjs trace <file>` reads, `trace --pid <pid>` asks a running app for, and `trace --phone` copies off a
+  phone; `--plan <dir>` joins another build's source map), the same on every host, with the clock
   in your hands (`clock settle` instead of waiting; `"screenshot out.png over 600 every
   50"` films motion on it as a contact sheet, `.apng` to play). The driver refuses a
   build older than its sources and names the rebuild (LLP 1012.001.000). `bun scripts/smoke.mjs
@@ -194,8 +211,19 @@ For all prose: comments, commit messages, guides, LLPs, issues and PR text.
   opens its update store at launch and checks after first pixel
   (`EXACT_UPDATE_ORIGIN=<url>` points a dev build at a directory `serve.mjs` serves;
   `state.delivery` shows what it did).
+  `bun scripts/push.mjs <app> [--watch]` publishes an edit to installed release binaries
+  as a signed update in about a second, from the stream a deploy or a production build
+  started; `deploy.activate: "immediate"` applies it while the app is open. A channel's
+  origin `"appdrop"` is AppDrop's, named after the signing key: no account, no server.
+  Moving a stream to a new origin, pass `--seq-above` the old origin's seq.
 - `QUEUE.md` is what would make sense to do next. Add a line when you find something
   worth doing; delete it when it lands. It decides nothing.
+- An app under `apps/` keeps a diary, as an app `exact new` made does (`docs/diary.md`,
+  "What to keep": the header, then Rough, Lean in, Needed and Checkpoints). Write it as
+  you work, at `apps/<app>/diary/<YYYY-MM-DD>-<topic>.md`, and commit it with the
+  change: it is how the team sees where building on Exact was rough, including what you
+  fixed in exact2 to get past it. The app's name may appear; secrets and personal data
+  may not. Nothing is sent: the repository is the record.
 - Each worktree builds into its own `target/`: never symlink or share another
   checkout's (the scripts refuse); a private `CARGO_TARGET_DIR` outside every
   checkout is fine. What a development Apple build takes from the machine
@@ -215,6 +243,6 @@ For all prose: comments, commit messages, guides, LLPs, issues and PR text.
   executor (the browser, for motion on the web) — never a cargo feature on a core crate.
   Each crate depends on strictly less than the one above it; there is no build matrix.
 
-Snapback4 consumers use published `snapback4@0.4.29` and the matching immutable
+Snapback4 consumers use published `snapback4@0.4.33` and the matching immutable
 Rust revision in `snapback4/Cargo.toml`; rebuild an app’s device with
 `bun exact.mjs snapback --rebuild` after changing these pins.

@@ -7,14 +7,17 @@
 // update (review C3). rt.js runs beside stand-ins for the modules it imports,
 // with the real shape.js.
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test';
-import { chromium } from 'playwright-core';
-import { chromium as browserPath } from '../../../scripts/agent-launch.mjs';
-import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { standIns } from './stand-ins.mjs';
 
-const dir = mkdtempSync(resolve(tmpdir(), 'exact-js-baked-'));
+// The runtime in a `web-js` directory, as built: modules.js imports the web host's `../web/address-space.js`, stood in.
+const root = mkdtempSync(resolve(tmpdir(), 'exact-js-baked-')), dir = resolve(root, 'web-js');
+mkdirSync(dir);
+mkdirSync(resolve(root, 'web'));
+writeFileSync(resolve(root, 'web/address-space.js'), 'export const setSpaceState = () => {};');
 const webJs = name => resolve(new URL(`../../web-js/${name}`, import.meta.url).pathname);
 
 // The collection protocol and index run unchanged; only DOM row construction
@@ -172,9 +175,8 @@ test('collection normal fast path retains noise, revives zeros and discards old-
     expect([c.index.leading, c.index.trailing]).toEqual([30, 70]);
   }
 });
-const REAL = ['rt.js', 'font-family.js', 'observers.js', 'grid.js', 'overlay.js', 'roster.js', 'router.js', 'schedule.js', 'budget.js', 'shape.js', 'notify.js'];
+const REAL = ['rt.js', 'uploads.js', 'held.js', 'font-family.js', 'observers.js', 'grid.js', 'overlay.js', 'roster.js', 'router.js', 'route-pattern.js', 'schedule.js', 'budget.js', 'shape.js', 'modules.js', 'samples.js', 'spans.js', 'update.js', 'arrival.js', 'devices.js', 'wakes.js', 'reach.js', 'members.js', 'resource-inspection.js', 'sheets.js'];
 for (const f of REAL) copyFileSync(webJs(f), resolve(dir, f));
-copyFileSync(resolve(new URL('../notify-glue.js', import.meta.url).pathname), resolve(dir, 'notify-glue.js'));
 for (const [file, source] of standIns(REAL)) writeFileSync(resolve(dir, file), source);
 // A view transition that holds every tree update (shared.js's commit returns before its callback).
 writeFileSync(resolve(dir, 'shared.js'), 'export const commit = (tail) => { globalThis.heldTail = tail; return true; };');
@@ -182,17 +184,18 @@ writeFileSync(resolve(dir, 'presence-glue.js'), 'globalThis.exact.presence = () 
 // ts-data.js over a scripted store (the storage test below), written before
 // anything is imported from here: the loader reads this directory once.
 const stub = (file, text) => writeFileSync(resolve(dir, file), text);
-stub('admission.js', 'export const createSecretFacade = () => ({ read: false }); export const hasGrant = () => true; export const setAppGrantSet = g => g; export const overlaying = { on: false }; export const inOverlay = api => new Error(api);');
+stub('admission.js', 'export const createSecretFacade = () => ({ read: false }); export const hasGrant = () => true; export const appGrantSet = () => null; export const coversPath = () => true; export const setAppGrantSet = g => g; export const overlaying = { on: false }; export const inOverlay = api => new Error(api);');
 stub('admission-data.js', 'export const tsGrantSet = {};');
-stub('ts-fetch.js', "export const answering = { call: null }; export const files = { appId: null }; export const SOCKET_AND_FETCH = 'a mutation cannot both send on a socket and fetch';");
+stub('ts-fetch.js', "export const answering = { call: null, untraced: new Set() }; export const files = { appId: null }; export const dropTimers = () => {}; export const SOCKET_AND_FETCH = 'a mutation cannot both send on a socket and fetch';");
 stub('names.js', 'export const sourceTypes = {};');
-stub('storage-environment.js', "export const storageKey = () => 'k'; export const agentStorageRefusal = 'no store';");
+stub('storage-environment.js', "export const storageKey = () => 'k'; export const agentStorageRefusal = 'no store'; export const agentReads = []; export const emptyRead = () => [];");
 // A write lands a task later; a read answers at once: unqueued, it would overtake.
 stub('storage-fs.js', `const files = new Map(); export const createFileSystem = () => ({
   atomicWriteFile: (p, v) => new Promise((ok, no) => setTimeout(() => p.includes('absent/') ? no(Object.assign(new Error('filesystem: No such file'), { code: 'ENOENT' })) : ok(files.set(p, v)), 5)),
   writeFile: (p, v) => new Promise(ok => setTimeout(() => ok(files.set(p, v)), 1)),
   readFile: async p => files.get(p) ?? '',
-  compressImage: async (from, to, o) => ({ path: to, type: 'image/jpeg', size: o.maxBytes, width: o.maxDimension, height: 1 }) });`);
+  compressImage: async (from, to, o) => ({ path: to, type: o.type, size: o.maxBytes, width: o.maxDimension, height: 1, ...(o.rotate === undefined ? {} : { rotate: o.rotate }) }),
+  transformImage: async (from, to, o) => ({ path: to + '.jpg', options: o }) });`);
 stub('app.mjs', `export const appId = 'test';
   export function answer(source, [op, value], store, storage) {
     if (op === 'save') { storage.fs.atomicWriteFile('app:/data/song', value).catch(() => {}); return 'saved ' + value; }
@@ -207,12 +210,33 @@ stub('app.mjs', `export const appId = 'test';
     }
     if (op === 'compress-bad') return storage.fs.compressImage('app:/tmp/in.jpg', 'app:/tmp/out.jpg', { maxDimension: 0, maxBytes: 1 })
       .then(() => 'ok', e => e.constructor.name + ' ' + e.code + ' ' + e.message);
+    if (op === 'compress-png') return storage.fs.compressImage('app:/tmp/in.png', 'app:/tmp/out.png', { maxDimension: 8, maxBytes: 100, type: 'image/png' }).then(r => JSON.stringify(r));
+    if (op === 'compress-bad-type') return storage.fs.compressImage('app:/tmp/in.png', 'app:/tmp/out.webp', { maxDimension: 8, maxBytes: 100, type: 'image/webp' })
+      .then(() => 'ok', e => e.constructor.name + ' ' + e.code + ' ' + e.message);
+    if (op === 'compress-edit') return storage.fs.compressImage('app:/tmp/in.jpg', 'app:/tmp/out.jpg', { maxDimension: 8, maxBytes: 100, rotate: 90 }).then(r => JSON.stringify(r));
+    if (op === 'transform') {
+      const options = { rotate: 90, crop: { x: 0, y: 0, width: 4, height: 4 }, metadata: 'no-location', unknown: true };
+      const done = storage.fs.transformImage('app:/tmp/in.jpg', 'app:/tmp/edit', options);
+      options.rotate = 0;
+      return done.then(r => JSON.stringify(r));
+    }
+    if (op === 'transform-bad') return storage.fs.transformImage('app:/tmp/in.jpg', 'app:/tmp/edit', { flip: 'both' })
+      .then(() => 'ok', e => e.constructor.name + ' ' + e.code + ' ' + e.message);
     const codes = [];
     for (let i = 0; i < 258; i++) codes.push(storage.fs.writeFile('app:/data/flood', String(i)).then(() => 'ok', e => e.code));
     return codes[257];
   }`);
+// The overlay test's two modules: `late.mjs` has none at install and sets, then deletes, one after; `topped.mjs`
+// has one from its top level. Each gets its own ts-data.js copy.
+stub('late.mjs', `export const appId = 'test'; export const answer = () => 'x';
+  export let overlay;
+  export function setOverlay(on) { overlay = on ? (source, args, answer) => answer.concat(['overlaid']) : undefined; }`);
+stub('topped.mjs', `export const appId = 'test'; export const answer = () => 'x';
+  export let overlay = (source, args, answer) => answer.concat(['overlaid']);
+  export function setOverlay(on) { overlay = on ? (source, args, answer) => answer.concat(['overlaid']) : undefined; }`);
 const tsData = readFileSync(webJs('ts-data.js'), 'utf8').replace("'__APP_TS__'", JSON.stringify(resolve(dir, 'app.mjs'))).replace('__AUTH_IMPORT__', '').replace('__AUTH_INSTALL__', '');
 writeFileSync(resolve(dir, 'ts-data.js'), tsData);
+for (const name of ['late', 'topped']) writeFileSync(resolve(dir, `ts-data-${name}.js`), tsData.replace(JSON.stringify(resolve(dir, 'app.mjs')), JSON.stringify(resolve(dir, `${name}.mjs`))));
 
 test('a baked answer shows until the source is ready, then is asked; a settled one is not', async () => {
   // A page with no checkpoint: another file's stand-in `document` (run in this process) may lack querySelector.
@@ -349,6 +373,47 @@ test('a mutation answered at once forces the async read it refreshes', async () 
   commit(() => M(op, 'inc', []));
   await new Promise(r => setTimeout(r, 0));
   expect([doc(), doc.p()]).toEqual([1, false]);
+});
+
+// `sin` and `cos` are `Math`'s; `sum` is `reduce((a, x) => a + x, 0)`, `range(n)` 0 to n - 1 and `flat()` depth 1, each a
+// list step an item (`flat` an outer item too) on the caller's budget, as the runner's `list_call` counts it.
+test('sin, cos, sum, range and flat compute as the runner does, and the lists step on the budget', async () => {
+  const { x_sin, x_cos } = await import(resolve(dir, 'roster.js'));
+  const budget = await import(resolve(dir, 'budget.js'));
+  expect([x_sin(0), x_cos(0), x_sin(1), x_cos(1)]).toEqual([0, 1, 0.8414709848078965, 0.5403023058681398]);
+  expect([budget.x_sum([1, 2, 3], 0, 7), budget.ST]).toEqual([6, 3]);
+  expect(budget.x_sum([0.1, 0.2, 0.3], 0, 7)).toBe(0.6000000000000001);
+  expect(Object.is(budget.x_sum([-0], 0, 7), 0)).toBe(true);
+  expect(budget.x_sum([], 0, 7)).toBe(0);
+  expect(() => budget.x_sum([1, 2], 65535, 7)).toThrow('IterationLimit');
+  expect([budget.x_range(3, 0, 7), budget.ST]).toEqual([[0, 1, 2], 3]);
+  expect([budget.x_range(0, 0, 7), budget.x_range(-0, 0, 7)]).toEqual([[], []]);
+  for (const n of [2.5, -1, NaN, Infinity]) expect(() => budget.x_range(n, 0, 7)).toThrow('Trap(TypeMismatch { pc: 7 })');
+  expect(() => budget.x_range(2, 65535, 7)).toThrow('IterationLimit');
+  expect(() => budget.x_range(1e300, 0, 7)).toThrow('IterationLimit');
+  expect([budget.x_flat([[1, 2], [], [3]], 0, 7), budget.ST]).toEqual([[1, 2, 3], 6]);
+  expect(budget.x_flat([[[1]], [[2]]], 0, 7)).toEqual([[1], [2]]);
+  expect(() => budget.x_flat([[1], [2]], 65533, 7)).toThrow('IterationLimit');
+});
+
+// `sortBy` (LLP 1116.016 §5): the runner's stable merge sort on precomputed keys, taking no step of its own; against a
+// stable `toSorted` on the decorated key with NaN read as 0, at every length to 40 and both directions.
+test('sortBy orders by key, stably both ways, as a reference stable sort does', async () => {
+  const { x_sortBy } = await import(resolve(dir, 'budget.js'));
+  const ids = (xs, keys, desc) => x_sortBy(xs, keys, desc, 7);
+  expect(ids([0, 1, 2, 3, 4, 5, 6], [3, NaN, -0, 1, 0, -1, 3], false)).toEqual([5, 1, 2, 4, 3, 0, 6]);
+  expect(ids([0, 1, 2, 3, 4, 5, 6], [3, NaN, -0, 1, 0, -1, 3], true)).toEqual([0, 6, 3, 1, 2, 4, 5]);
+  const words = ['～', '😀', 'a', 'ab', '', 'a'];
+  expect(ids(words, words, false)).toEqual(['', 'a', 'a', 'ab', '😀', '～']);
+  expect(ids([], [], true)).toEqual([]);
+  for (let n = 0; n < 40; n++) {
+    const xs = Array.from({ length: n }, (_, i) => i), keys = xs.map(i => [NaN, 2, -0, 1, 0][(i * 7) % 5]);
+    for (const desc of [false, true]) {
+      const k = i => (keys[i] !== keys[i] ? 0 : keys[i]);
+      const want = xs.toSorted((a, b) => (desc ? (k(b) < k(a) ? -1 : k(a) < k(b) ? 1 : 0) : k(a) < k(b) ? -1 : k(b) < k(a) ? 1 : 0));
+      expect(ids(xs, keys, desc)).toEqual(want);
+    }
+  }
 });
 
 
@@ -589,7 +654,7 @@ describe('browser TypeScript send failures', () => {
       }`, { headers: { 'Content-Type': 'text/javascript' } });
       return new Response(Bun.file(resolve(dir, path.slice(1))));
     } });
-    browser = await chromium.launch({ executablePath: browserPath().executable, headless: true });
+    browser = await suiteBrowser();
   });
   afterAll(async () => { await browser?.close(); server?.stop(true); });
   for (const failure of ['null', 'undefined', 'UnknownSource']) for (const queued of [false, true]) {
@@ -712,6 +777,18 @@ test('a key handler stops and prevents its event while a view transition holds t
   } finally { delete globalThis.document; delete globalThis.requestAnimationFrame; }
 });
 
+test('a key handler hears isComposing last in its KeyboardEvent record', async () => {
+  const { on, onKey } = await import(resolve(dir, 'rt.js'));
+  const listeners = [];
+  const el = { addEventListener: (type, f) => listeners.push([type, f]) };
+  const heard = [];
+  on(el, 'key', (_, record) => heard.push(record), onKey);
+  // Chrome's keydown for the Enter that commits a candidate: keyCode 229, isComposing.
+  for (const ev of [{ key: 'Enter', code: 'Enter', repeat: false, isComposing: true }, { key: 'Enter', code: 'Enter', repeat: false, isComposing: false }, { key: 'a' }])
+    for (const [type, f] of listeners) if (type === 'keydown') f({ shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, ...ev });
+  expect(heard.map(r => [r[0], r[7]])).toEqual([['Enter', true], ['Enter', false], ['a', false]]);
+});
+
 test('capture stop ends Exact key handlers but leaves Enter submission and the browser default available', async () => {
   const { on, onKey, onSubmit, Hosts } = await import(resolve(dir, 'rt.js'));
   const saved = globalThis.addEventListener, windowListeners = [];
@@ -744,8 +821,8 @@ test('capture stop ends Exact key handlers but leaves Enter submission and the b
 
 // LLP 1088 D2: the roster's string entries are JavaScript's, made well formed, and `replaceAll` is bounded by the
 // runner's MAX_STRING as it builds (a quadratic `$\`` stops there), throwing the runner's trap at the call's pc (budget.js).
-test('slice, replaceAll and toLowerCase are the web methods, well formed and bounded', async () => {
-  const { x_slice: slice, x_replaceAll: replaceAll, x_toLowerCase: toLowerCase } = await import(resolve(dir, 'budget.js'));
+test('slice, replaceAll, toLowerCase and toUpperCase are the web methods, well formed and bounded', async () => {
+  const { x_slice: slice, x_replaceAll: replaceAll, x_toLowerCase: toLowerCase, x_toUpperCase: toUpperCase } = await import(resolve(dir, 'budget.js'));
   const x_slice = (s, a, b) => slice(s, a, b, 0, 4);
   const x_replaceAll = (s, f, w) => replaceAll(s, f, w, 4), x_toLowerCase = s => toLowerCase(s, 4);
   expect([x_slice('calc', 0, -1), x_slice('hello', -3, Infinity), x_slice('a😀b', 1, 2), x_slice('hello', NaN, 2.9)]).toEqual(['cal', 'llo', '�', 'he']);
@@ -753,6 +830,7 @@ test('slice, replaceAll and toLowerCase are the web methods, well formed and bou
     expect(x_replaceAll(s, f, w)).toBe(s.replaceAll(f, w).toWellFormed());
   expect(x_replaceAll('😀', '', '-')).toBe('-�-�-');
   expect([x_toLowerCase('ΟΣ'), x_toLowerCase('İ'), x_toLowerCase('ABC')]).toEqual(['ος', 'i̇', 'abc']);
+  expect([toUpperCase('straße', 4), toUpperCase('ﬃ', 4), toUpperCase('\ud800a', 4)]).toEqual(['STRASSE', 'FFI', '\ufffdA']);
   expect(() => x_replaceAll('x'.repeat(10000), '', "$`$'")).toThrow('Trap(StringTooLong { pc: 4 })');
   // The bound at a smaller limit, as the runner's own tests take it (strings.rs `replace_all(…, max)`): a result
   // that ends on a completed surrogate pair past it traps too (review b5-a 1: "xxx" → three emoji is 12 bytes).
@@ -830,6 +908,39 @@ test('decimal, currency and percent numbers are Intl\'s', async () => {
     .toEqual(Array(9).fill(''));
 });
 
+// LLP 1116.020 D8: format.js's `formatDay` against Bun's own Intl at a fixed-offset `timeZone`: the medium and short
+// dates, the short time and the long weekday are Intl's; the day count is the offset's calendar days.
+test('formatDay\'s dates, times and weekdays are Intl\'s', async () => {
+  const { x_formatDay } = await import(webJs('format.js'));
+  const pad = n => String(n).padStart(2, '0');
+  const dtf = (off, options) => new Intl.DateTimeFormat('en-US',
+    { timeZone: `${off < 0 ? '-' : '+'}${pad(Math.abs(off) / 60 | 0)}:${pad(Math.abs(off) % 60)}`, ...options });
+  const expected = (then, now, off, mode) => {
+    const day = ms => Math.floor((Math.trunc(ms) + off * 6e4) / 864e5), apart = day(then) - day(now);
+    const at = options => dtf(off, options).format(new Date(then)), time = at({ timeStyle: 'short' });
+    if (mode === 'list') return apart === 0 ? time : apart === -1 ? 'Yesterday'
+      : apart >= -6 && apart <= -2 ? at({ weekday: 'long' }) : at({ dateStyle: 'short' });
+    const label = ({ 0: 'Today', '-1': 'Yesterday', 1: 'Tomorrow' })[apart] ?? at({ dateStyle: 'medium' });
+    return mode === 'day-time' ? `${label} at ${time}` : label;
+  };
+  let seed = 7;
+  const next = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const wrong = [];
+  for (let i = 0; i < 3000; i++) {
+    const now = 1e12 + next() * 1.5e12, then = now + Math.round((next() - 0.75) * 12 * 864e5);
+    const off = [0, 60, -60, 330, 345, -420, -480, 840, -720, 1080, -1080][Math.floor(next() * 11)];
+    for (const mode of ['day', 'day-time', 'list'])
+      if (x_formatDay(then, now, off, mode) !== expected(then, now, off, mode)) wrong.push([then, now, off, mode]);
+  }
+  expect(wrong.slice(0, 10)).toEqual([]);
+  // 2026-12-31T23:59 and 2027-01-01T00:01 in UTC; a Thursday a week back; invalid instants and offsets.
+  const eve = Date.UTC(2026, 11, 31, 23, 59), dawn = eve + 2 * 6e4;
+  expect([x_formatDay(eve, dawn, 0, 'day'), x_formatDay(eve, dawn, 0, 'day-time'), x_formatDay(eve, dawn, 0, 'list'),
+    x_formatDay(dawn, eve, 0, 'day'), x_formatDay(eve, dawn, 60, 'day'), x_formatDay(eve - 7 * 864e5, dawn, 0, 'list'),
+    x_formatDay(eve - 2 * 864e5, dawn, 0, 'list'), x_formatDay(NaN, dawn, 0, 'day'), x_formatDay(eve, dawn, 1081, 'list')])
+    .toEqual(['Yesterday', 'Yesterday at 11:59 PM', 'Yesterday', 'Tomorrow', 'Today', '12/24/26', 'Tuesday', '', '']);
+});
+
 // LLP 1088 §9.1: `concat`, and `slice` and `includes` over a list, are the web's array methods (`includes` by
 // SameValueZero), on the caller's budget: each takes its `$s`, traps where the runner's `list_call` does — before it
 // builds — and leaves its own steps in `ST` (one an item kept, or scanned up to the match); text takes none.
@@ -865,12 +976,6 @@ test('indexOf and split are the web methods, on the caller\'s list steps', async
   expect(B.x_split('a,b', ',', 65534, 6)).toEqual(['a', 'b']);
 });
 
-// Local notifications on the JS target (notify.js, linked by use, over the
-// web host's notify-glue.js): the runner's rule (runner/src/notify.rs)
-// refuses without `device.notifications`, lists under the agent (a tag
-// replacing its older one), and otherwise asks permission once and posts
-// through the Notification API, now or at `showTrigger` while the page is
-// open; a tag's `closeNotification` takes away a shown or a waiting one.
 // `requestFullscreen` in a plan with no video or audio, where media.js is not installed
 // (`useMedia`): the same refusal media.js journals for an id that names no video.
 test('requestFullscreen without media refuses as media.js does', async () => {
@@ -879,70 +984,119 @@ test('requestFullscreen without media refuses as media.js does', async () => {
   expect(journal.at(-1).replace(/^t=\S+ /, '')).toBe('requestFullscreen: refused: no video with id "player"');
 });
 
-test('notifications: refused without the grant, listed under the agent, else posted by the Notification API', async () => {
-  const { Hosts, clock, data, journal, navigateTo } = await import(resolve(dir, 'rt.js'));
-  await import(resolve(dir, 'notify.js'));
-  const notices = globalThis.exact.notices, posted = [], closed = [], last = () => journal.at(-1).replace(/^t=\S+ /, '');
-  clock.agent = true; data.grants = '';
-  Hosts.showNotification('Stretch', null, 'stretch', null);
-  expect(last()).toBe('showNotification: refused: the grants name no device.notifications');
-  data.grants = 'net.fetch https://a.example\ndevice.notifications purpose.notifications\n';
-  Hosts.showNotification('Stretch', 'Now', 'stretch', null, '/stretch');
-  Hosts.showNotification('Stretch', 'Later', 'stretch', 5, '/notifications');
-  Hosts.showNotification('Alert', null, null, null);
-  expect(notices).toEqual([{ title: 'Stretch', body: 'Later', tag: 'stretch', showTrigger: 5, navigate: '/notifications' }, { title: 'Alert', body: null, tag: null, showTrigger: null, navigate: null }]);
-  Hosts.closeNotification('stretch');
-  expect(notices.map(n => n.title)).toEqual(['Alert']);
+// `@exact/notifications`' web implementation (LLP 1133.004): it asks permission once and posts through the
+// Notification API, now or at `showTrigger` while the page is open; a tag's `closeNotification` takes away a shown or
+// a waiting one; the click is bound through the host's `activation`.
+test('@exact/notifications on the web: posts by the Notification API, closes, holds a showTrigger, binds the click', async () => {
+  const { implementation } = await import(new URL('../../../packages/notifications/web/index.js', import.meta.url).pathname);
+  const posted = [], closed = [], bound = [], said = [];
   globalThis.Notification = class { static permission = 'default'; static requestPermission() { Notification.permission = 'granted'; return Promise.resolve('granted'); }
-    constructor(title, options) { this.title = title; this.options = options; posted.push(this); } close() { closed.push(this.title); } };
-  const previousFocus = globalThis.focus;
+    constructor(title, options) { this.title = title; this.options = options; posted.push(this); } addEventListener() {} close() { closed.push(this.title); } };
   try {
-    clock.agent = false;
-    const navigated = [], focused = [];
-    globalThis.focus = () => focused.push(true);
-    navigateTo(location => navigated.push(location));
-    await Hosts.showNotification('Price alert', 'BTC crossed 100k', 'btc', null, 'https://example.test/notifications?unread=1');
-    expect([posted[0].title, posted[0].options, last()]).toEqual(['Price alert', { body: 'BTC crossed 100k', tag: 'btc' }, 'showNotification: shown']);
-    let prevented = false;
-    posted[0].onclick({ preventDefault() { prevented = true; } });
-    expect([navigated, focused.length, prevented]).toEqual([['/notifications?unread=1'], 1, true]);
-    await Hosts.showNotification('Stretch', null, 'stretch', Date.now() + 60_000);
-    expect([posted.length, last()]).toEqual([1, 'showNotification: scheduled while this page is open']);
-    await Hosts.closeNotification('stretch'); await Hosts.closeNotification('btc');
-    expect(closed).toEqual(['Price alert']);
-    await Hosts.showNotification('Soon', null, null, Date.now() + 20);
-    await new Promise(r => setTimeout(r, 60));
-    expect([posted.at(-1).title, last()]).toEqual(['Soon', 'showNotification: shown']);
-    for (const [input, expected] of [[' \tthread/./42#reply ', '/thread/42'], ['app://thread/../thread/43?view=full#reply', '/thread/43?view=full']]) {
-      await Hosts.showNotification('Route', null, null, null, input);
-      posted.at(-1).onclick({ preventDefault() {} });
-      expect(navigated.at(-1)).toBe(expected);
-    }
-  } finally { delete globalThis.Notification; if (previousFocus === undefined) delete globalThis.focus; else globalThis.focus = previousFocus; }
+    const n = implementation({ changed: () => {}, activation: (...a) => bound.push(a), log: line => said.push(line) });
+    expect(await n.notificationStatus()).toEqual({ available: true, state: 'prompt', badge: false, apple: null });
+    expect(await n.showNotification({ title: 'Done', body: 'Thread 4', tag: 't4', silent: true, data: 'thread-4' })).toBe(null);
+    expect([posted[0].title, posted[0].options, said.at(-1)]).toEqual(['Done', { body: 'Thread 4', tag: 't4', silent: true, data: 'thread-4' }, 'showNotification: shown']);
+    expect(bound[0].slice(1)).toEqual(['click', 'notificationclick', ['t4', { tag: 't4', data: 'thread-4', title: 'Done', body: 'Thread 4' }], { navigate: null }]);
+    expect(await n.showNotification({ title: 'Later', tag: 'l', showTrigger: Date.now() + 60_000 })).toBe(null);
+    expect([posted.length, said.at(-1)]).toEqual([1, 'showNotification: scheduled while this page is open']);
+    await n.closeNotification({ tag: 'l' }); await n.closeNotification({ tag: 't4' });
+    expect(closed).toEqual(['Done']);
+    expect(await n.setAppBadge({ contents: 3 })).toEqual({ error: 'NotSupportedError' });
+    Notification.permission = 'denied';
+    expect(await n.showNotification({ title: 'No' })).toEqual({ error: 'NotAllowedError' });
+  } finally { delete globalThis.Notification; }
 });
 
-test('notification clicks use the route location corpus, including canonical path encoding', async () => {
-  const { Hosts, clock, data, navigateTo } = await import(resolve(dir, 'rt.js'));
-  await import(resolve(dir, 'notify.js'));
+test('a module\'s activation: only a trusted event raises, and a navigate opens the route corpus\'s location', async () => {
+  const { clock, navigateTo, journal } = await import(resolve(dir, 'rt.js'));
+  const { modules } = await import(resolve(dir, 'modules.js'));
   const corpus = JSON.parse(readFileSync(new URL('../../../route/tests/corpus.json', import.meta.url), 'utf8'));
+  // A canonical case through a URL keeps its fragment (LLP 1153 D5), which its canonical form drops.
   const cases = [...corpus.location_of, ...corpus.canonical.map(({ input, expected }) => ({
-    input: 'https://x' + (input.startsWith('/') ? input : '/' + input), expected,
+    input: 'https://x' + (input.startsWith('/') ? input : '/' + input), expected, fragment: true,
   }))];
-  const previous = globalThis.Notification, previousFocus = globalThis.focus;
-  let posted, got;
-  globalThis.Notification = class { static permission = 'granted'; constructor() { posted = this; } };
+  let context = null;
+  clock.agent = false;
+  modules({ post: ['fixture.post', true, {}, 'u', 'never', null, false] }, { fixture: () => Promise.resolve({ implementation: c => { context = c; return { post: async () => null }; } }) });
+  await globalThis.exact.extensions.call({ extension: 'fixture', send: 'post', args: {} });
+  const previousFocus = globalThis.focus;
   globalThis.focus = () => {};
   try {
-    clock.agent = false; data.grants = 'device.notifications purpose.notifications\n';
+    const target = { listeners: [], addEventListener(type, f) { this.listeners.push(f); } };
+    context.activation(target, 'click', 'opened', ['t'], {});
+    target.listeners[0]({ isTrusted: false, type: 'click' });
+    expect(journal.at(-1).replace(/^t=\S+ /, '')).toBe('fixture.opened: an untrusted click raises nothing');
+    let got;
     navigateTo(location => { got = location; });
     const mismatches = [];
-    for (const { input, expected } of cases) {
-      await Hosts.showNotification('Route', null, null, null, input);
-      posted.onclick({ preventDefault() {} });
-      if (got !== expected) mismatches.push({ input, expected, got });
+    for (const { input, expected, fragment } of cases) {
+      const routed = { listeners: [], addEventListener(type, f) { this.listeners.push(f); } };
+      context.activation(routed, 'click', 'opened', [], { navigate: input });
+      routed.listeners[0]({ isTrusted: true, type: 'click' });
+      if ((fragment ? got?.split('#')[0] : got) !== expected) mismatches.push({ input, expected, got });
     }
     expect(mismatches).toEqual([]);
-  } finally { globalThis.Notification = previous; globalThis.focus = previousFocus; navigateTo(null); }
+  } finally { if (previousFocus === undefined) delete globalThis.focus; else globalThis.focus = previousFocus; navigateTo(null); }
+});
+
+// LLP 1133.030 D2: the declaration's `checks` hold a send under the agent, as the runner's do.
+test('a declared check refuses a send on the JS target, and leaves its state', async () => {
+  const { clock, journal } = await import(resolve(dir, 'rt.js'));
+  const { modules } = await import(resolve(dir, 'modules.js'));
+  clock.agent = true;
+  const checks = [{ min: { contents: 0 }, error: 'TypeError' }, { one: ['a', 'b'], error: 'TypeError' }, { nonEmpty: ['title'], error: 'TypeError' }];
+  modules({ badge: ['chk.badge', true, { admission: 'none', effect: true, checks: checks.slice(0, 1), set: { state: 'badge', from: 'contents' } }, 'u', 'never', null, false],
+    pick: ['chk.pick', true, { admission: 'none', effect: true, checks: checks.slice(1) }, 'u', 'never', null, false] }, {});
+  const call = (send, args) => globalThis.exact.extensions.call({ extension: 'chk', send, args });
+  expect(await call('badge', { contents: 3 })).toBe(null);
+  expect(await call('badge', { contents: -1 })).toEqual({ error: 'TypeError' });
+  expect(journal.at(-1).replace(/^t=\S+ /, '')).toBe('badge: refused: TypeError');
+  expect(globalThis.exact.extensions.declared().badge).toBe(3);
+  expect(await call('pick', { a: 1, b: 2, title: 't' })).toEqual({ error: 'TypeError' });
+  expect(await call('pick', { a: 1, title: '' })).toEqual({ error: 'TypeError' });
+  expect(await call('pick', { b: 2, title: 't' })).toBe(null);
+  clock.agent = false;
+});
+
+// LLP 1133.004 D6, LLP 1133.002 D12: a module event's origin on the JS target.
+test('a command keeps the origin of the commit that queued it, whenever its tail runs', async () => {
+  const { commit, C, Hosts, Origin } = await import(resolve(dir, 'rt.js'));
+  let got = null;
+  Hosts.probe = Object.assign((from, x) => { got = [from, x]; }, { origin: true });
+  const was = Origin.now;
+  try {
+    commit(() => { Origin.now = () => 'device'; C('probe', [1]); Origin.now = () => 'app'; });
+    // This file's view transition holds every tree update: the tail, and its commands, run later.
+    expect(got).toBe(null);
+    globalThis.heldTail();
+    expect(got).toEqual(['device', 1]);
+  } finally { Origin.now = was; delete Hosts.probe; }
+});
+
+test('an emitted event\'s requests make data code the device\'s until they land; activation binds only a person\'s input', async () => {
+  const { clock, inflight, After, journal } = await import(resolve(dir, 'rt.js'));
+  const { modules } = await import(resolve(dir, 'modules.js'));
+  const sub = { permission: { name: 'p', status: 'status', field: 'state', denied: 'NotAllowedError' }, admission: 'request' };
+  let context = null;
+  clock.agent = true;
+  modules({ ask: ['dev.ask', true, sub, ['?', 'n'], 'always', null, false] }, {}, {},
+    { 'dev.chime': [() => () => { inflight.n++; }, 'emit', 4, [], 'chimed'] });
+  const call = () => globalThis.exact.extensions.call({ extension: 'dev', send: 'ask', args: {} });
+  // A package's emit, through the bound context (the agent binds none: a stand-in context here).
+  globalThis.exact.extensions.raiseForTests?.('dev.chime');
+  await new Promise(r => setTimeout(r, 0));
+  expect(await Promise.race([call(), new Promise(r => setTimeout(() => r('held'), 30))])).toEqual({ error: 'NotAllowedError' });
+  inflight.n--; for (const f of After) f();
+  expect(await Promise.race([call(), new Promise(r => setTimeout(() => r('held'), 30))])).toBe('held');
+  clock.agent = false;
+  modules({ post: ['act.post', true, { effect: true }, 'u', 'never', null, false] }, { act: () => Promise.resolve({ implementation: c => { context = c; return { post: async () => null }; } }) });
+  await globalThis.exact.extensions.call({ extension: 'act', send: 'post', args: {} });
+  const target = { listeners: [], addEventListener(type, f) { this.listeners.push(type); } };
+  context.activation(target, 'pointermove', 'moved', []);
+  context.activation(target, 'click', 'opened', []);
+  expect(target.listeners).toEqual(['click']);
+  expect(journal.some(l => l.endsWith('act.moved: a pointermove is no person\'s activation; nothing is bound'))).toBe(true);
 });
 
 // LLP 1090: a string past MAX_STRING comes only from a data source, which the
@@ -954,6 +1108,29 @@ test('notification clicks use the route location corpus, including canonical pat
 // store would answer the read first; at most 256 wait behind the one in
 // flight, the next refused `full` and journaled; each counts in flight until
 // it lands, and a failure is journaled. ts-data.js over a scripted store.
+// Whether a module has an overlay is decided at install (ts-data.js `data.overlay`), as the native and wasm
+// executors decide it at load (js/tests/it/overlay.rs): a top-level overlay overlays, and one set or deleted after
+// install is not followed until the module is installed again (LLP 1054).
+test('an overlay is decided at install: a top-level one overlays, one set or deleted after is not followed', async () => {
+  const { data } = await import(resolve(dir, 'rt.js'));
+  const { sourceTypes } = await import(resolve(dir, 'names.js'));
+  const saved = data.overlay;
+  sourceTypes.items = [[], ['[', 's']];
+  try {
+    const late = await import(resolve(dir, 'late.mjs'));
+    (await import(resolve(dir, 'ts-data-late.js'))).install(data);
+    expect(data.overlay).toBeUndefined();
+    late.setOverlay(true);
+    expect(data.overlay).toBeUndefined(); // set after install: not followed
+    const topped = await import(resolve(dir, 'topped.mjs'));
+    (await import(resolve(dir, 'ts-data-topped.js'))).install(data);
+    expect(data.overlay('items', [], ['a'], [])?.value).toEqual(['a', 'overlaid']);
+    topped.setOverlay(false);
+    // Deleted after install: still asked, so the call fails (TypeError) rather than the answer passing unoverlaid.
+    expect(() => data.overlay('items', [], ['a'], [])).toThrow();
+  } finally { data.overlay = saved; delete sourceTypes.items; }
+});
+
 // A storage call in an overlay is refused by its method's name, as the prelude names it (js/tests/it/overlay.rs).
 test('storage in an overlay is refused by name', async () => {
   const { data } = await import(resolve(dir, 'rt.js'));
@@ -1003,6 +1180,18 @@ test('compressImage copies its options and refuses bad ones before the queue', a
   const bad = ask('compress-bad');
   expect(data.background().queued + data.background().inFlight).toBe(0);
   expect(await bad.promise).toBe('TypeError undefined storage.fs.compressImage(): maxDimension must be an integer from 1 to 8192');
+  // `type` (A1.11): JPEG when absent, PNG passed on, any other a TypeError before the queue.
+  expect(JSON.parse(await ask('compress-png').promise)).toEqual({ path: 'app:/tmp/out.png', type: 'image/png', size: 100, width: 8, height: 1 });
+  const badType = ask('compress-bad-type');
+  expect(data.background().queued + data.background().inFlight).toBe(0);
+  expect(await badType.promise).toBe('TypeError undefined storage.fs.compressImage(): type must be "image/jpeg" or "image/png"');
+  // LLP 1133.019 D14, D15: the edit and a transform's options, copied as checked.
+  expect(JSON.parse(await ask('compress-edit').promise)).toMatchObject({ rotate: 90, width: 8 });
+  expect(JSON.parse(await ask('transform').promise)).toEqual({ path: 'app:/tmp/edit.jpg',
+    options: { rotate: 90, crop: { x: 0, y: 0, width: 4, height: 4 }, metadata: 'no-location' } });
+  const badFlip = ask('transform-bad');
+  expect(data.background().queued + data.background().inFlight).toBe(0);
+  expect(await badFlip.promise).toBe('TypeError undefined storage.fs.transformImage(): flip must be "horizontal" or "vertical"');
 });
 
 test('a string past MAX_STRING joins to itself alone and is counted in UTF-8 bytes', async () => {
@@ -1081,6 +1270,11 @@ test('string builders check expanded size before calling their builders', async 
   String.prototype.toLowerCase = function () { if (this.length > 65536) throw new Error('lowercase built before its bound'); return lower.call(this); };
   try { expect(() => B.x_toLowerCase('İ'.repeat(22369622), 56)).toThrow('Trap(StringTooLong { pc: 56 })'); }
   finally { String.prototype.toLowerCase = lower; }
+  // `ŉ` is 2 bytes and `ʼN` 3: 22,369,622 of them pass the bound only once uppercased.
+  const upper = String.prototype.toUpperCase;
+  String.prototype.toUpperCase = function () { if (this.length > 65536) throw new Error('uppercase built before its bound'); return upper.call(this); };
+  try { expect(() => B.x_toUpperCase('ŉ'.repeat(22369622), 57)).toThrow('Trap(StringTooLong { pc: 57 })'); }
+  finally { String.prototype.toUpperCase = upper; }
 });
 
 test('translation expansion stops when its output exceeds the byte budget', async () => {
@@ -1099,7 +1293,7 @@ test('translation expansion stops when its output exceeds the byte budget', asyn
 
 test('an argument or a write past MAX_STRING is refused by name, and a trapping argument is a trap, poisoned or not', async () => {
   const { act, sig, W, effect, journal } = await import(resolve(dir, 'rt.js'));
-  const { Trap } = await import(resolve(dir, 'budget.js'));
+  const { Trap, tg } = await import(resolve(dir, 'budget.js'));
   const last = () => journal.at(-1).replace(/^t=\S+ /, '');
   const t = sig('', 's', 't');
   const put = act(v => W(t, v), ['s'], 0, ['v']);
@@ -1116,7 +1310,25 @@ test('an argument or a write past MAX_STRING is refused by name, and a trapping 
   expect(t()).toBe('');
   put.t(() => { throw new Trap('IterationLimit', 17); })();
   expect(last()).toBe('refused action: Trap(IterationLimit { pc: 17 })');
-  // A trap while the tree updates poisons, as the runner's InstanceError; an argument still traps first.
+  // A prop or style binding's trap unsets its row and the commit goes on (LLP 1017.003 D3), with one journal line however
+  // many writes read it (here two, as a painted flag and its row), until it evaluates to a value again.
+  const m = sig(0, 'm');
+  const el = {}, text = () => { if (m() > 0) throw new Trap('IterationLimit', 5); return 'x'; };
+  const lines = () => journal.filter(l => l.endsWith('site 4: text trapped Trap(IterationLimit { pc: 5 }); unset')).length;
+  let shown = 'x', painted = 'x';
+  effect(() => { shown = tg(el, 4, 'text', text)(); });
+  effect(() => { painted = tg(el, 4, 'text', text)(); });
+  const set = v => { act(() => W(m, v))(); globalThis.heldTail?.(); };
+  set(1);
+  expect(lines()).toBe(1);
+  expect([shown, painted]).toEqual([null, null]);
+  set(2);
+  expect(lines()).toBe(1);
+  set(0);
+  expect([shown, painted]).toEqual(['x', 'x']);
+  set(1);
+  expect(lines()).toBe(2);
+  // Any other trap while the tree updates (a subject's, a key's) poisons, as the runner's InstanceError; an argument still traps first.
   const n = sig(0, 'n');
   effect(() => { if (n() > 0) throw new Trap('IterationLimit', 9); });
   act(() => W(n, 1))();
@@ -1227,7 +1439,7 @@ test('clipboard handlers preserve the default unless prevented and restore the e
       let listener;
       const el = { addEventListener: (_, f) => { listener = f; } };
       on(el, kind, value => {
-        expect(value).toEqual(['clipboard text']);
+        expect(value).toEqual(['clipboard text', []]);
         if (prevent) Hosts.preventDefault();
       }, onClipboard);
       const ev = event();

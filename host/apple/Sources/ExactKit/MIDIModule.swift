@@ -7,9 +7,12 @@
 // CoreMIDI client exists; the first request opens the arm, whose first
 // enumeration reports `granted` and the ports. One arm serves the process:
 // every session that asked hears its ports, an input goes to each session
-// that opened it, and each session's message ids are its own. Nothing loads
-// under the agent, whose clock is virtual: the runner answers a request
-// itself there.
+// that opened it, and each session's message ids are its own. Timing Clock
+// goes only to a session that follows its input (the open op's `clock`,
+// LLP 1125 D9): ticks alone wait up to 50 ms from the oldest, and anything
+// else is delivered at once with the ticks ahead of it. Nothing loads under
+// the agent, whose clock is virtual: the runner answers a request itself
+// there.
 import Foundation
 import QuartzCore
 #if os(iOS)
@@ -59,10 +62,18 @@ final class MIDIHub {
     private final class Weak { weak var output: MIDIOutput?; init(_ o: MIDIOutput) { output = o } }
     /// The last ports the arm reported, as `exactMIDI`'s JSON.
     private(set) var ports: String?
-    /// Input messages from the arm's thread, drained on the main queue.
+    /// Input messages from the arm's thread, drained on the main queue: at
+    /// once for anything but Timing Clock (`draining`), else at most 50 ms
+    /// after the oldest tick (`ticking`).
     private let lock = NSLock()
     private var heard: [Heard] = []
     private var draining = false
+    private var ticking = false
+    /// Drains so far: a tick's delayed drain armed before the last drain is
+    /// stale, and leaves the ticks since to their own 50 ms.
+    private var drains = 0
+    /// The inputs some session follows the clock of (under `lock`).
+    private var clockUIDs: Set<Int32> = []
     private var nextID: UInt64 = 0
 
     private static var hubs: [ObjectIdentifier: MIDIHub] = [:]
@@ -132,32 +143,71 @@ final class MIDIHub {
         bytes.withUnsafeBufferPointer { library.op(handle, kind, id, uid, host, $0.baseAddress, $0.count) }
     }
 
-    /// Every session's open inputs, together.
+    /// Every session's open inputs, together, and the inputs whose clock
+    /// some session follows.
     func listen() {
+        let sessions = outputs.compactMap(\.output)
+        lock.withLock { clockUIDs = Set(sessions.flatMap(\.clock)) }
         guard let handle else { return }
-        let uids = Array(Set(outputs.compactMap(\.output).flatMap(\.open)))
+        let uids = Array(Set(sessions.flatMap(\.open)))
         uids.withUnsafeBufferPointer { library.inputs(handle, $0.baseAddress, $0.count) }
     }
 
+    /// Tests: each message's stamp and when the hub heard it (the arm's thread).
+    static var observeHeard: ((_ at: Double, _ heard: Double) -> Void)? {
+        get { observeLock.withLock { observing } }
+        set { observeLock.withLock { observing = newValue } }
+    }
+    private static let observeLock = NSLock()
+    nonisolated(unsafe) private static var observing: ((_ at: Double, _ heard: Double) -> Void)?
+
+    /// One message from the arm's thread. A tick no session follows goes no
+    /// further.
     private func heard(_ message: Heard) {
+        if let observe = Self.observeHeard { observe(message.at, CACurrentMediaTime()) }
+        let tick = message.bytes.first == 0xF8
         lock.lock()
+        if tick && !clockUIDs.contains(message.uid) {
+            lock.unlock()
+            return
+        }
         heard.append(message)
-        let schedule = !draining
-        draining = true
+        let now = !tick && !draining, later = tick && !draining && !ticking
+        draining = draining || now
+        ticking = ticking || later
+        let armed = drains
         lock.unlock()
-        if schedule { DispatchQueue.main.async { self.drain() } }
+        if now {
+            DispatchQueue.main.async { self.drain() }
+        } else if later {
+            // Strict, as the arm's hold: a coalesced `asyncAfter` can come
+            // 150 ms late where the system coalesces timers (an occluded or
+            // App Napped app), and a batch was held past a second one.
+            let wait = max(0, 0.05 - (CACurrentMediaTime() - message.at))
+            let timer = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+            timer.schedule(deadline: .now() + wait, leeway: .nanoseconds(0))
+            timer.setEventHandler { timer.cancel(); self.drain(armed: armed) }
+            timer.resume()
+        }
     }
 
     /// What arrived since the last drain: to each session that opened its
-    /// input, one delivery.
-    private func drain() {
+    /// input, one delivery, its ticks only to a session that follows them.
+    /// A tick's drain (`armed`, the drains when it was armed) that another
+    /// drain came before does nothing.
+    private func drain(armed: Int? = nil) {
         lock.lock()
+        if let armed, armed != drains {
+            lock.unlock()
+            return
+        }
         let batch = heard
         heard = []
-        draining = false
+        (draining, ticking) = (false, false)
+        drains += 1
         lock.unlock()
         for output in outputs.compactMap(\.output) {
-            let mine = batch.filter { output.open.contains($0.uid) }
+            let mine = batch.filter { output.open.contains($0.uid) && ($0.bytes.first != 0xF8 || output.clock.contains($0.uid)) }
             if !mine.isEmpty { output.received(mine.map { ($0.uid, $0.at, $0.bytes) }) }
         }
     }
@@ -172,8 +222,10 @@ final class MIDIOutput {
     private var hub: MIDIHub?
     /// This session's ids of messages still held, to the hub's.
     private var ids: [UInt64: UInt64] = [:]
-    /// The inputs this session opened, by unique ID.
+    /// The inputs this session opened, by unique ID, and those of them a
+    /// sequence follows the clock of.
     fileprivate(set) var open: Set<Int32> = []
+    fileprivate(set) var clock: Set<Int32> = []
     private var toldAbsent = false
 
     convenience init(_ session: ExactSession) {
@@ -197,7 +249,7 @@ final class MIDIOutput {
     func shutdown() {
         for id in ids.values { hub?.op(3, id, 0, 0, []) }
         ids = [:]
-        open = []
+        (open, clock) = ([], [])
         hub?.leave(self)
         hub = nil
     }
@@ -237,6 +289,7 @@ final class MIDIOutput {
                 if let global = ids.removeValue(forKey: id) { hub?.op(2, global, 0, 0, []) }
             case "open":
                 open = Set((op["inputs"] as? [String] ?? []).compactMap { Int32($0) })
+                clock = Set((op["clock"] as? [String] ?? []).compactMap { Int32($0) })
                 hub?.listen()
             default:
                 continue

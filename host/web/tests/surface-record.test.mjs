@@ -133,9 +133,36 @@ test('forwarded keyups survive focus changes; editable focus blurs; shortcuts st
   const send = (name, code, target = el, extra = {}) => el.listeners[name]({target, code, timeStamp:0, preventDefault(){}, ...extra});
   send('keydown', 'Space'); send('keyup', 'Space', button);
   send('keyup', 'KeyX'); send('keydown', 'Tab'); send('keydown', 'KeyR', button, {metaKey:true}); send('keydown', 'KeyW', el, {isComposing:true});
+  send('keydown', 'KeyW', el, {keyCode:229}); send('keydown', 'KeyW', el, {key:'Process'}); // an input method's keys: WebKit's committing one, Chromium's on Windows
   assert.deepEqual(f.events.map(e => [e.code, e.down]), [['Space',true],['Space',false]]);
   send('keydown', 'KeyW'); send('focusin', '', input); send('keyup', 'KeyW', input);
   assert.equal(f.events.at(-1).t, 'blur');
+});
+test('a held pad stays off a world while an editor in its canvas has the focus', async () => {
+  const { padPoller } = await import('../gpu-pads.js');
+  const frames = [], saved = { navigator: globalThis.navigator, requestAnimationFrame: globalThis.requestAnimationFrame, window: globalThis.window, document: globalThis.document };
+  const south = { index: 0, mapping: 'standard', connected: true, axes: [0, 0, 0, 0],
+    buttons: Array.from({ length: 17 }, (_, i) => ({ value: i === 0 ? 1 : 0, pressed: i === 0 })) };
+  globalThis.navigator = { getGamepads: () => [south] };
+  globalThis.requestAnimationFrame = fn => frames.push(fn);
+  globalThis.window = { addEventListener() {} };
+  globalThis.document = { hasFocus: () => true };
+  try {
+    const f = await fixture({input:true, padPoller}), el = f.create(1), input = new f.Element('input');
+    el.canvas.parent = el; input.parent = el; // an editor among the world's controls
+    const poll = () => frames.shift()(), pads = () => f.events.filter(e => e.t === 'pad').map(e => e.buttons[0]);
+    f.document.activeElement = el.canvas;
+    poll();
+    assert.deepEqual(pads(), [1]);
+    f.document.activeElement = input;
+    el.listeners.focusin({target:input, timeStamp:0});
+    assert.equal(f.events.at(-1).t, 'blur');
+    poll();
+    assert.deepEqual(pads(), [1], 'the editor has the pads: none go to the world');
+    f.document.activeElement = el.canvas;
+    poll();
+    assert.deepEqual(pads(), [1, 1], 'back on the canvas, the world hears the pad held');
+  } finally { Object.assign(globalThis, saved); }
 });
 test('only the focused game host or render canvas owns Ctrl and Meta chords', async () => {
   const f=await fixture({input:true}), el=f.create(1), button=new f.Element('button'), input=new f.Element('input');
@@ -326,11 +353,11 @@ test('the last bounded non-adapter failure enters fallback and logs the terminal
     return '{"status":"failed","code":"no-device","error":"no device: limits rejected"}';
   };
   f.exact.gpu.deviceLost();
-  for(let i=0;i<4;i++) await Promise.resolve();
+  await new Promise(setImmediate);
   for(const delay of [100,200,400,800]) {
     assert.equal(timers.length,1);
     const timer=timers.shift(); assert.equal(timer.ms,delay); timer.fn();
-    for(let i=0;i<4;i++) await Promise.resolve();
+    await new Promise(setImmediate);
   }
   assert.equal(attempts,5);
   assert.equal(f.exact.gpu.recovery.status,'no device');
@@ -507,8 +534,8 @@ test('second cutover failure preserves both live canvases and their input',async
 
 for(const refusal of ['disabled','hidden','inert','missing']) test(`control down refuses ${refusal}`,async()=>{
  const f=await fixture({input:true}),canvas=f.create(1),b=new f.Element('button');b.parent=canvas;
- b.closest=s=>s==='[data-gpu-input]'?canvas:s==='button[data-action]'?b:s.includes('[inert]')&&refusal==='inert'?b:null;
- b.getAttribute=()=>refusal==='missing'?null:'jump';b.disabled=refusal==='disabled';b.hidden=refusal==='hidden';
+ b.closest=s=>s==='[data-gpu-input]'?canvas:s==='button[data-action]'?b:null;
+ b.getAttribute=()=>refusal==='missing'?null:'jump';b.disabled=refusal==='disabled';b.hidden=refusal==='hidden';b.inert=refusal==='inert';
  canvas.listeners.pointerdown({target:b,pointerId:1,clientX:0,clientY:0,timeStamp:0,preventDefault(){}});
  assert.deepEqual(f.events,[]);
 });
@@ -660,4 +687,38 @@ test('a slow asset delivery leaves the first frame its own presentation budget',
   f.gpu.gpu_render = () => { preparing--; clock += 100; return 0; };
   assert.deepEqual(await f.exact.gpu.settled(), []);
   assert.equal(preparing, 0);
+});
+
+// LLP 1139.003 D2: `prefer gpu-tier` remakes renderers inside the module; no
+// world is captured, destroyed or created, so two instances of one name and a
+// world whose capture would fail keep running.
+test('prefer gpu-tier retiers every live world in place, duplicates and all', async () => {
+  const f=await fixture();f.create(1);f.create(2);
+  const told=[];let retiers=0,carries=0,creates=0,destroys=0;
+  Object.assign(f.gpu,{gpu_tier:code=>told.push(code),gpu_retier:()=>retiers++,gpu_carry:()=>{carries++;throw new Error('capture refused');}});
+  const create=f.gpu.gpu_create;f.gpu.gpu_create=(...a)=>{creates++;return create(...a);};
+  const destroy=f.gpu.gpu_destroy;f.gpu.gpu_destroy=(...a)=>{destroys++;return destroy(...a);};
+  f.exact.gpu.retier('low');
+  assert.deepEqual(told,[2]);
+  assert.equal(retiers,1);
+  assert.deepEqual([carries,creates,destroys],[0,0,0]);
+  assert.equal(f.exact.gpu.handle({op:'state',id:1,world:true},null,x=>x).world.tick,0);
+  assert.equal(f.exact.gpu.handle({op:'state',id:2,world:true},null,x=>x).world.tick,0);
+});
+
+// A world's render scale (its quality rung, LLP 1139.003 D3) is the canvas's backing store: the module
+// configures its drawable at that size, and a full-size backing store would leave it in one corner.
+test('the canvas backing store is the raster the module draws, at its render scale', async () => {
+  const f=await fixture();
+  f.gpu.gpu_published=()=>undefined;
+  const host=f.create(1), canvas=host.canvas;
+  let dirty=true;
+  f.gpu.gpu_dirty=()=>dirty;
+  f.gpu.gpu_render=()=>{dirty=false;return 0;};
+  f.gpu.gpu_render_scale=()=>0.5;
+  f.frame();
+  assert.deepEqual([canvas.width,canvas.height],[15,15],'10 points at 3 device pixels each, halved');
+  dirty=true; f.gpu.gpu_render_scale=()=>1;
+  f.frame();
+  assert.deepEqual([canvas.width,canvas.height],[30,30]);
 });

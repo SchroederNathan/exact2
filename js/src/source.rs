@@ -2,13 +2,61 @@
 //! source gives now or later.
 use super::*;
 
+/// The timers one answer may run at bake before it is refused: a loop that
+/// waits on a timer each time round never ends on a clock that jumps.
+const TIMERS_AT_BAKE: usize = 1000;
+
 impl DataSource for Module {
+    fn prepare_snapshot(
+        &mut self,
+        module: Option<exact_runner::SnapshotModule<'_>>,
+        deadline: std::time::Instant,
+    ) -> Result<(), DataError> {
+        if self.is_loaded() {
+            return Err(DataError::Unavailable(
+                "prepare snapshot before activation".into(),
+            ));
+        }
+        let module = module.ok_or_else(|| {
+            DataError::Unavailable("widget generation lacks TypeScript bytecode".into())
+        })?;
+        let admitted = Paired::module(
+            module.receipt,
+            std::sync::Arc::<[u8]>::from(module.bytecode),
+            Some((module.kind, module.plan)),
+            &self.app_id,
+            &self.grants,
+        )
+        .map_err(DataError::Unavailable)?;
+        self.bytecode = admitted.bytecode.clone();
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        self.snapshot_deadline = Some((deadline, left));
+        self.revision = Default::default();
+        self.snapshot = true;
+        self.native_factory = None;
+        self.native_slot = Default::default();
+        self.storage_wait = left;
+        Ok(())
+    }
+
+    fn take_storage_changed(&mut self) -> bool {
+        std::mem::take(&mut self.host.storage_changed)
+    }
+
+    fn note_storage_changed(&mut self) {
+        self.host.storage_changed = true;
+    }
+
     fn set_document_owner(&mut self, owner: u64) {
         self.document_owner = owner;
     }
 
     fn take_logs(&mut self) -> Vec<String> {
         self.journal_lines()
+    }
+
+    fn take_aborted(&mut self) -> Vec<u64> {
+        Module::take_aborted(self)
     }
 
     fn background(&mut self, store: &Store) -> Option<Request> {
@@ -23,6 +71,25 @@ impl DataSource for Module {
     ) -> Result<Option<Request>, DataError> {
         let _ = store;
         self.background_round(outcome)
+    }
+
+    fn keep_sent(
+        &mut self,
+        store: &Store,
+        let_go: &[InFlight<'_>],
+        refused: bool,
+    ) -> Vec<Option<u64>> {
+        let _ = store;
+        self.keep_sent_now(let_go, refused)
+    }
+
+    fn module_landed(
+        &mut self,
+        store: &mut Store,
+        token: u64,
+        outcome: Outcome,
+    ) -> Result<(), DataError> {
+        self.module_landed_now(store, token, outcome)
     }
 
     fn background_state(&self) -> Option<exact_runner::BackgroundState> {
@@ -64,6 +131,9 @@ impl DataSource for Module {
                 Dispatch::Held
             });
         }
+        if self.asked_again(token) {
+            return Module::ask_again();
+        }
         match self.continuation(token) {
             Some(work) => Dispatch::Run(Work::Now(work)),
             None => Dispatch::Missing,
@@ -89,6 +159,11 @@ impl DataSource for Module {
     fn continuation(&mut self, token: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
         if token == exact_runner::BACKGROUND {
             return Some(self.storage.as_ref()?.continuation());
+        }
+        // A worker's owner thread resumes a yield at once, as a host settles
+        // `Dispatch::Again`, and a timer when the runner hands it out.
+        if self.asked_again(token) {
+            return Some(Box::new(Dispatch::again_outcome));
         }
         // An owner thread runs one turn to its end, so another answer's
         // work cannot land while this one waits for it (LLP 1027.002).
@@ -139,6 +214,8 @@ impl DataSource for Module {
                 module.directories = self.directories.clone();
                 module.document_owner = self.document_owner;
                 module.native_factory = self.native_factory;
+                // It keeps the placement (`Placed::replacement`), not `placed`'s word.
+                module.keeps_plan = self.keeps_plan;
                 module
             })
             .map_err(DataError::Unavailable)
@@ -244,7 +321,9 @@ impl DataSource for Module {
 
     /// The seam's signatures, from the plan's `sources` table (LLP 1027 D2).
     fn bind(&mut self, plan: &Plan) {
-        self.plan = Some(plan.clone());
+        if self.keeps_plan {
+            self.plan = Some(plan.clone());
+        }
         self.sigs.clear();
         for row in &plan.sources {
             let start = row.params.start as usize;
@@ -260,17 +339,42 @@ impl DataSource for Module {
                 .unwrap_or_else(|| Err("a source's parameters run past the table".into()));
             let result = Shape::from_plan(plan, row.ty);
             if let (Ok(params), Ok(result)) = (params, result) {
-                self.sigs
-                    .insert(plan.str(row.name).to_string(), Sig { params, result });
+                self.sigs.insert(
+                    plan.str(row.name).to_string(),
+                    Sig {
+                        params,
+                        result,
+                        rows: Default::default(),
+                    },
+                );
             }
         }
     }
 
     /// The bake's path and the in-process path: no store, and an answer that
-    /// awaits a fetch cannot be given now.
+    /// awaits a fetch cannot be given now. One that awaits its own timers is
+    /// given: each fires at once, on a clock that moves to it, as `clock
+    /// settle` would (LLP 1027.000 D1).
     fn query(&mut self, source: &str, args: &[Value]) -> Result<Value, DataError> {
-        match self.begin(None, None, source, args)? {
+        let mut answer = self.begin(None, None, source, args)?;
+        for _ in 0..TIMERS_AT_BAKE {
+            match answer {
+                Answer::Later(request) if request.due_ms.is_some() => {
+                    answer = self.resume(None, None, source, args, Dispatch::again_outcome())?;
+                }
+                _ => break,
+            }
+        }
+        match answer {
             Answer::Now(v) => Ok(v),
+            Answer::Later(request) if request.due_ms.is_some() => {
+                self.forget_calls(request.continuation.into_iter().collect());
+                self.parked
+                    .retain(|(k, _)| *k != Module::key(None, source, args));
+                Err(DataError::Unavailable(format!(
+                    "`{source}` waited on more than {TIMERS_AT_BAKE} timers, and there is no clock to run them here"
+                )))
+            }
             Answer::Later(_) => {
                 self.parked
                     .retain(|(k, _)| *k != Module::key(None, source, args));
@@ -287,6 +391,19 @@ impl DataSource for Module {
         source: &str,
         args: &[Value],
     ) -> Result<Answer, DataError> {
+        // A handler a module calls back (LLP 1133.016 D9): `tools[name]`,
+        // its arguments and its value JSON text (the prelude's `tool`).
+        if source.starts_with(TOOL) && !self.sigs.contains_key(source) {
+            let (params, result) = (vec![Shape::String], Shape::String);
+            self.sigs.insert(
+                source.to_owned(),
+                super::Sig {
+                    params,
+                    result,
+                    rows: Default::default(),
+                },
+            );
+        }
         let answer = self.begin(Some(store), None, source, args);
         self.refresh_background();
         answer
@@ -299,7 +416,7 @@ impl DataSource for Module {
         args: &[Value],
         outcome: Outcome,
     ) -> Result<Answer, DataError> {
-        let answer = self.resume(store, None, source, args, outcome);
+        let answer = self.resume(Some(store), None, source, args, outcome);
         self.refresh_background();
         answer
     }
@@ -329,7 +446,7 @@ impl DataSource for Module {
         args: &[Value],
         outcome: Outcome,
     ) -> Result<Answer, DataError> {
-        let answer = self.resume(store, Some(target), source, args, outcome);
+        let answer = self.resume(Some(store), Some(target), source, args, outcome);
         self.refresh_background();
         answer
     }

@@ -171,7 +171,12 @@ fn collect(core: &Core, woke: &Receiver<()>, count: usize) -> Vec<(u64, Outcome)
         outcomes.extend(core.drain().into_iter().map(|(t, o, _)| (t, o)));
         if outcomes.len() < count {
             woke.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap();
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{} of {count} outcomes within the hang bound: {outcomes:?}",
+                        outcomes.len()
+                    )
+                });
         }
     }
     outcomes
@@ -182,10 +187,18 @@ fn bytes(core: &Core) -> [usize; 2] {
 }
 
 /// `until` within the hang bound.
-fn eventually(mut until: impl FnMut() -> bool) {
+fn eventually(until: impl FnMut() -> bool) {
+    eventually_said("a condition", until)
+}
+
+/// [`eventually`], saying what it waited for when the hang bound passes.
+fn eventually_said(what: &str, mut until: impl FnMut() -> bool) {
     let deadline = Instant::now() + HANG;
     while !until() {
-        assert!(Instant::now() < deadline, "not within the hang bound");
+        assert!(
+            Instant::now() < deadline,
+            "{what}: not within the hang bound"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -354,6 +367,37 @@ fn a_forgotten_running_write_keeps_the_ordered_slot_until_it_ends() {
     script.answer("https://a.example.test/next", b"ok");
     let outcomes = collect(&core, &woke, 1);
     assert_eq!(outcomes[0].0, 2, "the forgotten write's outcome is dropped");
+}
+
+#[test]
+fn an_app_aborted_running_write_frees_the_ordered_slot_at_once() {
+    // As `a_forgotten_running_write_keeps_the_ordered_slot_until_it_ends`,
+    // but the app aborted the write: its exchange is cancelled and claimed
+    // now, so the next ordered request starts without waiting for a reply.
+    let script = Arc::new(Script::default());
+    let (core, woke) = core(&script, ORIGINS);
+    let mut post = Request::get("https://a.example.test/post");
+    post.method = "POST".into();
+    core.run(job(1, post), None).unwrap();
+    core.run(job(2, Request::get("https://a.example.test/next")), None)
+        .unwrap();
+    script.wait(1);
+    core.cancel(&[1]);
+    assert_eq!(
+        script.wait(2),
+        2,
+        "the next starts once the write is cancelled"
+    );
+    script.answer("https://a.example.test/next", b"ok");
+    let outcomes = collect(&core, &woke, 1);
+    assert_eq!(outcomes[0].0, 2, "the aborted write's outcome is dropped");
+    // Its bytes go when its transport ends, as a forgotten read's do.
+    script
+        .take("https://a.example.test/post")
+        .sink
+        .end(Err(ibex2::boundary::HostError::Failed("cancelled".into())));
+    eventually(|| bytes(&core) == [0, 0]);
+    assert!(core.drain().is_empty());
 }
 
 #[test]
@@ -730,7 +774,9 @@ fn portable_upload_reserves_the_blocking_workers_additional_copy() {
             ),
             None,
         )
-        .unwrap();
+        .unwrap_or_else(|why| {
+            panic!("portable={portable}: the upload was refused at admission: {why}")
+        });
         if portable {
             let outcomes = collect(&core, &woke, 1);
             assert!(
@@ -743,14 +789,21 @@ fn portable_upload_reserves_the_blocking_workers_additional_copy() {
                 "refused before reading or transport activation"
             );
         } else {
-            script.wait(1);
+            assert_eq!(
+                script.wait(1),
+                1,
+                "portable=false: the upload never reached the transport"
+            );
             script.answer("https://a.example.test/", b"ok");
             assert!(matches!(
                 &collect(&core, &woke, 1)[0].1,
                 Outcome::Response(_)
             ));
         }
-        eventually(|| bytes(&core) == [0, 0]);
+        eventually_said(
+            &format!("portable={portable}: the lane's bytes released"),
+            || bytes(&core) == [0, 0],
+        );
     }
 }
 
@@ -816,25 +869,37 @@ fn reader_spawn_failure_and_panics_settle_and_release_the_lane() {
             job(1, upload("https://a.example.test/", "app:/tmp/file", 1024)),
             None,
         )
-        .unwrap();
+        .unwrap_or_else(|why| {
+            panic!("{phase:?}: the first upload was refused at admission: {why}")
+        });
         assert!(matches!(
             &collect(&core, &woke, 1)[0].1,
             Outcome::Failed { .. }
         ));
-        eventually(|| bytes(&core) == [0, 0]);
+        eventually_said(&format!("{phase:?}: the lane's bytes released"), || {
+            bytes(&core) == [0, 0]
+        });
         *machine.reader_hook.lock().unwrap() = None;
         core.run(
             job(2, upload("https://a.example.test/", "app:/tmp/file", 1024)),
             None,
         )
-        .unwrap();
-        assert_eq!(script.wait(1), 1);
+        .unwrap_or_else(|why| {
+            panic!("{phase:?}: the second upload was refused at admission: {why}")
+        });
+        assert_eq!(
+            script.wait(1),
+            1,
+            "{phase:?}: the second upload never reached the transport"
+        );
         script.answer("https://a.example.test/", b"alive");
         assert!(matches!(
             &collect(&core, &woke, 1)[0].1,
             Outcome::Response(_)
         ));
-        eventually(|| bytes(&core) == [0, 0]);
+        eventually_said(&format!("{phase:?}: the lane's bytes released"), || {
+            bytes(&core) == [0, 0]
+        });
     }
 }
 

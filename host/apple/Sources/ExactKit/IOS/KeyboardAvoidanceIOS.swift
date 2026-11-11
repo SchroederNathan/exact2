@@ -2,11 +2,11 @@
 // section stay above the keyboard, as in a UIKit table or a SwiftUI `Form`:
 // the nearest scroller (a `scroll`, a list, a grouped list's collection
 // view) scrolls by the least that shows them, in the keyboard's own
-// animation (Presenter.applyKeyboard), on focus and on every keyboard frame;
+// animation (Presenter.refitKeyboard), on focus and on every keyboard frame;
 // and a tab container keeps the screen's height under the keys, so its
 // floating tab bar is covered by them as UIKit's is, never riding above them
-// over the field. The viewport itself ends at the keyboard's top
-// (`resizes-content`, LLP 1116 D2; ExactView `fit`).
+// over the field. Under `resizes-content`, the editing route's layout block
+// ends at the keyboard; an ordinary page resizes its viewport instead.
 //
 // @ref LLP 1116.008 D8 — and above content pinned over the scroller's bottom
 // edge (an absolute bar riding the keyboard): what a pinned bar hides of the
@@ -15,6 +15,23 @@
 #if os(iOS) || os(tvOS)
 import UIKit
 
+/// One keyboard contribution to a scroll view's shared bottom insets.
+final class KeyboardInset {
+    private var amount: CGFloat = 0
+    func apply(_ desired: CGFloat, to scroll: UIScrollView) {
+        let change = desired - amount
+        // Record the contribution before UIKit setters can reenter layout
+        amount = desired
+        guard change != 0 else { return }
+        var inset = scroll.contentInset
+        inset.bottom += change
+        scroll.contentInset = inset
+        var indicators = scroll.verticalScrollIndicatorInsets
+        indicators.bottom += change
+        scroll.verticalScrollIndicatorInsets = indicators
+    }
+}
+
 extension Presenter {
     /// Scroll a node into the part of the viewport the keyboard leaves —
     /// the browser's rule for a focused field — through every scroll
@@ -22,8 +39,10 @@ extension Presenter {
     /// its edges. Animated by whatever animation block this runs inside.
     /// The nearest one keeps the rest of the node's section in view too when
     /// all of it fits (`kept`): the Add button under an inline number field.
-    func reveal(_ node: NodeView?) {
+    /// With `rect`, in the node's space, only that part of it is shown.
+    func reveal(_ node: NodeView?, rect: CGRect? = nil) {
         guard let node, node.window != nil else { return }
+        if surface(containing: node)?.kind == .popover { menus.rehostPopovers() }
         var v: UIView? = node.superview, nearest = true
         while let cur = v {
             var target: UIScrollView? = cur is ScrollView || cur is GroupedScroller ? cur as? UIScrollView : nil
@@ -38,7 +57,7 @@ extension Presenter {
                 // and the rows of the cells it brought in are carried there
                 // (a cell kept from before the keys came up showed empty).
                 for _ in 0..<(sv is GroupedScroller ? 3 : 1) {
-                    guard show(node, in: sv, keep: nearest, covered: pinnedCover(over: sv, field: node)) else { break }
+                    guard show(node, rect: rect, in: sv, keep: nearest && rect == nil, covered: pinnedCover(over: sv, field: node)) else { break }
                     guard sv is GroupedScroller else { continue }
                     carryRows(laying: sv)
                     sv.window?.layoutIfNeeded()
@@ -50,14 +69,38 @@ extension Presenter {
         }
     }
 
-    /// The colour the content at the viewport's bottom edge goes on with
+    /// Show the caret of the text area being typed into through every
+    /// scroller above it, as a browser does after an edit (UIKit and SwiftUI
+    /// leave a growing text area's new line under the keys). A browser does
+    /// so after the edit's `input` handlers run, so a handler that moved the
+    /// focus or hid the text area leaves nothing to show.
+    func revealCaret(of node: NodeView) {
+        guard let text = node.textArea, editor === node,
+              !sequence(first: text as UIView, next: \.superview).contains(where: \.isHidden),
+              let end = text.selectedTextRange?.end else { return }
+        let caret = text.caretRect(for: end)
+        guard !caret.isNull, !caret.isInfinite else { return }
+        // Keep the caret within what the text view shows: it scrolls itself
+        // to the caret only later, and a large font's caret can be taller
+        // than a short text area
+        let shown = text.bounds, height = min(caret.height, shown.height)
+        let y = min(max(caret.minY, shown.minY), shown.maxY - height)
+        reveal(node, rect: text.convert(CGRect(x: caret.minX, y: y, width: caret.width, height: height), to: node))
+    }
+
+    /// The colour the content above the keyboard goes on with
     /// below it (ExactView `paintUnderKeys`): the background of the scroller
     /// there (a grouped list's), or the nearest painted box above it (a
     /// route's backdrop), never a row's own. Nil where nothing is painted.
     func bottomEdgeColor() -> UIColor? {
-        let b = viewport.bounds
-        guard b.height > 1, let hit = viewport.hitTest(CGPoint(x: b.midX, y: b.maxY - 1), with: nil) else { return nil }
-        let chain = Array(sequence(first: hit, next: { $0 === self.viewport ? nil : $0.superview }))
+        var b = viewport.bounds.inset(by: pageMargins)
+        if let top = keyboardTop, let window = viewport.window {
+            let edge = viewport.convert(CGPoint(x: 0, y: top), from: window).y
+            b.size.height = max(0, min(b.maxY, edge) - b.minY)
+        }
+        let host = documentHost
+        guard b.height > 1, let hit = host.hitTest(host.convert(CGPoint(x: b.midX, y: b.maxY - 1), from: viewport), with: nil) else { return nil }
+        let chain = Array(sequence(first: hit, next: { $0 === host ? nil : $0.superview }))
         let from = chain.firstIndex { $0 is UIScrollView } ?? 0
         return chain[from...].lazy.compactMap { v in
             v.backgroundColor.flatMap { $0.resolvedColor(with: v.traitCollection).cgColor.alpha > 0.99 ? $0 : nil }
@@ -74,7 +117,7 @@ extension Presenter {
     func pinnedCover(over sv: UIScrollView, field node: NodeView) -> CGFloat {
         guard let window = sv.window else { return 0 }
         let owner = (sv.superview as? NodeView).flatMap { $0.scrollView === sv ? $0 : nil }
-        let port = sv.convert(sv.bounds.inset(by: owner?.scrollPortInsets(sv) ?? sv.adjustedContentInset), to: window)
+        let port = sv.convert(sv.pageBounds.inset(by: owner?.scrollPortInsets(sv) ?? sv.adjustedContentInset), to: window)
         guard port.height > 1, port.width > 1 else { return 0 }
         var top = port.maxY
         func consider(_ box: NodeView) {
@@ -89,7 +132,7 @@ extension Presenter {
         var child: UIView = sv, up = sv.superview
         while let parent = up {
             if let at = parent.subviews.firstIndex(of: child) {
-                for case let sibling as NodeView in parent.subviews[(at + 1)...] where sibling.style["position_type"]?.string == "absolute" {
+                for case let sibling as NodeView in parent.subviews[(at + 1)...] where sibling.layoutPosition == "absolute" {
                     consider(sibling)
                 }
             }
@@ -109,34 +152,41 @@ extension Presenter {
         }
     }
 
-    /// Scroll `sv` by the least that shows the node, with a little air, and
-    /// with `keep` the rest of its section when all of it fits; whether it moved.
-    private func show(_ node: NodeView, in sv: UIScrollView, keep: Bool, covered: CGFloat = 0) -> Bool {
-        let field = node.convert(node.bounds, to: sv)
+    /// Scroll `sv` by the least that shows the node (or `rect` in it), with a
+    /// little air, and with `keep` the rest of its section when all of it
+    /// fits; whether it moved.
+    private func show(_ node: NodeView, rect: CGRect? = nil, in sv: UIScrollView, keep: Bool, covered: CGFloat = 0) -> Bool {
+        let field = node.convert(rect ?? node.bounds, to: sv)
         let owner = (sv.superview as? NodeView).flatMap { $0.scrollView === sv ? $0 : nil }
-        var visible = sv.bounds.inset(by: owner?.scrollPortInsets(sv) ?? sv.adjustedContentInset)
+        var visible = sv.pageBounds.inset(by: owner?.scrollPortInsets(sv) ?? sv.adjustedContentInset)
         visible.size.height = max(0, visible.height - covered)
         var r = field.insetBy(dx: 0, dy: -8)
-        if keep, let span = Self.kept(node, field: field, in: sv), span.height + 16 <= visible.height {
-            r = CGRect(x: field.minX, y: span.minY, width: field.width, height: span.height).insetBy(dx: 0, dy: -8)
+        if keep, let span = Self.kept(node, field: field, in: sv) {
+            if span.height + 16 <= visible.height {
+                r = CGRect(x: field.minX, y: span.minY, width: field.width, height: span.height).insetBy(dx: 0, dy: -8)
+            } else if span.maxY > field.maxY {
+                // Too tall to show whole: the field at the top and as much of
+                // what follows it as fits, its hint first.
+                let end = min(span.maxY, field.minY + visible.height - 16)
+                r = CGRect(x: field.minX, y: field.minY, width: field.width, height: max(field.height, end - field.minY)).insetBy(dx: 0, dy: -8)
+            }
         }
         var o = sv.contentOffset
         if r.maxY > visible.maxY { o.y += r.maxY - visible.maxY } else if r.minY < visible.minY { o.y -= visible.minY - r.minY }
         if r.maxX > visible.maxX { o.x += r.maxX - visible.maxX } else if r.minX < visible.minX { o.x -= visible.minX - r.minX }
         // A field at the end of the content, under a bar pinned over it, has no
         // offset that shows it above the bar: the scroller takes room below
-        // its content for as long as the keyboard is up (`PinnedRoom`).
-        if covered > 0 {
+        // its content for as long as the keyboard is up (`PinnedRoom`), and
+        // none once it is down (a field still focused as it goes, revealed
+        // again after the room was given back, would keep that room at rest).
+        if covered > 0, keyboardTop != nil {
             let high = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.height
             if o.y > high + 0.5 { pinnedRoom.grow(sv, by: o.y - high) }
         }
-        let clamped = { (o: CGPoint, i: UIEdgeInsets) in
-            CGPoint(x: min(max(o.x, -i.left), max(-i.left, sv.contentSize.width + i.right - sv.bounds.width)),
-                    y: min(max(o.y, -i.top), max(-i.top, sv.contentSize.height + i.bottom - sv.bounds.height)))
-        }
         let insets = sv.adjustedContentInset
-        o = clamped(o, insets)
         guard abs(o.y - sv.contentOffset.y) > 0.5 || abs(o.x - sv.contentOffset.x) > 0.5 else { return false }
+        o = PixelGrid.offset(o, in: sv)
+        guard o != sv.contentOffset else { return false }
         sv.contentOffset = o
         // The bar's large title collapsing as the list scrolls changes its
         // insets inside this assignment, and UIKit moves the offset on by the
@@ -144,8 +194,8 @@ extension Presenter {
         // with the field shown, so no later pass takes it back. The offset
         // asked for, within the new insets, is the least.
         if sv.adjustedContentInset != insets {
-            let held = clamped(o, sv.adjustedContentInset)
-            if abs(held.y - sv.contentOffset.y) > 0.5 || abs(held.x - sv.contentOffset.x) > 0.5 { sv.contentOffset = held }
+            let held = PixelGrid.offset(o, in: sv)
+            if held != sv.contentOffset { sv.contentOffset = held }
         }
         return true
     }
@@ -185,16 +235,18 @@ extension Presenter {
 final class PinnedRoom {
     private struct Grown {
         weak var scroll: UIScrollView?
-        var base: CGFloat, added: CGFloat
+        var added: CGFloat
     }
     private var grown: [ObjectIdentifier: Grown] = [:]
 
     /// `extra` more points below the content, on top of what it already took.
+    /// Only its own share of the inset is added and taken back: a page band
+    /// may change the rest meanwhile (LLP 1130 D3).
     func grow(_ sv: UIScrollView, by extra: CGFloat) {
         let id = ObjectIdentifier(sv)
-        var room = grown[id] ?? Grown(scroll: sv, base: sv.contentInset.bottom, added: 0)
+        var room = grown[id] ?? Grown(scroll: sv, added: 0)
         room.added += extra
-        sv.contentInset.bottom = room.base + room.added
+        sv.contentInset.bottom += extra
         grown[id] = room
     }
 
@@ -203,9 +255,9 @@ final class PinnedRoom {
     func release() {
         for room in grown.values {
             guard let sv = room.scroll else { continue }
-            sv.contentInset.bottom = room.base
+            sv.contentInset.bottom -= room.added
             let high = max(-sv.adjustedContentInset.top, sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.height)
-            if sv.contentOffset.y > high { sv.contentOffset.y = high }
+            if sv.contentOffset.y > high { sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: high), in: sv) }
         }
         grown = [:]
     }
@@ -216,17 +268,25 @@ extension NodeView {
     /// What a drag on this node's scroller does to the keyboard. Unsaid, on
     /// a scroller that scrolls vertically, the keyboard follows a drag that
     /// reaches it (`.interactive`), as a hand-built list or form has it; it
-    /// never takes the keyboard from someone who was only scrolling. A
-    /// sideways scroller keeps UIKit's `.none`. An authored
-    /// `keyboardDismissMode` wins, `none` included: the prop has no default
-    /// row, so unsaid it is absent from the node's props, and absence is the
-    /// whole test.
+    /// never takes the keyboard from someone who was only scrolling. While
+    /// its route's bar search field is being typed in, a drag puts the
+    /// keyboard away (`.onDrag`), as SwiftUI's `searchable` list does and as
+    /// Contacts and Mail do, the search staying open. A sideways scroller
+    /// keeps UIKit's `.none`. An authored `keyboardDismissMode` wins, `none`
+    /// included: the prop has no default row, so unsaid it is absent from
+    /// the node's props, and absence is the whole test.
     var keyboardDismissal: UIScrollView.KeyboardDismissMode {
         switch props["keyboardDismissMode"] {
         case "interactive": return .interactive
         case "on-drag": return .onDrag
         case "none": return .none
-        default: return scrollsVertically ? .interactive : .none
+        default:
+            guard scrollsVertically else { return .none }
+            #if os(iOS)
+            let route = ViewPresentation.controllers(for: self).lazy.compactMap { $0 as? RouteController }.first
+            if route?.search?.controller.searchBar.searchTextField.isEditing == true { return .onDrag }
+            #endif
+            return .interactive
         }
     }
     /// Written again when the prop or the axes the node scrolls change; a
@@ -238,6 +298,12 @@ extension NodeView {
 }
 
 extension Presenter {
+    /// A bar's search field began or ended editing: the scrollers under it
+    /// take their drag's answer again (`keyboardDismissal`).
+    func searchEditingChanged() {
+        for id in scrollers { views[id]?.updateKeyboardDismissal() }
+    }
+
     /// Return with `enterkeyhint="next"`: the next field, shown as focus
     /// shows any (`reveal`). In a grouped list that is the list's own order,
     /// which its cells among a window's views are not, and a row scrolled
@@ -246,33 +312,37 @@ extension Presenter {
     /// as SwiftUI's focus moves through a `Form`. Past the list's last field
     /// the keyboard goes; outside a list, the window's next field.
     func focusNextField(after node: NodeView) -> Bool {
-        guard let (list, owner, path) = Self.listCell(of: node), let rows = groupedLists?.rows(for: owner.id),
+        guard let (_, owner, path) = Self.listCell(of: node), let rows = groupedLists?.rows(for: owner.id),
               rows.indices.contains(path.section), rows[path.section].indices.contains(path.item) else {
             return moveFocus(backward: false, fields: true)
         }
         // The fields after `node` in its own row, then each later row's.
-        var candidates = Self.fields(in: views[rows[path.section][path.item]]).drop { $0 !== node }.dropFirst().map { (path, $0) }
+        var candidates = Array(Self.fields(in: views[rows[path.section][path.item]]).drop { $0 !== node }.dropFirst())
         for (s, section) in rows.enumerated() where s >= path.section {
             for (i, row) in section.enumerated() where s > path.section || i > path.item {
-                candidates += Self.fields(in: views[row]).map { (IndexPath(item: i, section: s), $0) }
+                candidates += Self.fields(in: views[row])
             }
             if !candidates.isEmpty { break }
         }
-        guard let (at, next) = candidates.first, let field = next.field ?? next.textArea else { return false }
-        let hidden = sequence(first: next as UIView, next: \.superview).contains { $0.isHidden }
-        if next.window == nil || hidden {
-            // Its row has no cell: bring it into the list's port first,
-            // which makes its cell and carries the row there.
-            guard let frame = list.layoutAttributesForItem(at: at)?.frame else { return false }
-            let visible = list.bounds.inset(by: list.adjustedContentInset), i = list.adjustedContentInset
-            var y = list.contentOffset.y
-            if frame.maxY > visible.maxY { y += frame.maxY - visible.maxY } else if frame.minY < visible.minY { y -= visible.minY - frame.minY }
-            y = min(max(y, -i.top), max(-i.top, list.contentSize.height + i.bottom - list.bounds.height))
-            if ExactEnv.agentFreezes { list.contentOffset.y = y } else { UIView.animate(withDuration: 0.25) { list.contentOffset.y = y } }
-            carryRows(laying: list)
-        }
-        next.focusedByTouch = false
+        guard let next = candidates.first, let field = next.field ?? next.textArea else { return false }
+        carryGroupedRow(containing: next)
+        chooseFocus(next)
         return field.becomeFirstResponder()
+    }
+
+    /// Carry a field's row into a native cell before focus. Read native geometry
+    /// because rows with no cell wait in a hidden authored section.
+    func carryGroupedRow(containing node: NodeView) {
+        guard let list = groupedLists?.scroller(for: node.id),
+              node.window == nil || sequence(first: node as UIView, next: \.superview).contains(where: { $0.isHidden }),
+              let frame = groupedLists?.projectedRect(for: node, in: list) else { return }
+        let visible = list.bounds.inset(by: list.adjustedContentInset), insets = list.adjustedContentInset
+        var y = list.contentOffset.y
+        if frame.maxY > visible.maxY { y += frame.maxY - visible.maxY } else if frame.minY < visible.minY { y -= visible.minY - frame.minY }
+        y = min(max(y, -insets.top), max(-insets.top, list.contentSize.height + insets.bottom - list.bounds.height))
+        let offset = PixelGrid.offset(CGPoint(x: list.contentOffset.x, y: y), in: list)
+        if ExactEnv.agentFreezes { list.contentOffset = offset } else { UIView.animate(withDuration: 0.25) { list.contentOffset = offset } }
+        carryRows(laying: list)
     }
 
     /// The grouped list cell `node` is carried in: its collection view, the
@@ -299,26 +369,32 @@ extension Presenter {
 }
 
 extension NavigationHost {
-    /// The frame of the controller Exact installed under the root: the
-    /// root's bounds, and for a tab container, while the keyboard ends the
-    /// viewport above the screen's bottom, down to that bottom: its tab bar
-    /// stays under the keys, as UIKit's does, and the routes, laid out to
-    /// the keyboard's top, end there with nothing of the bar left over them
-    /// (`reportCovers` reads what is left of it).
+    /// The primary controller keeps its native bounds while route content avoids the keyboard.
     func ownerFrame(_ owner: UIViewController, in root: UIView) -> CGRect {
-        var frame = root.bounds
-        if owner === tabOwner, !ExactEnv.authoredChrome, !presenter.modals.active, presenter.keyboardPolicy == "resizes-content" {
-            frame.size.height += presenter.keyboardInset
+        let viewport = presenter.viewport
+        var frame = !ExactEnv.authoredChrome && presenter.inDocument(root) ? viewport.convert(viewport.pageBounds, to: root) : root.bounds
+        frame.size.height += ownerKeyboardExtension(owner)
+        // The authored tablist the agent paints takes its own place in the
+        // root, as on the web; the routes end at its edge, not under it.
+        if owner === tabOwner, ExactEnv.authoredChrome, let list = adoptedTablist.flatMap({ presenter.views[$0] }),
+           list.style["display"]?.string != "none", list.isDescendant(of: root) {
+            let rect = list.convert(list.bounds, to: root)
+            if rect.height > 0, rect.minY >= frame.midY {
+                frame.size.height = max(0, min(frame.maxY, rect.minY) - frame.minY)
+            } else if rect.height > 0, rect.maxY <= frame.midY {
+                let cut = max(0, rect.maxY - frame.minY)
+                frame.origin.y += cut
+                frame.size.height = max(0, frame.height - cut)
+            }
         }
         return frame
     }
 
-    /// The keyboard moved the viewport (ExactView `fit`): the tab container
-    /// keeps the screen's height under it.
-    func fitOwner() {
-        guard let owner = tabOwner, modalNavigation == nil, let root = owner.view.superview else { return }
-        let frame = ownerFrame(owner, in: root)
-        if owner.view.frame != frame { owner.view.frame = frame }
+    func ownerKeyboardExtension(_ owner: UIViewController) -> CGFloat {
+        #if os(iOS)
+        if ExactEnv.authoredChrome, owner === primaryOwner, presenter.keyboardPolicy == "resizes-content" { return presenter.keyboardAccessoryHeight }
+        #endif
+        return 0
     }
 }
 #endif

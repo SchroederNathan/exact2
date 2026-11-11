@@ -358,6 +358,21 @@ component A
     input value=q change=set
       text "inside an input"
 ---
+== lower-leaf-children
+# LLP 1011.002 D1: an image in text is its paragraph's own child.
+component A
+  view
+    text
+      text
+        image "app:/a.png"
+---
+== lower-css-shorthand
+# LLP 1011.002 D1: `top` aligns to the line box, which is not built.
+component A
+  view
+    text
+      image "app:/a.png" vertical-align="top"
+---
 == lower-native-attr
 # LLP 1024 D1: a known row a module's box never uses is refused, not bound
 # to nothing while the module waits for the prop.
@@ -842,6 +857,15 @@ component App
   view
     text "home"
 ---
+== type-haptic
+component App
+  state big = false
+  action buzz
+    haptic(big ? "heavy" : "impact-light")
+  view
+    button press=buzz
+      text "Buzz"
+---
 == analyze-routes-not-root
 routes nav
   home "/"
@@ -1044,21 +1068,6 @@ component Child
     button press=go
       text "a"
 ---
-== analyze-call-stale-read
-# A callee reads the state the action started with: a slot its caller
-# assigned first is stale behind the call (LLP 1089 D3).
-component A
-  state sel = 0
-  state seen = 0
-  action follow
-    seen = sel
-  action go
-    sel = 2
-    follow()
-  view
-    button press=go
-      text "a"
----
 == type-share-argument
 # `share` takes the Web Share API's names, named (LLP 1069.003 D1).
 component A
@@ -1140,47 +1149,20 @@ component A
     button press=go
       text "a"
 ---
-== type-notification-argument
-# `showNotification` takes the Notification API's names, named.
-component A
-  action go
-    showNotification("Stretch")
-  view
-    button press=go
-      text "a"
----
-== type-notification-argument
-# It needs a title.
-component A
-  action go
-    showNotification(body="Five minutes")
-  view
-    button press=go
-      text "a"
----
-== type-notification-argument
-# `showTrigger` is a time in epoch milliseconds, not text.
-component A
-  action go
-    showNotification(title="Stretch", showTrigger="7:30")
-  view
-    button press=go
-      text "a"
----
-== type-notification-argument
-# `closeNotification` takes the tag.
-component A
-  action go
-    closeNotification()
-  view
-    button press=go
-      text "a"
----
 == type-file-picker-argument
 # `showSaveFilePicker` takes (id, suggestedName) (LLP 1069.010 D2).
 component A
   action go
     showSaveFilePicker("out")
+  view
+    button press=go
+      text "a"
+---
+== type-permission-argument
+# `requestPermission` takes (id, path, mode), mode "read" or "readwrite" (LLP 1069.010.000 D7).
+component A
+  action go
+    requestPermission("asked", "doc:/1/notes.md", "write")
   view
     button press=go
       text "a"
@@ -1261,6 +1243,19 @@ component A
 == lower-attr-value
 component A
   view
+    button -exact-press-opacity=1.2
+      text "a"
+---
+== lower-keyframe-property
+keyframes wash
+  to -exact-press-background-color="#eee"
+component A
+  view
+    text "a"
+---
+== lower-attr-value
+component A
+  view
     view transform-origin="10px left"
       text "a"
 ---
@@ -1309,14 +1304,6 @@ component A
 # LLP 1116.015 D2: a list type is `T[]`.
 shape S
   xs: list<number>
-component A
-  view
-    text "a"
----
-== syntax-length-field
-# LLP 1116.015 D2: `.length` is a list's or text's length, so no field takes the name.
-shape S
-  length: number
 component A
   view
     text "a"
@@ -1744,15 +1731,6 @@ component A
   view
     text "a"
 ---
-== lower-sequence-clock
-# Clock in is LLP 1125 stage 4.
-component A
-  state on = false
-  sequence s when on
-    play([], bpm=120, clock="op-xy")
-  view
-    text "a"
----
 == type-send-midi
 # A literal message is held to MIDI 1.0: no running status.
 component A
@@ -1824,3 +1802,339 @@ component A
   view
     text m.state
 ---
+== syntax-expected-statement
+# Another action is called with its parentheses: `play()`.
+component A
+  state on = false
+  action play
+    on = true
+  action toggle
+    play
+  view
+    button "t" press=toggle
+---
+== type-prop-hides-fn
+# In B the call `pick(…)` under `text` is the fn to the checker and the bound action once inlined;
+# a handler `press=pick(…)` alone would be the action both ways.
+fn pick(xs: string[], i: number): string = match xs.at(i) { case some(s) => s, case none => "" }
+component A
+  state chosen = ""
+  action go(s: string)
+    chosen = s
+  view
+    B(pick=go)
+component B
+  props
+    pick: action
+  view
+    button "b" press=pick("b")
+    text pick(["a"], 0)
+---
+== type-prop-hides-fn
+# A value prop can redirect the call head to another fn during inlining.
+fn pick(n: number): number = n + 1
+fn other(n: number): number = n + 100
+component App
+  state other = 7
+  view
+    Seg(pick=other)
+component Seg
+  props
+    pick: number
+  view
+    text `${pick(1)}`
+---
+== type-prop-hides-fn
+# Injected values undergo the same call-head substitution as props.
+fn pick(n: number): number = n + 1
+fn other(n: number): number = n + 100
+component App
+  state other = 7
+  provide
+    pick = other
+  view
+    Seg()
+component Seg
+  inject
+    pick: number
+  view
+    text `${pick(1)}`
+---
+== type-handler-action
+# B's handler names A's action: B takes it as an `action` prop.
+component A
+  state v = ""
+  action go(s: string)
+    v = s
+  view
+    B()
+component B
+  view
+    button "go" press=go("x")
+---
+== lower-iframe-partition-sandbox
+# LLP 1020.002 D1: a partitioned guest is a top-level page, which WebKit
+# cannot sandbox; the host would have to fail open.
+component A
+  view
+    iframe "https://example.com" partition="persist:work" sandbox="allow-scripts"
+---
+== lower-iframe-partition-message
+# LLP 1020.002 D1: a partitioned guest has no message bridge.
+component A
+  action got(data: string)
+    let x = data
+  view
+    iframe "https://example.com" partition="persist:work" message=got
+---
+== lower-iframe-partition-message
+component A
+  action send
+    postMessage("hi", "tab")
+  view
+    iframe "https://example.com" id="tab" partition="work"
+    button "send" press=send
+---
+== lower-iframe-partition-src
+# LLP 1020.002 D1: a bundled or `app:/` page is the app's own; a
+# partitioned frame never reaches the `exact-app` scheme.
+component A
+  view
+    iframe "/deck/index.html" partition="persist:work"
+---
+== lower-frame-command
+# LLP 1020.002 D3: a literal id that names no iframe.
+component A
+  action back
+    traverseHistory("tab", -1)
+  view
+    iframe "https://example.com" id="page" partition="work"
+    button "back" press=back
+---
+== lower-frame-capture-path
+# LLP 1020.002 D7: a capture writes under the app's own roots.
+component A
+  action snap
+    captureScreenshot("tab", "/tmp/shot.png")
+  view
+    column
+      iframe "https://example.com" id="tab"
+      button "snap" press=snap
+---
+== type-frame-command
+component A
+  action back
+    traverseHistory("tab", "back")
+  view
+    iframe "https://example.com" id="tab" partition="work"
+    button "back" press=back
+---
+== lower-attr-value
+component A
+  view
+    iframe "https://example.com" partition="work" apple.inactiveSchedulingPolicy="sometimes"
+---
+
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=bogus)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=1)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=frame + 1)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=idle, max=0)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=idle, max=-1)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=idle, max=1.5)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=idle, max=4294967296)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=idle, max=count)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=frame, wait=idle)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=idle, max=1, max=2)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, max=1)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=frame, max=1)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, wait=update, max=1)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, tolerance=-1)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, tolerance=1.5)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, tolerance=4294967296)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, tolerance=count)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, tolerance=1, tolerance=2)
+  view
+    text "timer"
+---
+== lower-timer-wait
+component App
+  state count = 0
+  action tick
+    count = count + 1
+  task t mount
+    after(1, tick, tolerance=1, wait=frame)
+  view
+    text "timer"
+---
+== lower-table-content
+component App
+  view
+    table
+      td
+        text "a"
+---
+== lower-dl-content
+component App
+  view
+    column
+      dd
+        text "a"

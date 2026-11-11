@@ -61,9 +61,11 @@ final class HeavyLeaves: NSObject, UIGestureRecognizerDelegate {
     /// before they were made (`state`).
     private(set) var deferred = 0, released = 0, cancelled = 0
 
-    /// A new node's embedded view (from `NodeView.init`): a video's player
-    /// and an iframe's web view are made now, or held; a native module's
-    /// box is registered (its view is made at its first props, `NativeViews`).
+    /// A new node's embedded view (a video's and a module's from
+    /// `NodeView.init`, an iframe's from `embedFrame` once it has its props):
+    /// a video's player and an iframe's web view are made now, or held; a
+    /// native module's box is registered (its view is made at its first
+    /// props, `NativeViews`).
     func embed(_ node: NodeView) {
         if node.kind == "native", let natives = presenter.session?.natives, natives.holds == nil {
             natives.holds = { [weak self] owner in self?.hold(owner) ?? false }
@@ -113,8 +115,9 @@ final class HeavyLeaves: NSObject, UIGestureRecognizerDelegate {
     }
     private func make(_ node: NodeView) {
         guard node.kind == "video" || node.kind == "iframe" else { node.embedPlatformView(presenter); return }
+        if node.kind == "video" { node.video = VideoView(owner: node); return }
         let started = CACurrentMediaTime()
-        if node.kind == "video" { node.video = VideoView(owner: node) } else { node.embedPlatformView(presenter) }
+        node.embedPlatformView(presenter)
         Self.record(node.kind, CACurrentMediaTime() - started)
     }
 

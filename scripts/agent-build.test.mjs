@@ -1,17 +1,52 @@
 // A native drive's build first (agent-build.mjs, LLP 1116.002 D4): the decision an app's exact.mjs makes before
 // `test ios|macos` and `agent ios|macos`, on the driver's own record, with no simulator and no build run.
-import { test } from 'bun:test';
+import { afterEach, beforeEach, test } from 'bun:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 import { appleArtifacts, appleRunBinary } from '../host/apple/build.mjs';
-import { moduleGraph } from './agent-launch.mjs';
-import { buildArgs, buildFirst, buildReason, failureSummary, nativeBuild, overrideDir, planOverride, planSource, rebuildCommand, refuseBuild } from './agent-build.mjs';
-import { resolveApp } from './app.mjs';
+import { moduleGraph, notBuildInput } from './agent-launch.mjs';
+import { buildArgs, buildFirst, buildReason, childFailure, failureSummary, linuxRebuild, nativeBuild, overrideDir, planOverride, planSource, ownVerb, prebuild, rebuildCommand, refuseBuild } from './agent-build.mjs';
+import { openStdio } from './agent-stdio.mjs';
+import { linuxBinary, resolveApp } from './app.mjs';
+
+test('Mac drives use the assembled app bundle even without catalogs or widgets', () => {
+  const { dir } = scratchApp('ats-drive');
+  try {
+    const app = resolveApp(dir);
+    const paths = appleArtifacts(app);
+    assert.equal(appleRunBinary(app), resolve(paths.bundle, 'Contents/MacOS', paths.executable));
+    assert.equal(appleRunBinary(app, true), appleArtifacts(app, { host: true }).binary);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a child failure keeps stderr when stdout ends with successful build progress', () => {
+  assert.match(childFailure({ stderr: 'error: simulator installation failed\n', stdout: 'Building for production...\n[1/2] ExactIOS\nBuild complete!\n' }), /simulator installation failed/);
+  assert.match(childFailure({ error: new Error('spawn ENOENT') }), /spawn ENOENT/);
+  assert.equal(childFailure({ stdout: 'error: compiler failed\n' }), 'error: compiler failed');
+});
+
+test('a child failure retains errors from either stream past warnings and progress', () => {
+  assert.equal(childFailure({ stderr: 'warning: deprecated flag\n', stdout: 'Building...\nerror: could not find sdk\n' }), 'error: could not find sdk');
+  assert.equal(childFailure({ stderr: 'error: simulator installation failed\nwarning: one\nwarning: two\nwarning: three\n', stdout: 'Build complete!\n' }), 'error: simulator installation failed');
+});
+
+test('a metrics build summary does not claim that a drive was planned', () => {
+  const summary = failureSummary('error: missing sdk\n', { host: 'ios', code: 1, log: 'size.log', beforeDrive: false });
+  assert.match(summary, /the iOS build failed \(exit 1\); its whole log: size.log/);
+  assert.doesNotMatch(summary, /driven/);
+});
 
 /** An outside app, as `exact new` lays one out, with only what the decision reads. */
+// Each case starts with no target of the environment's: a command a case expects names one only when it is set
+// (`ownVerb`), and the cases that set one say so.
+const inheritedTarget = process.env.CARGO_TARGET_DIR;
+beforeEach(() => { delete process.env.CARGO_TARGET_DIR; });
+afterEach(() => { if (inheritedTarget === undefined) delete process.env.CARGO_TARGET_DIR; else process.env.CARGO_TARGET_DIR = inheritedTarget; });
+
 function scratchApp(name) {
   const dir = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-agent-build-')));
   const write = (path, text = '') => { mkdirSync(dirname(resolve(dir, path)), { recursive: true }); writeFileSync(resolve(dir, path), text); };
@@ -21,6 +56,125 @@ function scratchApp(name) {
   write('exact.mjs', "// …\nconst built = await run(['scripts/agent-build.mjs', host]);\n");
   return { dir, write };
 }
+
+test('macOS freshness checks the full product receipt when the bundle carries a reduced receipt', () => {
+  const previous = process.env.EXACT_APP_DIR, { dir, write } = scratchApp('ats-drive');
+  try {
+    process.env.EXACT_APP_DIR = dir;
+    const app = resolveApp('ats-drive'), source = resolve(dir, 'source.swift');
+    write('source.swift', 'before');
+    const paths = appleArtifacts(app), executable = resolve(paths.bundle, 'Contents/MacOS', paths.executable);
+    mkdirSync(dirname(executable), { recursive: true }); writeFileSync(executable, '');
+    const receipt = resolve(paths.products, 'receipt.json'), time = new Date(Date.now() + 60_000);
+    mkdirSync(dirname(receipt), { recursive: true });
+    writeFileSync(receipt, JSON.stringify({ target: paths.target, started: time.toISOString(), build: { trust: 'development', binary: { sha256: 'dev',
+      inputs: [{ name: 'source.swift', path: source, sha256: createHash('sha256').update('before').digest('hex') }], missing: [], directories: [] } } }));
+    utimesSync(receipt, time, time);
+    const bundled = resolve(paths.bundle, 'Contents/Resources/receipt.json');
+    mkdirSync(dirname(bundled), { recursive: true });
+    const shipped = JSON.parse(readFileSync(receipt, 'utf8')); shipped.build.binary = { sha256: 'dev' };
+    writeFileSync(bundled, JSON.stringify(shipped));
+    assert.equal(nativeBuild('macos', app).receipt, receipt);
+    assert.deepEqual(nativeBuild('macos', app).changed, []);
+    write('source.swift', 'after');
+    assert.deepEqual(nativeBuild('macos', app).changed, ['source.swift']);
+    write('source.swift', 'before');
+  } finally {
+    if (previous === undefined) delete process.env.EXACT_APP_DIR; else process.env.EXACT_APP_DIR = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a release published after a development build must be rebuilt before an agent drive', () => {
+  const previous = process.env.EXACT_APP_DIR, { dir, write } = scratchApp('release-after-dev');
+  try {
+    process.env.EXACT_APP_DIR = dir;
+    const app = resolveApp('release-after-dev'), paths = appleArtifacts(app), receipt = resolve(paths.products, 'receipt.json');
+    const bundled = resolve(paths.bundle, 'Contents/Resources/receipt.json'), binary = appleRunBinary(app);
+    const development = { built: new Date(Date.now() + 60_000).toISOString(), target: paths.target, composition: paths.composition,
+      build: { trust: 'development', binary: { sha256: 'dev', inputs: [], missing: [], directories: [] } } };
+    write(relative(dir, binary), 'development executable');
+    write(relative(dir, receipt), JSON.stringify(development));
+    write(relative(dir, bundled), JSON.stringify(development));
+    assert.deepEqual(nativeBuild('macos', app).changed, []);
+    const release = { ...development, build: { trust: 'production', binary: { sha256: 'release' } } };
+    write(relative(dir, bundled), JSON.stringify(release));
+    write(relative(dir, binary), 'production executable');
+    const stale = nativeBuild('macos', app);
+    assert.ok(stale.changed.includes(bundled), 'the development source receipt cannot approve a production bundle');
+    assert.throws(() => refuseBuild('macos', stale, app), /build is stale/);
+    write(relative(dir, bundled), JSON.stringify(development));
+    write(relative(dir, binary), 'rebuilt development executable');
+    assert.deepEqual(nativeBuild('macos', app).changed, []);
+  } finally {
+    if (previous === undefined) delete process.env.EXACT_APP_DIR; else process.env.EXACT_APP_DIR = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Both of a Linux drive's refusals (no build, a stale one) name this command (agent-stdio.mjs).
+test('a Linux drive is told the build that writes where it reads', () => {
+  const previous = { app: process.env.EXACT_APP_DIR, target: process.env.CARGO_TARGET_DIR };
+  const { dir } = scratchApp('field-log');
+  // An app directory inside this checkout, under the target/ a build makes and git ignores
+  mkdirSync(resolve(import.meta.dir, '../target'), { recursive: true });
+  const inside = mkdtempSync(resolve(import.meta.dir, '../target/agent-build-inside-'));
+  const target = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-agent-target-')));
+  try {
+    process.env.EXACT_APP_DIR = dir;
+    delete process.env.CARGO_TARGET_DIR;
+    assert.equal(linuxRebuild(resolveApp('field-log')), `(cd '${dir}' && bun exact.mjs linux)`);
+    // A target the environment names is resolved where the drive ran; the command runs in the app, so it names it whole.
+    process.env.CARGO_TARGET_DIR = relative(process.cwd(), target);
+    const app = resolveApp('field-log');
+    assert.equal(app.target, target);
+    assert.equal(linuxRebuild(app), `(cd '${dir}' && CARGO_TARGET_DIR='${target}' bun exact.mjs linux)`);
+    // An Apple host's command names it too.
+    assert.equal(rebuildCommand(app, 'ios'), `(cd '${dir}' && CARGO_TARGET_DIR='${target}' bun exact.mjs ios)`);
+    // An app inside this checkout has no verb of its own, an exact.mjs or not.
+    writeFileSync(resolve(inside, 'exact.mjs'), '');
+    assert.equal(ownVerb({ dir: inside }, 'linux'), null);
+  } finally {
+    for (const [name, value] of [['EXACT_APP_DIR', previous.app], ['CARGO_TARGET_DIR', previous.target]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+    for (const made of [dir, inside, target]) rmSync(made, { recursive: true, force: true });
+  }
+});
+
+// Each refusal reached through the driver, and its command run as written, by an exact.mjs that says where it ran and
+// which target it was given: the one the drive reads.
+test('a Linux drive refused for want of a current build names a command that builds where it reads', async () => {
+  const previous = { app: process.env.EXACT_APP_DIR, target: process.env.CARGO_TARGET_DIR, bin: process.env.EXACT_LINUX_BIN };
+  const { dir, write } = scratchApp('field-log');
+  const target = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-agent-target-')));
+  try {
+    Object.assign(process.env, { EXACT_APP_DIR: dir, CARGO_TARGET_DIR: target });
+    delete process.env.EXACT_LINUX_BIN;
+    const app = resolveApp('field-log'), bin = linuxBinary(app), command = linuxRebuild(app);
+    await assert.rejects(openStdio({ host: 'linux', app: 'field-log' }), { message: `run ${command} first` });
+    // A build a minute older than a source its dep-info names
+    mkdirSync(dirname(bin), { recursive: true });
+    writeFileSync(bin, '');
+    writeFileSync(`${bin}.d`, `${bin}: ${resolve(dir, 'app.contract')}\n`);
+    const now = new Date(), past = new Date(now.getTime() - 60_000);
+    utimesSync(resolve(dir, 'app.contract'), now, now);
+    utimesSync(bin, past, past);
+    await assert.rejects(openStdio({ host: 'linux', app: 'field-log' }), (e) => e.message.includes('linux build is stale') && e.message.includes(`; run ${command}`));
+    const ran = resolve(dir, 'ran.json');
+    write('exact.mjs', `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(ran)}, JSON.stringify({ cwd: process.cwd(), target: process.env.CARGO_TARGET_DIR, verb: process.argv[2] }));\n`);
+    // From a shell whose target is relative, as the drive's was before it resolved it
+    execFileSync('sh', ['-c', command], { env: { ...process.env, CARGO_TARGET_DIR: relative(process.cwd(), target) } });
+    assert.deepEqual(JSON.parse(readFileSync(ran, 'utf8')), { cwd: dir, target, verb: 'linux' });
+    assert.ok(bin.startsWith(`${target}/`), bin);
+  } finally {
+    for (const [name, value] of [['EXACT_APP_DIR', previous.app], ['CARGO_TARGET_DIR', previous.target], ['EXACT_LINUX_BIN', previous.bin]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  }
+});
 
 test('a missing or stale build is built first, said in one line; a fresh one runs nothing and says nothing', async () => {
   const previous = process.env.EXACT_APP_DIR, macBin = process.env.EXACT_MAC_BIN;
@@ -32,19 +186,20 @@ test('a missing or stale build is built first, said in one line; a fresh one run
     const built = new Date(Date.now() + 10_000), edited = new Date(+built + 10_000), before = new Date(Date.now() - 60_000);
     for (const file of ['app.contract', 'app.json', 'exact.mjs', 'apple/Cargo.toml', 'web/Cargo.toml']) utimesSync(resolve(dir, file), before, before);
     const said = [], builds = [];
-    const drive = (host, { sim, code = 0, output = '' } = {}) => buildFirst(host, app, {
-      sim, say: line => said.push(line), wait: () => {}, build: async (args, log) => (builds.push({ args, log }), { code, output }),
+    const drive = (host, { code = 0, output = '' } = {}) => buildFirst(host, app, {
+      say: line => said.push(line), wait: () => {}, build: async (args, log) => (builds.push({ args, log }), { code, output }),
     });
 
     // No build yet: built first, for either host, by the command `bun exact.mjs ios|mac` runs.
     for (const host of ['ios', 'macos']) assert.equal(buildReason(nativeBuild(host, app), app), 'there is no build yet');
     assert.throws(() => refuseBuild('ios', nativeBuild('ios', app), app), new RegExp(`^Error: run \\(cd '${dir}' && bun exact\\.mjs ios\\) first$`));
-    assert.equal(await drive('ios', { sim: 'lane-r5ab' }), 0);
-    assert.deepEqual(builds.map(b => b.args), [['--ios', 'field-log-apple', '--sim', 'lane-r5ab']]);
+    assert.equal(await drive('ios'), 0);
+    // The drive installs, keeping a Release build it replaces: the build installs nothing.
+    assert.deepEqual(builds.map(b => b.args), [['--ios', 'field-log-apple', '--no-install']]);
     assert.equal(builds[0].log, resolve(dir, '.exact/ios-build.log'));
     assert.equal(said.length, 1);
     assert.match(said[0], /^building for iOS: there is no build yet; its log: \S*\.exact\/ios-build\.log$/);
-    assert.deepEqual(buildArgs('macos', app, 'lane-r5ab'), ['field-log-apple'], 'a Mac build takes no simulator');
+    assert.deepEqual(buildArgs('macos', app), ['field-log-apple']);
 
     // A build its receipt shows fresh: nothing runs, nothing is said.
     const bundle = appleArtifacts(app, { destination: 'ios-simulator' }).bundle, receipt = resolve(bundle, 'receipt.json');
@@ -63,7 +218,7 @@ test('a missing or stale build is built first, said in one line; a fresh one run
     assert.throws(() => refuseBuild('ios', nativeBuild('ios', app), app), /^Error: ios build is stale: .*app\.contract changed since .*; run \(cd .* && bun exact\.mjs ios\)$/);
     assert.equal(await drive('ios'), 0);
     // (A contract edit alone is a plan-only edit, which a build with no module receipt to check its bake against still rebuilds.)
-    assert.deepEqual([said, builds.map(b => b.args)], [['building for iOS: the build is older than its sources (app.contract changed), and the build has no module receipt to check a new plan against; its log: ' + said[0].split('its log: ')[1]], [['--ios', 'field-log-apple']]]);
+    assert.deepEqual([said, builds.map(b => b.args)], [['building for iOS: the build is older than its sources (app.contract changed), and the build has no module receipt to check a new plan against; its log: ' + said[0].split('its log: ')[1]], [['--ios', 'field-log-apple', '--no-install']]]);
 
     // A scratch file in .exact/ (the build's log among them) is not a source.
     utimesSync(resolve(dir, 'app.contract'), before, before);
@@ -156,6 +311,69 @@ test('a source edited while the build ran is stale; a build claimed meanwhile is
   }
 });
 
+// The Apple build signs a copy of the GPU dylib and the app's bake reads it, so the archive's dep-info names a file the
+// build itself wrote after it started. Cargo leaves that dep-info as it was when a relink names the same paths, so its
+// time says nothing: the receipt's digest of the product decides, and every other input keeps the build's start.
+test('a product the build wrote and then read is judged by its recorded bytes; any other input by the build start', () => {
+  const previous = process.env.EXACT_APP_DIR, macBin = process.env.EXACT_MAC_BIN, targetDir = process.env.CARGO_TARGET_DIR, cwd = process.cwd();
+  const { dir, write } = scratchApp('gpu-log');
+  try {
+    process.env.EXACT_APP_DIR = dir;
+    delete process.env.EXACT_MAC_BIN; delete process.env.CARGO_TARGET_DIR;
+    const app = resolveApp('gpu-log');
+    const at = seconds => new Date(Date.now() + seconds * 1000), stamp = (file, seconds) => utimesSync(file, at(seconds), at(seconds));
+    for (const file of ['app.contract', 'app.json', 'exact.mjs', 'apple/Cargo.toml', 'web/Cargo.toml']) stamp(resolve(dir, file), -120);
+    const bundle = appleArtifacts(app, { destination: 'ios-simulator' }).bundle, receipt = resolve(bundle, 'receipt.json');
+    mkdirSync(bundle, { recursive: true });
+    const profile = resolve(app.target, 'aarch64-apple-ios-sim', 'host-dev'), dylib = resolve(profile, 'signed/libgpu_log_gpu.dylib');
+    const info = resolve(profile, 'libgpu_log_apple.d'), generated = resolve(profile, 'generated.contract');
+    const sha256 = text => createHash('sha256').update(text).digest('hex');
+    const changed = () => nativeBuild('ios', app).changed.map(p => resolve(p)).sort();
+    // The first build, t-100 s to t-70 s, wrote the dep-info at t-80 s.
+    write(dylib.slice(dir.length + 1), 'signed v1');
+    write(generated.slice(dir.length + 1), 'component Generated');
+    writeFileSync(info, `${profile}/libgpu_log_apple.a: ${resolve(dir, 'app.contract')} ${generated} ${dylib}\n`);
+    stamp(info, -80); stamp(generated, -110);
+    // A GPU source edited, and built again from t-20 s to t+10 s: the copy signed again at t-10 s, the archive relinked,
+    // and the dep-info, naming the same paths, left as it was.
+    writeFileSync(dylib, 'signed v2'); stamp(dylib, -10);
+    writeFileSync(receipt, JSON.stringify({ target: 'aarch64-apple-ios-sim', started: at(-20).toISOString(), build: { products: [{ path: dylib, bytes: 9, sha256: sha256('signed v2') }] } }));
+    stamp(receipt, 10);
+    assert.deepEqual(changed(), []);
+    // Other bytes, though put back with the time it had: not what the bundle holds.
+    writeFileSync(dylib, 'signed v3'); stamp(dylib, -10);
+    assert.deepEqual(changed(), [dylib]);
+    rmSync(dylib);
+    assert.deepEqual(changed(), [dylib]);
+    write(dylib.slice(dir.length + 1), 'signed v2');
+    assert.deepEqual(changed(), []);
+    // A source under the profile directory that the receipt does not name as a product keeps the build's start.
+    stamp(generated, -5);
+    assert.deepEqual(changed(), [generated]);
+    stamp(generated, -110); stamp(resolve(dir, 'app.contract'), -5);
+    assert.deepEqual(changed(), [resolve(dir, 'app.contract')]);
+    stamp(resolve(dir, 'app.contract'), -120);
+    // `build.dep-info-basedir` writes the paths relative to the workspace Cargo ran in, and the drive runs from
+    // elsewhere (here neither this checkout nor the workspace): both rules read them against that workspace.
+    const rel = path => relative(app.workspace, path);
+    writeFileSync(info, `${rel(profile)}/libgpu_log_apple.a: ${rel(resolve(dir, 'app.contract'))} ${rel(generated)} ${rel(dylib)}\n`);
+    stamp(info, -80);
+    process.chdir(dirname(dir));
+    assert.notEqual(realpathSync(process.cwd()), app.workspace);
+    assert.deepEqual(changed(), []);
+    writeFileSync(dylib, 'signed v3'); stamp(dylib, -10);
+    assert.deepEqual(changed(), [dylib]);
+    writeFileSync(dylib, 'signed v2'); stamp(dylib, -10); stamp(generated, -5);
+    assert.deepEqual(changed(), [generated]);
+  } finally {
+    process.chdir(cwd);
+    if (previous === undefined) delete process.env.EXACT_APP_DIR; else process.env.EXACT_APP_DIR = previous;
+    if (macBin === undefined) delete process.env.EXACT_MAC_BIN; else process.env.EXACT_MAC_BIN = macBin;
+    if (targetDir !== undefined) process.env.CARGO_TARGET_DIR = targetDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a build already running ends before the check: the drive neither races it nor is refused as busy', async () => {
   const previous = process.env.EXACT_APP_DIR;
   const { dir } = scratchApp('busy-log');
@@ -186,14 +404,18 @@ test('a plan-only edit runs its bake on the existing build; any other edit, or a
     const app = resolveApp('plan-log');
     const at = offset => new Date(Date.now() + offset * 1000), stamp = (file, offset) => utimesSync(resolve(dir, file), at(offset), at(offset));
     // app.ts and what it imports, type-only imports included; a backend beside it that the app reaches over HTTP.
-    write('app.ts', "import type { Book } from './types';\nimport { shelf } from './lib/model.js';\nimport seed from './lib/seed.json';\nexport const grants = '';\n");
+    write('app.ts', "import type { Book } from './types';\nimport { shelf } from './lib/model.js';\nimport seed from './lib/seed.json';\nimport { money } from './lib/format.mjs';\nexport const grants = '';\n");
     write('types.ts', 'export type Book = { title: string };\n');
     write('lib/model.ts', "export const shelf = [] as const;\n");
     write('lib/seed.json', '[]\n');
+    write('lib/format.mjs', "import { digits } from './digits.mjs';\nexport const money = n => digits(n);\n");
+    write('lib/digits.mjs', 'export const digits = n => String(n);\n');
+    // A helper script beside the app that app.ts never imports (an export, a seeding script).
+    write('scripts/export.mjs', 'console.log(1);\n');
     write('server/index.ts', "import { Database } from 'bun:sqlite';\nimport { routes } from './routes';\n");
     write('server/routes.ts', 'export const routes = {};\n');
     write('server/fixtures.json', '{}\n');
-    for (const file of ['app.contract', 'app.ts', 'types.ts', 'lib/model.ts', 'lib/seed.json', 'server/index.ts', 'server/routes.ts', 'server/fixtures.json', 'app.json', 'exact.mjs', 'apple/Cargo.toml', 'web/Cargo.toml']) stamp(file, -60);
+    for (const file of ['app.contract', 'app.ts', 'types.ts', 'lib/model.ts', 'lib/seed.json', 'lib/format.mjs', 'lib/digits.mjs', 'scripts/export.mjs', 'server/index.ts', 'server/routes.ts', 'server/fixtures.json', 'app.json', 'exact.mjs', 'apple/Cargo.toml', 'web/Cargo.toml']) stamp(file, -60);
     // The build: its receipt names the plan its build script baked, beside which is the module receipt it paired.
     const target = 'aarch64-apple-ios-sim', out = resolve(app.target, target, 'host-dev/build/plan-log-apple-0123/out');
     const module = { version: 1, appId: 'com.exact.plan-log', grants: '', abi: 1, surfaces: {}, bytecodeVersion: 96 };
@@ -225,7 +447,10 @@ test('a plan-only edit runs its bake on the existing build; any other edit, or a
     const kept = () => planOverride('ios', app, nativeBuild('ios', app));
 
     // What app.ts imports is the plan's; what it does not import is no input at all (LLP 1116.003 D1.1).
-    assert.deepEqual([...moduleGraph(dir, app.manifest)].map(p => p.slice(dir.length + 1)).sort(), ['app.ts', 'lib/model.ts', 'lib/seed.json', 'types.ts']);
+    assert.deepEqual([...moduleGraph(dir, app.manifest)].map(p => p.slice(dir.length + 1)).sort(), ['app.ts', 'lib/digits.mjs', 'lib/format.mjs', 'lib/model.ts', 'lib/seed.json', 'types.ts']);
+    // A script app.ts never imports is no input, a `.mjs` as a `.ts`; one it imports, through another, is.
+    const input = notBuildInput(dir);
+    assert.deepEqual(['scripts/export.mjs', 'lib/format.mjs', 'lib/digits.mjs', 'server/index.ts'].map(f => input(resolve(dir, f))), [true, false, false, true]);
     // Only the Contract and what app.ts imports, and nothing a native build reads, is a plan-only edit.
     for (const [path, only] of [['app.contract', true], ['app.ts', true], ['types.ts', true], ['lib/model.ts', true], ['lib/seed.json', true], ['screens/list.contract', true],
       ['server/index.ts', false], ['server/fixtures.json', false], ['app.json', false], ['app.contract.d.ts', false],
@@ -247,14 +472,16 @@ test('a plan-only edit runs its bake on the existing build; any other edit, or a
     assert.deepEqual([said, builds, bakes, kept()], [[], [], [], null]);
 
     // A contract edit: baked and kept beside the build, in one line, and no build; the driver runs it. The
-    // compiler's warnings the bake said follow it, one line each (LLP 1116.004 D7).
+    // compiler's warnings the bake said follow it, one line each the first time, then a count naming their file.
     write('app.contract', 'component App\n  view\n    text "hello again" color="#336699"\n');
     stamp('app.contract', 20);
     const warning = 'app.contract:3:31 warning [lower-colour-one-scheme] `#336699` on `color` stays the same in dark mode';
     bakeSays = `${warning}\n{"version":1}\n`;
     assert.throws(() => refuseBuild('ios', nativeBuild('ios', app), app), /ios build is stale/, 'before the bake, the driver refuses as before');
     assert.equal(await drive(), 0);
-    assert.deepEqual([said, builds, bakes.length], [['iOS: app.contract changed; running the new plan on the existing build (no native rebuild)', warning], [], 1]);
+    assert.deepEqual([said.slice(0, 2), builds, bakes.length], [['iOS: app.contract changed; running the new plan on the existing build (no native rebuild). Only the agent\'s drives run it: a launch outside them (`simctl launch`, the home screen) runs the installed plan, so `bun exact.mjs ios` before timing one', warning], [], 1]);
+    assert.equal(said.length, 3);
+    assert.match(said[2], /^compiler: 1 warning; \S+\/\.exact\/warnings-ios\.txt lists them all$/);
     bakeSays = '';
     assert.deepEqual(kept(), { plan: resolve(overrideDir('ios', app), 'app.plan'), dir: overrideDir('ios', app) });
     assert.equal(readFileSync(kept().plan, 'utf8'), 'plan two');
@@ -273,7 +500,7 @@ test('a plan-only edit runs its bake on the existing build; any other edit, or a
     reset();
     assert.equal(await drive(), 0);
     assert.deepEqual([said.length, builds.length, bakes.length], [1, 0, 1]);
-    assert.match(said[0], /^iOS: (app\.contract, app\.ts|app\.ts, app\.contract) changed; running the new plan on the existing build \(no native rebuild\)$/);
+    assert.match(said[0], /^iOS: (app\.contract, app\.ts|app\.ts, app\.contract) changed; running the new plan on the existing build \(no native rebuild\)\. Only the agent's drives run it: .*`bun exact\.mjs ios` before timing one$/);
     assert.ok(kept());
 
     // A newer real build retires it: fresh, the build's own plan runs; a later touch of the same sources does not bring it back.
@@ -284,13 +511,19 @@ test('a plan-only edit runs its bake on the existing build; any other edit, or a
     assert.equal(kept(), null, 'kept for another build: never run as fresh');
 
     // Anything else edited is built, and what was kept goes with it; the warnings Cargo said for the bake's
-    // build script follow, in the compiler's own form.
+    // build script follow, in the compiler's own form: in full, since the bake before said none.
     reset();
     stamp('app.json', 60);
     buildSays = `   Compiling plan-log-apple v0.1.0\nwarning: plan-log-apple@0.1.0: ${warning}\nhost/apple: built\n`;
     assert.equal(await drive(), 0);
+    assert.deepEqual([bakes.length, builds.length, said[1], said.length], [0, 1, warning, 3]);
+    // Built again over the same warning: its count alone.
+    reset();
+    stamp('app.json', 70);
+    assert.equal(await drive(), 0);
     buildSays = '';
-    assert.deepEqual([bakes.length, builds.length, said.slice(1)], [0, 1, [warning]]);
+    assert.equal(said.length, 2);
+    assert.match(said[1], /^compiler: 1 warning, as before \(\S+\/warnings-ios\.txt lists them; /);
     assert.match(said[0], /^building for iOS: the build is older than its sources \((app\.contract, app\.json|app\.json, app\.contract) changed\); its log: /);
     assert.ok(!existsSync(overrideDir('ios', app)));
 
@@ -318,4 +551,96 @@ test('a plan-only edit runs its bake on the existing build; any other edit, or a
     if (trust === undefined) delete process.env.EXACT_UPDATE_TRUST; else process.env.EXACT_UPDATE_TRUST = trust;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// A drive's compiler warnings keep the compiler's order, the symbols only the web draws blank one line at the end;
+// the file beside the app lists each (the euxy port's header warning was one of 43, behind 21 of them).
+// A background build ends apart from every shell, so the next build or drive says once how it failed (the euxy port's
+// `--prebuild --release`, failed by an edit, said so only in its log).
+test('a failed background build is said once by the next drive, from its part of the log', async () => {
+  const previous = process.env.EXACT_APP_DIR;
+  const { dir, write } = scratchApp('prebuilt-log');
+  try {
+    process.env.EXACT_APP_DIR = dir;
+    const app = resolveApp('prebuilt-log'), said = [];
+    // The drive rebuilds, writing the build log anew.
+    const drive = () => buildFirst('ios', app, { say: line => said.push(line), wait: () => {}, build: async (args, log) => (writeFileSync(log, 'rebuilt'), { code: 0, output: '' }) });
+    const build = 'app: the bake failed:\napp.contract:14:10 [syntax-expected] expected `)`, found `like`\n';
+    write('.exact/ios-build.log', `${build}   Compiling the bake tool\n`);
+    write('.exact/ios-prebuild.json', JSON.stringify({ args: ['--ios', 'prebuilt-log-apple', '--release'], started: '08:02:54', pid: 1, exit: 1, bytes: build.length }));
+    await drive();
+    assert.match(said[0], /^app: the bake failed:\napp\.contract:14:10 \[syntax-expected\] expected `\)`, found `like`\nthe background iOS build \(--prebuild --ios --release, started 08:02:54\) failed \(exit 1\); its whole log: \S*\.exact\/ios-prebuild-failed\.log$/);
+    assert.equal(readFileSync(resolve(dir, '.exact/ios-prebuild-failed.log'), 'utf8'), build, 'its part, kept from the rebuild');
+    assert.ok(!existsSync(resolve(dir, '.exact/ios-prebuild.json')), 'said once');
+    said.length = 0;
+    await drive();
+    assert.ok(!said.some(line => line.includes('background')), said.join('\n'));
+    // One that ended before it could say (its shell gone) is dropped, unsaid.
+    write('.exact/ios-prebuild.json', JSON.stringify({ args: ['--ios'], started: '08:02:54', pid: 2 ** 22 + 1 }));
+    await drive();
+    assert.ok(!said.some(line => line.includes('background')) && !existsSync(resolve(dir, '.exact/ios-prebuild.json')));
+    // A second started while a build holds the claim starts nothing, and leaves the first's log and record.
+    const lock = appleArtifacts(app).lock;
+    mkdirSync(dirname(lock), { recursive: true });
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, app: app.id, source: dir, started: new Date().toISOString() }) + '\n');
+    write('.exact/ios-prebuild.json', '{"id":"first"}');
+    assert.equal(await prebuild(app, ['--ios', 'prebuilt-log-apple', '--prebuild'], { say: line => said.push(line) }), 1);
+    assert.match(said.at(-1), /already running, so none was started/);
+    assert.equal(readFileSync(resolve(dir, '.exact/ios-prebuild.json'), 'utf8'), '{"id":"first"}');
+    assert.equal(readFileSync(resolve(dir, '.exact/ios-build.log'), 'utf8'), 'rebuilt');
+    rmSync(lock);
+    // So does one started before the first's build has claimed it: that record names a live shell.
+    write('.exact/ios-prebuild.json', JSON.stringify({ id: 'first', pid: process.pid }));
+    assert.equal(await prebuild(app, ['--ios', 'prebuilt-log-apple', '--prebuild'], { say: line => said.push(line) }), 1);
+    assert.equal(JSON.parse(readFileSync(resolve(dir, '.exact/ios-prebuild.json'), 'utf8')).id, 'first');
+    assert.equal(readFileSync(resolve(dir, '.exact/ios-build.log'), 'utf8'), 'rebuilt');
+  } finally {
+    if (previous === undefined) delete process.env.EXACT_APP_DIR; else process.env.EXACT_APP_DIR = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a drive says the web-only symbol warnings in one line and lists each in its file', async () => {
+  const { warningLines } = await import('./app-cli.mjs');
+  const dir = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-warning-lines-')));
+  try {
+    const header = 'app.contract:9:3 warning [lower-header-unplaced] this `button` in this route\'s `header` is not shown on iOS';
+    const first = 'app.contract:4:5 warning [lower-symbol-platform] symbol `sf/a` draws only on Apple, and the app ships web (app.json `host.web`), where it is blank. Declare an icon token';
+    const later = 'app.contract:5:5 warning [lower-symbol-platform] symbol `sf/b` is blank on web too: write `symbol:add`, the role, which draws on every host';
+    const native = 'app.contract:6:5 warning [lower-symbol-platform] symbol `sf/c` is blank on linux and web too: write `symbol:add`, the role, which draws on every host';
+    const said = warningLines(dir, 'ios', [header, native, first, later]);
+    assert.deepEqual(said.slice(0, 2), [header, native]);
+    assert.match(said[2], /^app\.contract:4:5 warning \[lower-symbol-platform\] 2 SF Symbol uses draw blank on the web, here first: .*\.exact\/warnings-ios\.txt lists each, and how\)$/);
+    assert.match(said[3], /^compiler: 4 warnings; /);
+    assert.equal(readFileSync(resolve(dir, '.exact', 'warnings-ios.txt'), 'utf8'), [header, native, first, later].map((w) => `${w}\n`).join(''));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a drive counts a warning that is information apart (tamber-unreachable, LLP 1121 D9)', async () => {
+  const { warningLines } = await import('./app-cli.mjs');
+  const dir = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-warning-notes-')));
+  try {
+    const note = 'app.contract:3:5 warning [tamber-unreachable] accent-color on macOS switches: NSSwitch draws the system accent (the first at line 4; LLP 1121 D9)';
+    const header = 'app.contract:9:3 warning [lower-header-unplaced] this `button` in this route\'s `header` is not shown on iOS';
+    assert.match(warningLines(dir, 'web', [note]).at(-1), /^compiler: 1 note \(not counted\); /);
+    assert.match(warningLines(dir, 'web', [header, note]).at(-1), /^compiler: 1 warning and 1 note \(not counted\), 1 new \(above\); /);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// An Apple build's bake says its warnings on every build: the SF Symbols only the web draws blank one line where the
+// first was (euxy's 18, every Release build), the rest each.
+test('an Apple bake says the web-only symbol warnings in one line', async () => {
+  const { bakeWarnings } = await import('./linked-plan.mjs');
+  const alias = 'app.contract:2:5 warning [lower-symbol-alias] symbol `sf/arrow.up.arrow.down` is the role `sort`: write `symbol:sort`';
+  const first = 'app.contract:4:5 warning [lower-symbol-platform] symbol `sf/a` draws only on Apple, and the app ships web (app.json `host.web`), where it is blank. Declare an icon token';
+  const later = 'app.contract:5:5 warning [lower-symbol-platform] symbol `sf/b` is blank on web too: write `symbol:add`, the role, which draws on every host';
+  assert.deepEqual(bakeWarnings('euxy', [alias, first, later]), [
+    `warning: euxy: ${alias}`,
+    'warning: euxy: app.contract:4:5 warning [lower-symbol-platform] 2 SF Symbol uses draw blank on the web, here first: an icon token or a role draws on every host (`bun exact.mjs contract build --json` says each, and how)',
+  ]);
+  assert.deepEqual(bakeWarnings('euxy', [alias]), [`warning: euxy: ${alias}`]);
 });

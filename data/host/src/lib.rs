@@ -46,6 +46,11 @@ pub struct Storage<D> {
     /// A scripted drive (`EXACT_AGENT=1`): storage is the scratch store it
     /// names, else none.
     agent: bool,
+    /// Lines for the journal beside the source's own: the first write such a
+    /// drive refuses, as a TypeScript source's prelude says it (LLP 1102 §3.17).
+    logs: Vec<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    told_agent: bool,
 }
 impl<D> Storage<D> {
     /// Wrap a source without creating storage or starting any thread.
@@ -60,6 +65,9 @@ impl<D> Storage<D> {
             pending: BTreeMap::new(),
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             agent: std::env::var("EXACT_AGENT").as_deref() == Ok("1"),
+            logs: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            told_agent: false,
         }
     }
 }
@@ -78,7 +86,7 @@ impl<D: DataSource> Storage<D> {
         if let Answer::Later(request) = &mut answer {
             // Storage becomes a continuation below: a deadline on it is
             // refused, not dropped.
-            if let Some(why) = request.timeout_refusal() {
+            if let Some(why) = request.timeout_refusal().or(request.long_poll_refusal()) {
                 return Err(unavailable(why));
             }
             if request.http != exact_runner::HttpScheduling::Ordered
@@ -145,6 +153,17 @@ fn unavailable(s: impl Into<String>) -> DataError {
     DataError::Unavailable(s.into())
 }
 impl<D: DataSource> DataSource for Storage<D> {
+    fn prepare_snapshot(
+        &mut self,
+        module: Option<exact_runner::SnapshotModule<'_>>,
+        deadline: std::time::Instant,
+    ) -> Result<(), DataError> {
+        self.source.prepare_snapshot(module, deadline)
+    }
+    fn take_storage_changed(&mut self) -> bool {
+        self.source.take_storage_changed()
+    }
+
     fn set_document_owner(&mut self, owner: u64) {
         self.document_owner = owner;
         self.source.set_document_owner(owner);
@@ -372,8 +391,39 @@ impl<D: DataSource> DataSource for Storage<D> {
         self.source.background_state()
     }
 
+    // Work that outlives its answer (LLP 1146 D2): its tokens are the
+    // source's own, which the runner keeps beside its tickets, so nothing is
+    // remapped.
+    fn keep_sent(
+        &mut self,
+        store: &Store,
+        let_go: &[exact_runner::InFlight<'_>],
+        refused: bool,
+    ) -> Vec<Option<u64>> {
+        self.source.keep_sent(store, let_go, refused)
+    }
+
+    fn module_landed(
+        &mut self,
+        store: &mut Store,
+        token: u64,
+        outcome: Outcome,
+    ) -> Result<(), DataError> {
+        self.source.module_landed(store, token, outcome)
+    }
+
     fn take_logs(&mut self) -> Vec<String> {
-        self.source.take_logs()
+        let mut lines = std::mem::take(&mut self.logs);
+        lines.extend(self.source.take_logs());
+        lines
+    }
+
+    fn take_aborted(&mut self) -> Vec<u64> {
+        self.source.take_aborted()
+    }
+
+    fn abort_wake(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.source.abort_wake(wake);
     }
 
     fn continuation(&mut self, token: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
@@ -389,6 +439,13 @@ impl<D: DataSource> DataSource for Storage<D> {
                 let alive = self.alive.clone();
                 let refused =
                     paths.is_none() && self.agent && !native::independent_storage(&payload);
+                if refused && !self.told_agent {
+                    self.told_agent = true;
+                    self.logs.push(format!(
+                        "storage refused (agent): {}",
+                        native::AGENT_REFUSAL
+                    ));
+                }
                 Some(Box::new(move || {
                     if !alive.load(std::sync::atomic::Ordering::Acquire) {
                         return Outcome::Failed {

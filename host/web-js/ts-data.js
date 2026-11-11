@@ -8,10 +8,15 @@
 import * as source from '__APP_TS__';
 import { createSecretFacade, hasGrant, inOverlay, overlaying, setAppGrantSet } from './admission.js';
 import { tsGrantSet } from './admission-data.js';
-import { answering, files as bodyFiles, SOCKET_AND_FETCH } from './ts-fetch.js';
+import { answering, dropTimers, files as bodyFiles, SOCKET_AND_FETCH } from './ts-fetch.js';
 import { sourceTypes } from './names.js';
-import { checkpoint, clock, commit, inflight, journal, painted, R, Resources } from './rt.js';
+import { checkpoint, clock, commit, drive, inflight, journal, Origin, painted, R, Resources } from './rt.js';
 import { Shaped } from './shape.js';
+import { ledger, requestKey } from './uploads.js';
+// Work an answer awaits that is no held fetch, counted on its answer (ts-fetch.js `answering.ordinary`, LLP 1016.000 D9).
+const ordinary = start => (answering.ordinary ?? (f => f()))(start);
+// What an answer's timers run on (ts-fetch.js `arm`).
+answering.page = { clock, journal, drive };
 __AUTH_IMPORT__
 // Values cross by the plan's types (`named` into the module's objects,
 // `arrays` back into the runtime's arrays), with each type's converters made
@@ -131,8 +136,25 @@ const changed = (r, topic) => {
   if (!t.again) journal.push(`t=${clock.now} changed ${topic}: ticket ${t.id} (${r.name}) lands first, then it is asked again`);
   t.again = true;
 };
-const announce = (topic, why) => commit(() => { const s = watched.get(topic); for (const r of Resources) if (s?.has(r.source)) changed(r, topic); }, `${why} ${topic}`);
+const announce = (topic, why) => commit(() => { const s = watched.get(topic), m = moduleWatched.get(topic); for (const r of Resources) if (s?.has(r.source) || m?.has(r.source)) changed(r, topic); }, `${why} ${topic}`);
 const watch = topic => (watched.get(topic) ?? watched.set(topic, new Set()).get(topic)).add(watching);
+// A native module's name called from data code (LLP 1133.002 D14): admitted by
+// the page runtime's modules.js as a Contract read is; a source's reader is
+// asked again when its answer changes, as a topic's is.
+// Its source's readers are the answers' that read it last: each answer's own
+// reads replace the last's, as the runner's `watching` does.
+const moduleWatched = new Map(); // module key -> sources
+// Whether the answer that made the call still wants its reply is its call's `wanted`, its ticket's `held` (rt.js
+// `reply`), which a registration's reply reads (LLP 1133.011 D11).
+globalThis.__exact_module = body => {
+  const key = `${body.extension}.${body.source}`, call = answering.call;
+  if (body.source && watching) (moduleWatched.get(key) ?? moduleWatched.set(key, new Set()).get(key)).add(watching);
+  // A tool handler's call carries its origin (`data.tool`); every other is the app's.
+  const origin = call?.origin ?? 'app';
+  return ordinary(() => globalThis.exact?.extensions?.call?.({ ...body, origin }, () => call?.wanted?.() ?? true) ?? Promise.resolve({ error: 'NotSupportedError' }));
+};
+(globalThis.exact ??= {}).announceModule = topic => announce(topic, 'module');
+globalThis.exact.moduleReaders = key => Resources.filter(r => moduleWatched.get(key)?.has(r.source)).map(r => r.name);
 // The documents the answers watch, for the agent's `state.watches`, as the runner lists them.
 (globalThis.exact ??= {}).watchState = () => [...watched.keys()].sort().flatMap(t => {
   const m = /^doc-watch(-recursive)?:(.*)$/.exec(t);
@@ -146,7 +168,8 @@ const native = Object.freeze({
   get available() { return true; },
   call() { if (overlaying.on) throw inOverlay('native.call()'); throw new Error('native.call: the web has no synchronous module call; use native.later'); },
   watch(topic) { if (overlaying.on) throw inOverlay('native.watch()'); if (!watching) throw new Error('native.watch outside an answer'); watch(String(topic)); },
-  later: request => overlaying.on ? Promise.reject(inOverlay('native.later()')) : pageModule().then(p => p.later(request)),
+  // Counted on its answer as an ordinary fetch is (ts-fetch.js `ordinary`, LLP 1016.000 D9).
+  later: request => overlaying.on ? Promise.reject(inOverlay('native.later()')) : ordinary(() => pageModule().then(p => p.later(request))),
 });
 // App storage as a source sees it (`storage`, LLP 1027.001): `fs` and
 // `sqlite` over the web host's own adapters (`storage-fs.js`,
@@ -225,20 +248,30 @@ function storageOf(grants) {
   let fs, sqlite;
   const key = () => import('./storage-environment.js').then(({ storageKey, agentStorageRefusal }) => {
     const k = source.appId ? storageKey(source.appId) : null;
-    if (k == null) {
-      // Said once in the journal, as on every host (trivia F7).
-      if (!toldAgent) { toldAgent = true; journal.push(`t=${clock.now} storage refused (agent): ${agentStorageRefusal}`); }
-      throw Object.assign(new Error(agentStorageRefusal), { kind: 'Unavailable', code: 'agent' });
-    }
+    if (k == null) throw Object.assign(new Error(agentStorageRefusal), { kind: 'Unavailable', code: 'agent' });
     return k;
   });
+  // The first refused read or write is said once in the journal, as on every host (trivia F7).
+  const tell = () => import('./storage-environment.js').then(env => {
+    if (!toldAgent) { toldAgent = true; journal.push(`t=${clock.now} storage refused (agent): ${env.agentStorageRefusal}`); }
+    return env;
+  });
+  const refused = e => (e?.code === 'agent' ? tell() : Promise.resolve()).then(() => coded(e));
+  // A refused read answers as an empty store would (storage-environment.js `emptyRead`).
+  const orEmpty = (m, path) => e => e?.code === 'agent' ? tell().then(env => { if (!env.agentReads.includes(m)) throw e; return env.emptyRead(m, path); }) : Promise.reject(e);
   const files = () => fs ??= key().then(k => import(new URL('./storage-fs.js', import.meta.url).href).then(m => m.createFileSystem(k, grants)));
   // A document the person chose (`doc:/`, LLP 1069.010 D1) is the page's
   // handle, not app storage: no store key, so a drive without a scratch
   // store reaches it too, as a Rust source's storage request does.
   let docs;
-  const documents = () => docs ??= ((globalThis.exact ??= {}), import(new URL('./documents-glue.js', import.meta.url).href)).then(() => globalThis.exact.documents.files(grants));
+  // What the app keeps across launches is read back first (LLP 1069.010.000 D4).
+  const documents = () => docs ??= ((globalThis.exact ??= {}), import(new URL('./documents-glue.js', import.meta.url).href)).then(() => globalThis.exact.documents.keeping(source.appId, grants)).then(() => globalThis.exact.documents.files(grants));
+  // In the storage queue, as every storage call is (an overlay refuses it).
+  const keptDocuments = (what, f) => ordinary(() => queued(what, () => documents().then(() => f(globalThis.exact.documents))).catch(refused));
+  let listWatched = false;
   const isDocument = args => args.slice(0, 2).some(p => typeof p === 'string' && p.startsWith('doc:/'));
+  // A document copied into an app file needs both (documents-glue.js `copyFile`).
+  const copiesIn = (m, args) => m === 'copyFile' && typeof args[0] === 'string' && args[0].startsWith('doc:/') && typeof args[1] === 'string' && args[1].startsWith('app:/');
   const denied = (op, document = false) => (document ? Promise.resolve() : key()).then(() => {
     throw Object.assign(new Error(`denied: ${op}`), { kind: 'Unavailable', code: 'denied' });
   });
@@ -259,16 +292,35 @@ function storageOf(grants) {
     } });
   };
   const methods = ['readFile', 'writeFile', 'atomicWriteFile', 'appendFile', 'readdir', 'mkdir', 'rm', 'stat', 'rename', 'copyFile', 'realpath'];
-  // `compressImage` (LLP 1069.002 A1): its options are checked before it is
-  // queued, as the native prelude checks them; app files only.
+  // `compressImage` (LLP 1069.002 A1) and `transformImage` (LLP 1133.019
+  // D14): their options are checked before either is queued, as the native
+  // prelude checks them (binary.js `imageOptions`); app files only.
+  const image = (method, from, to, options, limits) => {
+    const api = `storage.fs.${method}()`, out = { ...limits }, o = options ?? {};
+    const finite = n => typeof n === 'number' && Number.isFinite(n), side = n => Number.isInteger(n) && n >= 1 && n <= 16384;
+    const checks = { rotate: [finite, 'a finite number of degrees'], flip: [w => w === 'horizontal' || w === 'vertical', '"horizontal" or "vertical"'],
+      crop: [c => c && typeof c === 'object' && [c.x, c.y, c.width, c.height].every(finite) && c.width > 0 && c.height > 0, '{x, y, width, height}, finite, with a positive width and height'] };
+    if (method === 'transformImage') Object.assign(checks, { resizeWidth: [side, 'an integer from 1 to 16384'], resizeHeight: [side, 'an integer from 1 to 16384'],
+      resizeQuality: [w => ['pixelated', 'low', 'medium', 'high'].includes(w), '"pixelated", "low", "medium" or "high"'], type: [t => typeof t === 'string' && /^image\/[a-z0-9.+-]+$/.test(t), 'a media type such as "image/jpeg"'],
+      quality: [q => typeof q === 'number' && q >= 0 && q <= 1, 'a number from 0 to 1'], metadata: [w => ['keep', 'no-location', 'none'].includes(w), '"keep", "no-location" or "none"'] });
+    if (typeof from !== 'string' || typeof to !== 'string') return Promise.reject(new TypeError(`${api}: from and to must be app:/ paths`));
+    if (typeof o !== 'object') return Promise.reject(new TypeError(`${api}: options must be an object`));
+    for (const [name, [ok, says]] of Object.entries(checks)) {
+      if (o[name] === undefined) continue;
+      if (!ok(o[name])) return Promise.reject(new TypeError(`${api}: ${name} must be ${says}`));
+      out[name] = o[name];
+    }
+    return (admitted ? queued(`${method} ${from}`, () => files().then(f => f[method](from, to, out))) : denied(`fs.${method}`)).catch(refused);
+  };
   const compressImage = (from, to, options) => {
     const api = 'storage.fs.compressImage()', d = options?.maxDimension, b = options?.maxBytes;
     if (typeof from !== 'string' || typeof to !== 'string') return Promise.reject(new TypeError(`${api}: from and to must be app:/ paths`));
     if (!options || typeof options !== 'object') return Promise.reject(new TypeError(`${api}: options must be {maxDimension, maxBytes}`));
     if (!Number.isInteger(d) || d < 1 || d > 8192) return Promise.reject(new TypeError(`${api}: maxDimension must be an integer from 1 to 8192`));
     if (!Number.isInteger(b) || b < 1 || b > 67108864) return Promise.reject(new TypeError(`${api}: maxBytes must be an integer from 1 to 67108864`));
-    const limits = { maxDimension: d, maxBytes: b };
-    return (admitted ? queued(`compressImage ${from}`, () => files().then(f => f.compressImage(from, to, limits))) : denied('fs.compressImage')).catch(coded);
+    const type = options.type === undefined ? 'image/jpeg' : options.type;
+    if (type !== 'image/jpeg' && type !== 'image/png') return Promise.reject(new TypeError(`${api}: type must be "image/jpeg" or "image/png"`));
+    return image('compressImage', from, to, options, { maxDimension: d, maxBytes: b, type });
   };
   // `fs.watch(path, {recursive})` (LLP 1069.010.000 D1): the answer depends
   // on a document the person chose; the page's FileSystemObserver announces
@@ -280,20 +332,25 @@ function storageOf(grants) {
     if (typeof path !== 'string' || !path.startsWith('doc:/')) throw new TypeError(`${api}: path must be a doc:/ path`);
     const recursive = !!options?.recursive, topic = `${recursive ? 'doc-watch-recursive:' : 'doc-watch:'}${path}`;
     watch(topic);
+    // `doc:/` itself is the kept list (LLP 1069.010.000 D5).
+    if (path === 'doc:/') return void (listWatched || documents().then(() => { if (!listWatched) globalThis.exact.documents.onList(() => announce(topic, 'changed')); listWatched = true; }).catch(() => {}));
     documents().then(() => globalThis.exact.documents.observe(path, recursive, grants, () => announce(topic, 'changed'))).catch(() => {});
   };
   const expecting = (m, args) => ['writeFile', 'atomicWriteFile', 'appendFile'].includes(m) && args[2]?.expect;
   return Object.freeze({
     fs: Object.freeze({ directories: Object.freeze({ data: 'app:/data', cache: 'app:/cache', temporary: 'app:/tmp' }),
-      compressImage, watch: watchDocument,
-      ...Object.fromEntries(methods.map(m => [m, (...args) => {
+      compressImage: (...a) => ordinary(() => compressImage(...a)), watch: watchDocument,
+      recentDocuments: () => keptDocuments('fs.recentDocuments', d => d.recent(grants)), forgetDocument: path => keptDocuments(`fs.forgetDocument ${path}`, d => d.forget(path, grants)),
+      transformImage: (from, to, options) => ordinary(() => image('transformImage', from, to, options, {})),
+      ...Object.fromEntries(methods.map(m => [m, (...args) => ordinary(() => {
         // A write's `expect` (LLP 1069.010.000 D2a) is the glue's, documents only.
         if (expecting(m, args) && !isDocument(args)) return Promise.reject(new TypeError(`storage.fs.${m}(): expect is for doc:/ paths`));
         const captured = structuredClone(args);
-        const run = () => (isDocument(captured) ? documents() : files()).then(f => f[m](...captured));
-        return (admitted ? queued(`${m}${typeof args[0] === 'string' ? ` ${args[0]}` : ''}`, run) : denied(`fs.${m}`, isDocument(captured))).catch(coded);
-      }])) }),
-    sqlite: Object.freeze({ open: path => { const call = answering.call; return (admitted ? queued(`open ${path}`, () => databases().then(d => d.open(path))).then(d => database(d, path, call)) : denied(`sqlite.open ${path}: no grant covers it; grant \`sqlite.open ${path}\`, or \`sqlite.open ${String(path).slice(0, String(path).lastIndexOf('/'))}\` for every file there (a grant covers its path and what is below it, by whole names)`)).catch(coded); } }),
+        const run = () => copiesIn(m, captured) ? documents().then(files).then(f => globalThis.exact.documents.copyFile(captured[0], captured[1], grants, f))
+          : isDocument(captured) ? documents().then(f => f[m](...captured)) : files().then(f => f[m](...captured), orEmpty(m, captured[0]));
+        return (admitted ? queued(`${m}${typeof args[0] === 'string' ? ` ${args[0]}` : ''}`, run) : denied(`fs.${m}`, isDocument(captured) && !copiesIn(m, captured))).catch(refused);
+      })])) }),
+    sqlite: Object.freeze({ open: path => ordinary(() => { const call = answering.call; return (admitted ? queued(`open ${path}`, () => databases().then(d => d.open(path))).then(d => database(d, path, call)) : denied(`sqlite.open ${path}: no grant covers it; grant \`sqlite.open ${path}\`, or \`sqlite.open ${String(path).slice(0, String(path).lastIndexOf('/'))}\` for every file there (a grant covers its path and what is below it, by whole names)`)).catch(refused); }) }),
     work: promise => Promise.resolve(promise),
   });
 }
@@ -318,7 +375,20 @@ export function install(data, mixed = false, modules = null) {
   // paint (rt.js `painted`), whether or not anything asks `later`.
   load = modules && (() => painted().then(modules));
   if (modules && typeof requestAnimationFrame === 'function') pageModule().catch(e => journal.push(`t=${clock.now} native: ${e.message}`));
-  let keys = null, asking = '';
+  let keys = null, asking = '', thrown = null, threwRead = false;
+  // The answer an async function was called under, put back around each of
+  // its steps by the bundle's async helper (js/bake/src/typescript.mjs
+  // `asyncContextHelper`, LLP 1133.002 D14), as Hermes's prelude does with
+  // its `currentCall`: a watch, a fetch or a storage step after an `await` is
+  // that answer's. The synchronous turn alone stays `call.turn`.
+  globalThis.__exact_async_context = Object.freeze({
+    current: () => ({ call: answering.call, watching, asking }),
+    swap(to) {
+      const before = { call: answering.call, watching, asking };
+      answering.call = to?.call ?? null; watching = to?.watching ?? null; asking = to?.asking ?? '';
+      return before;
+    },
+  });
   const kept = () => keys ??= import('./storage-environment.js').then(({ keyStore, storageKey }) =>
     keyStore(typeof location === 'object' && source.appId ? storageKey(source.appId) : null, globalThis.indexedDB));
   __AUTH_INSTALL__
@@ -339,11 +409,27 @@ export function install(data, mixed = false, modules = null) {
     const types = sourceTypes[name], [params, result] = types ?? [[], 'u'];
     // The store as the module sees it (LLP 1018): a read marks the answer.
     const seen = createSecretFacade(store, tsGrantSet, kept);
+    // A call that read the store and then threw read it too: its resource is a store reader (LLP 1146 §2.3).
+    threwRead = false;
+    try { return answerWith(name, args, target, mutation, types, params, result, seen); } catch (e) { threwRead = !!seen.read; throw e; }
+  };
+  const answerWith = (name, args, target, mutation, types, params, result, seen) => {
+    // A kept key's work is counted on its answer as an ordinary fetch is (LLP 1016.000 D9).
+    for (const name of ['key', 'keepKey']) { const op = seen[name]; seen[name] = (...a) => ordinary(() => op(...a)); }
     asking = target ?? name; watching = name;
-    const call = answering.call = { stream: null, mutation };
+    for (const sources of moduleWatched.values()) sources.delete(name);
+    // The origin of the commit that asked it (LLP 1133.002 D12), which a fetch it makes carries (LLP 1133.036 D6).
+    const call = answering.call = { stream: null, mutation, name: target ?? name, turn: true, origin: Origin.now() }, target_ = target ?? name;
+    if (call.origin !== 'app') answering.untraced.add(call);
+    // What the source sent goes once the commit that asked it stands: an answer in flight's (a resource's, or a mutation's that
+    // answers with a promise) whatever it then answers, a refused commit saying so (LLP 1016.000 D7, amended 2026-10-18).
+    const effectsOf = answer => {
+      const said = why => journal.push(`t=${clock.now} ${answer ? 'answer' : 'send'} ${target_} failed: ${why}; socket frames were refused`);
+      return call.effects?.map(effect => Object.assign(() => { try { effect(); } catch (e) { said(e?.message ?? e); } }, answer ? { refused: said } : {}));
+    };
     let r;
-    try { r = source.answer(name, args.map((a, i) => named(a, params[i])), seen, storage, modules ? native : null); } catch (e) { call.settled = true; throw e; } finally { asking = ''; watching = null; answering.call = null; }
-    const target_ = target ?? name;
+    thrown = null;
+    try { r = source.answer(name, args.map((a, i) => named(a, params[i])), seen, storage, modules ? native : null); } catch (e) { call.settled = true; if (!mutation) thrown = effectsOf(true); throw e; } finally { call.turn = false; asking = ''; watching = null; answering.call = null; }
     const shaped = types ? v => checked(name, v, result) : v => v;
     // A stream's answer has replied once it returns (LLP 1016.000): what runs on is background work.
     // Socket operations go out only with a value given now: not with a
@@ -352,26 +438,24 @@ export function install(data, mixed = false, modules = null) {
       call.socketConflict = true; Promise.resolve(r).catch(() => {}); call.settled = true;
       throw new Error(SOCKET_AND_FETCH);
     }
-    if (call.effects?.length && r && typeof r.then === 'function') {
-      // A fetch its continuation makes is the module's, not the mutation's:
-      // the page has no turn to tie it to (LLP 1016.000 D7).
-      Promise.resolve(r).catch(() => {}); call.settled = true;
-      throw new Error('a socket mutation must answer synchronously');
-    }
-    if (call.stream) { call.settled = true; return { stream: opener(call.stream, v => conv(shaped(v), result, target_), target_), store: seen.read }; }
+    const effects = effectsOf(!mutation || !!(r && typeof r.then === 'function'));
+    // An upload's request identity: the same request for newer arguments keeps it (rt.js, LLP 1016.000 D10).
+    if (call.stream) { call.settled = true; return { stream: opener(call.stream, v => conv(shaped(v), result, target_), target_), upload: requestKey(call.stream), store: seen.read, effects }; }
     if (r && typeof r.then === 'function') {
       pendingAnswers++;
-      const settle = () => { call.settled = true; pendingAnswers--; if (!pendingAnswers && owed) { owed = false; leftOpen(); } };
-      return { promise: r.then(v => (settle(), conv(shaped(v), result, target_)), e => { settle(); leftOpen(); throw e; }), store: seen.read };
+      call.seen = seen; // a read after an `await` makes a store reader too: rt.js looks when the answer lands (LLP 1146 §2.3)
+      // Once: an answer let go while its timers were armed never settles, and ends here (ts-fetch.js `dropTimers`).
+      const settle = () => { if (call.settled) return; call.settled = true; dropTimers(call); answering.untraced.delete(call); pendingAnswers--; if (!pendingAnswers && owed) { owed = false; leftOpen(); } };
+      call.abandon = settle;
+      return { promise: r.then(v => (settle(), conv(shaped(v), result, target_)), e => { settle(); leftOpen(); throw e; }), store: seen.read, effects, call };
     }
-    call.settled = true;
-    return { v: conv(shaped(r), result, target_), store: seen.read, effects: call.effects?.map(effect => () => {
-      try { effect(); } catch (e) { journal.push(`t=${clock.now} send ${target_} failed: ${e?.message ?? e}; socket frames were refused`); }
-    }) };
+    call.settled = true; dropTimers(call); answering.untraced.delete(call);
+    return { v: conv(shaped(r), result, target_), store: seen.read, effects };
   };
   // Beside a Rust source (LLP 1027.002): a source this module does not
   // answer is the Rust module's, not ready until it loads; rust-data.js
   // then asks it first and this module for what it calls unknown.
+  data.uploads = ledger; // the uploads a resource asks are asked once (LLP 1016.000 D10)
   data.answer = mixed ? (name, args, store, target, mutation) => { try { return ts(name, args, store, target, mutation); } catch { return null; } } : ts;
   // An overlay (`overlay.js`): what a resource shows while writes affect it, in overlay mode; `undefined` without one.
   overlaying.say = line => journal.push(`t=${clock.now} ${line}`);
@@ -387,5 +471,21 @@ export function install(data, mixed = false, modules = null) {
     } finally { overlaying.on = false; }
   });
   data.ts = ts;
+  // A module calling the app back (LLP 1133.016 D9, D15 item 1): the handler `tools` exports under `name`, run as a
+  // fresh answer that fills no slot, with the call's origin on it, so a module call it makes is admitted with that
+  // origin (`__exact_module`). Its answer, or null for a name `tools` does not export.
+  data.tool = (name, args, store, origin) => {
+    const handler = source.tools?.[name];
+    if (typeof handler !== 'function') return null;
+    const call = answering.call = { stream: null, mutation: true, name, turn: true, origin };
+    asking = name;
+    let r;
+    try { r = handler(args, createSecretFacade(store, tsGrantSet, kept), storage); }
+    finally { call.turn = false; asking = ''; answering.call = null; }
+    return Promise.resolve(r).finally(() => { call.settled = true; dropTimers(call); });
+  };
+  // A resource's source that sent and then threw: what it sent, which rt.js `ask` queues with the commit.
+  data.thrown = () => { const t = thrown ?? []; thrown = null; return t; };
+  data.threwRead = () => { const read = threwRead; threwRead = false; return read; };
   for (const f of data.q.splice(0)) f();
 }

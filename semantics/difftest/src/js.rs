@@ -9,10 +9,11 @@
 //! target makes that the runner did not is a divergence. A program
 //! `exact-web-js` refuses is outside the JS target, not a failure.
 
-use crate::oracle::{self, Oracle};
+use crate::oracle::Oracle;
 use crate::script::{Case, Event};
 use crate::{compile, observe};
 use exact_plan::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -20,7 +21,10 @@ use std::process::Command;
 #[derive(Debug, Clone)]
 pub enum JsVerdict {
     /// The JS target printed the runner's observation.
-    Agree,
+    Agree {
+        /// The JS observation, retained for property checks.
+        js: Vec<String>,
+    },
     /// The compiler refused the program (the runner never ran it).
     Refused(String),
     /// `exact-web-js` refused it: outside the JS target.
@@ -118,7 +122,8 @@ fn event(e: &Event) -> String {
     match e {
         Event::Tap(t) => format!("{{\"tap\":{}}}", string(t)),
         Event::Type(t, s) => format!("{{\"type\":[{},{}]}}", string(t), string(s)),
-        Event::Clock(ms) => format!("{{\"clock\":{}}}", number(*ms)),
+        Event::Clock(ms) | Event::TestClock(ms) => format!("{{\"clock\":{}}}", number(*ms)),
+        Event::Land | Event::InputLand => "{\"land\":true}".into(),
     }
 }
 
@@ -126,11 +131,32 @@ fn event(e: &Event) -> String {
 struct Ready {
     rust: Vec<String>,
     json: String,
+    /// The runner's `sin` and `cos` of each input the JS target asked for,
+    /// by `sin:`/`cos:` and the input's bits, as the driver keys them.
+    trig: BTreeMap<String, String>,
+}
+
+impl Ready {
+    /// The case's line of the driver's batch, with its `trig` answers.
+    fn line(&self) -> String {
+        let answers: Vec<String> = self
+            .trig
+            .iter()
+            .map(|(k, v)| format!("{}:{}", string(k), string(v)))
+            .collect();
+        let open = self.json.strip_suffix('}').expect("the case is an object");
+        format!("{open},\"trig\":{{{}}}}}", answers.join(","))
+    }
 }
 
 /// Run `case` on the runner and write its half of a batch; the program goes
 /// to `dir` unless it is its own file, unchanged (its `use`s resolve there).
 fn prepare(case: &Case, dir: &Path, index: usize) -> Result<Ready, JsVerdict> {
+    if case.prerendered {
+        return Err(JsVerdict::Outside(
+            "a prerendered page: the driver boots the agent's way, every tab panel waiting".into(),
+        ));
+    }
     let plan = compile(case).map_err(JsVerdict::Refused)?;
     let (rust, data) = observe::run(plan.clone(), Oracle::for_case(&plan, case), &case.events);
     let data = data.expect("the oracle comes back");
@@ -180,8 +206,10 @@ fn prepare(case: &Case, dir: &Path, index: usize) -> Result<Ready, JsVerdict> {
         .filter(|s| s.persist)
         .map(|s| string(plan.str(s.name)))
         .collect();
+    let hosts: Vec<String> = data.host_sources().into_iter().map(string).collect();
     let json = format!(
-        "{{\"file\":{},\"events\":[{}],\"answers\":[{}],\"facts\":{{{}}},\"stored\":{{{}}},\"persisted\":[{}]}}",
+        "{{\"hostSources\":[{}],\"file\":{},\"events\":[{}],\"answers\":[{}],\"facts\":{{{}}},\"stored\":{{{}}},\"persisted\":[{}]}}",
+        hosts.join(","),
         string(&file.display().to_string()),
         events.join(","),
         answers.join(","),
@@ -189,18 +217,20 @@ fn prepare(case: &Case, dir: &Path, index: usize) -> Result<Ready, JsVerdict> {
         stored.join(","),
         persisted.join(",")
     );
-    Ok(Ready { rust, json })
+    Ok(Ready {
+        rust,
+        json,
+        trig: BTreeMap::new(),
+    })
 }
 
 /// One driver process over `ready`; each case's result line.
 fn drive(compiler: &Path, dir: &Path, ready: &[&Ready]) -> Result<Vec<String>, String> {
-    let hosts: Vec<String> = oracle::HOST_SOURCES.iter().map(|s| string(s)).collect();
-    let cases: Vec<&str> = ready.iter().map(|r| r.json.as_str()).collect();
+    let cases: Vec<String> = ready.iter().map(|r| r.line()).collect();
     let batch = format!(
-        "{{\"compiler\":{},\"work\":{},\"hostSources\":[{}],\"cases\":[{}]}}",
+        "{{\"compiler\":{},\"work\":{},\"cases\":[{}]}}",
         string(&compiler.display().to_string()),
         string(&dir.join("runtime").display().to_string()),
-        hosts.join(","),
         cases.join(",\n")
     );
     let file = dir.join("batch.json");
@@ -243,6 +273,12 @@ fn field(line: &serde_json::Value, name: &str) -> Option<Vec<String>> {
 }
 
 fn verdict(rust: Vec<String>, text: &str) -> JsVerdict {
+    // The JS module exposes no commit trace. Compare configurations and
+    // outcomes, omitting `ran` lines on both sides (LLP 1148 D3).
+    let rust: Vec<String> = rust
+        .into_iter()
+        .filter(|l| !l.starts_with("ran "))
+        .collect();
     let line: serde_json::Value = match serde_json::from_str(text) {
         Ok(l) => l,
         Err(e) => return JsVerdict::Error(format!("{e}: {text}")),
@@ -256,6 +292,7 @@ fn verdict(rust: Vec<String>, text: &str) -> JsVerdict {
             field(line, "error").map_or_else(|| text.to_string(), |e| e.concat()),
         );
     };
+    let js: Vec<String> = js.into_iter().filter(|l| !l.starts_with("ran ")).collect();
     let keep = |v: &[String]| -> Vec<String> {
         v.iter().filter(|l| !l.starts_with('#')).cloned().collect()
     };
@@ -265,7 +302,7 @@ fn verdict(rust: Vec<String>, text: &str) -> JsVerdict {
     // what each evaluates before refusing is not observable).
     let at = r.iter().zip(&j).position(|(a, b)| a != b);
     match at {
-        None if r.len() == j.len() => JsVerdict::Agree,
+        None if r.len() == j.len() => JsVerdict::Agree { js },
         None => JsVerdict::Diverge {
             at: r.len().min(j.len()),
             rust,
@@ -274,6 +311,34 @@ fn verdict(rust: Vec<String>, text: &str) -> JsVerdict {
         Some(at) => JsVerdict::Diverge { at, rust, js },
     }
 }
+
+/// The `sin:`/`cos:` inputs a driver line says the JS target asked for and
+/// the harness has not answered.
+fn asked(text: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|l| field(&l, "asked"))
+        .unwrap_or_default()
+}
+
+/// The runner's answer for a driver's `sin:<bits>` or `cos:<bits>` key, as
+/// its bits: `exact_motion::math`, the runner's pinned libm.
+fn libm(key: &str) -> Option<String> {
+    let (f, bits) = key.split_once(':')?;
+    let x = f64::from_bits(u64::from_str_radix(bits, 16).ok()?);
+    let y = match f {
+        "sin" => exact_motion::math::sin(x),
+        "cos" => exact_motion::math::cos(x),
+        _ => return None,
+    };
+    Some(format!("{:016x}", y.to_bits()))
+}
+
+/// How many times a case is driven at most while it asks for `sin` or
+/// `cos` of inputs not yet answered: each drive answers the inputs the one
+/// before it reached, so a chain of `n` trig results takes `n + 1`. A case
+/// still asking after the last is a driver error, never scored.
+const TRIG_ROUNDS: usize = 32;
 
 /// Run `cases` on the runner and the JS target, `batch` cases per driver
 /// process, the processes side by side (`DIFFTEST_JOBS`, as [`crate::check`]).
@@ -325,17 +390,52 @@ fn run_chunk(compiler: &Path, chunk: &[Case], dir: &Path) -> Result<Vec<JsVerdic
         .enumerate()
         .map(|(i, c)| prepare(c, dir, i))
         .collect();
-    let ready: Vec<&Ready> = prepared.iter().filter_map(|p| p.as_ref().ok()).collect();
-    let mut lines = if ready.is_empty() {
-        Vec::new()
-    } else {
-        drive(compiler, dir, &ready)?
+    let mut ready: Vec<Ready> = Vec::new();
+    let mut slots: Vec<Result<usize, JsVerdict>> = Vec::new();
+    for p in prepared {
+        slots.push(p.map(|r| {
+            ready.push(r);
+            ready.len() - 1
+        }));
     }
-    .into_iter();
-    Ok(prepared
+    // Drive every case, then again each that asked for `sin` or `cos` of an
+    // input the harness had not answered, with those answered.
+    let mut lines: Vec<String> = vec![String::new(); ready.len()];
+    let mut pending: Vec<usize> = (0..ready.len()).collect();
+    for _ in 0..TRIG_ROUNDS {
+        if pending.is_empty() {
+            break;
+        }
+        let batch: Vec<&Ready> = pending.iter().map(|&i| &ready[i]).collect();
+        let driven = drive(compiler, dir, &batch)?;
+        let mut again = Vec::new();
+        for (&i, line) in pending.iter().zip(driven) {
+            let keys = asked(&line);
+            lines[i] = line;
+            if keys.is_empty() {
+                continue;
+            }
+            for k in keys {
+                if let Some(v) = libm(&k) {
+                    ready[i].trig.insert(k, v);
+                }
+            }
+            again.push(i);
+        }
+        pending = again;
+    }
+    let mut ready: Vec<Option<Ready>> = ready.into_iter().map(Some).collect();
+    Ok(slots
         .into_iter()
-        .map(|p| match p {
-            Ok(r) => verdict(r.rust, &lines.next().expect("one line per case")),
+        .map(|s| match s {
+            Ok(i) if pending.contains(&i) => JsVerdict::Error(format!(
+                "sin or cos inputs still unanswered after {TRIG_ROUNDS} drives: {}",
+                asked(&lines[i]).join(" ")
+            )),
+            Ok(i) => {
+                let r = ready[i].take().expect("each case once");
+                verdict(r.rust, &lines[i])
+            }
             Err(v) => v,
         })
         .collect())
@@ -384,7 +484,7 @@ pub fn report(
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for (i, (case, v)) in cases.iter().zip(verdicts).enumerate() {
         match v {
-            JsVerdict::Agree => agree += 1,
+            JsVerdict::Agree { .. } => agree += 1,
             JsVerdict::Refused(_) => refused += 1,
             JsVerdict::Outside(why) => {
                 outside += 1;
@@ -457,4 +557,50 @@ pub fn report(
         cases.len()
     );
     Ok(diverge == 0 && errors == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agreeing_js_observations_are_retained_for_always_checks() {
+        let lines = vec![
+            "== boot".into(),
+            "outcome ok".into(),
+            "slot ready true".into(),
+            "== tap \"go\"".into(),
+            "ran handler go ok".into(),
+            "outcome ok".into(),
+            "slot ready false".into(),
+        ];
+        let json = serde_json::json!({ "lines": lines.iter().filter(|l: &&String| !l.starts_with("ran ")).collect::<Vec<_>>() });
+        let JsVerdict::Agree { js } = verdict(lines, &json.to_string()) else {
+            panic!("configurations agree")
+        };
+        let properties =
+            contract::properties("always \"ready stays\"\n  expect state ready stays true\n")
+                .unwrap();
+        let report = crate::property::evaluate(&properties, &js);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].step, 1);
+    }
+
+    /// The driver's key for `sin(4)` answers the runner's bits, which
+    /// JavaScriptCore's `Math.sin` misses by one unit in the last place.
+    #[test]
+    fn a_trig_key_answers_the_runners_bits() {
+        let key = format!("sin:{:016x}", 4f64.to_bits());
+        assert_eq!(libm(&key).as_deref(), Some("bfe837b9dddc1eae"));
+        assert_eq!(libm("tan:3fe0000000000000"), None);
+        let ready = Ready {
+            rust: Vec::new(),
+            json: "{\"file\":\"a\"}".into(),
+            trig: BTreeMap::from([(key, "bfe837b9dddc1eae".to_string())]),
+        };
+        assert_eq!(
+            ready.line(),
+            "{\"file\":\"a\",\"trig\":{\"sin:4010000000000000\":\"bfe837b9dddc1eae\"}}"
+        );
+    }
 }

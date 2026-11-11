@@ -137,9 +137,10 @@ final class SplitMacTests: XCTestCase {
 
     /// The window's owner, as ExactMac composes it: a full-size-content
     /// window whose content is the split view, and the window's toolbar.
-    private func compose(_ view: ExactView, width: CGFloat, sidebar: Bool, minimum: CGFloat = 320, autosave: String? = nil) -> ExactSidebarController {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 500),
-                              styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+    private func compose(_ view: ExactView, width: CGFloat, sidebar: Bool, minimum: CGFloat = 320, autosave: String? = nil,
+                         window kind: NSWindow.Type = NSWindow.self) -> ExactSidebarController {
+        let window = kind.init(contentRect: NSRect(x: 0, y: 0, width: width, height: 500),
+                               styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         self.window = window
         window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 500))
@@ -155,6 +156,172 @@ final class SplitMacTests: XCTestCase {
         window.layoutIfNeeded()
     }
     private func items(_ window: NSWindow) -> [String] { window.toolbar?.items.map(\.itemIdentifier.rawValue) ?? [] }
+
+    func testTheRunnerReadsFramesAndHitsInTheDetailPanesSpace() throws {
+        let source = app(tabs: false)
+            .replacingOccurrences(of: "  state query = \"\"", with: "  state observed = \"unread\"\n  state hit = \"unread\"\n  state query = \"\"")
+            .replacingOccurrences(of: "  action count\n", with: "  action readGeometry\n    let f = frame(\"geometry-card\")\n    observed = `${f.x},${f.y},${f.width}`\n    hit = match elementFromPoint(321 + f.width / 2, f.y + 5) { case some(id) => id, case none => \"none\" }\n  action count\n")
+            .replacingOccurrences(of: "box testId=`half-${e.params.id}`", with: "box id=\"geometry-card\" testId=`half-${e.params.id}`")
+            .replacingOccurrences(of: "testId=`field-${e.params.id}`", with: "testId=`field-${e.params.id}`\n            button testId=\"read-geometry\" press=readGeometry\n              text \"Read\"\n            text `${observed} ${hit}` testId=\"geometry-result\"")
+        let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: source)
+        let columns = compose(ExactView(session: session), width: 1000, sidebar: false)
+        let window = try XCTUnwrap(self.window)
+        try press("row-a")
+        func check(dx: CGFloat = 0) throws {
+            window.layoutIfNeeded()
+            session.presenter.settlePump()
+            try press("read-geometry")
+            let card = try node("half-a"), clip = session.presenter.viewport.contentView
+            XCTAssertTrue(card.isDescendant(of: columns.detailPane))
+            let shown = clip.convert(card.bounds, from: card).offsetBy(dx: -clip.bounds.minX, dy: -clip.bounds.minY)
+            let words = try node("geometry-result").accessibleText.split(separator: " ")
+            let frame = try XCTUnwrap(words.first).split(separator: ",").compactMap { Double($0) }
+            XCTAssertEqual(frame.count, 3)
+            guard frame.count == 3 else { return }
+            XCTAssertGreaterThan(shown.minX, 200)
+            XCTAssertEqual(frame[0], shown.minX + dx, accuracy: 0.5)
+            XCTAssertEqual(frame[1], shown.minY, accuracy: 0.5)
+            XCTAssertEqual(frame[2], shown.width, accuracy: 0.5)
+            XCTAssertEqual(words.last, "geometry-card")
+        }
+        try check()
+        width(window, 1200)
+        try check()
+        window.orderFrontRegardless()
+        columns.detailPane.wantsLayer = true
+        window.displayIfNeeded()
+        CATransaction.flush()
+        let layer = try XCTUnwrap(columns.detailPane.layer)
+        let restingFrame = columns.detailPane.frame
+        let end = layer.position.x
+        let motion = CABasicAnimation(keyPath: "position.x")
+        motion.fromValue = end - 80; motion.toValue = end
+        motion.duration = 1; motion.speed = 0; motion.timeOffset = 0.5
+        motion.fillMode = .both; motion.isRemovedOnCompletion = false
+        layer.add(motion, forKey: "split-placement-test")
+        CATransaction.flush()
+        let deadline = Date(timeIntervalSinceNow: 30)
+        while layer.presentation() == nil, Date() < deadline { RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05)) }
+        XCTAssertEqual(try XCTUnwrap(layer.presentation()).position.x, end - 40, accuracy: 0.1)
+        XCTAssertEqual(columns.detailPane.frame, restingFrame, "presentation movement does not resize or move the model pane")
+        try check(dx: -40)
+        layer.removeAnimation(forKey: "split-placement-test")
+        try check()
+    }
+
+    func testTheDriverCapturesAndReadsBothPanes() throws {
+        let session = try boot(tabs: false, size: CGSize(width: 900, height: 500))
+        let columns = compose(ExactView(session: session), width: 900, sidebar: false)
+        try press("row-a")
+        let agent = Agent(session: session)
+        let picture = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".png")
+        defer { try? FileManager.default.removeItem(at: picture) }
+        let capture = agent.screenshot(["path": picture.path])
+        XCTAssertNil(capture["error"], "\(capture)")
+        XCTAssertEqual(capture["w"] as? Double, Double(columns.view.bounds.width))
+        let ax = agent.accessibilityElementsTree([:])["ax"] as? [String: Any]
+        let exposed = (ax?["elements"] as? [[String: Any]] ?? []).compactMap { $0["testId"] as? String }
+        XCTAssertTrue(exposed.contains("row-a"), "the list is still exposed")
+        XCTAssertTrue(exposed.contains("field-a"), "the detail is exposed too: \(exposed)")
+        let box = try node("half-a")
+        let frame = agent.box(box)
+        let point = NSPoint(x: frame.minX + 10, y: frame.minY + 10)
+        let pixels = agent.sample(["points": [[point.x, point.y]]])["values"] as? [[Double]]
+        let pixel = try XCTUnwrap(pixels?.first)
+        XCTAssertGreaterThan(pixel[0], 0.8)
+        XCTAssertLessThan(pixel[2], 0.1)
+        for name in ["row-a", "half-a"] {
+            let reply = agent.tap(["id": Int(try node(name).id), "hover": true])
+            XCTAssertNil(reply["error"], "\(name): \(reply)")
+        }
+        let split = session.presenter.navigation.split
+        split.listOwnsWindow = false
+        XCTAssertEqual(window?.title, "About a")
+        XCTAssertTrue(try node("title-a").isHiddenOrHasHiddenAncestor)
+        split.listOwnsWindow = true
+        XCTAssertEqual(window?.title, "Library")
+        XCTAssertFalse(try node("title-a").isHiddenOrHasHiddenAncestor)
+    }
+
+    func testAnUnsaidWindowGroundLetsTheSplitSurfaceShowThrough() throws {
+        let session = try boot(tabs: false, size: CGSize(width: 900, height: 500))
+        let p = session.presenter
+        _ = compose(ExactView(session: session), width: 900, sidebar: false)
+        try press("row-a")
+        let role: [String: Any] = ["sys": "windowBackgroundColor", "c": [[255, 255, 255, 255], [30, 30, 30, 255]]]
+        let route = try node("route-book-a")
+        p.apply(wireBatch([["op": "style", "id": route.id, "style": ["background_color": role]]]))
+        XCTAssertNil(route.layer?.backgroundColor)
+        p.apply(wireBatch([["op": "style", "id": route.id, "style": ["background_color": role, "written": ["background_color"]]]]))
+        XCTAssertNotNil(route.layer?.backgroundColor, "an author's explicit role still paints")
+    }
+
+    /// A card on that ground (secondary-background, the under-page grey on the Mac) paints its own fill while the
+    /// ground under it still lets the split surface show through
+    func testACardOnAnUnsaidWindowGroundPaintsTheUnderPageGrey() throws {
+        let session = try boot(tabs: false, size: CGSize(width: 900, height: 500))
+        let p = session.presenter
+        _ = compose(ExactView(session: session), width: 900, sidebar: false)
+        try press("row-a")
+        let ground: [String: Any] = ["sys": "windowBackgroundColor", "c": [[255, 255, 255, 255], [30, 30, 30, 255]]]
+        let route = try node("route-book-a")
+        p.apply(wireBatch([["op": "style", "id": route.id, "style": ["background_color": ground]]]))
+        let card = NodeView(id: 99_997, kind: "view", presenter: p)
+        p.views[card.id] = card
+        route.container.addSubview(card)
+        card.frame = NSRect(x: 16, y: 16, width: 200, height: 80)
+        card.applyStyle(["background_color": .object(["sys": .string("underPageBackgroundColor"), "c": .array([.array([242, 242, 247, 255]), .array([28, 28, 30, 255])])])])
+        route.display(); card.display()
+        XCTAssertTrue(route.standsOnSplitGround, "the ground still shows the split's surface")
+        XCTAssertNil(route.layer?.backgroundColor, "and paints none of its own")
+        XCTAssertFalse(card.standsOnSplitGround)
+        // The card's layer paints AppKit's under-page grey, as resolved where it stands
+        let srgb = { (c: CGColor) in c.converted(to: CGColorSpace(name: CGColorSpace.sRGB)!, intent: .defaultIntent, options: nil)?.components?.map { ($0 * 255).rounded() } }
+        let painted = try XCTUnwrap(card.layer?.backgroundColor.flatMap(srgb), "the card's layer has a fill")
+        var want = NSColor.underPageBackgroundColor.cgColor
+        card.effectiveAppearance.performAsCurrentDrawingAppearance { want = NSColor.underPageBackgroundColor.cgColor }
+        XCTAssertEqual(painted, try XCTUnwrap(srgb(want)))
+    }
+
+    func testPublicLayoutSamplesAndScreenshotClicksShareThePageOrigin() throws {
+        let source = app(tabs: true).replacingOccurrences(of: "box testId=`half-${e.params.id}`", with: "box press=count testId=`half-${e.params.id}`")
+        let session = try boot(tabs: true, size: CGSize(width: 1100, height: 500), source: source)
+        let columns = compose(ExactView(session: session), width: 1100, sidebar: true)
+        try press("row-a")
+        let window = try XCTUnwrap(window), p = session.presenter, agent = Agent(session: session)
+        window.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        window.orderFrontRegardless()
+        XCTAssertNotNil(window.toolbar)
+        XCTAssertGreaterThan(columns.sidebarWidth, 100)
+        let card = try node("half-a")
+        let layout = try XCTUnwrap(agent.layout()["nodes"] as? [[String: Any]])
+        let frame = try XCTUnwrap(layout.first { $0["id"] as? Int == Int(card.id) })
+        let x = try XCTUnwrap(frame["x"] as? Double), y = try XCTUnwrap(frame["y"] as? Double)
+        let sampled = agent.sample(["points": [[x + 5, y + 10]]])
+        let pixel = try XCTUnwrap((sampled["values"] as? [[Double]])?.first)
+        XCTAssertGreaterThan(pixel[0], 0.8)
+        XCTAssertLessThan(pixel[2], 0.1, "a public layout point samples the orange card")
+
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".png")
+        defer { try? FileManager.default.removeItem(at: path) }
+        let capture = agent.screenshot(["path": path.path])
+        XCTAssertNil(capture["error"])
+        let image = try XCTUnwrap(NSBitmapImageRep(data: Data(contentsOf: path)))
+        let scale = CGFloat(image.pixelsWide) / CGFloat(try XCTUnwrap(capture["w"] as? Double))
+        var right = 0, top = image.pixelsHigh
+        for py in 0..<image.pixelsHigh { for px in 0..<image.pixelsWide {
+            guard let c = image.colorAt(x: px, y: py)?.usingColorSpace(.sRGB),
+                  c.redComponent > 0.9, c.greenComponent > 0.5, c.greenComponent < 0.8, c.blueComponent < 0.05 else { continue }
+            right = max(right, px); top = min(top, py)
+        } }
+        XCTAssertGreaterThan(right, 0)
+        XCTAssertLessThan(top, image.pixelsHigh)
+        let reply = agent.tap(["id": Int(card.id), "hover": true, "x": CGFloat(right) / scale - 5, "y": CGFloat(top) / scale + 10])
+        XCTAssertNil(reply["error"], "\(reply)")
+        let point = try XCTUnwrap(p.agentPointer)
+        let hit = window.contentView?.hitTest(point)
+        XCTAssertTrue(hit === card || hit?.isDescendant(of: card) == true, "a screenshot point sends the pointer to the card")
+    }
 
     func testAnUnsplitStackClosesADetailPaneRestoredByAppKit() throws {
         let session = try boot(tabs: true, size: CGSize(width: 1100, height: 500))
@@ -194,6 +361,37 @@ final class SplitMacTests: XCTestCase {
         XCTAssertTrue(window.makeFirstResponder(nil))
         session.presenter.focusEvents.reset()
         return (session.presenter, window, path)
+    }
+
+    func testExitingAnAncestorRetiresItsFocusedPaneRoute() throws {
+        let (p, window, path) = try listeningDetail()
+        let fieldNode = path[0], route = path[1], panel = path[2]
+        let field = try XCTUnwrap(fieldNode.field)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        let editor = try XCTUnwrap(field.currentEditor())
+        XCTAssertFalse(route.isDescendant(of: panel))
+        let pane = try XCTUnwrap(route.superview), frame = route.frame
+        p.apply(wireBatch([["op": "exit", "id": Int(panel.id)]]))
+        XCTAssertNil(p.views[route.id])
+        XCTAssertNil(p.views[fieldNode.id])
+        XCTAssertFalse(window.firstResponder === editor)
+        XCTAssertNil(field.currentEditor())
+        let members = try XCTUnwrap(p.leaving[panel.id]).members
+        XCTAssertTrue(members.contains { $0 === route })
+        XCTAssertTrue(members.contains { $0 === fieldNode })
+        XCTAssertEqual(Set(members.map(\.id)).count, members.count)
+        XCTAssertTrue(route.superview === pane, "the exit keeps the pane content mounted")
+        XCTAssertTrue(route.window === window)
+        XCTAssertEqual(route.frame, frame)
+        XCTAssertFalse(route.isHiddenOrHasHiddenAncestor)
+        XCTAssertTrue(route.routeInert)
+        XCTAssertTrue(route.isAccessibilityHidden())
+        XCTAssertTrue(p.navigation.split.holds(route))
+        p.apply(wireBatch([]))
+        XCTAssertTrue(route.superview === pane, "a later batch must not release it either")
+        p.apply(wireBatch([["op": "destroy", "id": Int(panel.id)]]))
+        XCTAssertNil(route.superview)
+        XCTAssertFalse(p.navigation.split.holds(route))
     }
 
     func testDetailFocusBubblesThroughItsAuthoredAncestorsAndStops() throws {
@@ -432,6 +630,23 @@ final class SplitMacTests: XCTestCase {
         XCTAssertFalse(p.navigation.canGoBack)
     }
 
+    /// The text pump paints the detail's pane as it paints the page: a route
+    /// there is out of the root, and its kept heading, outside every scroll
+    /// view, is in view. Left out, a rasterized heading kept the pixels of
+    /// the appearance it was first painted in (black in Dark Mode).
+    func testTheDetailPanesTextIsThePumpsToPaint() throws {
+        let session = try boot(tabs: false, size: CGSize(width: 900, height: 500))
+        let columns = compose(ExactView(session: session), width: 900, sidebar: false)
+        try press("row-a")
+        let title = try node("title-a")
+        XCTAssertTrue(title.isDescendant(of: columns.detailPane))
+        XCTAssertNil(title.enclosingScrollView)
+        let shown = session.presenter.selection.shownParagraphs
+        XCTAssertTrue(shown.contains { $0 === title })
+        XCTAssertTrue(TextViewportIndex(shown).candidates().contains { $0 === title })
+        XCTAssertEqual(shown.count, Set(shown.map(ObjectIdentifier.init)).count, "each paragraph once")
+    }
+
     func testARetainedListObeysTheCurrentSplitRule() throws {
         let source = """
         routes nav
@@ -640,5 +855,407 @@ final class SplitMacTests: XCTestCase {
         XCTAssertTrue(again.superview === columns.detailPane)
         XCTAssertFalse(library.isHidden)
     }
+
+    /// A popover declared in a route the split shows in its detail pane opens,
+    /// painted and as AppKit's: the pane is a block's native container, and
+    /// whether the popover is in the page walks out of it to the route's
+    /// authored home (theme2 12:32; it had never opened there, the pane being
+    /// under no page root).
+    func testAPopoverInTheDetailPaneOpens() throws {
+        for painted in [true, false] {
+            let source = app(tabs: false).replacingOccurrences(
+                of: "testId=`field-${e.params.id}`",
+                with: "testId=`field-${e.params.id}`\n            button testId=\"pop-open\" popovertarget=\"bookpop\"\n              text \"More\"\n            column id=\"bookpop\" testId=\"bookpop\" popover=\"auto\" width=100 height=40"
+            ).replacingOccurrences(
+                of: "      for e in stack(nav) key=e.id\n",
+                with: "      button testId=\"list-pop-open\" popovertarget=\"listpop\"\n        text \"Filter\"\n      column id=\"listpop\" testId=\"listpop\" popover=\"manual\" width=100 height=40\n      for e in stack(nav) key=e.id\n")
+            let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: source)
+            _ = compose(ExactView(session: session), width: 1000, sidebar: false)
+            let window = try XCTUnwrap(self.window)
+            window.setFrameOrigin(NSPoint(x: 120, y: 120))
+            window.orderFrontRegardless()
+            let p = session.presenter
+            p.menus.painted = painted
+            func settle() { for _ in 0..<20 { p.settlePump(); session.drainFill(); RunLoop.main.run(until: Date().addingTimeInterval(0.02)) } }
+            try press("row-a")
+            settle()
+            window.layoutIfNeeded()
+            let pop = try node("bookpop"), opener = try node("pop-open")
+            XCTAssertTrue(p.navigation.split.holds(try node("route-book-a")), "the book is in the detail pane")
+            XCTAssertFalse(opener.isDescendant(of: p.root), "its invoker is under no page root")
+            try press("pop-open")
+            let end = Date().addingTimeInterval(3)
+            while !p.menus.isOpen(pop), Date() < end { settle() }
+            XCTAssertTrue(p.menus.isOpen(pop), painted ? "painted" : "AppKit's popover")
+            if !painted { XCTAssertEqual(p.menus.windowed.count, 1) }
+            if painted {
+                // In the pane's own layer, beside its invoker: not clamped into the list.
+                let pane = try XCTUnwrap(p.navigation.split.pane(holding: opener))
+                XCTAssertTrue(pop.isDescendant(of: pane))
+                let shown = pop.convert(pop.bounds, to: nil), invoker = opener.convert(opener.bounds, to: nil)
+                XCTAssertEqual(shown.minX, invoker.minX, accuracy: 1, "\(shown) under \(invoker)")
+                // A menu-shaped one (AppKit's menu) pops up there too, not clamped into the list.
+                let menu = NSMenu()
+                menu.addItem(withTitle: "Row", action: nil, keyEquivalent: "")
+                menu.minimumWidth = 100
+                XCTAssertEqual(p.menus.popUpPoint(menu, pop, in: opener).x, 0, accuracy: 1, "under its invoker's left edge")
+                // Escape closes it with the keyboard still in the pane.
+                XCTAssertTrue(window.makeFirstResponder(try XCTUnwrap(try node("field-a").field)))
+                let escape = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53))
+                XCTAssertTrue(p.menus.key(escape))
+                XCTAssertFalse(p.menus.isOpen(pop), "Escape from the pane's field")
+                // Open again, then the split ends (the driver's own chrome): the
+                // route goes back into the page, and the open popover's layer with it.
+                try press("pop-open")
+                let again = Date().addingTimeInterval(3)
+                while !p.menus.isOpen(pop), Date() < again { settle() }
+                XCTAssertTrue(pop.isDescendant(of: pane))
+                // And one opened after it with no invoker (`showPopover`), in the page's layer.
+                let later = try node("listpop")
+                p.menus.action("showPopover", ["listpop"])
+                let opened = Date().addingTimeInterval(3)
+                while !p.menus.isOpen(later), Date() < opened { settle() }
+                // A depth from the pane's own ranking must not travel with the
+                // layer: a box ranked there that stays when the split ends (as a
+                // retained route of another stack would) gives the pane's layers
+                // a deeper depth than the page's.
+                let paneLayer = try XCTUnwrap(pop.superview)
+                let retained = NodeView(id: 9_999_001, kind: "view", presenter: p)
+                pane.addSubview(retained, positioned: .below, relativeTo: nil)
+                retained.setRank(2)
+                XCTAssertGreaterThan(paneLayer.layer?.zPosition ?? 0, 0.0015, "deeper by the pane's own ranking")
+                p.navigation.split.painted = true
+                settle()
+                XCTAssertFalse(p.navigation.split.active, "no split")
+                XCTAssertTrue(p.menus.isOpen(pop) && p.menus.isOpen(later))
+                XCTAssertTrue(pop.isDescendant(of: p.viewport), "its layer follows the route into the page")
+                let layers = p.viewport.subviews
+                let (first, second) = (layers.firstIndex { pop.isDescendant(of: $0) }, layers.firstIndex { later.isDescendant(of: $0) })
+                XCTAssertLessThan(try XCTUnwrap(first), try XCTUnwrap(second), "under the one opened after it")
+                let depths = (paneLayer.layer?.zPosition, later.superview?.layer?.zPosition)
+                XCTAssertEqual(depths.0, depths.1, "ranked among the page's layers, so their order paints")
+                retained.removeFromSuperview()
+            }
+            session.destroy(); self.session = nil; window.close(); self.window = nil
+        }
+    }
+
+    /// A route mounted in the pane after a painted popover opened from it (a
+    /// push) goes under the popover's layer, which stays on top of the pane,
+    /// so a click on the popover reaches it, as it paints.
+    func testARouteMountedInThePaneStaysUnderAnOpenPopover() throws {
+        let source = app(tabs: false).replacingOccurrences(
+            of: "testId=`field-${e.params.id}`",
+            with: "testId=`field-${e.params.id}`\n            button testId=\"pane-pop-open\" popovertarget=\"panepop\"\n              text \"Keep\""
+        ).replacingOccurrences(
+            of: "      for e in stack(nav) key=e.id\n",
+            with: "      column id=\"panepop\" testId=\"panepop\" popover=\"manual\" width=100 height=40\n        box testId=\"in-pop\" width=100 height=40\n      for e in stack(nav) key=e.id\n")
+        let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: source)
+        _ = compose(ExactView(session: session), width: 1000, sidebar: false)
+        let window = try XCTUnwrap(self.window)
+        window.setFrameOrigin(NSPoint(x: 120, y: 120))
+        window.orderFrontRegardless()
+        let p = session.presenter
+        p.menus.painted = true
+        func settle() { for _ in 0..<20 { p.settlePump(); session.drainFill(); RunLoop.main.run(until: Date().addingTimeInterval(0.02)) } }
+        try press("row-a")
+        settle()
+        let pop = try node("panepop")
+        try press("pane-pop-open")
+        let end = Date().addingTimeInterval(3)
+        while !p.menus.isOpen(pop), Date() < end { settle() }
+        let pane = try XCTUnwrap(p.navigation.split.pane(holding: try node("pane-pop-open")))
+        let layer = try XCTUnwrap(pop.superview)
+        XCTAssertTrue(layer.superview === pane)
+        try press("notes-a")
+        settle()
+        XCTAssertTrue(has("route-notes"), "notes pushed into the pane")
+        XCTAssertTrue(p.menus.isOpen(pop), "a manual popover stays open")
+        XCTAssertTrue(pane.subviews.last === layer, "the layer is back on top of the pane")
+        let inside = try node("in-pop")
+        let point = inside.convert(NSPoint(x: inside.bounds.midX, y: inside.bounds.midY), to: nil)
+        let hit = try XCTUnwrap(window.contentView?.hitTest(window.contentView!.convert(point, from: nil)))
+        XCTAssertTrue(hit.isDescendant(of: inside), "the click reaches the popover: \(type(of: hit))")
+    }
+
+    /// `source` with each line that contains `marker` replaced by `lines`,
+    /// written at that line's indent.
+    private func replacing(_ marker: String, with lines: [String], in source: String) -> String {
+        source.components(separatedBy: "\n").flatMap { line -> [String] in
+            guard line.contains(marker) else { return [line] }
+            let indent = String(line.prefix { $0 == " " })
+            return lines.map { indent + $0 }
+        }.joined(separator: "\n")
+    }
+
+    /// LLP 1116.006 D2: the box the root route marks
+    /// `navigationSplit="placeholder"` is what the empty pane shows, in
+    /// place of AppKit's "No Selection": laid out at the pane's size, its
+    /// content centred, its size kept when the author's rows change, and
+    /// `display: none` in its route again while a detail shows.
+    func testTheAuthorsPlaceholderIsTheEmptyPanes() throws {
+        let source = replacing("list testId=\"books\"", with: [
+            "column navigationSplit=\"placeholder\" width=50 margin-left=(counted > 0 ? 30 : 0) testId=\"own\"",
+            "  text \"Pick a book\" testId=\"own-text\"",
+            "  button press=count testId=\"own-count\"",
+            "    text \"Count\"",
+            "list testId=\"books\" flex=1 min-height=0",
+        ], in: app(tabs: false))
+        let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: source)
+        let columns = compose(ExactView(session: session), width: 1000, sidebar: false)
+        let split = session.presenter.navigation.split, pane = columns.detailPane
+        let own = try node("own"), library = try node("route-library")
+        func shown() throws {
+            XCTAssertTrue(own.superview === pane)
+            XCTAssertEqual(own.style["display"]?.string, "flex")
+            XCTAssertEqual(own.frame, NSRect(origin: .zero, size: pane.bounds.size))
+            XCTAssertNil(columns.detail.saysNothing, "no words of AppKit's over the author's")
+            XCTAssertEqual(split.summary["placeholder"] as? Int, Int(own.id))
+            let words = try node("own-text"), text = pane.convert(words.bounds, from: words)
+            XCTAssertEqual(text.midX, pane.bounds.midX, accuracy: 1)
+        }
+        try shown()
+        // The author's margin changes, which moves the box and sends no style: the pane's box stands, as the web shell's `!important` does.
+        try press("own-count")
+        try shown()
+        // A detail: the pane is the route's, and the box is no box in the list's column.
+        try press("row-a")
+        XCTAssertTrue(try node("route-book-a").superview === pane)
+        XCTAssertTrue(own.isDescendant(of: library))
+        XCTAssertEqual(own.style["display"]?.string, "none")
+        XCTAssertTrue(split.summary["placeholder"] is NSNull)
+        XCTAssertTrue(split.closeDetail())
+        try shown()
+        // A wider window: the box follows the pane.
+        width(try XCTUnwrap(window), 1200)
+        try shown()
+        // The driver's own chrome pushes: the box is in its route, hidden.
+        split.painted = true
+        XCTAssertTrue(own.isDescendant(of: library))
+        XCTAssertEqual(own.style["display"]?.string, "none")
+    }
+
+    /// The library with its books in the painted grouped form (D6), as
+    /// Excord's channels are: a section of rows whose press is an action
+    /// that pushes the book. A book's Next replaces it with the next.
+    private func paintedList() -> String {
+        let swapping = app(tabs: false).replacingOccurrences(of: "  action count\n", with: "  action swap(url: string)\n    nav = replace(nav, url)\n  action count\n")
+        let next = replacing("box testId=`half-${e.params.id}`", with: [
+            "box testId=`half-${e.params.id}` width=\"50%\" height=40 background-color=\"#f9ab00\"",
+            "button press=swap(path(\"book\", e.params.id == \"a\" ? \"b\" : e.params.id == \"b\" ? \"c\" : \"a\")) testId=`next-${e.params.id}`",
+            "  text \"Next\"",
+        ], in: swapping)
+        let grouped = next.replacingOccurrences(of: "list testId=\"books\"", with: "list testId=\"books\" appearance=\"auto\" listStyle=\"plain\"")
+        // A grouped list's rows are in sections; the link rows go.
+        let bare = replacing("text `Book ${id}`", with: [], in: replacing("link href=path(\"book\", id)", with: [], in: grouped))
+        return replacing("for id in [\"a\", \"b\", \"c\"] key=id", with: [
+            "section",
+            "  for id in (counted > 1 ? [\"a\", \"b\"] : [\"a\", \"b\", \"c\"]) key=id",
+            "    button press=follow(path(\"book\", id)) testId=`row-${id}`",
+            "      row gap=8 align-items=\"center\" flex=1 min-width=0",
+            "        text `Book ${id}` flex=1 testId=`name-${id}`",
+            "        image \"symbol:forward-chevron\" testId=`chevron-${id}`",
+            "  button press=count testId=\"row-count\"",
+            "    text \"Count\"",
+            "  input value=query input=search placeholder=\"Filter\" testId=\"row-field\"",
+        ], in: bare)
+    }
+
+    /// LLP 1115.002 D5: the list's column draws no disclosure chevron, as
+    /// a hand-built Mac list beside its detail has none, also where the list
+    /// is no table but the painted grouped form (D6), as Excord's channels
+    /// are. Pushed, the rows draw them again.
+    func testAPaintedListBesideItsDetailDrawsNoChevrons() throws {
+        let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: paintedList())
+        _ = compose(ExactView(session: session), width: 1000, sidebar: false)
+        let p = session.presenter, split = p.navigation.split
+        XCTAssertTrue(split.active)
+        XCTAssertNil(p.tables.feeds[try node("books").id], "the grouped form is painted")
+        func drawn(_ id: String) throws -> CGFloat? { try node(id).symbolView?.alphaValue }
+        XCTAssertEqual(try drawn("chevron-a"), 0)
+        XCTAssertEqual(try drawn("chevron-c"), 0)
+        try press("row-b")
+        XCTAssertEqual(try drawn("chevron-b"), 0, "beside its detail too")
+        split.painted = true
+        XCTAssertEqual(try drawn("chevron-a"), 1, "a pushed stack's rows keep theirs")
+        split.painted = false
+        XCTAssertEqual(try drawn("chevron-a"), 0)
+    }
+
+    /// LLP 1115.002 D5: the painted list's row whose detail shows is drawn
+    /// selected, as a table's row is: AppKit's selection, the separators
+    /// beside it not drawn, and while the window is key with the keyboard
+    /// in the list or nowhere, emphasized, its text in the selected item's
+    /// ink. The selection moves with the detail and goes with it.
+    func testAPaintedListMarksTheRowWhoseDetailShows() throws {
+        let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: paintedList())
+        let columns = compose(ExactView(session: session), width: 1000, sidebar: false, window: KeyedWindow.self)
+        let window = try XCTUnwrap(self.window)
+        let p = session.presenter, split = p.navigation.split
+        func mark(_ id: String) throws -> RowSelectionLayer? {
+            let row = try node(id)
+            return row.superview?.layer?.sublayers?.lazy.compactMap { $0 as? RowSelectionLayer }.first { $0.row === row }
+        }
+        func separated(_ id: String) throws -> Bool? {
+            try node(id).layer?.sublayers?.lazy.compactMap { $0 as? GroupedSeparatorLayer }.first.map { !$0.isHidden }
+        }
+        func fill(_ emphasized: Bool, in id: String) throws -> CGColor? {
+            var color: CGColor?
+            try node(id).effectiveAppearance.performAsCurrentDrawingAppearance {
+                color = (emphasized ? NSColor.selectedContentBackgroundColor : .unemphasizedSelectedContentBackgroundColor).cgColor
+            }
+            return color
+        }
+        func ink(_ id: String) throws -> [Double] {
+            let spec = try node(id).paragraphSpec()
+            return (spec.runs.first?.color ?? spec.color).map { ($0 * 100).rounded() / 100 }
+        }
+        XCTAssertTrue(split.active)
+        XCTAssertNil(try mark("row-a"))
+        XCTAssertEqual(try separated("row-a"), true)
+        XCTAssertEqual(try separated("row-b"), true)
+        let plain = try ink("name-b")
+
+        // A row is pressed: its detail shows, and the row is drawn selected, 8 points before its text.
+        try press("row-b")
+        XCTAssertTrue(try node("route-book-b").superview === columns.detailPane)
+        XCTAssertEqual(split.summary["marked"] as? Int, Int(try node("row-b").id))
+        let row = try node("row-b"), selection = try XCTUnwrap(mark("row-b"))
+        let card = try XCTUnwrap(row.superview), text = card.convert(try node("name-b").bounds, from: try node("name-b"))
+        XCTAssertEqual(selection.frame.minX, text.minX - 8, accuracy: 0.5)
+        XCTAssertEqual(selection.frame.maxX, row.frame.maxX - row.number("padding_right") + 8, accuracy: 0.5)
+        XCTAssertEqual(selection.frame.minY, row.frame.minY)
+        XCTAssertEqual(selection.frame.height, row.frame.height)
+        XCTAssertEqual(selection.cornerRadius, 7)
+        XCTAssertNil(try mark("row-a"))
+        XCTAssertEqual(try separated("row-a"), false, "no separator above the selected row")
+        XCTAssertEqual(try separated("row-b"), false, "nor under it")
+        // Another row, whose press pushes over the first: it is that row's detail, with no Back, and the
+        // selection moves, and so do the separators it hides.
+        try press("row-c")
+        XCTAssertFalse(p.navigation.canGoBack)
+        XCTAssertNil(try mark("row-b"))
+        XCTAssertNotNil(try mark("row-c"))
+        XCTAssertEqual(try separated("row-a"), true)
+        XCTAssertEqual(try separated("row-b"), false)
+
+        // In the key window, with the keyboard nowhere: emphasized, and its text the selected item's. A
+        // test process cannot make its window key, so the window says it is, and says when it stops.
+        let keyed = try XCTUnwrap(window as? KeyedWindow)
+        keyed.key = true
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: keyed)
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertEqual(try mark("row-c")?.backgroundColor, try fill(true, in: "row-c"))
+        XCTAssertEqual(try ink("name-c"), [255, 255, 255, 255])
+        XCTAssertEqual(try ink("name-a"), plain, "the rows beside it are as they were")
+        // A row whose press only acts, writing no router: the detail is still the other row's.
+        try press("row-count")
+        XCTAssertEqual(split.shown?.row, try node("row-c").id)
+        XCTAssertNotNil(try mark("row-c"))
+        XCTAssertNil(try mark("row-count"))
+        // A field in the list has the keyboard: emphasized no more, as a table would not be first responder.
+        XCTAssertTrue(window.makeFirstResponder(try node("row-field").field))
+        XCTAssertEqual(try mark("row-c")?.backgroundColor, try fill(false, in: "row-c"))
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertEqual(try mark("row-c")?.backgroundColor, try fill(true, in: "row-c"))
+        // The keyboard goes to the detail: a table there would no longer be first responder.
+        XCTAssertTrue(window.makeFirstResponder(try node("field-c").field))
+        XCTAssertEqual(try mark("row-c")?.backgroundColor, try fill(false, in: "row-c"))
+        XCTAssertEqual(try ink("name-c"), plain)
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertEqual(try ink("name-c"), [255, 255, 255, 255])
+        // Another window takes key.
+        keyed.key = false
+        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: keyed)
+        XCTAssertEqual(try mark("row-c")?.backgroundColor, try fill(false, in: "row-c"))
+        XCTAssertEqual(try ink("name-c"), plain)
+        keyed.key = true
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: keyed)
+        XCTAssertEqual(try ink("name-c"), [255, 255, 255, 255])
+
+        // A control in the detail replaces its book with another: the route moved where no row's
+        // press or link took it, so no row is selected (LLP 1127 D3), and the pane begins where it did.
+        try press("next-c")
+        let swapped = try node("route-book-a")
+        XCTAssertTrue(swapped.superview === columns.detailPane)
+        XCTAssertEqual(split.shown?.detail, swapped)
+        XCTAssertFalse(p.navigation.canGoBack)
+        XCTAssertNil(try mark("row-c"))
+        XCTAssertNil(try mark("row-a"))
+        XCTAssertTrue(split.summary["marked"] is NSNull)
+        XCTAssertEqual(try ink("name-c"), plain)
+        XCTAssertEqual(try separated("row-b"), true)
+        // Its row is pressed: selected again.
+        try press("row-a")
+        XCTAssertNotNil(try mark("row-a"))
+
+        // The detail goes: no row is selected, and the separators are back.
+        XCTAssertTrue(split.closeDetail())
+        XCTAssertNil(try mark("row-a"))
+        XCTAssertEqual(try ink("name-a"), plain)
+        XCTAssertEqual(try separated("row-a"), true)
+        XCTAssertTrue(split.summary["marked"] is NSNull)
+        // Pushed, as under the driver's own chrome: the list is no split's, and marks nothing.
+        try press("row-a")
+        XCTAssertNotNil(try mark("row-a"))
+        split.painted = true
+        XCTAssertNil(try mark("row-a"))
+        split.painted = false
+
+        // The selected row leaves the list while its detail shows: its selection goes with it.
+        try press("row-c")
+        let holder = try XCTUnwrap(try node("row-c").superview)
+        XCTAssertNotNil(try mark("row-c"))
+        try press("row-count")
+        XCTAssertFalse(has("row-c"))
+        XCTAssertNotNil(split.shown?.detail)
+        XCTAssertFalse(holder.layer?.sublayers?.contains { $0 is RowSelectionLayer } ?? false)
+    }
+
+    /// A list of the author's own rows (`appearance="none"`) is painted as
+    /// written: no selection is drawn on its row, as none is on a card.
+    func testTheAuthorsOwnRowsAreNotMarked() throws {
+        let source = app(tabs: false).replacingOccurrences(of: "list testId=\"books\"", with: "list testId=\"books\" appearance=\"none\"")
+        let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: source)
+        let columns = compose(ExactView(session: session), width: 1000, sidebar: false)
+        let split = session.presenter.navigation.split
+        XCTAssertNil(session.presenter.tables.feeds[try node("books").id])
+        try press("row-a")
+        XCTAssertTrue(try node("route-book-a").superview === columns.detailPane)
+        XCTAssertTrue(split.summary["marked"] is NSNull)
+        XCTAssertFalse(try node("row-a").superview?.layer?.sublayers?.contains { $0 is RowSelectionLayer } ?? false)
+    }
+
+    /// A node in the detail's pane is hovered as one in the page is: the
+    /// pane is beside the viewport, not in it.
+    func testHoverReachesTheDetailPane() throws {
+        let source = app(tabs: false)
+            .replacingOccurrences(of: "  state query = \"\"", with: "  state hot = false\n  state query = \"\"")
+            .replacingOccurrences(of: "  action count\n", with: "  action hovered(over: bool)\n    hot = over\n  action count\n")
+        let hovering = replacing("box testId=`half-${e.params.id}`", with: [
+            "box testId=`half-${e.params.id}` width=\"50%\" height=40 background-color=\"#f9ab00\" hover=hovered",
+            "text (hot ? \"hot\" : \"cold\") testId=\"hot\"",
+        ], in: source)
+        let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: hovering)
+        let columns = compose(ExactView(session: session), width: 1000, sidebar: false)
+        try press("row-a")
+        let box = try node("half-a"), agent = Agent(session: session)
+        XCTAssertTrue(box.isDescendant(of: columns.detailPane))
+        let reply = agent.tap(["id": Int(box.id), "hover": true])
+        XCTAssertNil(reply["error"], "\(reply)")
+        XCTAssertTrue(session.presenter.hoveredNodes.contains { $0 === box })
+        XCTAssertEqual(try node("hot").accessibleText, "hot")
+        // Over the list: the box is left.
+        XCTAssertNil(agent.tap(["id": Int(try node("row-b").id), "hover": true])["error"])
+        XCTAssertFalse(session.presenter.hoveredNodes.contains { $0 === box })
+        XCTAssertEqual(try node("hot").accessibleText, "cold")
+    }
+}
+
+/// A window that is key while it says so.
+private final class KeyedWindow: NSWindow {
+    var key = false
+    override var isKeyWindow: Bool { key }
 }
 #endif

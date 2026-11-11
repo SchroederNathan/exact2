@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 mod boot;
 mod direct;
+mod longpoll;
 mod overload;
 mod serve;
 mod viewport;
@@ -30,6 +31,8 @@ enum Post {
     Elsewhere,
     /// A real fetch from a server on this machine.
     Local(u16),
+    /// A turn over its budget refuses it: the runner holds it to ask again.
+    Overrun,
 }
 
 #[derive(Clone, Default)]
@@ -77,6 +80,11 @@ impl DataSource for Blog {
                 Answer::Now(Value::list(private.into_iter().collect()))
             }
             ("post", Post::Soon | Post::Never) => Answer::Later(Request::continuation(1)),
+            ("post", Post::Overrun) => {
+                return Err(DataError::Overrun(
+                    "took 180.0 ms, over the 100 ms budget for one turn".into(),
+                ))
+            }
             ("post", Post::Storage) => Answer::Later(Request::storage(b"get".to_vec())),
             ("post", Post::Elsewhere) => {
                 Answer::Later(Request::get("https://elsewhere.invalid/post"))
@@ -224,6 +232,22 @@ fn at_the_deadline_the_placeholder_stays_and_the_checkpoint_lists_it() {
     );
 }
 
+/// A resource a turn over its budget refused waits in the runner to be asked
+/// again (exact-runner's `overrun.rs`): no timer fires in a render, so it
+/// completes with the placeholder, and its checkpoint lists the resource for
+/// the client to ask, rather than waiting out its deadline for nothing.
+#[test]
+fn a_resource_held_to_be_asked_again_completes_the_render() {
+    let r = at(Post::Overrun, Duration::from_secs(3));
+    assert_eq!(r.settled, Settled::Complete);
+    assert!(r.document.root.contains(">loading<"), "{}", r.document.root);
+    assert!(
+        r.checkpoint.contains("\"pending\":[\"post\"]"),
+        "{}",
+        r.checkpoint
+    );
+}
+
 #[test]
 fn what_the_environment_does_not_hold_keeps_its_placeholder() {
     for post in [Post::Storage, Post::Elsewhere] {
@@ -237,9 +261,18 @@ fn what_the_environment_does_not_hold_keeps_its_placeholder() {
             r.checkpoint
         );
     }
-    // Only the app's fetch grants reach the render.
+    // Only the app's fetch grants reach the render, and of those no
+    // scheme-wide line.
     let data = Anonymous::new(Blog::new(Post::Soon));
     assert_eq!(DataSource::grants(&data), "net.fetch https://blog.test/");
+    let data = Anonymous::new(Blog {
+        grants: "net.fetch https:\nnet.fetch https://blog.test/\nnet.fetch HTTP:\nnet.websocket ws:\nnet.fetch https://blog.test:".into(),
+        ..Blog::new(Post::Soon)
+    });
+    assert_eq!(
+        DataSource::grants(&data),
+        "net.fetch https://blog.test/\nnet.fetch https://blog.test:"
+    );
 }
 
 #[test]
@@ -409,12 +442,21 @@ fn a_document_whose_ids_nobody_keeps_is_the_settled_tree_projected() {
         });
         assert_eq!(strip(&runtime.document.root), strip(&any.document.root));
         assert_eq!(
-            (
-                runtime.settled,
-                runtime.checkpoint.clone(),
-                runtime.activate
-            ),
-            (any.settled, any.checkpoint.clone(), any.activate)
+            (runtime.settled, runtime.checkpoint.clone()),
+            (any.settled, any.checkpoint.clone())
+        );
+        // Only a JavaScript page infers its activation (LLP 1048.007 D1): the
+        // answered post waits for the reader, the one held at the deadline
+        // runs its runtime at once to finish it.
+        assert_eq!(runtime.activate, exact_plan::ActivatePolicy::Inferred);
+        let waits = matches!(post, Post::Soon);
+        assert_eq!(
+            any.activate,
+            if waits {
+                exact_plan::ActivatePolicy::Interaction
+            } else {
+                exact_plan::ActivatePolicy::Inferred
+            }
         );
     }
     assert!(exact_render::projects_as_booted(&plan()));
@@ -513,11 +555,13 @@ fn a_javascript_page_preloads_its_runtime_and_runs_it_after_first_paint(mut r: R
     let shell = "<!doctype html>\n<html lang=\"en\">\n<meta charset=\"utf-8\">\n<base href=\"/\">\n<title>Blog</title>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"modulepreload\" href=\"./app.js\">\n<link rel=\"modulepreload\" href=\"./shared-1.js\">\n<style>p{margin:0}</style>\n<div id=\"exact-root\"></div>\n<script type=\"module\" src=\"./app.js\"></script>\n";
     let html = exact_render::page(shell, &r).unwrap();
     // Undeclared is eager: the runtime downloads from the head, before the
-    // stylesheet and the document, while the page streams.
+    // stylesheet and the document, while the page streams, at low priority:
+    // the page paints without it (LLP 1153.001 D8).
     assert!(html.contains("data-activate=\"eager\""), "{html}");
     let head = &html[..html.find("<style>").unwrap()];
-    assert!(head.contains("<link rel=\"modulepreload\" href=\"./app.js\">\n"));
-    assert!(head.contains("<link rel=\"modulepreload\" href=\"./shared-1.js\">\n"));
+    assert!(head.contains("<link rel=\"modulepreload\" href=\"./app.js\" fetchpriority=\"low\">\n"));
+    assert!(head
+        .contains("<link rel=\"modulepreload\" href=\"./shared-1.js\" fetchpriority=\"low\">\n"));
     // First paint runs nothing of the app's: no module script is in the
     // page (the checkpoint takes the entry's place), and the one script
     // that runs is the capture script, in the head, which imports the entry
@@ -593,6 +637,7 @@ fn a_javascript_page_preloads_its_runtime_and_runs_it_after_first_paint(mut r: R
     let html = exact_render::page(shell, &r).unwrap();
     assert!(html.contains("data-activate=\"idle\""));
     assert_eq!(html.matches("rel=\"modulepreload\"").count(), 2);
+    assert_eq!(html.matches("fetchpriority=\"low\"").count(), 2);
     r.activate = exact_plan::ActivatePolicy::Interaction;
     let html = exact_render::page(shell, &r).unwrap();
     assert!(html.contains("data-activate=\"interaction\""));

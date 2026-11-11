@@ -20,7 +20,7 @@ object Native {
      * with them, and again on the host's thread whenever one changes. */
     @JvmStatic external fun configure(
         night: Boolean, fontScale: Float, locale: String, rtl: Boolean, hour24: Boolean, noAnimations: Boolean,
-        boldText: Boolean, highContrast: Boolean, touch: Boolean, touchSlop: Float, dates: String,
+        boldText: Boolean, highContrast: Boolean, touch: Boolean, tv: Boolean, touchSlop: Float, dates: String,
     )
     /** The device's colours ([Palette], LLP 1115.001 D4): Material 3's colour roles as the reader resolved them for
      * this device, twelve under the light scheme and then the same twelve under the dark one, ARGB. Before [start],
@@ -38,6 +38,10 @@ object Native {
     @JvmStatic external fun chrome(): IntArray?
     @JvmStatic external fun frame(): ByteBuffer?
     @JvmStatic external fun poll(): Boolean
+    @JvmStatic external fun acquired(running: Boolean)
+    @JvmStatic external fun timerObservation(scrolling: Boolean, sampling: Boolean, applying: Boolean, idle: Boolean): Boolean
+    @JvmStatic external fun timerHeld(): Int
+    @JvmStatic external fun displayFrame()
     @JvmStatic external fun animating(): Boolean
     @JvmStatic external fun owed(): Boolean
     /** The collection pass a scroll left; `limit` >= 0 slices it (rows past what shows per list), the scrolled list
@@ -54,7 +58,9 @@ object Native {
      * innermost first: its id, flags (bit 0 it takes a sideways drag from here, bit 1 one up or down, bit 2 its
      * rows are a node the reader can move), its revision, then as float bits its offset (x, y), its farthest offset
      * (x, y) and the box it shows in (x, y, width, height). exact2 tells the reader of each of them from then on
-     * ([scrollers]). */
+     * ([scrollers]). After the scrollers: the native module button under the point (0: none), then its painted
+     * box x, y, width and height as float bits, in pixels, its allocation slot and generation, and how many long
+     * presses a node has taken so far (wrapping). */
     @JvmStatic external fun under(x: Float, y: Float): IntArray
     /** What exact2 tells the reader of the text fields it hosts (LLP 1115.001 D8), when that is not what this last
      * returned (else null): a count, then for each field, in tree order: its id, its generation (moved on when its
@@ -62,12 +68,15 @@ object Native {
      * takes no touch and no focus) and the scroller whose rows it was painted among (0: none); as float bits its
      * content box and the clip it shows through (x, y, width, height each; a negative clip width: none); the count
      * of the reader's edits that reached exact2 and the value the app shows as of it (a string: its bytes' count,
-     * then UTF-8 padded to whole words); its look, eighteen words (`Presenter::reader_fields` lists them), and three
-     * strings: its placeholder, its `autocomplete` and its font's file. A field it leaves out is gone. */
+     * then UTF-8 padded to whole words); its look, eighteen words (`Presenter::reader_fields` lists them), and four
+     * strings: its placeholder, its `autocomplete`, its font's file and its axes. A field it leaves out is gone. */
     @JvmStatic external fun fields(): IntArray?
     /** Hosted field [id], known at [generation], took the focus (a finger tapped it) or lost it. On the host's
      * thread, as every `field` call is; what one says of a generation exact2 has moved on from is dropped. */
     @JvmStatic external fun fieldFocused(id: Int, generation: Int, focused: Boolean)
+    /** Hosted field [id], known at [generation], had real input that may change nothing exact2 hears of: a finger
+     * down in it, a key down. A state held on it (LLP 1122 D8) lets go. */
+    @JvmStatic external fun fieldInput(id: Int, generation: Int)
     /** Hosted field [id] holds [value] after the person's edit number [seq], its selection at [start] to [end]
      * (UTF-16 units). Composing text is part of the value: exact2 fires `input` as the text composes. */
     @JvmStatic external fun fieldEdited(id: Int, generation: Int, seq: Int, value: String, start: Int, end: Int)
@@ -81,6 +90,8 @@ object Native {
      * key said it does: 0 Enter with no action, 2 done, 3 go, 4 next, 5 previous, 6 search, 7 send, 16 Tab, 17
      * Shift+Tab. exact2 does that: Enter's `key` handlers, `change` and `submit`, then the move or the leave. */
     @JvmStatic external fun fieldAction(id: Int, generation: Int, action: Int)
+    /** A module event, checked against the allocation generation carried by its painted view. */
+    @JvmStatic external fun moduleEvent(id: Int, slot: Int, generation: Int, kind: String, payload: String)
     /** The reader moved scroller [id] by ([dx], [dy]) px, knowing revision [rev] of it. exact2 clamps the move to
      * the scroller's travel, and drops one sent under a revision the app's own scroll has moved on from. */
     @JvmStatic external fun scrolled(id: Int, dx: Float, dy: Float, rev: Int)
@@ -146,16 +157,27 @@ object Native {
     /** A buffered canvas's newest frame (any thread): generation (24 bits), slot (8), serial (32); -1 none yet, -2 no
      * buffers on this device. */
     @JvmStatic external fun canvasFrame(view: Int): Long
+    /** -1 attachment refused, 0 waiting, 1 first window frame submitted to the compositor. Any thread. */
+    @JvmStatic external fun canvasReady(view: Int): Int
     /** That frame's buffer, or null. */
     @JvmStatic external fun canvasBuffer(view: Int): android.hardware.HardwareBuffer?
     /** A key at the focused node when no hosted field holds the focus: a character (or '\n' for Enter), or
      * Backspace. A hosted field ([Fields]) takes its keys itself. */
     @JvmStatic external fun key(code: Int, backspace: Boolean)
+    /** A gamepad's state for the canvas a key would reach (LLP 1127.003 D2): [values] its 17 standard buttons, then
+     * its 4 axes; [connected] false when it went away. */
+    @JvmStatic external fun pad(index: Int, connected: Boolean, values: FloatArray)
+    /** A remote's key, down or up, by the web's `code` and `key` (LLP 1115.001.003 D3): a D-pad arrow, or Select. */
+    @JvmStatic external fun namedKey(code: String, key: String, down: Boolean, repeat: Boolean)
     /** System Back (LLP 1115.001 D6): whether the app took it. From its navigation root's selected route it goes to
      * the Back control the root names, else to the root's `navigate` handler, else it is the runner's own `back`;
      * false when there is nowhere to go back to, and the activity finishes. The reader takes Back only while the
      * host says it has somewhere to go (a request, [requests]). */
     @JvmStatic external fun back(): Boolean
+    /** A URL given to the running app: its location goes to the navigation root's `navigate` (LLP 1133.023 D15 item 3). */
+    @JvmStatic external fun open(href: String)
+    /** A share given to the running app, `{"target", "share"}` as [Shares.request] writes it (LLP 1133.024 D5). */
+    @JvmStatic external fun share(request: String)
     /** What exact2 asks of the platform since this last returned any (LLP 1115.001 D5), or null when it asks
      * nothing: the one channel out, which [Requests] reads and acts on, on the main thread. exact2 queues a request
      * and makes the first of [fds] readable, so the reader comes for it whether or not a frame follows. The words:
@@ -164,6 +186,47 @@ object Native {
     /** The answer to request [id] (the share sheet's: `shared` or `dismissed`, or why it could not be shown), or null
      * when it was cancelled. On the host's thread. */
     @JvmStatic external fun answer(id: Int, answer: String?)
+    /** A topic an extension announced ([ExtensionContext.changed]): its readers are asked again. On the host's thread. */
+    @JvmStatic external fun changed(topic: String)
+    /** The extensions the APK carries, one a line ([Extensions]); under the agent, told so unless the drive names them
+     * (`--bind`). On the host's thread. */
+    @JvmStatic external fun bindExtensions(names: String)
+    /** How a presence check ended ([Presence]), on the store's completion path: never journaled. On the host's thread. */
+    @JvmStatic external fun presence(answer: String)
+    /** A package's picture for request [id] (LLP 1133.019 D11 item 1): [bitmap], software `ARGB_8888`, or why there is
+     * none ([error]) when it is null. On the host's thread. */
+    @JvmStatic external fun picture(id: Int, bitmap: android.graphics.Bitmap?, error: String?)
+    /** Picture [source] changed, so it is asked for again, or was [revoked]: every box showing it is emptied. On the
+     * host's thread. */
+    @JvmStatic external fun pictureChanged(source: String, revoked: Boolean)
+    /** The activity stopped (true) or started (false): the page's `visibilityState`. On the host's thread. */
+    @JvmStatic external fun hidden(hidden: Boolean)
+    /** Waits up to [ms] for the store's writes, which exact2 makes on a thread of its own: whether every commit handed
+     * over was written (a write that failed is tried once more; failing again, it stays pending). Any thread. */
+    @JvmStatic external fun storeDrain(ms: Int): Boolean
+    /** What [Orientation] asked of the activity for the session's orientation lock (LLP 1133.029 §8), JSON, whether
+     * its resolution found a conflict, and a line for the journal or null. On the host's thread. */
+    @JvmStatic external fun orientationApplied(applied: String, conflict: Boolean, line: String?)
+    /** The session's clock, ms, as of the host's last turn and moved on by the wall's outside the agent
+     * ([ExtensionContext.now]). Any thread. */
+    @JvmStatic external fun now(): Double
+
+    /** The file an `app:/data|cache|tmp/…` path names, or null (`ExtensionContext.file`). */
+    @JvmStatic external fun appFile(path: String): String?
+    /** Whether extension [name] is told it runs under the agent ([ExtensionContext.agent]). Any thread. */
+    @JvmStatic external fun underAgent(name: String): Boolean
+    /** A package's call of the app's handler, `{"extension", "handle", "handler", "args"}` (LLP 1133.016 D15 item 1):
+     *  its number, or -1 with no session; [invoked] reads its answer. */
+    @JvmStatic external fun invoke(body: String): Int
+    /** Call [id]'s answer as JSON, once; null while it has none. */
+    @JvmStatic external fun invoked(id: Int): String?
+    /** Whether the page places a canvas of surface [name], as of the host's last turn ([ExtensionSurfaces]). Any
+     * thread. */
+    @JvmStatic external fun surfaceHas(name: String): Boolean
+    /** A package's sample for surface [surface]'s canvas input (LLP 1133.013 D6), or with [ended] its end: kept until
+     * the host's next display frame delivers it to the canvas. [values] x, y, z and w; [at] the session clock's ms.
+     * Any thread; it waits for nothing. Whether none waited before it: the host is then woken for a frame. */
+    @JvmStatic external fun sensorInput(surface: String, sensor: String, values: DoubleArray, dropped: Int, at: Double, ended: Boolean): Boolean
     /** What the app's Kotlin hatches ask, for node [node] or 0 for their module (LLP 1115.001.000 D4; the kinds are
      * `hatches::reader::act`'s): its answer, a ticket for a registration, -1 when refused. */
     @JvmStatic external fun hatchAct(node: Int, kind: Int, text: String?): Long
@@ -171,6 +234,11 @@ object Native {
      * host's own handler (`host/linux/src/canvas/agent.rs`), on the host's thread. From the first one the host's turns
      * run at the driver's clock, which only a `clock` request moves. [AgentDrive] calls it for a driver over adb. */
     @JvmStatic external fun agent(line: ByteArray): ByteArray
+    /** What an [ExactTamber] asks (LLP 1121 D12), on the host's thread: `{"view": id or 0, "names": [..]}`, answered
+     * `{"inputs": "<u64>", "colors": {name: ARGB or null}}`, each colour as exact2 paints it at that view (its pinned
+     * modes, its scheme), null for a name the design lacks; `inputs` moves when anything the answer read does. A
+     * view that is no live node, or a name that is no string, is answered `{"error": ...}`. */
+    @JvmStatic external fun tamber(request: String): String
     /** Run the calling thread on the cores outside the slowest cluster; whether it was set. */
     @JvmStatic external fun fastCores(): Boolean
     /** An ADPF hint session over [tids] (this process's threads), [targetNs] their work's target. */

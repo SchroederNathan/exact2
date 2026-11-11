@@ -139,14 +139,14 @@ fn every_check_names_its_instructions_pc() {
     }
 }
 
-/// LLP 1088 §9.1: `concat`, `split`, and `slice`, `includes` and `indexOf`
+/// LLP 1088 §9.1: `concat`, `split`, `sum`, `range`, `flat`, and `slice`, `includes` and `indexOf`
 /// over a list, take their steps on the caller's budget, as `join` does:
 /// each gets the body's
 /// `$s` at its call and its pc, and the body adds the steps it took (`ST`);
 /// a body that calls one is metered, text's included.
 #[test]
 fn the_list_builders_step_on_the_callers_counter_at_their_call() {
-    let (plan, js) = js(&format!("{CARD}component App\n  resource cards = cards(3) as shape Card[]\n  state s = \"ab\"\n  derive both = cards.concat(cards).length\n  derive kept = cards.slice(1).length\n  derive found = cards.map(c => c.label).includes(s)\n  derive text = s.includes(\"a\")\n  derive at = cards.map(c => c.label).indexOf(s)\n  derive pieces = s.split(\"\").length\n  derive textAt = s.indexOf(\"b\")\n  view\n    text `${{both}} ${{kept}} ${{found}} ${{text}} ${{at}} ${{pieces}} ${{textAt}}`\n"));
+    let (plan, js) = js(&format!("{CARD}component App\n  resource cards = cards(3) as shape Card[]\n  state s = \"ab\"\n  derive both = cards.concat(cards).length\n  derive kept = cards.slice(1).length\n  derive found = cards.map(c => c.label).includes(s)\n  derive text = s.includes(\"a\")\n  derive at = cards.map(c => c.label).indexOf(s)\n  derive pieces = s.split(\"\").length\n  derive textAt = s.indexOf(\"b\")\n  derive total = sum(cards.map(c => c.label.length))\n  derive counted = range(s.length).length\n  derive flat = cards.map(c => [c.label]).flat().length\n  view\n    text `${{both}} ${{kept}} ${{found}} ${{text}} ${{at}} ${{pieces}} ${{textAt}} ${{total}} ${{counted}} ${{flat}}`\n"));
     for (i, d) in plan.derives.iter().enumerate() {
         let body = decl(&js, &format!("d_{i}"));
         assert_eq!(body.matches("let $s=0").count(), 1, "{body}");
@@ -160,6 +160,9 @@ fn the_list_builders_step_on_the_callers_counter_at_their_call() {
                     Stdlib::Includes,
                     Stdlib::IndexOf,
                     Stdlib::Split,
+                    Stdlib::Sum,
+                    Stdlib::Range,
+                    Stdlib::Flat,
                 ]
                 .iter()
                 .any(|&f| x.args[0] == f as u64)
@@ -186,4 +189,16 @@ fn development_derive_checks_name_the_authored_derive() {
     let production = crate::emit::emit(&plan, false, false).unwrap().js;
     assert!(dev.contains(",\"doubled\")"), "{dev}");
     assert!(!production.contains(",\"doubled\")"), "{production}");
+}
+
+/// A prop or style binding that can trap is guarded (`tg`): its trap unsets
+/// the row with a journal line naming its site, and the commit goes on
+/// (LLP 1017.003 D3). One that names nothing of budget.js's cannot trap and
+/// is left as it is.
+#[test]
+fn a_binding_that_can_trap_unsets_its_row() {
+    let (_, js) = js("component App\n  state n = 1\n  view\n    column\n      text range(n).map(i => \"x\").join(\",\") opacity=range(n).length / 2\n      text `${n}`\n");
+    assert!(js.contains("tg(e1,1,\"text\",()=>"), "{js}");
+    assert!(js.contains("tg(e1,1,\"opacity\",()=>"), "{js}");
+    assert!(!js.contains("tg(e2,"), "{js}");
 }

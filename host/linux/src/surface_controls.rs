@@ -20,6 +20,19 @@ pub(crate) fn disabled_control(n: &exact_kernel::NodeRef<'_>) -> bool {
         }
 }
 
+/// Where the pads' states go: the canvas that has them, and each connected
+/// pad's last reading, so moving the pads releases them on the old canvas
+/// and gives the new one each pad as it is.
+#[derive(Default)]
+pub(crate) struct PadRoute {
+    owner: Option<u32>,
+    readings: std::collections::BTreeMap<u8, ([f32; 17], [f32; 4])>,
+}
+/// The contact of a control pressed without a pointer: a declared shortcut,
+/// as the web's assistive click (gpu-glue.js) presses it. It moves no focus,
+/// so a focused world keeps its keyboard and its held keys.
+pub(crate) const ASSISTIVE_CONTACT: u32 = u32::MAX - 3;
+
 impl<D: DataSource> Presenter<D> {
     pub(crate) fn control_target(&self, id: u32) -> Option<u32> {
         let mut cursor = Some(id);
@@ -76,10 +89,11 @@ impl<D: DataSource> Presenter<D> {
             let Some((ox, oy, _, _)) = self.rect_of(id) else {
                 return false;
             };
-            if !self
-                .focus
-                .and_then(|v| self.host.kernel().node(v))
-                .is_some_and(|n| n.node_type == exact_kernel::NodeType::TextInput)
+            if contact != ASSISTIVE_CONTACT
+                && !self
+                    .focus
+                    .and_then(|v| self.host.kernel().node(v))
+                    .is_some_and(|n| n.node_type == exact_kernel::NodeType::TextInput)
             {
                 self.focus = Some(id);
             }
@@ -271,15 +285,106 @@ impl<D: DataSource> Presenter<D> {
             self.surfaces
                 .input(view, serde_json::json!({"t":"blur","at":self.host.now()}));
         }
+        // The pads leave their canvas; the next pad state finds one again.
+        let now = self.host.now();
+        self.move_pads(None, None, now);
         if let Some(e) = self.set_focus(None, self.host.now()) {
             eprintln!("exact: {e}");
         }
     }
 
+    /// A gamepad's state (LLP 1127.003 D2, D9) goes to the canvas that has
+    /// the pads: the focus's canvas, or with no focus the first canvas that
+    /// takes input; an editor's focus takes them from every canvas.
+    /// `at` is when the device reported it, in the host's clock.
+    pub fn hardware_pad(
+        &mut self,
+        index: u8,
+        connected: bool,
+        buttons: [f32; 17],
+        axes: [f32; 4],
+        at: f64,
+    ) {
+        let was = if connected {
+            self.pads.readings.insert(index, (buttons, axes)).is_some()
+        } else {
+            self.pads.readings.remove(&index).is_some()
+        };
+        let target = self.pad_target();
+        if target != self.pads.owner {
+            return self.move_pads(target, (!connected && was).then_some(index), at);
+        }
+        if let Some(view) = target.filter(|_| connected || was) {
+            self.send_pad(view, index, connected.then_some((buttons, axes)), at);
+        }
+    }
+    /// Whether any mounted canvas accepts device input. A polling host can
+    /// stop reading controllers when there is no consumer; focus changes
+    /// within an app that has one still use the latest controller readings.
+    pub fn has_gamepad_input(&self) -> bool {
+        self.surfaces
+            .canvases
+            .keys()
+            .any(|view| self.surfaces.wants_input(*view))
+    }
+    fn pad_target(&self) -> Option<u32> {
+        match self.focus {
+            Some(id) => self.input_surface(id),
+            None => {
+                let mut canvases = self.surfaces.canvases.keys().copied();
+                canvases.find(|view| self.surfaces.wants_input(*view))
+            }
+        }
+    }
+    /// The focus moved: the pads follow it to its canvas, or leave every
+    /// canvas for an editor.
+    pub(crate) fn pads_follow_focus(&mut self) {
+        let target = self.pad_target();
+        if target != self.pads.owner {
+            let now = self.host.now();
+            self.move_pads(target, None, now);
+        }
+    }
+    /// The old canvas hears every pad go (and `gone`, one that just did); the
+    /// new one hears every connected pad as it is now. `at` is the move's
+    /// time: the report's that caused it, or the focus change's.
+    fn move_pads(&mut self, target: Option<u32>, gone: Option<u8>, at: f64) {
+        let readings: Vec<_> = self.pads.readings.iter().map(|(i, r)| (*i, *r)).collect();
+        if let Some(old) = self.pads.owner.take() {
+            for index in readings.iter().map(|(i, _)| *i).chain(gone) {
+                self.send_pad(old, index, None, at);
+            }
+        }
+        self.pads.owner = target;
+        if let Some(view) = target {
+            for (index, reading) in readings {
+                self.send_pad(view, index, Some(reading), at);
+            }
+        }
+    }
+    /// The pads' last readings are no longer known (a host stopped reading
+    /// them while unfocused): no canvas receives them again until each pad
+    /// reports itself.
+    pub fn forget_pads(&mut self) {
+        let now = self.host.now();
+        self.move_pads(None, None, now);
+        self.pads.readings.clear();
+    }
+    fn send_pad(&mut self, view: u32, index: u8, reading: Option<([f32; 17], [f32; 4])>, at: f64) {
+        let (buttons, axes) = reading.unwrap_or_default();
+        self.surfaces.input(
+            view,
+            json!({"t":"pad","index":index,"connected":reading.is_some(),"standard":true,
+            "buttons":buttons,"axes":axes,"at":at}),
+        );
+    }
     /// Route device keys through the same targeted path as agent keys.
     pub fn hardware_key(&mut self, code: &str, key: &str, down: bool, repeat: bool) {
         self.restore_controls();
         self.hold_modifier(code, down);
+        if down {
+            self.key_shows_ring(key);
+        }
         // A hardware release returns before `type_key`, which is what forgets
         // a shortcut's code. Left set, an agent key of that code after the
         // button is gone delivers the down and swallows the up.
@@ -290,12 +395,17 @@ impl<D: DataSource> Presenter<D> {
             self.key_up(key, code, self.host.now());
         }
         // A Control or Meta chord is a shortcut, as a browser's: the focus's
-        // `key` handlers hear it, and no canvas or control starts with it.
+        // `key` handlers hear it (the root's with nothing focused), and no
+        // canvas or control starts with it.
         if down && self.held & 0b1100_1100 != 0 {
-            if self.focus.is_some() {
-                let name = if code == "NumpadEnter" { "Enter" } else { key };
-                self.key_down_with(name, code, repeat, self.host.now());
-            }
+            let name = if code == "NumpadEnter" { "Enter" } else { key };
+            self.key_down_with(name, code, repeat, self.host.now());
+            return;
+        }
+        // Winit forwards Alt+Space before Windows opens the system menu. It
+        // must not activate a focused button. Keep releases for held controls.
+        #[cfg(target_os = "windows")]
+        if down && code == "Space" && matches!(key, "Space" | " ") && self.modifiers().alt {
             return;
         }
         let contact = if code == "Space" {
@@ -355,6 +465,19 @@ impl<D: DataSource> Presenter<D> {
             }
             return;
         }
+        // A TV remote's focus on a bar's target, a node out of the page, or
+        // its arrow at a control a commit disabled: the key goes to the
+        // remote's keys, not to the page's (LLP 1115.001.003 D4).
+        let focus = self.focus;
+        let disabled = |p: &Self, f: ViewId| {
+            crate::presenter::remote::Direction::of(key).is_some()
+                && p.host.kernel().node(f).is_none_or(|n| disabled_control(&n))
+        };
+        if down && self.remote() && focus.is_some_and(|f| self.bar_node(f) || disabled(self, f)) {
+            self.key_down_with(key, code, repeat, self.host.now());
+            return;
+        }
+        let surface_was_open = self.surface_takes_keys();
         if let Some(id) = self.focus.or_else(|| {
             self.surfaces.canvases.keys().copied().find(|view| {
                 self.surfaces.wants_input(*view)
@@ -367,14 +490,21 @@ impl<D: DataSource> Presenter<D> {
             })
         }) {
             let _ = self.type_key(id, code, key, down, repeat);
-        } else if down && code == "Tab" {
-            // From no focus, Tab takes the first stop (LLP 1088 D7.3).
-            self.key_down("Tab", self.host.now());
-        } else if down && self.back_key(key) {
-            // And a Back key goes back (LLP 1115.000 D5.4).
-            self.key_down_with(key, code, repeat, self.host.now());
+        } else if down {
+            // With nothing focused the root's handlers hear the key; then Tab
+            // takes the first stop (LLP 1088 D7.3), a remote's arrow moves
+            // toward one (LLP 1115.001.003 D4) and a Back key goes back
+            // (LLP 1115.000 D5.4).
+            let name = match key {
+                "Space" => " ",
+                "NumpadEnter" => "Enter",
+                name => name,
+            };
+            self.key_down_with(name, code, repeat, self.host.now());
         }
+        // Dismissal already restores the surface's invoker; keep that focus.
         if code == "Escape"
+            && !surface_was_open
             && self.focus.is_some_and(|id| {
                 self.host
                     .kernel()
@@ -496,6 +626,9 @@ impl<D: DataSource> Presenter<D> {
         );
         let mut at = Some(id);
         while let Some(n) = at {
+            if key && !self.alert_allows(n) {
+                return None;
+            }
             let node = kernel.node(n)?;
             let disabled = if key {
                 disabled_control(&node)
@@ -514,12 +647,43 @@ impl<D: DataSource> Presenter<D> {
         None
     }
 
+    /// A captured mouse click follows kernel ancestry through nodes hidden
+    /// by pointerup. A picture boundary is returned for retained dispatch;
+    /// ordinary live handler lookup must not cross it.
+    fn mouse_press_target(&self, id: ViewId) -> Option<ViewId> {
+        if self.host.route_visibility(id).1 {
+            return None;
+        }
+        let kernel = self.host.kernel();
+        let mut at = Some(id);
+        while let Some(id) = at {
+            if self.brush.region_blocks_action(id) {
+                return Some(id);
+            }
+            let node = kernel.node(id)?;
+            if node.props.bool(PropId::Disabled) == Some(true) {
+                return None;
+            }
+            if self
+                .host
+                .runner()
+                .handlers_of(id)
+                .contains(&EventKind::Press)
+            {
+                return Some(id);
+            }
+            at = node.parent;
+        }
+        None
+    }
+
     /// The web's focusable nodes: controls, inputs, buttons and links, a
     /// node with a `focus`, `blur` or `key` handler (the web gives it a
     /// `tabindex`), and any node with an explicit `tabindex`, a negative one
     /// included (LLP 1088 D7.3), as the Apple hosts take the first
     /// responder. What tap, `autofocus` and `focus()` may focus; Tab takes
     /// only the `tabbable` ones.
+    /// Windows also focuses overflowing scroll containers for keyboard navigation.
     ///
     /// `disabled` keeps only a form control out (a button, an input, a
     /// control), where HTML defines it; on a box it means nothing to focus,
@@ -534,6 +698,9 @@ impl<D: DataSource> Presenter<D> {
                 == exact_kernel::Visibility::Visible
                 && !disabled_control(&n)
                 && (n.props.get(PropId::TabIndex).is_some()
+                    || self.desktop_scroll_focus(id)
+                    || self.alert_message_overflows(id)
+                    || self.focus == Some(id) && self.alert_message(id)
                     || n.props.str(PropId::Action).is_some()
                     || n.node_type == NodeType::TextInput
                     // A native button is a button under any role (LLP 1069.011.000 D1).
@@ -578,18 +745,66 @@ impl<D: DataSource> Presenter<D> {
 
     /// Pointer activation returns HUD button focus to its input canvas after press.
     pub fn press_at(&mut self, x: f32, y: f32, now_ms: f64) -> Option<ViewId> {
+        self.touched();
+        self.press_at_after_down(x, y, now_ms, None, false)
+    }
+
+    /// A press released at (`x`, `y`); `finger`, a finger's, which under the
+    /// Material look reaches the nearest control whose 48 dp touch box it is
+    /// in when it reached nothing that takes it ([`Presenter::touch_target`]).
+    pub(crate) fn press_at_after_down(
+        &mut self,
+        x: f32,
+        y: f32,
+        now_ms: f64,
+        focus_before_down: Option<Option<ViewId>>,
+        finger: bool,
+    ) -> Option<ViewId> {
         // An open select menu takes the press: a row, or light dismiss.
         if let Some(select) = self.menu_press(x, y) {
             return Some(select);
         }
-        let hit = self.hit(x, y)?;
-        self.note_press(hit, false);
-        let focus = !self.pointerdown_prevents_focus(hit);
+        let hit = self.hit(x, y);
+        let hit = if finger {
+            self.touch_target(hit, x, y)
+        } else {
+            hit
+        }?;
+        self.press_hit_after_down(hit, (x, y), now_ms, focus_before_down, false)
+    }
+
+    pub(crate) fn press_hit_after_down(
+        &mut self,
+        hit: ViewId,
+        (x, y): (f32, f32),
+        now_ms: f64,
+        focus_before_down: Option<Option<ViewId>>,
+        mouse_click: bool,
+    ) -> Option<ViewId> {
+        self.press_point = Some((x, y));
+        self.note_press_from(hit, false, focus_before_down.unwrap_or(self.focus));
+        let focus = focus_before_down.is_none() && !self.pointerdown_prevents_focus(hit);
+        let click = mouse_click.then(|| self.mouse_press_target(hit)).flatten();
+        if let Some(picture) = click.filter(|id| self.brush.region_blocks_action(*id)) {
+            return self.retained_press(picture, now_ms);
+        }
         // A popover's invoker, or a dialog's button: the top layer's, where
         // a shell presents one (`presenter/top.rs`); else refused.
         if let Some(invoker) = self.top_invoker(hit) {
-            if self.has_windows() && focus {
-                self.focus_for_press(hit, now_ms, self.direct());
+            if (self.has_windows() || self.neutral_alerts()) && focus {
+                self.focus_for_press(hit, (x, y), now_ms, self.direct());
+            }
+            if mouse_click {
+                let key = self.host.kernel().node(invoker)?.key;
+                if let Some(target) = click {
+                    self.dispatch_press(target, now_ms, true);
+                }
+                if !self.has_windows() && !self.neutral_alerts() {
+                    self.host.log(crate::navigation::POPOVER_UNSUPPORTED);
+                    return None;
+                }
+                self.follow_invocation(key, invoker, now_ms);
+                return Some(invoker);
             }
             return self.invoke(invoker, now_ms, true);
         }
@@ -597,23 +812,40 @@ impl<D: DataSource> Presenter<D> {
             return self.retained_press(hit, now_ms);
         }
         if let Some(control) = self.control_target(hit) {
-            for phase in ["down", "up"] {
-                if !self.control_input(control, phase, x, y, 1, now_ms) {
-                    return None;
-                }
+            let accepted = ["down", "up"]
+                .into_iter()
+                .all(|phase| self.control_input(control, phase, x, y, 1, now_ms));
+            if let Some(target) = click {
+                self.dispatch_press(target, now_ms, true);
             }
-            return Some(control);
+            return accepted.then_some(control);
         }
         if focus {
-            self.focus_for_press(hit, now_ms, self.direct());
+            self.focus_for_press(hit, (x, y), now_ms, self.direct());
         }
-        if self.press_range(hit, x) || self.toggle_control(hit, now_ms) {
+        if self.press_range(hit, x) {
+            if let Some(target) = click {
+                self.dispatch_press(target, now_ms, true);
+            }
+            return Some(hit);
+        }
+        let control = if mouse_click {
+            self.click_control(hit, now_ms, click)
+        } else {
+            self.toggle_control(hit, now_ms)
+        };
+        if control {
             return Some(hit);
         }
         // A link under the press is followed after the press's own handler,
         // as a click's default action follows its listeners (LLP 1038 §7).
         let link = self.link_at(hit, x, y);
-        let Some(target) = self.handler_target(hit, EventKind::Press) else {
+        let target = if mouse_click {
+            click
+        } else {
+            self.handler_target(hit, EventKind::Press)
+        };
+        let Some(target) = target else {
             if let Some(href) = link {
                 self.follow(hit, &href, now_ms);
                 return Some(hit);
@@ -628,27 +860,40 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// A press moves focus to the nearest focusable node at or above `hit`,
-    /// except that a canvas press leaves an editor focused. A finger's press
-    /// gives the focus without its ring (LLP 1115.001 D7.6: no focus ring in
-    /// touch mode, as the web's `:focus-visible`); a mouse's shows it, as it
-    /// did, and so does a focus a key or the app moves there after.
-    pub(crate) fn focus_for_press(&mut self, hit: ViewId, now_ms: f64, direct: bool) {
+    /// except that a canvas press leaves an editor focused. The focus a press
+    /// gives shows no ring, as the web's `:focus-visible` has it (LLP 1115.004
+    /// D9.2: Fluent's focus visual follows keyboard input only); a focus a key
+    /// moves there after shows it, and one the app moves shows it only where
+    /// the focus it leaves did (`set_focus`). A mouse pressing the focus it
+    /// does not move leaves its ring as it was, as Chrome's does; a finger
+    /// takes it away (LLP 1115.001 D7.6: no focus ring in touch mode). A text
+    /// field keeps its ring and `:focus-visible` look, as in Chrome.
+    pub(crate) fn focus_for_press(
+        &mut self,
+        hit: ViewId,
+        point: (f32, f32),
+        now_ms: f64,
+        direct: bool,
+    ) {
         let mut focus = Some(hit);
         while let Some(id) = focus {
-            if self.focusable(id) {
+            if self.focusable(id) && self.focus_refusal(id).is_none() {
                 break;
             }
             focus = self.host.kernel().node(id).and_then(|n| n.parent);
         }
-        let ringless = focus.filter(|_| direct);
-        self.dirty |= self.brush.ringless != ringless;
-        self.brush.ringless = ringless;
         let editing = self.surfaces.wants_input(hit)
             && self
                 .focus
                 .and_then(|id| self.host.kernel().node(id))
                 .is_some_and(|node| node.node_type == NodeType::TextInput);
-        if self.focus != focus && !editing {
+        let moves = self.focus != focus && !editing;
+        if direct || moves {
+            let ringless = focus.and_then(|id| self.unringed(id));
+            self.dirty |= self.brush.ringless != ringless;
+            self.brush.ringless = ringless;
+        }
+        if moves {
             if let Some(e) = self.set_focus(focus, now_ms) {
                 eprintln!("exact: {e}");
             }
@@ -656,7 +901,7 @@ impl<D: DataSource> Presenter<D> {
         }
         // A press in a text field puts its caret there (x2apps codeedit #2).
         if let Some(id) = focus.filter(|id| self.focus == Some(*id)) {
-            self.press_field(id);
+            self.press_field(id, point.0, point.1);
         }
     }
 
@@ -682,12 +927,27 @@ impl<D: DataSource> Presenter<D> {
     /// pointer's `down`. False when the canvas refuses it.
     pub(crate) fn canvas_contact_down(&mut self, hit: ViewId, x: f32, y: f32, at: f64) -> bool {
         self.note_press(hit, false);
-        self.focus_for_press(hit, at, self.direct());
+        self.focus_for_press(hit, (x, y), at, self.direct());
         self.input_surface(hit)
             .is_some_and(|view| self.canvas_pointer(view, "down", 1, x, y, at))
     }
 
+    /// A press's event: the modifiers held, and the point the pointer path
+    /// that sent it left (`press_point`), taken so no later press reads it.
+    /// A key's press has none, as a browser's synthetic click is at 0, 0.
+    pub(crate) fn press_event(&mut self, pointer: bool) -> Event {
+        let point = self.press_point.take();
+        let (client_x, client_y) = point.filter(|_| pointer).unwrap_or_default();
+        Event::pressed(exact_runner::MouseEvent {
+            client_x: client_x.into(),
+            client_y: client_y.into(),
+            held: self.modifiers(),
+        })
+    }
+
     pub(crate) fn dispatch_press(&mut self, target: ViewId, now_ms: f64, pointer: bool) {
+        self.disabled_blur.clear();
+        let row = self.capture_split_row(target);
         // Capture ancestry before the handler can remove its button. Pointer
         // activation yields focus to commit autofocus; keyboard activation keeps
         // a surviving button focused. Never clear an editor or explicit focus.
@@ -704,15 +964,11 @@ impl<D: DataSource> Presenter<D> {
             }
         });
         // With the modifiers held (gallery F20: shift-click), as a click has them.
-        let held = self.modifiers();
-        let press = if held == Default::default() {
-            Event::Press
-        } else {
-            Event::PressWith(held)
-        };
+        let press = self.press_event(pointer);
         if let Some(e) = self.host.dispatch_at(target, press, now_ms) {
             eprintln!("exact: {e}");
         }
+        self.associate_split_row(row);
         let prior_autofocus = self.autofocus_from;
         if pointer && fallback.is_some() {
             self.autofocus_from = Some(target);
@@ -721,8 +977,14 @@ impl<D: DataSource> Presenter<D> {
             eprintln!("exact: {e}");
         }
         self.autofocus_from = prior_autofocus;
-        if self.focus.is_none()
-            || (pointer && self.focus == Some(target) && fallback != Some(target))
+        // A control this press's commits disabled has had its `blur`
+        // (`clear_removed_focus`), the pressed one or a control inside it:
+        // whatever focus that left stands, and none comes back to the press,
+        // even to a control its blur enabled again.
+        let blurred = !std::mem::take(&mut self.disabled_blur).is_empty();
+        if !blurred
+            && (self.focus.is_none()
+                || (pointer && self.focus == Some(target) && fallback != Some(target)))
         {
             self.focus = fallback;
             // A pressed button its own handler removed: `focusout` at the

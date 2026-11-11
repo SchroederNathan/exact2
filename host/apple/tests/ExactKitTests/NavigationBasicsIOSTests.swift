@@ -25,16 +25,16 @@ final class NavigationBasicsIOSTests: XCTestCase {
         let presenter = NotificationPresenter()
         presenter.app = ExactApp.shared
         let date = Date()
-        let info: [AnyHashable: Any] = ["navigate": "/thread/42", "session": session.label,
-                                        "owner": session.notificationOwnerID]
+        let info: [AnyHashable: Any] = ["exact": ["navigate": "/thread/42", "session": session.label,
+                                        "owner": session.notificationOwnerID]]
         presenter.deliver(id: "thread-42", date: date, info: info)
         XCTAssertEqual(session.launchLocation, "/thread/42")
-        presenter.deliver(id: "thread-42", date: date, info: ["navigate": "/other", "session": session.label,
-                                                                           "owner": session.notificationOwnerID])
+        presenter.deliver(id: "thread-42", date: date, info: ["exact": ["navigate": "/other", "session": session.label,
+                                                                           "owner": session.notificationOwnerID]])
         XCTAssertEqual(session.launchLocation, "/thread/42")
         XCTAssertTrue(session.pendingLaunchLocations.isEmpty, "a duplicate click must not queue another navigation")
-        presenter.deliver(id: "thread-43", date: date, info: ["navigate": "/thread/43", "session": session.label,
-                                                                           "owner": session.notificationOwnerID])
+        presenter.deliver(id: "thread-43", date: date, info: ["exact": ["navigate": "/thread/43", "session": session.label,
+                                                                           "owner": session.notificationOwnerID]])
         XCTAssertEqual(session.launchLocation, "/thread/42")
         XCTAssertEqual(session.pendingLaunchLocations, ["/thread/43"])
     }
@@ -95,6 +95,268 @@ final class NavigationBasicsIOSTests: XCTestCase {
 
     private func text(_ session: ExactSession, _ testId: String) -> String? {
         (try? node(session, testId))?.accessibleText
+    }
+
+    func testNativeNavigationKeepsItsViewportWhileThePageScrolls() throws {
+        guard hostedWindowScene() != nil else {
+            throw missing("scene", "UIKit publishes pinned placements through its natural layout pass")
+        }
+        let session = try fixture("native-allocation", plan: "EXACT_PUSHED_TITLE_PLAN"), p = session.presenter
+        let owner = try XCTUnwrap(p.navigation.primaryOwner?.view), window = try XCTUnwrap(window)
+        let allocation = owner.convert(owner.bounds, to: window)
+        try tapNode(session, "home-open-edit-overflow")
+        let field = try XCTUnwrap(try node(session, "edit-draft").field)
+        until("the editor and its native screen settle") { field.isFirstResponder && !p.navigation.inTransition }
+        let agent = Agent(session: session)
+        _ = agent.clock(["settle": true])
+        XCTAssertEqual(owner.convert(owner.bounds, to: window), allocation, "page extent does not size the native screen")
+        XCTAssertGreaterThan(p.viewport.contentSize.height, p.viewport.bounds.height)
+        let route = try XCTUnwrap(p.navigation.primaryNavigation?.topViewController as? RouteController)
+        XCTAssertEqual(p.owners.told[route.node.id]?.block, .size(p.owners.block(in: route.view).size), "the editing route receives its keyboard allocation")
+        XCTAssertLessThan(route.node.bounds.height, p.viewportSize.height, "the native container stays full size around the editing route")
+        let before = try XCTUnwrap(p.owners.told[route.node.id]?.placement).rect
+        let editorFrame = field.convert(field.bounds, to: window)
+        p.viewport.setContentOffset(CGPoint(x: 0, y: 100), animated: false)
+        until("scrolling publishes the fixed native allocation without an agent settle") {
+            abs((p.owners.told[route.node.id]?.placement?.rect.minY ?? -.infinity) - before.minY - p.viewport.contentOffset.y) <= 0.5
+        }
+        _ = agent.clock(["settle": true])
+        XCTAssertGreaterThan(p.viewport.contentOffset.y, 0)
+        XCTAssertEqual(owner.convert(owner.bounds, to: window), allocation, "UIKit keeps the screen in the viewport")
+        XCTAssertEqual(field.convert(field.bounds, to: window), editorFrame)
+        XCTAssertTrue(field.isFirstResponder)
+        XCTAssertEqual(try XCTUnwrap(p.owners.told[route.node.id]?.placement).rect.minY,
+                       before.minY + p.viewport.contentOffset.y, accuracy: 0.5, "public geometry follows the fixed allocation")
+        _ = agent.back()
+        until("Home returns") { !p.navigation.inTransition }
+        try tapNode(session, "home-open-edit")
+        _ = agent.clock(["settle": true])
+        XCTAssertEqual(p.viewport.contentOffset, .zero, "shrinking the page restores its rest offset")
+        // UIKit places a container's bars only where no scroll view holds it (DocumentMountIOS.swift).
+        XCTAssertTrue(p.documentFixed && !p.viewport.isScrollEnabled, "the native container's document is in its mount")
+        XCTAssertFalse(sequence(first: owner, next: { $0.superview }).contains { $0 is UIScrollView }, "no scroll view holds the container")
+    }
+
+    func testTheDocumentLeavesItsMountWithTheNativeContainerUnderCover() throws {
+        guard hostedWindowScene() != nil else {
+            throw missing("scene", "the native container needs the hosted window")
+        }
+        let session = try fixture("mount-under-cover", plan: "EXACT_NAVIGATION_BARS_PLAN"), p = session.presenter
+        let app = try node(session, "app")
+        p.apply(wireBatch([["op": "props", "id": Int(app.id), "set": ["viewportFit": "cover"]]]))
+        let view = try XCTUnwrap(session.view)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        let hearsTouches = { (host: UIView) in host.gestureRecognizers?.contains { $0 is PopoverTouch } == true }
+        XCTAssertTrue(p.documentFixed)
+        XCTAssertTrue(hearsTouches(p.documentMount))
+        let frame = p.viewport.frame
+        // Every route leaves the root, which retires the container
+        p.apply(wireBatch([["op": "children", "id": Int(app.id), "ids": []]]))
+        view.layoutIfNeeded()
+        XCTAssertNil(p.navigation.primaryOwner)
+        XCTAssertEqual(p.viewport.frame, frame, "under cover the session's area is the same without the container")
+        XCTAssertFalse(p.documentFixed, "the document leaves its mount with the container")
+        XCTAssertTrue(p.viewport.isScrollEnabled)
+        XCTAssertTrue(hearsTouches(p.viewport) && !hearsTouches(p.documentMount), "light dismissal hears the document where it is")
+    }
+
+    func testPageScrollDoesNotChangeRouteClearance() throws {
+        guard hostedWindowScene() != nil else {
+            throw missing("scene", "route clearance follows native bars independently of page scrolling")
+        }
+        let session = try fixture("page-scroll-clearance", plan: "EXACT_PUSHED_TITLE_PLAN"), p = session.presenter
+        // The visual policy keeps a route viewport that scrolls the route's whole page.
+        p.apply(wireBatch([["op": "props", "id": Int(try node(session, "app").id), "set": ["interactiveWidget": "resizes-visual"]]]))
+        try tapNode(session, "home-open-viewport")
+        XCTAssertEqual(Agent(session: session).clock(["settle": true])["settled"] as? Bool, true)
+        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let route = try XCTUnwrap(nav.topViewController as? RouteController)
+        let page = try XCTUnwrap(route.contentViewport)
+        bottomToolbar(nav, route, shown: true)
+        p.apply(wireBatch([["op": "content", "id": route.node.id, "w": route.node.bounds.width, "h": page.bounds.height + 200]]))
+        route.fitContentViewport()
+        let cover = try XCTUnwrap(p.navigation.covers[route.node.id]), clearance = route.bottomClearance
+        XCTAssertGreaterThan(clearance, 0)
+        XCTAssertGreaterThan(page.contentSize.height, page.bounds.height + 40)
+        page.setContentOffset(CGPoint(x: 0, y: 40), animated: false)
+        XCTAssertEqual(page.contentOffset.y, 40, accuracy: 0.5)
+        p.navigation.reportCovers()
+        XCTAssertEqual(p.navigation.covers[route.node.id], cover)
+        XCTAssertEqual(route.bottomClearance, clearance)
+    }
+
+    func testVisualKeyboardInsetsRevealALowNativeRouteFieldWithoutAnInnerScroller() throws {
+        guard hostedWindowScene() != nil else {
+            throw missing("scene", "keyboard ownership requires the hosted app responder chain")
+        }
+        let session = try fixture("native-visual-keyboard", plan: "EXACT_PUSHED_TITLE_PLAN"), p = session.presenter
+        try tapNode(session, "home-open-edit-visual")
+        let field = try node(session, "edit-draft")
+        until("the pushed editor settles") { field.field?.isFirstResponder == true && !p.navigation.inTransition }
+        XCTAssertEqual(p.keyboardPolicy, "resizes-visual")
+        setKeyboard(p, top: nil)
+        let route = try XCTUnwrap(p.navigation.primaryNavigation?.topViewController as? RouteController)
+        let layoutAllocation = route.node.bounds.size
+        let owner = try XCTUnwrap(p.navigation.primaryOwner?.view)
+        let ownerFrame = owner.convert(owner.bounds, to: window)
+        let keys = try XCTUnwrap(window).bounds.maxY - 250
+        XCTAssertGreaterThan(field.convert(field.bounds, to: window).maxY, keys, "the authored field starts below the keyboard")
+        setKeyboard(p, top: keys)
+        p.viewport.layoutIfNeeded()
+        _ = Agent(session: session).clock(["settle": true])
+        XCTAssertEqual(route.node.bounds.size, layoutAllocation, "visual keyboard accommodation does not reflow the route")
+        XCTAssertLessThanOrEqual(field.convert(field.bounds, to: window).maxY, keys + 0.5,
+                                 "a native route still reveals a field with no authored scroller")
+        let content = try XCTUnwrap(route.contentViewport)
+        XCTAssertEqual(p.viewport.contentInset.bottom, 0, "the keyboard adds range to the route, not the pinned owner's outer page")
+        XCTAssertGreaterThan(content.contentInset.bottom, 0)
+        XCTAssertGreaterThan(content.contentOffset.y, 0)
+        XCTAssertEqual(p.owners.told[route.node.id]?.placement?.contentOffset, content.contentOffset)
+        let observation = try XCTUnwrap(Agent(session: session).layout(["id": Int(field.id)])["node"] as? [String: Any])
+        let scrolls = try XCTUnwrap(observation["scroll"] as? [[String: Any]])
+        let routeScroll = try XCTUnwrap(scrolls.first { $0["route"] as? Int == Int(route.node.id) })
+        XCTAssertEqual(routeScroll["sy"] as? Double, Agent.r2(content.contentOffset.y))
+        let clips = try XCTUnwrap(observation["clip"] as? [[String: Any]])
+        XCTAssertTrue(clips.contains { $0["id"] as? Int == Int(route.node.id) && $0["kind"] as? String == "viewport" })
+        XCTAssertTrue(FocusSearch.items(p.documentMount, in: p.documentMount.bounds).contains { ($0 as? UIView) === field.field },
+                      "the session's focus search includes native fields inside the route")
+        XCTAssertEqual(owner.convert(owner.bounds, to: window), ownerFrame, "the content reveal leaves UIKit's container in place")
+        let applied = session.appliedBatches
+        let offset = CGPoint(x: content.contentOffset.x, y: content.contentOffset.y - 10)
+        content.contentOffset = offset
+        until("the native scroll publishes its placement") { p.owners.told[route.node.id]?.placement?.contentOffset == offset }
+        XCTAssertEqual(session.appliedBatches, applied, "a placement-only scroll skips the presentation pass")
+        p.hostDocument(fixed: false)
+        XCTAssertEqual(p.viewport.contentInset.bottom, p.keyboardInset, "an unpinned document owns keyboard accommodation again")
+        var room = p.viewport.contentInset
+        room.bottom += 40
+        p.viewport.contentInset = room
+        p.hostDocument(fixed: false)
+        XCTAssertEqual(p.viewport.contentInset, room, "unchanged ownership preserves room another inset writer added")
+        p.navigation.fitOwner()
+        XCTAssertEqual(p.viewport.contentInset.bottom, 40, "repinning removes only the keyboard's contribution")
+        setKeyboard(p, top: nil)
+        XCTAssertEqual(p.viewport.contentInset.bottom, 40, "dismissal preserves the other writer's contribution")
+        XCTAssertEqual(content.contentOffset, .zero, "hiding the keyboard releases its scroll accommodation")
+    }
+
+    func testNativeBackKeepsItsScopeInsideTheHostsTabController() throws {
+        let session = try fixture("native-back-host-tabs", plan: "EXACT_NAVIGATION_BARS_PLAN")
+        let window = try XCTUnwrap(window), host = try XCTUnwrap(window.rootViewController)
+        let tabs = UITabBarController()
+        tabs.view.accessibilityIdentifier = "host-tabs"
+        window.rootViewController = nil
+        tabs.setViewControllers([host], animated: false)
+        window.rootViewController = tabs
+        window.makeKeyAndVisible()
+        tabs.view.layoutIfNeeded()
+        session.view?.frame = host.view.bounds
+        session.view?.layoutIfNeeded()
+        try tapNode(session, "start-open-detail")
+        until("the route settles inside the host's tabs") { !session.presenter.navigation.inTransition }
+        let navigation = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        XCTAssertTrue(navigation.tabBarController === tabs, "UIKit also sees the host's enclosing controller")
+        let container = try XCTUnwrap(session.presenter.navigation.observation()["nativeBack"] as? String)
+        XCTAssertEqual(container, navigation.view.accessibilityIdentifier)
+        XCTAssertNotEqual(container, tabs.view.accessibilityIdentifier, "the host's tabs can contain other sessions")
+    }
+
+    func testNativeBackIdentifiesEachEmbeddedNavigationContainer() throws {
+        let first = try fixture("native-back"), firstWindow = try XCTUnwrap(window)
+        let host = try XCTUnwrap(firstWindow.rootViewController), firstView = try XCTUnwrap(first.view)
+        let second = ExactApp.shared.makeSession(label: "native-back")
+        sessions.append(second)
+        let secondView = ExactView(session: second)
+        let frame = host.view.bounds
+        firstView.frame = CGRect(x: 0, y: 0, width: frame.width, height: frame.height / 2)
+        secondView.frame = firstView.frame.offsetBy(dx: 0, dy: frame.height / 2)
+        host.view.addSubview(secondView)
+        let plan = try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_FIXTURE_PLAN"])))
+        XCTAssertNil(second.boot(plan: plan, size: secondView.bounds.size).error)
+        firstView.layoutIfNeeded()
+        secondView.layoutIfNeeded()
+        XCTAssertNil(first.presenter.navigation.observation()["nativeBack"] as? String, "a root has no native Back")
+        try tapNode(first, "open-plain")
+        try tapNode(second, "open-plain")
+        until("the first route settles") { !first.presenter.navigation.inTransition }
+        until("the second route settles") { !second.presenter.navigation.inTransition }
+        let firstContainer = try XCTUnwrap(first.presenter.navigation.observation()["nativeBack"] as? String)
+        let secondContainer = try XCTUnwrap(second.presenter.navigation.observation()["nativeBack"] as? String)
+        XCTAssertNotEqual(firstContainer, secondContainer, "overlapping node ids and session labels cannot share Back's scope")
+        XCTAssertEqual(firstContainer, first.presenter.navigation.primaryOwner?.view.accessibilityIdentifier)
+        XCTAssertEqual(secondContainer, second.presenter.navigation.primaryOwner?.view.accessibilityIdentifier)
+        secondView.removeFromSuperview()
+        XCTAssertNil(second.presenter.navigation.observation()["nativeBack"] as? String, "an unmounted session cannot tap Back")
+        XCTAssertEqual(first.presenter.navigation.observation()["nativeBack"] as? String, firstContainer)
+        host.view.addSubview(secondView)
+        secondView.layoutIfNeeded()
+        let remountedContainer = try XCTUnwrap(second.presenter.navigation.observation()["nativeBack"] as? String)
+        XCTAssertNotEqual(remountedContainer, firstContainer)
+        XCTAssertEqual(remountedContainer, second.presenter.navigation.primaryOwner?.view.accessibilityIdentifier,
+                       "the driver reads the current native container after remounting")
+        _ = Agent(session: first).back()
+        until("the first route returns") { !first.presenter.navigation.inTransition }
+        XCTAssertNil(first.presenter.navigation.observation()["nativeBack"] as? String)
+        XCTAssertEqual(second.presenter.navigation.observation()["nativeBack"] as? String, remountedContainer,
+                       "popping one session leaves the other's Back available")
+    }
+
+    func testNativeRouteKeepsItsPopoverAnchoredAndWaitsForAFillBeforeRevealing() throws {
+        guard hostedWindowScene() != nil else {
+            throw missing("scene", "native route scrolling and anchored popovers need a scene's layout passes")
+        }
+        let session = try fixture("native-viewport-interop", plan: "EXACT_PUSHED_TITLE_PLAN"), p = session.presenter
+        try tapNode(session, "home-open-viewport")
+        until("the route settles") { !p.navigation.inTransition }
+        _ = Agent(session: session).clock(["settle": true])
+        let route = try XCTUnwrap(p.navigation.primaryNavigation?.topViewController as? RouteController)
+        let document = try node(session, "viewport-scroll")
+        let content = try XCTUnwrap(document.scroll)
+        let opener = try node(session, "viewport-info-open"), info = try node(session, "viewport-info")
+        p.press(opener.id)
+        until("the popover opens") { p.menus.isOpen(info) && !p.menus.inTransition }
+        let gap = { info.convert(info.bounds, to: self.window).minY - opener.convert(opener.bounds, to: self.window).maxY }
+        let openingGap = gap()
+        let before = try XCTUnwrap(p.owners.told[route.node.id]?.placement).rect
+        p.viewport.contentOffset.y = 100
+        until("the outer scroll publishes") {
+            abs((p.owners.told[route.node.id]?.placement?.rect.minY ?? -.infinity) - before.minY - p.viewport.contentOffset.y) <= 0.5
+        }
+        XCTAssertEqual(p.viewport.contentOffset.y, 100, accuracy: 0.5)
+        XCTAssertEqual(p.owners.told[route.node.id]?.placement?.rect.minY ?? -.infinity,
+                       before.minY + p.viewport.contentOffset.y, accuracy: 0.5, "the published allocation follows the settled native owner")
+        XCTAssertEqual(gap(), openingGap, accuracy: 0.5, "the pinned invoker keeps its popover as the outer page scrolls")
+        content.contentOffset.y = 40
+        XCTAssertEqual(gap(), openingGap, accuracy: 0.5, "the popover follows its invoker through route scrolling")
+        p.press(opener.id)
+        until("the popover closes") { !p.menus.isOpen(info) }
+        content.contentOffset = .zero
+        let target = try node(session, "viewport-target")
+        session.holdFillForTests()
+        p.scrollElementIntoView(["viewport-target", "start", "nearest", "instant"])
+        XCTAssertEqual(content.contentOffset, .zero, "the reveal waits for the fill's geometry")
+        XCTAssertEqual(p.elementScrolls.names, ["viewport-target"])
+        let shown = target.convert(target.bounds, to: content)
+        let moved = try XCTUnwrap(target.grid).layout.offsetBy(dx: 0, dy: content.bounds.maxY + 100 - shown.minY)
+        let extent = max(document.content.height, content.bounds.height + 200)
+        session.publishFillForTests(route.node.id, wireBatch([
+            ["op": "content", "id": document.id, "w": content.bounds.width, "h": extent],
+            ["op": "frame", "id": target.id, "x": moved.minX, "y": moved.minY, "w": moved.width, "h": moved.height],
+        ]), generation: session.generation)
+        session.landFill()
+        until("the fill lands and the target is revealed") { !session.fillInFlight && p.elementScrolls.names.isEmpty && content.contentOffset.y > 0 }
+        XCTAssertTrue(content.bounds.contains(target.convert(target.bounds, to: content)), "the reveal uses the target's new frame")
+        // The page does not enclose a native container's routes, so a route's drag has no outer scroller to chain to.
+        for behavior in ["auto", "contain", "none", "auto"] {
+            document.style["overscroll_behavior_y"] = .string(behavior)
+            content.contentOffset.y = -content.adjustedContentInset.top
+            p.viewport.contentOffset.y = 100
+            XCTAssertFalse(content.handsOff(CGPoint(x: 0, y: 400)), "\(behavior): the route keeps its drag")
+            XCTAssertEqual(content.bounces, behavior != "none", "\(behavior) controls the native affordance")
+            Agent.scroll(from: opener, dx: 0, dy: -20)
+            XCTAssertEqual(p.viewport.contentOffset.y, 100, accuracy: 0.5, "the agent's drag does not reach the page under \(behavior)")
+        }
     }
 
     func testDeclaredProtocolCarriesColdAndWarmURLsThroughTheRouter() throws {
@@ -244,33 +506,227 @@ final class NavigationBasicsIOSTests: XCTestCase {
         // A heading in a wrapper with a bar item (Chat's press group aside)
         // and a box before a direct heading are not avatars: Home's badge
         // button is an item, and its title stays UIKit's.
-        nav.popViewController(animated: false)
-        spin(0.3)
+        nav.popViewController(animated: false) // then settled, UIKit's pop and the session's answer, whatever the load
+        until("Home settles") { nav.viewControllers.count == 1 && nav.transitionCoordinator == nil && !session.advanceInFlight && !Agent(session: session).nativeInFlight() }
         let home = try XCTUnwrap(nav.topViewController)
         XCTAssertFalse(home.navigationItem.titleView is HeaderTitleView, "Home's segments keep the title view")
-        if #available(iOS 26.0, *) { XCTAssertNil(home.navigationItem.subtitle, "Home has no text after its heading") }
+        if #available(iOS 26.0, *) { XCTAssertNil(home.navigationItem.subtitle, "Home has no text after its heading; the stack: \(nav.viewControllers.map { "\($0.navigationItem.title ?? "?") / \($0.navigationItem.subtitle ?? "none")" })") }
+    }
+
+    /// LLP 1075.003 §9.15: a readout (`role="status"`) after the header's
+    /// buttons is a trailing item with a custom view, as a hand-built bar's
+    /// "● Clock" is: its dot and monospaced text drawn as written, read by
+    /// VoiceOver as static text, the bar's and not the page's; it follows
+    /// the Contract in place, the same item and view.
+    func testAReadoutIsATrailingItemWhoseViewFollowsItInPlace() throws {
+        let session = try fixture("basics-readout")
+        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
+        let nav = try XCTUnwrap(tabs.selectedViewController as? UINavigationController)
+        try tapNode(session, "open-plain")
+        until("Plain pushed") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
+        spin(0.3)
+        let plain = try XCTUnwrap(nav.topViewController as? RouteController)
+        let right = plain.navigationItem.rightBarButtonItems ?? []
+        let item = try XCTUnwrap(right.first, "the readout is after Compose: the rightmost item")
+        XCTAssertEqual(item.accessibilityIdentifier, "readout-plain")
+        XCTAssertTrue(right.contains { $0.accessibilityLabel == "Compose" }, "Compose is still an item")
+        let view = try XCTUnwrap(item.customView as? ReadoutView, "a custom view, not a title or an image")
+        XCTAssertNil(item.action, "nothing presses a readout")
+        func labels() -> [UILabel] { view.subviews.flatMap(\.subviews).compactMap { $0 as? UILabel } }
+        let label = try XCTUnwrap(labels().first)
+        XCTAssertEqual(label.text, "0 sent")
+        XCTAssertEqual(label.font.pointSize, 12)
+        XCTAssertTrue(label.font.fontName.lowercased().contains("menlo"), "the author's font: \(label.font.fontName)")
+        let dot = try XCTUnwrap(view.subviews.flatMap(\.subviews).first { !($0 is UILabel) })
+        view.layoutIfNeeded()
+        XCTAssertEqual(dot.bounds.size, CGSize(width: 7, height: 7), "the dot at its authored size")
+        XCTAssertGreaterThan(view.intrinsicContentSize.width, 7 + 6)
+        XCTAssertTrue(view.isAccessibilityElement)
+        XCTAssertTrue(view.accessibilityTraits.contains(.staticText))
+        XCTAssertEqual(view.accessibilityLabel, "0 composed", "its `aria-label`")
+        // The bar's, not the page's: the agent does not call it unshown.
+        let unshown = session.presenter.navigation.unshownByBar()
+        for shown in ["readout-plain", "readout-text"] { XCTAssertNil(unshown[try node(session, shown).id], "\(shown) is the bar's") }
+        // Nor the subtitle's: the first text after the heading still is.
+        if #available(iOS 26.0, *) { XCTAssertEqual(plain.navigationItem.subtitle, "No Back control") }
+        // The agent's tap on it is a person's: it lands, and nothing is pressed.
+        let tap = Agent(session: session).tap(["id": Int(try node(session, "readout-text").id)])
+        XCTAssertNil(tap["error"], "\(tap)")
+        XCTAssertEqual(tap["native"] as? String, "bar-readout")
+        try tapNode(session, "compose-plain")
+        until("the readout follows the count") { labels().first?.text == "1 sent" }
+        XCTAssertTrue(plain.navigationItem.rightBarButtonItems?.first === item, "the same item")
+        XCTAssertTrue(item.customView === view, "the same view")
+        XCTAssertEqual(view.accessibilityLabel, "1 composed")
+        // `aria-hidden` on the tabpanel, which UIKit holds the route apart
+        // from, takes the readout off the accessibility tree.
+        let panel = try node(session, "panel-home")
+        session.presenter.apply(wireBatch([["op": "props", "id": Int(panel.id), "set": ["accessibilityElementsHidden": "true"], "clear": []]]))
+        until("hidden by its logical ancestor") { !view.isAccessibilityElement }
+        session.presenter.apply(wireBatch([["op": "props", "id": Int(panel.id), "set": [:], "clear": ["accessibilityElementsHidden"]]]))
+        until("shown again") { view.isAccessibilityElement }
+        // A sibling button kept authored lifts the header only in part; the
+        // agent's tap on the readout still lands on the bar's.
+        let compose = try node(session, "compose-plain")
+        session.presenter.apply(wireBatch([["op": "style", "id": Int(compose.id), "style": ["appearance": "none", "written": ["appearance"]]]]))
+        spin(0.2)
+        XCTAssertTrue(plain.navigationItem.rightBarButtonItems?.contains { $0.customView === view } == true, "still the bar's")
+        let partial = Agent(session: session).tap(["id": Int(try node(session, "readout-text").id)])
+        XCTAssertEqual(partial["native"] as? String, "bar-readout", "\(partial)")
+    }
+
+    /// Whether the tab bar insets a tab's content from below: a phone's (and
+    /// a compact width's) does; iPadOS's floating bar, at the top in a
+    /// regular width, insets nothing, so there the bar's own state is read.
+    private func barInsets(_ tabs: UITabBarController) -> Bool { tabs.tabBar.window != nil }
+    private func barShows(_ tabs: UITabBarController) -> Bool {
+        let bar: UIView? = barInsets(tabs) ? tabs.tabBar : tabs.floatingTabList
+        return NavigationHost.shownBar(bar) != nil
+    }
+
+    private func assertTabBar(_ session: ExactSession, visible: Bool, file: StaticString = #filePath, line: UInt = #line) throws {
+        let list = try node(session, "tabs")
+        let observed = try XCTUnwrap(Agent(session: session).layout(["id": Int(list.id)])["node"] as? [String: Any], file: file, line: line)
+        let native = try XCTUnwrap(observed["native"] as? [String: Any], file: file, line: line)
+        let bar = try XCTUnwrap(native["tabBar"] as? [String: Any], file: file, line: line)
+        XCTAssertEqual(bar["visible"] as? Bool, visible, file: file, line: line)
+        XCTAssertEqual(bar["frame"] != nil, visible, "only the visible bar supplies geometry", file: file, line: line)
+    }
+
+    func testNativeTabAccessibilityCoverageIncludesTheProjectionOrNamesItsLimit() throws {
+        guard UIApplication.shared.connectedScenes.contains(where: { $0 is UIWindowScene }) else {
+            throw missing("scene", "native tab accessibility uses the scene's platform projection")
+        }
+        let session = try fixture("basics-tabbar-ax"), p = session.presenter
+        let tabs = try XCTUnwrap(p.navigation.tabController)
+        let agent = Agent(session: session)
+        guard Presenter.axRuntimeLoaded else { throw missing("accessibility", "UIKit's accessibility runtime is not loaded") }
+        func read(visible: Bool) throws {
+            until("the native tab bar settles") { self.barShows(tabs) == visible && !agent.nativeInFlight() }
+            let bar = tabs.shownTabBar
+            XCTAssertEqual(bar != nil, visible)
+            let frame = bar.map { $0.convert($0.bounds, to: p.viewport).offsetBy(dx: -p.viewport.pageOrigin.x, dy: -p.viewport.pageOrigin.y) }
+            for excluded in [false, true] {
+                let reply = agent.accessibilityElementsTree(["ax": true, "excluded": excluded])
+                let ax = try XCTUnwrap(reply["ax"] as? [String: Any])
+                let coverage = try XCTUnwrap(ax["coverage"] as? [String: Any])
+                let limit = (coverage["excluded"] as? [[String: Any]])?.first { $0["root"] as? String == "tab-bar" }
+                if let frame {
+                    let items = try XCTUnwrap(tabs.tabBar.items)
+                    XCTAssertFalse(items.isEmpty)
+                    let buttons = (ax["elements"] as? [[String: Any]] ?? []).filter { element in
+                        guard element["role"] as? String == "button", element["excluded"] == nil,
+                              let r = element["frame"] as? [String: Any], let x = r["x"] as? Double, let y = r["y"] as? Double,
+                              let w = r["w"] as? Double, let h = r["h"] as? Double else { return false }
+                        return CGRect(x: x, y: y, width: w, height: h).intersects(frame)
+                    }
+                    let names = items.compactMap { $0.accessibilityLabel ?? $0.title }
+                    XCTAssertEqual(names.count, items.count)
+                    let found = Set(buttons.compactMap { $0["name"] as? String })
+                    if buttons.count < items.count || !Set(names).isSubset(of: found) {
+                        XCTAssertNotNil(limit, "missing native tabs cannot be reported as complete coverage")
+                        XCTAssertEqual(coverage["complete"] as? Bool, false)
+                    } else {
+                        XCTAssertNil(limit, "a projection already walked needs no additional limit")
+                    }
+                } else {
+                    XCTAssertNil(limit, "a hidden bar is intentionally absent")
+                }
+            }
+        }
+        try read(visible: true)
+        let scoped = p.axElements(roots: [try node(session, "detail")])
+        let view = try XCTUnwrap(session.view)
+        let bar = try XCTUnwrap(tabs.projectedTabBar)
+        let alpha = bar.alpha
+        let beforeFade = p.axElements(roots: [view])
+        let beforeCoverage = try XCTUnwrap(beforeFade["coverage"] as? [String: Any])
+        let missingProjection = (beforeCoverage["excluded"] as? [[String: Any]] ?? []).contains { $0["root"] as? String == "tab-bar" }
+        for opacity in [CGFloat(0.001), 0] {
+            bar.alpha = opacity
+            let faded = p.axElements(roots: [view])
+            bar.alpha = alpha
+            let coverage = try XCTUnwrap(faded["coverage"] as? [String: Any])
+            let limited = (coverage["excluded"] as? [[String: Any]] ?? []).contains { $0["root"] as? String == "tab-bar" }
+            XCTAssertEqual(limited, opacity > 0 && missingProjection, "only zero alpha intentionally excludes the bar from accessibility")
+        }
+        let container = try XCTUnwrap(tabs.view.superview)
+        let modal = NodeView(id: .max, kind: "view", presenter: p)
+        let nested = NodeView(id: .max - 1, kind: "view", presenter: p)
+        modal.frame = container.bounds
+        nested.frame = modal.bounds
+        modal.accessibilityViewIsModal = true
+        nested.accessibilityViewIsModal = true
+        modal.addSubview(nested)
+        container.addSubview(modal)
+        do {
+            defer { modal.removeFromSuperview() }
+            for excluded in [false, true] {
+                let hiddenByModal = p.axElements(roots: [view], excluded: excluded)
+                XCTAssertEqual((hiddenByModal["modal"] as? [String: Any])?["id"] as? UInt32, nested.id)
+                let coverage = try XCTUnwrap(hiddenByModal["coverage"] as? [String: Any])
+                XCTAssertEqual(coverage["complete"] as? Bool, true, "modal siblings intentionally exclude the native bar")
+                XCTAssertFalse((coverage["excluded"] as? [[String: Any]] ?? []).contains { $0["root"] as? String == "tab-bar" })
+            }
+            let route = try XCTUnwrap(p.navigation.primaryNavigation?.topViewController?.view)
+            route.addSubview(modal)
+            modal.frame = route.bounds
+            nested.frame = modal.bounds
+            let besideModal = p.axElements(roots: [view])
+            XCTAssertEqual((besideModal["modal"] as? [String: Any])?["id"] as? UInt32, nested.id)
+            let coverage = try XCTUnwrap(besideModal["coverage"] as? [String: Any])
+            XCTAssertEqual((coverage["excluded"] as? [[String: Any]] ?? []).contains { $0["root"] as? String == "tab-bar" },
+                           missingProjection, "a modal inside a page does not hide the bar in another branch")
+        }
+        view.accessibilityElementsHidden = true
+        let suppressed = p.axElements(roots: [view])
+        view.accessibilityElementsHidden = false
+        for ax in [scoped, suppressed] {
+            let coverage = try XCTUnwrap(ax["coverage"] as? [String: Any])
+            XCTAssertEqual(coverage["complete"] as? Bool, true, "unrelated or intentionally hidden native tabs add no gap")
+            XCTAssertFalse((coverage["excluded"] as? [[String: Any]] ?? []).contains { $0["root"] as? String == "tab-bar" })
+        }
+        try tapNode(session, "toggle-choosing")
+        try read(visible: false)
+        try tapNode(session, "toggle-choosing")
+        try read(visible: true)
     }
 
     func testARoutePushedWhileTheTablistIsHiddenHidesTheTabBar() throws {
         let session = try fixture("basics-tabbar")
         let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
         let home = try XCTUnwrap((tabs.selectedViewController as? UINavigationController)?.topViewController)
+        let insets = barInsets(tabs)
+        if !insets { XCTAssertNotNil(tabs.floatingTabList, "no UITabBar in the window: an iPad's floating bar") }
+        XCTAssertTrue(barShows(tabs), "the tab bar shows over Home")
+        try assertTabBar(session, visible: true)
         let shown = home.view.safeAreaInsets.bottom
-        XCTAssertGreaterThan(shown, 40, "the tab bar insets the root")
+        if insets { XCTAssertGreaterThan(shown, 40, "the tab bar insets the root") }
         try tapNode(session, "detail")
         let nav = try XCTUnwrap(tabs.selectedViewController as? UINavigationController)
         until("Detail pushed") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
         let detail = try XCTUnwrap(nav.topViewController)
         XCTAssertFalse(detail.hidesBottomBarWhenPushed, "the tablist shows over Detail")
-        XCTAssertEqual(detail.view.safeAreaInsets.bottom, shown, accuracy: 0.5)
+        if insets { XCTAssertEqual(detail.view.safeAreaInsets.bottom, shown, accuracy: 0.5) }
+        XCTAssertTrue(barShows(tabs), "and over Detail")
+        try assertTabBar(session, visible: true)
         nav.popViewController(animated: true)
         until("back to Home") { nav.viewControllers.count == 1 && nav.transitionCoordinator == nil }
         let (_, _, chat) = try chat(session)
         XCTAssertTrue(chat.hidesBottomBarWhenPushed, "the authored tablist is hidden over Chat")
-        until("the tab bar left") { chat.view.safeAreaInsets.bottom < shown - 20 }
+        // (On an iPad the floating bar, which does not take
+        // `hidesBottomBarWhenPushed`, is hidden by `setTabBarHidden`.)
+        until("the tab bar left") { !barShows(tabs) && (!insets || chat.view.safeAreaInsets.bottom < shown - 20) }
+        try assertTabBar(session, visible: false)
+        // Another tab, its root showing the tablist, and back to Chat (selected by the app, as a link would).
+        tapTab(tabs, 1)
+        until("Second shows the bar") { tabs.selectedIndex == 1 && barShows(tabs) }
+        tapTab(tabs, 0)
+        until("back on Chat, the bar hidden again") { tabs.selectedIndex == 0 && nav.topViewController === chat && !barShows(tabs) }
         nav.popViewController(animated: true)
         until("back to Home") { nav.viewControllers.count == 1 && nav.transitionCoordinator == nil }
-        until("the tab bar came back") { abs(home.view.safeAreaInsets.bottom - shown) < 0.5 }
+        until("the tab bar came back") { barShows(tabs) && (!insets || abs(home.view.safeAreaInsets.bottom - shown) < 0.5) }
+        try assertTabBar(session, visible: true)
     }
 
     /// LLP 1075.003 §3.7, amended 2026-10-05: the root's tablist hidden
@@ -292,16 +748,19 @@ final class NavigationBasicsIOSTests: XCTestCase {
         let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
         let nav = try XCTUnwrap(tabs.selectedViewController as? UINavigationController)
         let home = try XCTUnwrap(nav.topViewController as? RouteController)
+        let insets = barInsets(tabs)
         let shown = home.view.safeAreaInsets.bottom
-        XCTAssertGreaterThan(shown, 40, "the tab bar insets the root")
+        if insets { XCTAssertGreaterThan(shown, 40, "the tab bar insets the root") }
         let settled = { nav.transitionCoordinator == nil }
         // Hidden over the root: the bar goes.
         try tapNode(session, "toggle-choosing")
-        until("the bar left") { tabs.isTabBarHidden && home.view.safeAreaInsets.bottom < shown - 20 }
+        until("the bar left") { tabs.isTabBarHidden && !barShows(tabs) && (!insets || home.view.safeAreaInsets.bottom < shown - 20) }
+        try assertTabBar(session, visible: false)
         XCTAssertFalse(home.hidesBottomBarWhenPushed, "the root is never pushed: no flag")
         // Shown again: it comes back.
         try tapNode(session, "toggle-choosing")
-        until("the bar came back") { !tabs.isTabBarHidden && abs(home.view.safeAreaInsets.bottom - shown) < 0.5 }
+        until("the bar came back") { !tabs.isTabBarHidden && barShows(tabs) && (!insets || abs(home.view.safeAreaInsets.bottom - shown) < 0.5) }
+        try assertTabBar(session, visible: true)
         // A hatch's hide, with the tablist shown and unchanged, stands; and
         // the tablist hidden and shown again over it leaves it standing too:
         // Exact did not make that hide.
@@ -354,7 +813,7 @@ final class NavigationBasicsIOSTests: XCTestCase {
         tapTab(tabs, 0)
         until("back to Home (2)") { nav.viewControllers.count == 1 && settled() }
         until("the bar is back over Home") { !tabs.isTabBarHidden }
-        until("Home inset by it again") { abs(home.view.safeAreaInsets.bottom - shown) < 0.5 }
+        if insets { until("Home inset by it again") { abs(home.view.safeAreaInsets.bottom - shown) < 0.5 } }
         // The pushed-route rule stands.
         let (_, _, chat) = try chat(session)
         XCTAssertTrue(chat.hidesBottomBarWhenPushed, "the authored tablist is hidden over Chat")
@@ -373,7 +832,7 @@ final class NavigationBasicsIOSTests: XCTestCase {
         let list = try node(session, "list-chat")
         let sv = try XCTUnwrap(list.scroll)
         XCTAssertTrue(journal(session).contains("scrolls its content under the bar"))
-        XCTAssertEqual(sv.contentInsetAdjustmentBehavior, .always, "UIKit insets it")
+        XCTAssertEqual(sv.contentInsetAdjustmentBehavior, .automatic, "UIKit insets it")
         XCTAssertEqual(list.convert(list.bounds, to: chat.view).minY, 0, accuracy: 0.5, "it starts under the bar")
         XCTAssertEqual(sv.adjustedContentInset.top, chat.view.safeAreaInsets.top, accuracy: 0.5, "inset to the bar's bottom")
         XCTAssertFalse(nav.isNavigationBarHidden)
@@ -431,35 +890,36 @@ final class NavigationBasicsIOSTests: XCTestCase {
             return n
         }
         // The route's cover pads 34 under its child, which stands at the foot
-        // of the content box the cover shortens.
+        // of the route's content box less that cover: the box the kernel
+        // sends is the authored one, the cover said apart (`cover:`).
         let route = box(nil, y: 0, height: 600)
-        route.applyKernelContentBox(CGRect(x: 0, y: 0, width: 400, height: 566), padding: [0, 0, 34, 0])
         let sheet = box(route, y: 0, height: 566)
         _ = box(sheet, y: 0, height: 60)
         let scroller = box(sheet, y: 60, height: 506, overflow: "y")
-        XCTAssertTrue(NavigationHost.bottomScroller(in: route) === scroller, "the component's scroller reaches the edge")
+        XCTAssertTrue(NavigationHost.bottomScroller(in: route, cover: 34) === scroller, "the component's scroller reaches the edge")
+        XCTAssertNil(NavigationHost.bottomScroller(in: route), "not with the cover unsaid: it ends 34 above the content box")
         sheet.applyKernelContentBox(CGRect(x: 0, y: 0, width: 400, height: 546), padding: [0, 0, 20, 0])
-        XCTAssertNil(NavigationHost.bottomScroller(in: route), "a padding under it keeps the cover")
+        XCTAssertNil(NavigationHost.bottomScroller(in: route, cover: 34), "a padding under it keeps the cover")
         sheet.applyKernelContentBox(nil, padding: nil)
         scroller.frame.size.height = 446
         let footer = box(sheet, y: 506, height: 60)
-        XCTAssertNil(NavigationHost.bottomScroller(in: route), "a footer under it keeps the cover")
+        XCTAssertNil(NavigationHost.bottomScroller(in: route, cover: 34), "a footer under it keeps the cover")
         footer.removeFromSuperview()
-        XCTAssertNil(NavigationHost.bottomScroller(in: route), "nor does a scroller that ends short of its parent")
+        XCTAssertNil(NavigationHost.bottomScroller(in: route, cover: 34), "nor does a scroller that ends short of its parent")
         scroller.frame.size.height = 506
         scroller.style["overflow_y"] = nil
         scroller.style["overflow_x"] = .string("scroll")
-        XCTAssertNil(NavigationHost.bottomScroller(in: route), "a sideways scroller takes no bottom inset")
+        XCTAssertNil(NavigationHost.bottomScroller(in: route, cover: 34), "a sideways scroller takes no bottom inset")
         scroller.style["overflow_x"] = nil
         scroller.style["overflow_y"] = .string("scroll")
         // The route's child sized to its content, 200 points of a 600-point
         // route: its scroller ends far above the home indicator.
         sheet.frame.size.height = 200
         scroller.frame.size.height = 140
-        XCTAssertNil(NavigationHost.bottomScroller(in: route), "a route's child short of its content box keeps the cover")
+        XCTAssertNil(NavigationHost.bottomScroller(in: route, cover: 34), "a route's child short of its content box keeps the cover")
         sheet.frame.size.height = 566
         scroller.frame.size.height = 506
-        XCTAssertTrue(NavigationHost.bottomScroller(in: route) === scroller)
+        XCTAssertTrue(NavigationHost.bottomScroller(in: route, cover: 34) === scroller)
         // The component's column ends in a row filling it: a side column
         // beside the scroller reaches the edge too.
         scroller.removeFromSuperview()
@@ -467,7 +927,7 @@ final class NavigationBasicsIOSTests: XCTestCase {
         _ = box(split, y: 0, height: 506)
         let right = box(split, y: 0, height: 506, overflow: "y")
         right.frame.origin.x = 200
-        XCTAssertNil(NavigationHost.bottomScroller(in: route), "a row's scroller beside a column keeps the cover")
+        XCTAssertNil(NavigationHost.bottomScroller(in: route, cover: 34), "a row's scroller beside a column keeps the cover")
         // A full-height row: a column with Save at its foot, and a scroller
         // beside it. The Save button reaches the edge too: the cover stays.
         sheet.removeFromSuperview()
@@ -476,13 +936,43 @@ final class NavigationBasicsIOSTests: XCTestCase {
         _ = box(side, y: 522, height: 44)
         let beside = box(row, y: 0, height: 566, overflow: "y")
         beside.frame.origin.x = 200
-        XCTAssertNil(NavigationHost.bottomScroller(in: route), "a scroller with a sibling beside it in a row keeps the cover")
+        XCTAssertNil(NavigationHost.bottomScroller(in: route, cover: 34), "a scroller with a sibling beside it in a row keeps the cover")
         side.removeFromSuperview()
-        XCTAssertTrue(NavigationHost.bottomScroller(in: route) === beside, "the row's only child spans its bottom edge")
+        XCTAssertTrue(NavigationHost.bottomScroller(in: route, cover: 34) === beside, "the row's only child spans its bottom edge")
         // A reversed column: its last child is at its top, above the scroller.
         _ = box(row, y: 0, height: 60)
         beside.frame.origin = CGPoint(x: 0, y: 60); beside.frame.size.height = 506
-        XCTAssertNil(NavigationHost.bottomScroller(in: route), "a last child above its sibling is not at the edge")
+        XCTAssertNil(NavigationHost.bottomScroller(in: route, cover: 34), "a last child above its sibling is not at the edge")
+    }
+
+    /// A route's closed menus and confirmations take no place in its flow, as
+    /// a browser lays out neither: one written after its scroller leaves the
+    /// scroller at the bottom edge (euxy's Patterns tab, clipped at the tab
+    /// bar by its sort menu and its "Restore factory presets?" dialog).
+    func testTopLayerBoxesAfterAScrollerLeaveItAtTheBottomEdge() {
+        let p = Presenter()
+        var next: UInt32 = 0
+        func box(_ parent: NodeView?, y: CGFloat, height: CGFloat, props: [String: String] = [:], scrolls: Bool = false) -> NodeView {
+            next += 1
+            let n = NodeView(id: next, kind: "view", presenter: p)
+            n.props = props
+            n.frame = CGRect(x: 0, y: y, width: 400, height: height)
+            if scrolls { n.style["overflow_y"] = .string("scroll"); n.syncScroll() }
+            parent?.container.addSubview(n)
+            return n
+        }
+        let route = box(nil, y: 0, height: 600)
+        _ = box(route, y: 0, height: 100)
+        // Closed, a top-layer box is covered whole: laid out at no size.
+        _ = box(route, y: 0, height: 0, props: ["popover": "auto"])
+        let scroller = box(route, y: 100, height: 500, scrolls: true)
+        let menu = box(route, y: 0, height: 0, props: ["popover": "auto"])
+        let dialog = box(route, y: 0, height: 0, props: ["semanticTag": "dialog"])
+        XCTAssertTrue(NavigationHost.bottomScroller(in: route) === scroller)
+        XCTAssertFalse(NavigationHost.inFlow(menu))
+        XCTAssertFalse(NavigationHost.inFlow(dialog))
+        _ = box(route, y: 0, height: 0)
+        XCTAssertNil(NavigationHost.bottomScroller(in: route), "a box in the flow after it still keeps the cover")
     }
 
     /// A route that paints no background shows what the web shows through
@@ -693,6 +1183,79 @@ final class NavigationBasicsIOSTests: XCTestCase {
                       "and the stack beneath is as it was")
     }
 
+    /// LLP 1141.001 D7: a sheet whose heading says level 1 has a large title,
+    /// as its author asked (a Settings sheet's).
+    func testASheetsLevelOneTitleIsLarge() throws {
+        let (session, _, _) = try bars("bars-titled-sheet")
+        let navigation = session.presenter.navigation
+        try tapNode(session, "start-open-titled")
+        until("the sheet has its own stack") { navigation.modalNavigation?.viewControllers.count == 1 }
+        let route = try XCTUnwrap(navigation.modalNavigation?.topViewController as? RouteController)
+        XCTAssertEqual(route.navigationItem.title, "Titled")
+        XCTAssertEqual(route.navigationItem.largeTitleDisplayMode, .always, "the author's level 1 is a large title")
+    }
+
+    /// LLP 1116.020 D2: a sheet's heading of no level is an inline title, as
+    /// UIKit's sheets and Apple's are.
+    func testASheetsHeadingOfNoLevelIsInline() throws {
+        let (session, _, _) = try bars("bars-glass-title")
+        let navigation = session.presenter.navigation
+        try tapNode(session, "start-open-glass")
+        until("the sheet has its own stack") { navigation.modalNavigation?.viewControllers.count == 1 }
+        let route = try XCTUnwrap(navigation.modalNavigation?.topViewController as? RouteController)
+        XCTAssertEqual(route.navigationItem.title, "Glass")
+        XCTAssertEqual(route.navigationItem.largeTitleDisplayMode, .never, "a sheet's title is inline")
+    }
+
+    /// The presented sheet holding `name`'s route, opened from `start`, at
+    /// its first detent: its controller and the route's.
+    private func openSheet(_ session: ExactSession, _ name: String) throws -> (UIViewController, RouteController, UISheetPresentationController) {
+        let navigation = session.presenter.navigation
+        try tapNode(session, "start-open-\(name)")
+        until("the sheet has its own stack") { navigation.modalNavigation?.viewControllers.count == 1 }
+        let sheet = try XCTUnwrap(navigation.modalNavigation?.parent)
+        let route = try XCTUnwrap(navigation.modalNavigation?.topViewController as? RouteController)
+        XCTAssertEqual(route.node.props["testId"], "route-\(name)")
+        let presentation = try XCTUnwrap(sheet.sheetPresentationController)
+        XCTAssertEqual(presentation.selectedDetentIdentifier, .medium)
+        return (sheet, route, presentation)
+    }
+
+    /// A person's drag to `detent`, as UIKit reports it.
+    private func drag(_ presentation: UISheetPresentationController, to detent: UISheetPresentationController.Detent.Identifier) {
+        presentation.selectedDetentIdentifier = detent
+        presentation.delegate?.sheetPresentationControllerDidChangeSelectedDetentIdentifier?(presentation)
+    }
+
+    private func alpha(_ view: UIView) -> CGFloat? { view.backgroundColor?.resolvedColor(with: view.traitCollection).cgColor.alpha }
+
+    /// LLP 1141.001 D3: a sheet whose route paints nothing leaves its views
+    /// clear below its large detent, so UIKit draws its glass as for a
+    /// hand-built sheet; at the large detent it is the system background
+    /// (LLP 1116.021 D7).
+    func testAnUnpaintedSheetIsGlassBelowItsLargeDetent() throws {
+        let (session, _, _) = try bars("bars-glass")
+        let (sheet, route, presentation) = try openSheet(session, "glass")
+        XCTAssertEqual(sheet.view.backgroundColor, .clear, "UIKit's glass shows at the medium detent")
+        XCTAssertEqual(alpha(route.view), 0, "and the route paints none over it")
+        drag(presentation, to: .large)
+        XCTAssertEqual(sheet.view.backgroundColor, .systemBackground, "the system background at the large detent")
+        XCTAssertEqual(alpha(route.view), 0)
+        drag(presentation, to: .medium)
+        XCTAssertEqual(sheet.view.backgroundColor, .clear, "glass again")
+    }
+
+    /// LLP 1141.001 D3: an authored `transparent` is clear at every detent.
+    func testATransparentSheetStaysClearAtEveryDetent() throws {
+        let (session, _, _) = try bars("bars-clear")
+        let (sheet, route, presentation) = try openSheet(session, "clear")
+        XCTAssertEqual(sheet.view.backgroundColor, .clear)
+        XCTAssertEqual(alpha(route.view), 0)
+        drag(presentation, to: .large)
+        XCTAssertEqual(sheet.view.backgroundColor, .clear, "the author's transparent at the large detent too")
+        XCTAssertEqual(alpha(route.view), 0)
+    }
+
 
     /// A scroller UIKit insets lays its content out between those insets
     /// (LLP 1116.000 D1.2): Chat's column, its tall box gone, fills the port
@@ -789,6 +1352,7 @@ final class NavigationBasicsIOSTests: XCTestCase {
             abs(sv.contentSize.height + sv.adjustedContentInset.top + sv.adjustedContentInset.bottom - sv.bounds.height) < 0.5
         }
         until("short content fits above the toolbar") { automaticBottom() > self.window!.safeAreaInsets.bottom + 1 && fits() }
+        XCTAssertTrue(sv.alwaysBounceVertical, "the native document viewport preserves the authored scroller's short-content behavior")
         let shown = automaticBottom(), manual = sv.contentInset.bottom, height = sv.contentSize.height
         let end = sv.contentSize.height + sv.adjustedContentInset.bottom - sv.bounds.height
         sv.contentInset.bottom += 180 // the keyboard toolbar's manual inset basis
@@ -803,6 +1367,69 @@ final class NavigationBasicsIOSTests: XCTestCase {
         bottomToolbar(nav, route, shown: true)
         until("showing the toolbar refits short content") { automaticBottom() > hidden + 1 && fits() }
         XCTAssertEqual(sv.contentInset.bottom, manual, accuracy: 0.5)
+    }
+
+    /// The tab bar follows the stack shown, on a phone by UIKit's
+    /// `hidesBottomBarWhenPushed`, on an iPad's floating bar by Exact's
+    /// `setTabBarHidden`: Chat (hiding it) over Detail (showing it) hides it;
+    /// a cancelled interactive pop back to Detail keeps it hidden, a completed
+    /// one shows it; another tab selected while Chat is still being pushed
+    /// shows it there, and Chat hides it again on return.
+    func testTheTabBarFollowsTheStackThroughCancelledPopsAndTabSwitches() throws {
+        let session = try fixture("basics-follow")
+        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
+        let nav = try XCTUnwrap(tabs.selectedViewController as? UINavigationController)
+        let settled = { nav.transitionCoordinator == nil }
+        try tapNode(session, "detail")
+        until("Detail pushed") { nav.viewControllers.count == 2 && settled() && barShows(tabs) }
+        spin(0.3)
+        // Chat pushed, and another tab selected before the push is over.
+        let tapped = Agent(session: session).tap(["id": Int(try node(session, "detail-chat").id)])
+        XCTAssertNil(tapped["error"], "\(tapped)")
+        until("Chat's push started") { nav.viewControllers.count == 3 }
+        XCTAssertNotNil(nav.transitionCoordinator, "the tab is switched while Chat's push runs")
+        tapTab(tabs, 1)
+        until("Second selected") { tabs.selectedIndex == 1 }
+        // (Home's push ends here, or, its stack off screen, when it shows again.)
+        spin(0.6)
+        XCTAssertTrue(barShows(tabs), "Second's root shows the bar, Home's late push notwithstanding")
+        tapTab(tabs, 0)
+        until("back on Chat over Detail, hidden") { tabs.selectedIndex == 0 && settled() && nav.viewControllers.count == 3 && !barShows(tabs) }
+        spin(0.3)
+        // A cancelled interactive pop back to Detail keeps it hidden; a completed one shows it.
+        let pop = InteractivePop()
+        session.presenter.navigation.setAppDelegate(nav, pop)
+        pop.interactive = true
+        nav.popViewController(animated: true)
+        spin(0.05)
+        pop.interaction.update(0.4)
+        spin(0.1)
+        pop.interaction.cancel()
+        until("the cancelled pop leaves Chat, the bar hidden") { settled() && nav.viewControllers.count == 3 && !barShows(tabs) }
+        spin(0.3)
+        XCTAssertFalse(barShows(tabs), "still hidden over Chat")
+        pop.interactive = false
+        nav.popViewController(animated: true)
+        until("back on Detail, the bar shows") { settled() && nav.viewControllers.count == 2 && barShows(tabs) }
+        session.presenter.navigation.setAppDelegate(nav, nil)
+        // A route that shows the tablist pushed over Chat, which hides it: hidden still, as Chat is under it.
+        nav.popToRootViewController(animated: true)
+        until("back at Home") { settled() && nav.viewControllers.count == 1 && barShows(tabs) }
+        spin(0.3)
+        try tapNode(session, "chat")
+        until("Chat") { settled() && nav.viewControllers.count == 2 && !barShows(tabs) }
+        spin(0.3)
+        try tapNode(session, "chat-detail")
+        until("Detail over Chat") { settled() && nav.viewControllers.count == 3 }
+        spin(0.4)
+        XCTAssertFalse(barShows(tabs), "Chat under Detail keeps the bar hidden")
+        try tapNode(session, "compose-detail") // a batch: the stack at rest is followed again
+        spin(0.4)
+        XCTAssertFalse(barShows(tabs), "and after an ordinary update")
+        nav.popViewController(animated: true)
+        until("back on Chat, hidden") { settled() && nav.viewControllers.count == 2 && !barShows(tabs) }
+        nav.popViewController(animated: true)
+        until("back at Home, shown") { settled() && nav.viewControllers.count == 1 && barShows(tabs) }
     }
 
     /// A real interactive pop from Photo, driven by a percent-driven
@@ -848,7 +1475,7 @@ final class NavigationBasicsIOSTests: XCTestCase {
 
 /// A pop the test drives: a cross-fade animator under a percent-driven
 /// interaction, as NavigationBarIOSTests' forwarded delegate does.
-private final class InteractivePop: NSObject, UINavigationControllerDelegate, UIViewControllerAnimatedTransitioning {
+final class InteractivePop: NSObject, UINavigationControllerDelegate, UIViewControllerAnimatedTransitioning {
     var interactive = false
     let interaction = UIPercentDrivenInteractiveTransition()
     func navigationController(_ nav: UINavigationController, animationControllerFor operation: UINavigationController.Operation,

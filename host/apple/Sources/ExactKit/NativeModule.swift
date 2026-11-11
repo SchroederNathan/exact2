@@ -58,6 +58,16 @@
 // 216  module_tamber(module)                         size ≥ 224; nullable:
 //        after a batch that moved what a binding reads (LLP 1121 D12), the
 //        module asks its places again (ExactTamber.swift)
+// 224  create_view(module, view, tag, …)              size ≥ 232; nullable:
+//        `create` with the node's id (u64), which a package's view is made
+//        with and its displayed reports name (LLP 1133.008 D8 item 1)
+// 232  authenticate(module, json, len, access, ctx, done)  size ≥ 240;
+//        nullable: a presence check (LLP 1133.010 D13), Presence.swift
+// 240  image(module, json, len, ctx, done)              size ≥ 248;
+//        nullable: a package picture (LLP 1133.019 D11 item 1), PackagePictures.swift
+// 248  session_view(module, view)                     size ≥ 256;
+//        nullable: the session's root view, borrowed, or nil, each time it
+//        changes (LLP 1133.027 D17 item 3)
 //
 //   event(ctx, nonce, kind, bytes, len)          kind: EventKind 0–8 — press,
 //     change, hover, focus, blur, key, submit, load, message; change, key and
@@ -102,8 +112,17 @@ private final class NativeTable {
     static let major: UInt32 = 3
     /// The hatch words the module handles, or nil for one that does not say.
     var hatchWords: Set<String>?
+    /// Whether its `tabContainer` takes a tab Exact holds without a
+    /// navigation controller (HeldStackIOS.swift); an older module's does not.
+    var heldStacks = false
+    /// The modules' extensions the artifact composes (LLP 1133.001 D4).
+    var extensions: [String] = []
+    /// The module reads `app.onLine` through the host table's `on_line`
+    /// (its roster's `facts`); an older module reads only the app facts.
+    var asksOnLine = false
     static let size: UInt32 = 104
     typealias CreateFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, UInt32, UnsafePointer<UInt8>?, UInt32, NativeEventFn?, NativeReplyFn?, UnsafeMutableRawPointer?, UInt32, UnsafeMutablePointer<UInt8>?, UInt32) -> UnsafeMutableRawPointer?
+    typealias CreateViewFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, UnsafePointer<UInt8>?, UInt32, UnsafePointer<UInt8>?, UInt32, NativeEventFn?, NativeReplyFn?, UnsafeMutableRawPointer?, UInt32, UnsafeMutablePointer<UInt8>?, UInt32) -> UnsafeMutableRawPointer?
     typealias ViewFn = @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer?
     typealias SetFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, UInt32, UnsafeMutablePointer<UInt8>?, UInt32) -> Int32
     typealias SnapshotFn = @convention(c) (UnsafeMutableRawPointer?, UInt32) -> Void
@@ -146,6 +165,15 @@ private final class NativeTable {
     var willQuit: WillQuitFn?
     /// The bindings' moved inputs (LLP 1121 D12), in one of 224 or more.
     var tamber: ModuleDestroyFn?
+    /// `create` with the node's id (LLP 1133.008 D8 item 1), in one of 232 or more.
+    var createView: CreateViewFn?
+    /// The authenticator entry (LLP 1133.010 D13), in one of 240 or more.
+    var authenticate: PresenceAuthenticateFn?
+    /// A package picture (LLP 1133.019 D11 item 1), in one of 248 or more.
+    var image: PackageImageFn?
+    /// The session's root view for packages (LLP 1133.027 D17 item 3), in one of 256 or more.
+    var sessionView: SessionViewFn?
+    typealias SessionViewFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void
     var agentInput: SetFn?
     var focusTarget: ViewFn?
 
@@ -184,7 +212,10 @@ private final class NativeTable {
         else { return .failure(NativeFailure(state: "unavailable", message: "\(path): unreadable roster")) }
         // The hatch words the module was built to handle, under a key no tag
         // can take (LLP 1075.003.000.001 §4.3); an older module names none.
-        let hatchWords = (roster.removeValue(forKey: "hatches")?["words"] as? [String]).map(Set.init)
+        let hatches = roster.removeValue(forKey: "hatches")
+        let hatchWords = (hatches?["words"] as? [String]).map(Set.init)
+        let extensions = roster.removeValue(forKey: "extensions")?["names"] as? [String] ?? []
+        let asksOnLine = roster.removeValue(forKey: "facts")?["onLine"] as? String == "asks"
         guard let create = pointer(16), let view = pointer(24), let set = pointer(32), let destroy = pointer(48),
               let moduleCreate = pointer(72), let moduleDestroy = pointer(80), let moduleLater = pointer(88),
               let moduleCall = pointer(96) else {
@@ -200,6 +231,9 @@ private final class NativeTable {
             moduleLater: unsafeBitCast(moduleLater, to: ModuleLaterFn.self),
             moduleCall: unsafeBitCast(moduleCall, to: ModuleLaterFn.self))
         loaded.hatchWords = hatchWords
+        loaded.heldStacks = hatches?["heldStacks"] as? Bool == true
+        loaded.extensions = extensions
+        loaded.asksOnLine = asksOnLine
         loaded.agentInput = pointer(64).map { unsafeBitCast($0, to: SetFn.self) }
         loaded.focusTarget = size >= 120 ? pointer(112).map { unsafeBitCast($0, to: ViewFn.self) } : nil
         loaded.prepareForReuse = size >= 112 ? pointer(104).map { unsafeBitCast($0, to: ReuseFn.self) } : nil
@@ -222,6 +256,10 @@ private final class NativeTable {
         if size >= 208 { loaded.tickHatch = pointer(200).map { unsafeBitCast($0, to: HatchTickFn.self) } }
         if size >= 216 { loaded.willQuit = pointer(208).map { unsafeBitCast($0, to: WillQuitFn.self) } }
         if size >= 224 { loaded.tamber = pointer(216).map { unsafeBitCast($0, to: ModuleDestroyFn.self) } }
+        if size >= 232 { loaded.createView = pointer(224).map { unsafeBitCast($0, to: CreateViewFn.self) } }
+        if size >= 240 { loaded.authenticate = pointer(232).map { unsafeBitCast($0, to: PresenceAuthenticateFn.self) } }
+        if size >= 248 { loaded.image = pointer(240).map { unsafeBitCast($0, to: PackageImageFn.self) } }
+        if size >= 256 { loaded.sessionView = pointer(248).map { unsafeBitCast($0, to: SessionViewFn.self) } }
         return .success(loaded)
     }
 }
@@ -426,8 +464,12 @@ final class NativeViews {
         #else
         let standard = embeddedModule(framework: "ExactModules", dylib: "libexact_modules.dylib")
         #endif
-        let trust = ((BakedCompatibility.json["inputs"] as? [String: Any])?["trust"] as? String) ?? "development"
-        guard trust != "production", let override = ExactEnv.environment["EXACT_MODULES"], !override.isEmpty else { return standard }
+        return modulePath(standard: standard, production: ExactEnv.productionBake, environment: ExactEnv.environment)
+    }
+
+    /// `standard`, or the `EXACT_MODULES` a build that is not production names.
+    static func modulePath(standard: String, production: Bool, environment: [String: String]) -> String {
+        guard !production, let override = environment["EXACT_MODULES"], !override.isEmpty else { return standard }
         return override
     }
 
@@ -532,6 +574,10 @@ final class NativeViews {
     /// The hatch words the loaded module was built to handle (LLP
     /// 1075.003.000.001 §4.3), or nil when it does not say: then every word is called.
     var handledHatches: Set<String>? { if case .success(let t) = NativeProcess.table { t.hatchWords } else { nil } }
+    /// Whether the loaded module's `tabContainer` takes held tabs (HeldStackIOS.swift).
+    var takesHeldStacks: Bool { if case .success(let t) = NativeProcess.table { t.heldStacks } else { false } }
+    /// Whether the loaded module asks the host for `app.onLine` (`NativeTable.asksOnLine`).
+    var moduleAsksOnLine: Bool { if case .success(let t) = NativeProcess.table { t.asksOnLine } else { false } }
     var onHatchesConnected: (() -> Void)?
     var hatchCalls: (navigation: HatchNavigationFn, route: HatchRouteFn)?
     var tabCalls: (HatchTabsFn, HatchTabContainerFn)?
@@ -545,7 +591,9 @@ final class NativeViews {
         if let instanceFailure { return .failure(instanceFailure) }
         guard let session else { return .failure(NativeFailure(state: "unavailable", message: "the session ended")) }
         let roots = NativeViews.roots(session: session)
-        let context: [String: Any] = ["agent": ExactEnv.agentMode, "data": roots.data, "cache": roots.cache, "temporary": roots.temporary]
+        // Who posts what an activation is for (LLP 1133.004 D7), as the host's delegate matches it.
+        let context: [String: Any] = ["agent": ExactEnv.agentMode, "data": roots.data, "cache": roots.cache, "temporary": roots.temporary,
+                                      "session": session.label, "owner": session.notificationOwnerID, "process": session.app.notificationProcessID]
         let json = (try? JSONSerialization.data(withJSONObject: context)) ?? Data()
         var error = [UInt8](repeating: 0, count: 512)
         let host = UnsafeMutableRawPointer(bitPattern: UInt(session.runtime.rt))
@@ -560,6 +608,7 @@ final class NativeViews {
         }
         instance = made
         log("module instance made (agent \(ExactEnv.agentMode)) \(sincePixel)")
+        sessionViewChanged()
         if Self.hatchesOff { log("hatches: off (EXACT_HATCHES=off); no hatch is connected or called") }
         if !Self.hatchesOff, let connect = table.connect, let navigation = table.navigationHatch, let route = table.routeHatch {
             let tabs = table.tabsHatch.flatMap { tabs in table.tabContainerHatch.map { (tabs, $0) } }
@@ -578,7 +627,18 @@ final class NativeViews {
         return .success(made)
     }
 
+    /// The module is handed the session's view as it changes (`session_view`).
+    func sessionViewChanged() {
+        guard let instance, case .success(let table)? = NativeProcess.table, let call = table.sessionView else { return }
+        call(instance, session?.view.map { Unmanaged.passUnretained($0).toOpaque() })
+    }
+
     private var pendingHatches: (() -> Void)?
+    /// Whether this session's hatches may still connect with `word` handled (a hatched frame waits, ElementHatches.swift).
+    func hatchesMayConnect(_ word: String) -> Bool {
+        guard hasAppModule, !hatchesConnected, !Self.hatchesOff, instanceFailure == nil, instance == nil || pendingHatches != nil else { return false }
+        switch NativeProcess.table { case .success(let t)?: return t.connect != nil && t.elementHatch != nil && t.hatchWords?.contains(word) != false; case .failure?: return false; case nil: return true }
+    }
     /// Connects the hatches of a module made before first pixel.
     private func activateHatches() {
         guard let pending = pendingHatches else { return }
@@ -618,7 +678,7 @@ final class NativeViews {
         session.runtime.on { exact_set_app_module(rt, nativeLaterCallback, nativeCallCallback, UnsafeMutableRawPointer(bitPattern: UInt(rt))) }
     }
 
-    private var hasAppModule = false
+    var hasAppModule = false
 
     /// After first pixel, before data activates: load the artifact and make
     /// the session's instance, so the first `native.call` pays for neither.
@@ -626,8 +686,19 @@ final class NativeViews {
     /// 100 ms budget (the sample host, 2026-09-27).
     func prepareAppModule() {
         activateHatches()
+        defer { if !hatchesConnected, pendingHatches == nil { session?.presenter.elements.releaseFrames() } } // they never will
         guard hasAppModule, instance == nil, case .success(let table) = self.table() else { return }
         _ = module(table)
+        // Its extensions answer their names from now on, outside the agent.
+        // Under the agent those the drive binds (`--bind`) answer as in
+        // production, and the rest are told they run under the agent: they
+        // answer an interface that is its own substitute, and the runner's
+        // substitute every other (LLP 1124 D7, LLP 1133.006 D8).
+        let real = ExactEnv.agentMode ? table.extensions.filter(ExactEnv.agentBind.contains) : table.extensions
+        let agent = ExactEnv.agentMode ? table.extensions.filter { !ExactEnv.agentBind.contains($0) } : []
+        if !(real.isEmpty && agent.isEmpty), let session {
+            session.runtime.bindExtensions(real + agent.map { "agent " + $0 })
+        }
     }
 
     /// A long call, on the main thread: the artifact loads, the instance is
@@ -649,6 +720,20 @@ final class NativeViews {
                 table.moduleLater(m, b.bindMemory(to: UInt8.self).baseAddress, body.count, reply, { reply, status, bytes, length in exact_app_reply(reply, status, bytes, length) })
             }
         }
+    }
+
+    /// The module's authenticator entry and its instance, made if need be;
+    /// nil for an artifact without one. Main thread.
+    func imageEntry() -> (UnsafeMutableRawPointer, PackageImageFn)? {
+        guard hasAppModule, case .success(let table) = self.table(), let entry = table.image,
+              case .success(let m) = module(table) else { return nil }
+        return (m, entry)
+    }
+
+    func authenticator() -> (UnsafeMutableRawPointer, PresenceAuthenticateFn)? {
+        guard hasAppModule, case .success(let table) = self.table(), let entry = table.authenticate,
+              case .success(let m) = module(table) else { return nil }
+        return (m, entry)
     }
 
     /// A `native.call`, on the main thread: answered before this returns.
@@ -757,8 +842,12 @@ final class NativeViews {
         var error = [UInt8](repeating: 0, count: 512)
         let tag = Data(entry.name.utf8), json = Data(props.utf8)
         let handle = tag.withUnsafeBytes { t in json.withUnsafeBytes { p in
-            table.create(module, t.bindMemory(to: UInt8.self).baseAddress, UInt32(tag.count), p.bindMemory(to: UInt8.self).baseAddress, UInt32(json.count),
-                         nativeEventCallback, nativeReplyCallback, nil, nonce, &error, UInt32(error.count))
+            let (tag, json) = (t.bindMemory(to: UInt8.self).baseAddress, p.bindMemory(to: UInt8.self).baseAddress)
+            // The node's id, which a package's view is made with (`create_view`, a table of 232 or more).
+            if let createView = table.createView {
+                return createView(module, UInt64(entry.id), tag, UInt32(t.count), json, UInt32(p.count), nativeEventCallback, nativeReplyCallback, nil, nonce, &error, UInt32(error.count))
+            }
+            return table.create(module, tag, UInt32(t.count), json, UInt32(p.count), nativeEventCallback, nativeReplyCallback, nil, nonce, &error, UInt32(error.count))
         } }
         guard let handle else {
             NativeProcess.owners.removeValue(forKey: nonce)
@@ -1218,6 +1307,7 @@ extension NodeView {
         #else
         w.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         #endif
+        w.isHidden = cssVisibilityHidden
         addSubview(w)
         web = w
     }

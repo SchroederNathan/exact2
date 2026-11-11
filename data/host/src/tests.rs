@@ -652,6 +652,49 @@ fn a_document_path_reads_and_writes_the_chosen_file_under_its_grant() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// LLP 1069.010 D1 (2026-10-26): `copyFile` takes a chosen file into an app
+/// file under `fs.read` on the one and `fs.write` on the other, needing the
+/// app's directories, while a copy between documents is still refused.
+#[test]
+fn a_chosen_file_is_copied_into_an_app_file_under_both_grants() {
+    let paths = Paths::new();
+    let folder = paths.0.join("chosen");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.png"), "picture").unwrap();
+    let doc = exact_data::documents::mint(&folder.join("a.png"), 9007).unwrap();
+    let copy = |grants: &str, to: &str| {
+        let args = serde_json::json!({"path": doc, "destination": to});
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"version":1,"op":"fs.copyFile","args":args}))
+                .unwrap();
+        assert_eq!(
+            super::native::independent_storage(&payload),
+            !to.starts_with("app:/")
+        );
+        storage::response(super::native::run(
+            Some(&paths.directories()),
+            grants,
+            &payload,
+            9007,
+        ))
+    };
+    let both = "fs.read doc:/\nfs.write app:/data";
+    assert_eq!(copy(both, "app:/data/a.png").unwrap(), Json::Null);
+    assert_eq!(
+        std::fs::read_to_string(paths.0.join("data/a.png")).unwrap(),
+        "picture"
+    );
+    for grants in ["fs.read doc:/\nfs.write app:/cache", "fs.write app:/data"] {
+        let refused = copy(grants, "app:/data/b.png").unwrap_err();
+        assert!(refused.starts_with("denied: "), "{grants}: {refused}");
+    }
+    assert!(!paths.0.join("data/b.png").exists());
+    let to_doc = format!("{}/copy.png", doc.rsplit_once('/').unwrap().0);
+    assert!(copy("fs.read doc:/\nfs.write doc:/", &to_doc).is_err());
+    assert!(!folder.join("copy.png").exists());
+    exact_data::documents::forget(9007);
+}
+
 /// LLP 1069.010.000 D2a: a write that expects the stat it read is refused
 /// `ECHANGED`, writing nothing, once another writer changed the file, and
 /// lands while the file is as read.
@@ -691,6 +734,89 @@ fn a_write_that_expects_what_it_read_is_refused_once_the_file_changed() {
     .unwrap();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
     exact_data::documents::forget(9004);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// LLP 1069.010.000 D5: under `doc.keep` the app lists what it keeps and
+/// forgets one; without it both are refused. The app's own atomic save keeps
+/// its document (D4).
+#[test]
+#[cfg(unix)]
+fn the_kept_list_reads_and_forgets_under_doc_keep() {
+    use exact_data::documents::kept;
+    let dir = std::env::temp_dir().join(format!("exact-doc-kept-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("drawing.json");
+    std::fs::write(&file, "one").unwrap();
+    kept::open(9005, "test.storage.kept", &dir.join("kept.json"));
+    let doc = kept::keep(9005, &file, "", "readwrite").unwrap();
+    let run = |grants: &str, op: &str, args: serde_json::Value| {
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"version":1,"op":op,"args":args})).unwrap();
+        storage::response(super::native::run(None, grants, &payload, 9005))
+    };
+    let keeps = "fs.read doc:/\nfs.write doc:/\ndoc.keep";
+    let listed = run(keeps, "fs.recentDocuments", serde_json::json!({})).unwrap();
+    assert_eq!(listed[0]["path"], doc.as_str());
+    assert_eq!(listed[0]["kind"], "file");
+    let refused = run("fs.read doc:/", "fs.recentDocuments", serde_json::json!({}));
+    assert!(refused.unwrap_err().contains("needs the doc.keep grant"));
+    let atomic = serde_json::json!({"path": doc, "text": "two"});
+    run(keeps, "fs.atomicWriteFile", atomic).unwrap();
+    kept::held(9005, std::slice::from_ref(&file));
+    assert_eq!(
+        run(keeps, "fs.recentDocuments", serde_json::json!({})).unwrap()[0]["path"],
+        doc.as_str(),
+        "the app's own save is still the document kept"
+    );
+    run(keeps, "fs.forgetDocument", serde_json::json!({"path": doc})).unwrap();
+    let again = run(keeps, "fs.forgetDocument", serde_json::json!({"path": doc}));
+    assert!(again.unwrap_err().starts_with("document ENOENT: "));
+    assert_eq!(
+        run(keeps, "fs.recentDocuments", serde_json::json!({})).unwrap(),
+        serde_json::json!([])
+    );
+    kept::end(9005);
+    exact_data::documents::forget(9005);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// LLP 1069.010.000 D4: a kept file renamed while the app was closed is
+/// read at its new name through the path it was kept by.
+#[test]
+#[cfg(unix)]
+fn a_kept_file_renamed_between_launches_reads_through_its_kept_path() {
+    use exact_data::documents::kept::{self, Identity};
+    let dir = std::env::temp_dir().join(format!("exact-doc-renamed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    std::fs::write(dir.join("moved.md"), "kept").unwrap();
+    let (identity, _) = Identity::of(&dir.join("moved.md")).unwrap();
+    // What an earlier launch wrote, before the file was renamed.
+    let n = 900_000 + u64::from(std::process::id() % 1000);
+    let set = serde_json::json!({"version": 1, "next": n + 1, "documents": [{
+        "n": n, "name": "chosen.md", "kind": "file", "mode": "readwrite", "opened": 1,
+        "device": identity.device, "inode": identity.inode,
+        "path": dir.join("chosen.md").to_str().unwrap(), "bookmark": ""}]});
+    std::fs::write(dir.join("kept.json"), set.to_string()).unwrap();
+    kept::open(9006, "test.storage.renamed", &dir.join("kept.json"));
+    kept::restore(9006, &[(n, dir.join("moved.md"), None)]);
+    let doc = format!("doc:/{n}/chosen.md");
+    let run = |op: &str, path: &str| {
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"version":1,"op":op,"args":{"path": path}}))
+                .unwrap();
+        storage::response(super::native::run(None, "fs.read doc:/", &payload, 9006))
+    };
+    let read = run("fs.readFile", &doc).unwrap();
+    assert_eq!(read["base64"], exact_runner::agent::base64(b"kept"));
+    assert!(run("fs.readFile", &format!("doc:/{n}/moved.md")).is_err());
+    assert!(
+        run("fs.readdir", &doc).is_err(),
+        "still one file, not a folder"
+    );
+    kept::end(9006);
+    exact_data::documents::forget(9006);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -992,12 +1118,21 @@ fn an_agent_drive_without_a_store_answers_with_the_webs_refusal() {
     host.activate().unwrap();
     let refused = run(
         &mut host,
-        storage::request("fs.writeFile", json!({"path":"app:/data/x","text":"x"})),
+        storage::request("fs.readFile", json!({"path":"app:/data/x"})),
     );
     assert_eq!(
         refused,
         Err("storage is unavailable in agent mode unless the drive names a scratch store (--storage <name>)".into())
     );
+    // The first refused read or write is said in the journal, for the driver's note; a second is not.
+    let lines = host.take_logs();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("storage refused (agent): "));
+    let _ = run(
+        &mut host,
+        storage::request("fs.writeFile", json!({"path":"app:/data/y","text":"y"})),
+    );
+    assert!(host.take_logs().is_empty());
     host.agent = false;
     host.source.request = storage::request("fs.readFile", json!({"path":"app:/data/x"}));
     assert!(host
@@ -1112,13 +1247,103 @@ fn compress_image_answers_a_rust_source_as_typescripts() {
     assert!(!paths.0.join("data/x.jpg").exists());
 }
 
+/// A Rust source's `fs.transformImage` (LLP 1133.019 D17): the record is
+/// D14's options beside the two paths, and the answer is D14's record; and
+/// `fs.compressImage` takes the edit as TypeScript's call does (D15).
+#[test]
+fn transform_image_answers_a_rust_source_as_typescripts() {
+    let paths = Paths::new();
+    let mut host = Storage::new(Fixture::new());
+    paths.configure(&mut host);
+    host.activate().unwrap();
+    run(
+        &mut host,
+        storage::request("fs.mkdir", json!({"path":"app:/data/in"})),
+    )
+    .unwrap();
+    std::fs::write(
+        paths.0.join("data/in/photo.jpg"),
+        include_bytes!("../../../scripts/fixtures/picker/oriented-gps.jpg"),
+    )
+    .unwrap();
+    let transform = |to: &str, options: Json| {
+        let mut args = json!({"path":"app:/data/in/photo.jpg","destination":to});
+        args.as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        storage::request("fs.transformImage", args)
+    };
+    let result = run(
+        &mut host,
+        transform("app:/data/turned", json!({"rotate":90,"metadata":"none"})),
+    );
+    let cropped = run(
+        &mut host,
+        storage::request(
+            "fs.compressImage",
+            json!({"path":"app:/data/in/photo.jpg","destination":"app:/data/crop.jpg","maxDimension":100,"maxBytes":2_000_000,
+                "crop":{"x":0,"y":0,"width":24,"height":64}}),
+        ),
+    );
+    if cfg!(target_vendor = "apple") {
+        let size = std::fs::metadata(paths.0.join("data/turned.jpg"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            result.unwrap(),
+            json!({"path":"app:/data/turned.jpg","type":"image/jpeg","size":size,"width":64,"height":48,
+                "colorSpace":"srgb","hdr":false,"metadata":"none"})
+        );
+        assert_eq!(cropped.unwrap()["width"], 24);
+        let err = run(
+            &mut host,
+            transform(
+                "app:/data/x.jpg",
+                json!({"crop":{"x":0,"y":100,"width":1,"height":1}}),
+            ),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("transformImage: outside: "), "{err}");
+    } else {
+        assert_eq!(
+            result.unwrap_err(),
+            "transformImage: unsupported: no image codec"
+        );
+        assert!(cropped.is_err());
+    }
+    for (request, expected) in [
+        (
+            transform("app:/cache/out.jpg", json!({})),
+            "denied: fs.write",
+        ),
+        (
+            transform("doc:/1/out.jpg", json!({})),
+            "transformImage: needs app:/ paths",
+        ),
+    ] {
+        let err = run(&mut host, request).unwrap_err();
+        assert!(err.starts_with(expected), "{err}");
+    }
+    if cfg!(target_vendor = "apple") {
+        let err = run(
+            &mut host,
+            transform("app:/data/x.jpg", json!({"flip":"both"})),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("transformImage: invalid: flip"), "{err}");
+    }
+    assert!(!paths.0.join("data/x.jpg").exists());
+}
+
 /// A Rust source's upload from a file (LLP 1108 D6 R2): the storage composer
-/// passes `Request::body_from` through untouched, the path alone, for the
-/// host's executor to read when it sends the request.
+/// passes `Request::body_from` and `body_to` through untouched, the paths
+/// alone, for the host's executor to read and write when it runs the request.
 #[test]
 fn a_rust_sources_body_from_passes_to_the_host_as_its_path() {
     let mut host = Storage::new(Fixture::new());
-    let mut upload = Request::get("https://example.test/upload").body_from("app:/data/photo.jpg");
+    let mut upload = Request::get("https://example.test/upload")
+        .body_from("app:/data/photo.jpg")
+        .body_to("app:/cache/reply.json");
     upload.method = "POST".into();
     host.source.request = upload.clone();
     host.configure_storage("data".into(), "cache".into(), "tmp".into())
@@ -1167,6 +1392,7 @@ fn image_cancellation_orders_publication_and_the_consumer_reads_only_success() {
                 bytes: b"published".to_vec(),
                 width: 1,
                 height: 1,
+                ..Default::default()
             })
         }
     }
@@ -1184,6 +1410,7 @@ fn image_cancellation_orders_publication_and_the_consumer_reads_only_success() {
             ImageRequest {
                 max_dimension: 1,
                 max_bytes: 100,
+                ..Default::default()
             },
         )
         .unwrap()

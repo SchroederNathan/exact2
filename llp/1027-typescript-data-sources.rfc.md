@@ -52,7 +52,8 @@ may have both (D8).
 **The seam in TypeScript** is four exports — `appId`, `grants`,
 `answer(source, args, store)`, `parse(source, args, outcome, store)` —
 with values as JSON and the plan's own shapes directing the conversion
-both ways (D1, D2). No `fetch`, no timers, no filesystem: the module
+both ways (D1, D2). No `fetch` (D1a later gave it one), no timers (LLP
+1027.000 D1 later gave an answer its own), no filesystem: the module
 has no globals that reach outside the process, so a request is a value
 the host runs under the grants, exactly as in Rust (LLP 1016 D1). That
 is not discipline; it is the absence of a binding.
@@ -237,7 +238,8 @@ return { value: { ok: false, username: "", error: json?.errors?.[0]?.message ?? 
 
 **The module has no I/O because it has no bindings.** The executor
 creates a runtime with `eval` closed and installs nothing: no `fetch`,
-no timers, no `console` unless D10 admits it, no filesystem, no
+no timers (LLP 1027.000 D1 later gave an answer its own), no `console`
+unless D10 admits it, no filesystem, no
 `URL`. A module that reaches for one throws a `ReferenceError` at the
 call, which the executor reports as `DataError::Unavailable` naming
 the source — the LLP 1026 D3 discipline ("not 'the data crate does no
@@ -587,6 +589,12 @@ median of 100 rounds of `ibex2`'s kv `FileStore` and the runner's
   Linux keeps them in the same kv scope as Apple (LLP 1027.007 D13),
   written with the commit.
 
+**Ruled (Charlie, 2026-10-22):** the 2026-10-16 amendment stands: 256 KiB
+per answer and 512 KiB together. No per-resource `keep <size>` declaration;
+authors do not tune launch budgets. Measure the launch read on a physical
+phone. Raise the total toward 1 MiB only if a real app needs it and the
+phone's read stays about 3 ms or less.
+
 The kept answers are also bounded together, at twice one answer's bound
 (512 KiB): the runner, which knows every entry, forgets the longest others
 when keeping one would pass it, in the same commit, and says so (`kept
@@ -678,7 +686,8 @@ captures app-local `app.ts`/Contract sources, generates those declarations,
 runs the pinned TypeScript checker and Rolldown, compiles with `hermesc`, and
 bakes through that HBC with an empty store. Rolldown is already in this repo's
 toolchain; the Bun command below describes the original probe, not this producer.
-Imports outside the captured app refuse; npm dependency capture remains owed.
+Imports outside the captured app refuse; a package's code is captured as the
+bundle reaches it (below, "D5 Package code").
 A package's declarations are captured for the type check alone (below, "D5
 Type-only package imports").
 As of 2026-09-13, the snapshot also carries `.ttf`/`.otf` fonts and every
@@ -723,7 +732,11 @@ Bake gains three steps, all build-time, all reproducible:
    bundler in the loop; §10 Q1). 6 KB of JavaScript for the probe.
 2. **Compile.** `hermesc -O -emit-binary` → `app.hbc`, 11 KB for the
    probe (as built since 2026-09-23 with `-emit-async-break-check` too,
-   so a host can interrupt a running call; LLP 1048.000 D10), with the
+   so a host can interrupt a running call; LLP 1048.000 D10; and since
+   2026-10-22 with `-Xes6-block-scoping`, without which Hermes scopes
+   `let` and `const` like `var` and a closure made in a loop sees the
+   loop's last binding; Hermes still makes no temporal-dead-zone check,
+   so reading a `let` before its declaration gives `undefined`), with the
    `hermesc` that ships beside the VM it targets (the
    receipt, D9): bytecode is version-coupled to the engine, and a
    mismatch is refused outright (ibex2 bytecode.rs). Steps 1–2: 20 ms.
@@ -992,8 +1005,8 @@ The checker therefore reads a package's types from the capture, and
   is refused by the same `--listFiles` check. A package's own `declare global`
   is its author's; this is a type boundary, not a sandbox (above).
 - **Not in this slice.** A package whose types are `.ts` sources rather than
-  declarations does not resolve from the capture; npm runtime capture remains
-  owed; the native wasm dev loop (`dev.mjs --wasm`) does not watch packages.
+  declarations does not resolve from the capture; package code came later
+  ("D5 Package code"); the native wasm dev loop (`dev.mjs --wasm`) does not watch packages.
   Packages are found by scanning the captured sources for specifiers, not
   by a parser: a match that is no import stages declarations nobody reads.
 - **Review (GPT-6 Astra, 2026-10-08).** Folded: the one-shot check, the
@@ -1007,6 +1020,125 @@ Qualification: `type_only_package_imports_check_alike_and_package_code_never_run
 bake over a fixture with a nested dependency and an `@types` companion; a
 scratch `exact new` app with `snapback4@0.4.13` and `snapback4 types` builds,
 type-checks and passes `bun exact.mjs test web`.
+
+#### D5 Package code (2026-10-16, implemented)
+
+**Implementer:** Claude, for the euxy port (FRICTION 1: `import … from
+'qrcode/lib/core/qrcode'` was refused, so the porter bundled the package into
+a `// @ts-nocheck` `src/qrcode.ts` by hand).
+
+A data module imports pure-JavaScript packages installed in `node_modules`
+(ESM or CommonJS; `.js`, `.mjs`, `.cjs`, JSON; `exports`, `main` and the
+`browser` field) and the app's own `.js` files, on every target that runs it.
+
+- **Captured as reached.** The shared plugin (`typescript.mjs`
+  `capturedSources`, in the one-shot, resident and web producers) resolves
+  each package import from where its importer really is, copies the file it
+  leads to into the stage under `node_modules/.packages/<name>@<version>/`
+  with every `package.json` between it and the package root (`type`,
+  `sideEffects`), and returns the copy; a captured file's own imports resolve
+  the same way. Only the copies load. Nothing a bundle does not reach is
+  taken, so a package's Node entry or CLI costs nothing until imported. A
+  name and version that are not npm's (`"version": "../../x"`) are refused,
+  and no write leaves `.packages`.
+- **Recorded.** The stage's `__exact_packages.json` lists each file with
+  where it was read and its SHA-256, each resolution (importer, specifier,
+  kind, the copy it reached), and each package's installed paths: where
+  Node's lookup found it, a link as a link. A package's digest covers its
+  files and the resolutions that reached it, so a retargeted or swapped link
+  is another capture; the receipt's `packages` carries the digests (absent
+  with none). A Cargo bake prints `rerun-if-changed` for each installed path,
+  which Cargo walks with the link's own time, and for each captured file
+  where it was read (a package reached through a file link has no installed
+  path); the JS dev loop watches each
+  package tree and each installed entry, as it does declarations. Two
+  installs of one `name@version` are refused (`install one`): a place in the
+  stage, which a bundle's output names, is the same on every machine.
+- **One graph.** Every bundle of the module resolves as a browser bundle
+  does (`platform: 'browser'`), so the page and Hermes run the same file of a
+  package; `process.env.NODE_ENV` is `"production"`. A bundle of the existing
+  apps is byte-identical to the `neutral` platform's. No build runs app or
+  package code to learn about the module: `appId`, `grants` and the export
+  names are read from app.ts's syntax (`staticFacts`), so each of `appId`
+  and `grants` is a constant (a string, a template or `+` of constants, an
+  array of them `.join(…)`, or a top-level `const` holding one). Grants may
+  also be an object literal keyed by http(s) origin string literals, each
+  value a string literal or an array of string literal grant lines. The bake
+  requires an exact key for the selected `origin` and replaces the captured
+  initializer with that entry's lines joined by `\n` before type-checking; the authored file stays unchanged.
+  In a development build, an unlisted loopback or private-network origin may take a loopback key
+  of the same scheme: prefer the same port, otherwise require exactly one candidate. Its matching
+  fetch and socket grant lines move to the selected host and port, preserving paths and other grants.
+  Production still requires an exact key (LLP 1142 §13 D13, 2026-10-26).
+  Every producer refuses other forms by
+  name and place. (The web build had imported
+  `app.ts` into Bun, whose resolver takes a package's Node entry; a `node:vm`
+  realm is no boundary either: on Bun 1.4.2 its global's constructor reaches
+  `process`, and promise jobs outlive its timeout.) Every import from a
+  captured file is recorded, a `paths` alias's too, and the web's page and
+  server bundles take `app.ts` from the capture and replay those
+  resolutions (`replayCaptured`): any other import, absolute or relative, is
+  refused there, save the host module the build injects.
+- **Refused, by package, version and file,** in every producer: an import of
+  a Node built-in a `browser` field does not replace; a `.node` file or a
+  package with `binding.gyp`/`gypfile`; an import that is not installed, the
+  app's own included; and, in package code and the app's own JavaScript, a
+  use of the DOM's globals (`window`, `document`, `navigator`, …), Node's
+  (`process` but `process.env.NODE_ENV`, `Buffer`, `global`, `__dirname`,
+  `__filename`) or a computed `require`, bare or as a member of `globalThis`
+  or `self`, that no enclosing scope binds and no dominating `typeof` test
+  guards (its `&&`, `?:` or `if`, or an earlier `if (typeof x …) return`); a
+  member of the global object's other names (`window`, `frames`, `parent`,
+  `top`, `opener`); and code from a string (`Function`, `eval` direct or
+  indirect, `import()` of a computed name). A `try` guards nothing. A package's use of the clock is the executor's to
+  refuse when it runs (a date library's `isToday` is not refused for being
+  bundled); the app's own code keeps the build-time refusal.
+- **Absent alike.** Hermes's realm has no DOM or Node globals and no other
+  name for its global object; the web's module bindings hide the page's
+  (`ts-fetch.js`: bare names bind to `undefined`; the module's `globalThis`
+  is a proxy over a target of its own, whose reads, `in`, own descriptors and
+  keys leave out `window`, `self`, `frames`, `parent`, `top`, `opener` and the
+  DOM and Node names), so a feature test answers the same on both. They are
+  absent, not throwing getters: a getter would make `typeof document` throw
+  and break the feature tests packages are written with.
+- **A portability boundary, not a security one.** These checks keep a
+  module that runs on Hermes from quietly depending on the page. They do
+  not contain hostile code: on the web the module runs in the page's realm,
+  as the app's own code always has, and a language-level path to the page
+  (a function's `constructor`) stays open. An npm package is code the author
+  chose, trusted as their own; no capability boundary is attempted on the
+  web.
+- **Types.** The app's `.js` files are typed from their code (`allowJs`, not
+  checked; the refusals above check them); its `.d.ts` files are in the check
+  as in an editor's project, so an untyped package takes a `declare module`.
+
+Qualification: `js/bake/tests/packages.rs` drives the web build, the resident
+and the one-shot producers: ESM and CommonJS packages, a nested dependency, a
+`browser` condition and field, `.mjs`/`.cjs`/JSON and an app `.js` file bake,
+boot and draw from the `browser` file, the unselected Node entry with a side
+effect never runs, recorded digests are the files' bytes and the receipt's
+are the record's, and a second bake is identical; the web build there makes
+its server bundle too, so both replays run; a retargeted and a swapped
+install link change the capture; each refusal above (an unrelated `typeof`, a
+shadowing parameter elsewhere, a `try`, `globalThis.localStorage`,
+`globalThis.top`, `Function`, an indirect `eval`, a computed `import()`, a
+missing direct dependency, the app's own `Buffer`, a traversing version) is
+refused in all three with the package's code never run; an aliased
+`document` is absent on Hermes; computed `grants` are refused by every
+producer and a constant one built of a template and `.join` is read; a
+package-shaped `paths` alias bakes and replays; replay resolves a recorded
+absolute import to its captured file and refuses an unrecorded absolute,
+relative or package import; and Cargo's watched paths include a captured
+file reached through a file link. The euxy port with its hand-bundled `src/qrcode.ts`
+replaced by `import { create } from 'qrcode/lib/core/qrcode'` (and a `declare
+module`) bakes `qrcode@1.5.4` and `dijkstrajs@1.0.3` into the receipt and, on
+an iOS 27 simulator, answers the share card byte for byte as before (URL,
+path, size) and draws the same QR. Its web build passes, but its page does
+not boot on this checkout before or after the change (`exactTransport`: "is
+not a function", a JS-target fault apart from this one); a scratch app
+answering the same URL with the same `qrPath` over the package draws the
+identical path on the web. Every TypeScript app in `apps/` builds on the JS
+target, and Shelf runs there.
 
 ### D6 — The web: the browser is the executor; one wasm import; the same module under two loaders
 
@@ -1344,9 +1476,10 @@ measures, and there is nothing to close at the next release.
 **Level A and Level B (LLP 1026 D12) restated for the paved path:** a
 TypeScript app's binary always links `exact-js` (it is the app's
 logic), so a code update costs it no extra binary — Level B is free
-where Level A was. A Rust-logic app is Level A with no interpreter, as
-before. The one interpreter a phone binary carries is chosen by the
-app's language (§8 records what this takes off LLP 1026's list).
+where Level A was. **Amended (Charlie, 2026-10-22; LLP 1029.000):** a phone carries
+at most one interpreter per language the app uses. A TypeScript app with
+a Rust module carries Hermes and wasmi; Rust replacement is on by default
+and `"rust": false` opts out (§8).
 
 Signing, anti-rollback, crash fallback, assets by digest, apply at next
 launch, static files, no service: unchanged. The App Store clause is
@@ -1553,10 +1686,25 @@ restart, backup, deletion, and transactional restore. Snapback2 remains deferred
   module *describes* the request instead). The bundler resolves; the
   fixture judges.
 - **Size and time:** the module runs under the executor's budgets — a
-  wall-clock bound per call and a heap bound on the runtime (Hermes
-  `RuntimeConfig` has both), the LLP 1026 D5 fuel-and-limits shape by
-  the engine's own means; a call over budget is `Unavailable` and the
-  last value stays on screen.
+  bound per turn on the module's own time (the calling thread's CPU clock
+  where the platform keeps one, else the wall clock), with a wall-clock
+  backstop of ten budgets for a turn that waits rather than works, and a
+  heap bound on the runtime (Hermes `RuntimeConfig` has the heap's), the
+  LLP 1026 D5 fuel-and-limits shape by the engine's own means; a turn over
+  budget is refused as an overrun (`DataError::Overrun`, envelope kind
+  `Overrun`, which an older peer reads as `Unavailable`). A resource an
+  overrun refused keeps its last value and is asked again at 250 ms, then
+  1 s; a third overrun in that streak fails it as any refusal does. Until
+  then the runner holds the ask, never sent: it reads as the ask in flight
+  (`pending`, no failure), keeps that ask's origin and invocation, and comes
+  due in the runner's deadline order. A commit that doesn't ask the
+  resource again leaves the wait as it is; new arguments or a refresh
+  replace it and start a new streak. The agent's `settle` goes to its time;
+  a render completes past it, its checkpoint listing the resource for the
+  client to ask. A mutation's or a stream message's overrun is never asked
+  again. (Amended 2026-10-27, twice: under CPU load a wall-clock budget
+  refused turns the machine had merely descheduled, and a resource an
+  overrun refused stood stale until something else asked it.)
 - **Not before first pixel, never in Contract, never touching the tree**
   — §7.
 
@@ -1682,7 +1830,9 @@ reads only).
   store-reading resource is the observable cost.
 - **Per call:** microseconds to tens of microseconds, per resource
   change, never per frame (§5). The 100 ms per-call budget is a runtime
-  promise about a device. The bake's module (`js/bake`, after `Module::inspect`) is not held
+  promise about a device, measured in the calling thread's CPU time with a
+  1 s wall backstop (2026-10-27), so a loaded machine does not refuse a
+  turn's own small work. The bake's module (`js/bake`, after `Module::inspect`) is not held
   to it (2026-10-03): a heavily loaded build Mac failed the Signal Clone's
   bake at 104.8 ms and passed on retry. A build fails on the source, not on
   the machine's load. A runaway call hangs the bake as it did before; the
@@ -1738,13 +1888,13 @@ what it unblocks, and take something off the doing-list in the same PR.
   the app's, in TypeScript by default or in Rust, behind one seam."
   Unblocks: substantial app logic in the language people and agents
   write it in, on every host, without a compiler in the loop — the
-  ruling. **The take: LLP 1026 D2's wasm data module leaves 1026's
+  ruling. **The take (2026-09-03): LLP 1026 D2's wasm data module leaves 1026's
   staging.** With TypeScript as the paved path for logic, over-the-air
   *logic* travels as Hermes bytecode (D7); a Rust data crate is Level A
-  — native, no interpreter, updated by binary — and the phone carries
-  at most **one** interpreter, chosen by the app's language. wasmi
-  returns only if LLP 1026 D6 (surfaces as wasm) is ever built, and
-  then for surfaces. One executor slot, one engine per app, not two.
+  — native, no interpreter, updated by binary. **Amended (Charlie,
+  2026-10-22; LLP 1029.000 §2):** a phone carries at most one interpreter
+  per language the app uses. A TypeScript app with a Rust module carries
+  Hermes and wasmi; the earlier one-engine-per-app trade is overtaken.
 - **`rules/DEFERRED.md` §Runtime "HBC compilation"** → moved, for
   the *bake* only: `hermesc` runs at build, in the same step that
   compiles `app.contract`; nothing compiles at runtime, which is what

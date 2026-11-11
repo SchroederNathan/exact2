@@ -14,7 +14,9 @@ private final class VideoModule {
     typealias Update = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Void
     typealias Handle = @convention(c) (UnsafeMutableRawPointer?) -> Void
     let create: Create, view: View, update: Update, destroy: Handle, state: Handle, fullscreen: Handle, toggle: Handle
+    fileprivate let library: UnsafeMutableRawPointer
     private init(_ library: UnsafeMutableRawPointer) {
+        self.library = library
         func symbol<T>(_ name: String, _: T.Type) -> T { unsafeBitCast(dlsym(library, name)!, to: T.self) }
         create = symbol("exact_video_create", Create.self)
         view = symbol("exact_video_view", View.self)
@@ -43,6 +45,9 @@ private final class VideoModule {
         return VideoModule(library)
     }()
 }
+
+/// The loaded video arm, for its picture-in-picture exports (PictureInPicture.swift).
+enum VideoArmLibrary { static var handle: UnsafeMutableRawPointer? { VideoModule.shared?.library } }
 
 /// Chrome's rule for a muted video its `autoplay` attribute started, with
 /// `paused` unbound (LLP 1042 §3, ruled 2026-09-28): it plays only while some
@@ -79,6 +84,10 @@ struct OffscreenAutoplay {
 
 final class VideoView {
     weak var owner: NodeView?
+    #if os(iOS) || os(tvOS)
+    // Player creation and the first source update together include AVKit's presentation view.
+    private var creationSeconds: TimeInterval?
+    #endif
     private var handle: UnsafeMutableRawPointer?
     private var platformView: MediaPlatformView?
     private var last: [String: String] = [:]
@@ -151,6 +160,10 @@ final class VideoView {
     }
     #endif
     init(owner: NodeView) {
+        #if os(iOS) || os(tvOS)
+        let started = CACurrentMediaTime()
+        defer { creationSeconds = CACurrentMediaTime() - started }
+        #endif
         self.owner = owner
         guard let module = VideoModule.shared else { return }
         let context = Unmanaged.passUnretained(self).toOpaque()
@@ -207,6 +220,9 @@ final class VideoView {
         BorderPaint.clip(layer, in: CGRect(origin: .zero, size: content.size), radii: radii)
     }
     func update() {
+        #if os(iOS) || os(tvOS)
+        let started = CACurrentMediaTime()
+        #endif
         // Radius, borders and padding are style, not player props. Refresh
         // their geometry even when the AVKit update below is deduplicated.
         layout()
@@ -281,6 +297,10 @@ final class VideoView {
         data.withUnsafeBytes { module.update(handle, $0.bindMemory(to: UInt8.self).baseAddress, data.count) }
         #if os(iOS) || os(tvOS)
         if !audible { holdSession(false) }
+        if props["src"] != nil, let creationSeconds {
+            self.creationSeconds = nil
+            HeavyLeaves.record("video", creationSeconds + CACurrentMediaTime() - started)
+        }
         #endif
     }
     /// `fastSeek(id, seconds)`, `load(id)` or `requestFullscreen(id)`, by HTML's method names.
@@ -358,6 +378,8 @@ extension Presenter {
     /// `fastSeek(id, seconds)` and `load(id)` on the video or audio with that
     /// HTML `id`, as `focus(id)` names one.
     func mediaCommand(_ name: String, _ args: [Any]) {
+        if name == "requestPictureInPicture" { return pictureInPicture(args) }
+        if name == "exitPictureInPicture" { return PictureInPictureHost.exit(session) }
         let id = args.first as? String ?? ""
         let node = views.values.sorted(by: { $0.id < $1.id }).first(where: { $0.props["id"] == id })
         guard let video = node?.video else {

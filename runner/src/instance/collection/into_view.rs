@@ -128,8 +128,17 @@ impl Collection {
             ListAxis::Vertical => [StyleId::MarginTop, StyleId::MarginBottom],
             ListAxis::Horizontal => [StyleId::MarginLeft, StyleId::MarginRight],
         };
-        let number = |id| match root.bound_style(u.env.plan, id) {
-            Some(Value::Number(n)) if n.is_finite() => *n,
+        // As the kernel lays it out, under a terminal's rule (any length, in
+        // whole cells); else as the plan binds it.
+        let laid = u.cell_margins.map(|margins| margins(root.view));
+        let number = |id| match (laid, root.bound_style(u.env.plan, u.sites, id).as_ref()) {
+            (Some([t, r, b, l]), _) => match id {
+                StyleId::MarginTop => t,
+                StyleId::MarginRight => r,
+                StyleId::MarginBottom => b,
+                _ => l,
+            },
+            (None, Some(Value::Number(n))) if n.is_finite() => *n,
             _ => 0.0,
         };
         let [top, right, bottom, left] = u
@@ -157,7 +166,9 @@ impl Collection {
     }
     /// The offset that aligns row `position` by `align`, from the index,
     /// within the port less its `scroll-padding`, as CSS aligns in the
-    /// snapport (@ref LLP 1010 §6.9). It may be negative, down to the padding
+    /// snapport (@ref LLP 1010 §6.9), and less what the platform covers of it
+    /// (`covered`), as UIKit's `scrollToItem(at:at:animated:)` aligns within
+    /// the adjusted content insets. It may be negative, down to the padding
     /// before the first row: `scrollTop` 0.
     fn aligned(
         &self,
@@ -176,7 +187,11 @@ impl Collection {
         let start = self.index.prefix(position).unwrap_or(0.0) + before;
         let size = (self.index.height(position).unwrap_or(0.0) - before - after).max(0.0);
         let port = self.geometry.as_ref().map_or(0.0, |g| g.port_main);
-        let [inset_start, inset_end] = self.scroll_padding(u);
+        let [padding_start, padding_end] = self.scroll_padding(u);
+        let (inset_start, inset_end) = (
+            padding_start + self.covered[0],
+            padding_end + self.covered[1],
+        );
         // The snapport, as offsets from the port's start.
         let (low, high) = (inset_start, (port - inset_end).max(inset_start));
         let view = high - low;
@@ -253,7 +268,14 @@ impl Collection {
                 });
             }
         }
-        self.realize_window_with_row(u, frames, false, CollectionFill::default(), Some(position))?;
+        self.realize_window_with_row(
+            u,
+            frames,
+            false,
+            CollectionFill::default(),
+            Some(position),
+            false,
+        )?;
         advance(&mut self.revision)?;
         Ok(())
     }
@@ -308,12 +330,19 @@ impl Collection {
         let desired = self.aligned(u, position, target.align, reported, target.offset);
         // Every mounted row up to it: one above the port, laid out at its
         // real size but still an estimate here, puts the target elsewhere.
-        let first = self
-            .mounted
-            .first()
-            .map_or(position, |m| m.position)
-            .min(position);
-        let measured = self.index.range_measured(first..position + 1);
+        // The rows between a kept row and the window are not mounted and
+        // never measured, so the range is the run of mounted rows that
+        // reaches the target, and a mounted row before that run counts alone.
+        let (mut first, mut joined, mut others) = (position, true, true);
+        for m in self.mounted.iter().rev().filter(|m| m.position < position) {
+            if joined && m.position + 1 == first {
+                first = m.position;
+            } else {
+                joined = false;
+                others &= self.index.is_measured_at(m.position);
+            }
+        }
+        let measured = others && self.index.range_measured(first..position + 1);
         if (desired - reported).abs() <= 0.5 {
             // Done when it holds for two reports: filling around it measures
             // rows that can still move it.
@@ -362,30 +391,35 @@ type Found<'a> = (&'a mut Collection, Option<exact_plan::Str>, Vec<Frame>);
 
 /// The collections under `children`, outside other collections' rows,
 /// each with its node's `id` and the frames in force at it.
-fn lists<'a>(children: &'a mut [Child], plan: &Plan, frames: &[Frame], out: &mut Vec<Found<'a>>) {
+fn lists<'a>(
+    children: &'a mut [Child],
+    (plan, sites): (&Plan, &SiteIndex),
+    frames: &[Frame],
+    out: &mut Vec<Found<'a>>,
+) {
     for child in children {
         match child {
             Child::Node(node) => {
-                let id = match node.bound_prop(plan, PropId::Id) {
-                    Some(v @ exact_plan::str_value!()) => v.to_shared_str(),
+                let id = match node.bound_prop(plan, sites, PropId::Id) {
+                    Some(ref v @ exact_plan::str_value!()) => v.to_shared_str(),
                     _ => None,
                 };
-                match &mut node.collection {
+                match crate::instance::rare::list_mut(&mut node.rare) {
                     Some(c) => out.push((c, id, frames.to_vec())),
-                    None => lists(&mut node.children, plan, frames, out),
+                    None => lists(&mut node.children, (plan, sites), frames, out),
                 }
             }
             Child::Region(region) => match &mut region.active {
                 Active::Arm { roots, frame, .. } => {
                     let mut inner = frames.to_vec();
                     inner.push(frame.scope());
-                    lists(roots, plan, &inner, out);
+                    lists(roots, (plan, sites), &inner, out);
                 }
                 Active::Rows { rows } => {
                     for row in rows {
                         let mut inner = frames.to_vec();
                         inner.push(row.frame.clone());
-                        lists(&mut row.roots, plan, &inner, out);
+                        lists(&mut row.roots, (plan, sites), &inner, out);
                     }
                 }
             },
@@ -404,10 +438,10 @@ fn by_view<'a>(
     for child in children {
         match child {
             Child::Node(node) => {
-                if node.collection.as_ref().is_some_and(|c| c.view == view) {
-                    return node.collection.as_deref_mut().map(|c| (c, frames.to_vec()));
+                if node.collection().is_some_and(|c| c.view == view) {
+                    return node.collection_mut().map(|c| (c, frames.to_vec()));
                 }
-                if let Some(c) = &mut node.collection {
+                if let Some(c) = crate::instance::rare::list_mut(&mut node.rare) {
                     for m in &mut c.mounted {
                         let mut inner = frames.to_vec();
                         inner.push(m.row.frame.clone());
@@ -481,6 +515,15 @@ impl Collection {
 }
 
 impl Tree {
+    /// [`crate::Runner::set_list_covered`]: whether `view` is a mounted list.
+    pub(crate) fn set_list_covered(&mut self, view: ViewId, covered: [f64; 2]) -> bool {
+        let Some((list, _)) = by_view(&mut self.children, view, &[]) else {
+            return false;
+        };
+        list.covered = covered.map(|n| if n.is_finite() { n.max(0.0) } else { 0.0 });
+        true
+    }
+
     /// Keyboard traversal already knows a logical row position. Resolve its
     /// identity here, without exporting the unmounted keys to a host.
     pub(crate) fn reveal_collection_index(
@@ -551,7 +594,7 @@ impl Tree {
             return Ok(IntoViewStatus::Pending);
         }
         let mut found = Vec::new();
-        lists(&mut self.children, plan, &[], &mut found);
+        lists(&mut self.children, (plan, u.sites), &[], &mut found);
         let Some(row) = &request.row else {
             let Some((list, _, frames)) = found
                 .into_iter()
@@ -594,7 +637,12 @@ impl Tree {
         let mut inner_frames = frames.clone();
         inner_frames.push(mounted.row.frame.clone());
         let mut inner = Vec::new();
-        lists(&mut mounted.row.roots, plan, &inner_frames, &mut inner);
+        lists(
+            &mut mounted.row.roots,
+            (plan, u.sites),
+            &inner_frames,
+            &mut inner,
+        );
         let Some((list, _, frames)) = inner
             .into_iter()
             .find(|(_, id, _)| id.as_deref() == Some(request.list.as_str()))
@@ -624,7 +672,7 @@ impl Tree {
         while let Some(child) = stack.pop() {
             match child {
                 Child::Node(node) => {
-                    if let Some(c) = &node.collection {
+                    if let Some(c) = node.collection() {
                         if let Some((key, status)) = &c.into_view_status {
                             if out.len() > 1 {
                                 out.push(',');

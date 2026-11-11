@@ -30,13 +30,15 @@ final class NavigationHost {
     /// host's views name them (`NavigationTabs`) and the tab whose stack
     /// holds the route it shows: what the sidebar reads (SidebarMac.swift).
     private(set) var root: (node: NodeView, tabs: NavigationTabs?, at: Int?)?
+    /// Whether that root has no routes, in any of its stacks (BackMac.swift `routerRoot`).
+    private(set) var routeless = false
     /// @ref LLP 1115.002 D7.1 — the ground under each modal route that
     /// paints none of its own, by the route's id (`ModalGround`).
     private var grounds: [UInt32: ModalGround] = [:]
     /// @ref LLP 1115.002 D7.4 — the modal routes that are sheets as of the
     /// last batch, bottom to top, with what each sheet shows of its header
     /// (RouteSheetMac.swift), and why a route that is not one stays painted.
-    private(set) var sheets: [(route: NodeView, header: SheetHeader?)] = []
+    private(set) var sheets: [(base: NodeView, route: NodeView, header: SheetHeader?)] = []
     var keptSheets: [UInt32: String] = [:]
     /// A batch that can have changed a header came since the sheets last showed theirs.
     var sheetsRead = false
@@ -50,12 +52,18 @@ final class NavigationHost {
     }
     /// What is shown, read again with no batch: a sheet left, a window came.
     func resync() { sync(Batch(ops: [], timers: false, motion: false, clock: nil, error: nil), concerned: true) }
+    /// A stack's routes as authored, a route in its sheet's window among
+    /// them. What else has left `node`'s views for a container of its own
+    /// (a `dialog` in its sheet) is no route.
+    func routes(in node: NodeView) -> [NodeView] {
+        presenter.blocks.authored(NavigationTabs.routes(in: node), in: node.container).filter { $0.props["navigationKey"] != nil }
+    }
     /// LLP 1080.001 D3: a modal route's ground is this host's view.
     func inspectionOwns(_ view: NSView) -> Bool { view is ModalGround }
     /// The page's ground changed colour: the grounds are painted again.
     func groundChanged() { for ground in grounds.values { ground.needsDisplay = true }; split.groundChanged() }
     func reset() {
-        refused.removeAll(); gates.removeAll(); panels.removeAll(); shown.removeAll(); selection = nil; barRoute = false; root = nil
+        refused.removeAll(); gates.removeAll(); panels.removeAll(); shown.removeAll(); selection = nil; barRoute = false; root = nil; routeless = false
         sheets = []; keptSheets.removeAll(); split.reset()
         for ground in grounds.values { ground.removeFromSuperview() }
         grounds.removeAll()
@@ -85,10 +93,13 @@ final class NavigationHost {
         var touched = Set<UInt32>()
         var subtrees = reparented
         // Whether a header can have changed: what the window's bar reads again for.
-        let concerned = concerned ?? presenter.toolbar.concerns(batch)
+        let concerned = concerned ?? presenter.toolbar.mayChangeAHeader(batch)
         if concerned { sheetsRead = true }
-        var sheeted: [(route: NodeView, header: SheetHeader?)] = []
+        var sheeted: [(base: NodeView, route: NodeView, header: SheetHeader?)] = []
         for op in batch.ops {
+            // A row, or a symbol in one, came or changed: the split's painted list is read again (SplitMac.swift `veil`).
+            if op.op == .create || op.op == .children || op.op == .props { split.rowsChanged = true }
+            if op.op == .style || op.op == .frame, let id = op.nodeID { split.restyled(id) }
             if let id = op.nodeID {
                 if op.op == .destroy { gates.removeValue(forKey: id); refused.removeValue(forKey: id); shown.removeValue(forKey: id); keptSheets.removeValue(forKey: id) }
                 else if Self.gating.contains(op.op) { touched.insert(id) }
@@ -111,13 +122,12 @@ final class NavigationHost {
         selection = nil
         barRoute = false
         root = nil
+        routeless = false
         for nav in roots {
             // @ref LLP 1075.003 §3.7 — with tabs, each panel is a stack.
             let tabs = NavigationTabs.of(nav, presenter)
-            // A stack's routes as authored: one in its sheet's window has left its parent's views.
-            let routes = { [presenter] (node: NodeView) in presenter.blocks.authored(NavigationTabs.routes(in: node), in: node.container) }
             let locate = { (key: String) -> (at: Int?, stacks: [[NodeView]]) in
-                let stacks = tabs.map { $0.panels.map(routes) } ?? [routes(nav)]
+                let stacks = tabs.map { $0.panels.map(self.routes(in:)) } ?? [self.routes(in: nav)]
                 return (stacks.firstIndex { $0.contains { $0.props["navigationKey"] == key } }, stacks)
             }
             var key = nav.props["navigationKey"] ?? ""
@@ -145,7 +155,7 @@ final class NavigationHost {
                 sheets = sheeted
             }
             for routes in stacks { ground(routes, grounded: &grounded) }
-            if nav === roots.first { root = (nav, tabs, tabs == nil ? nil : found) }
+            if nav === roots.first { root = (nav, tabs, tabs == nil ? nil : found); routeless = stacks.allSatisfy(\.isEmpty) }
             guard let at = found else {
                 managed.formUnion((tabs?.panels ?? []).map(\.id))
                 continue
@@ -163,12 +173,12 @@ final class NavigationHost {
                 if nav === roots.first, routes.contains(where: { $0.props["navigationBar"] != "none" }) { barRoute = true }
                 let modal = routes.indices.contains(selected) && routes[selected].props["navigationPresentation"] == "modal"
                 // The lowest route in a sheet: it and the sheets on it are shown, and the route they stand over.
-                let lowest = stack == at && nav === roots.first ? sheeted.first.flatMap { low in routes.firstIndex { $0 === low.route } } : nil
+                let lowest = stack == at && nav === roots.first ? sheeted.first.flatMap { low in routes.firstIndex { $0 === low.base } } : nil
                 // A stack that splits (D4) shows its list and the route its pane shows, and the list stays live beside its detail.
                 let splits = stack == at && nav === roots.first && split.active, beside = splits ? split.shown?.detail : nil
                 let covered = routes.indices.contains(selected) && ["modal", "fullscreen"].contains(routes[selected].props["navigationPresentation"] ?? "")
                 for (index, route) in routes.enumerated() {
-                    let under = lowest.map { index >= $0 - 1 && index <= selected } ?? false
+                    let under = lowest.map { index == $0 - 1 || sheeted.contains { $0.route === route } } ?? false
                     // A route still in its sheet is shown until the sheet has gone (`DialogHost.syncRoutes`).
                     let leaving = presenter.dialogs.owns(route) && !sheeted.contains { $0.route === route }
                     let column = splits && (index == 0 || route === beside)
@@ -200,6 +210,11 @@ final class NavigationHost {
             for child in view.subviews { descendants(child) }
         }
         for id in subtrees { if let node = presenter.views[id] { descendants(node) } }
+        // The placeholder the split's pane shows is out of its route's views: its gates follow its authored ancestors'.
+        if let lifted = split.shownPlaceholder, !subtrees.isEmpty,
+           presenter.logicalAncestry(of: lifted).contains(where: { ($0 as? NodeView).map { subtrees.contains($0.id) } ?? false }) {
+            descendants(lifted)
+        }
         for id in touched {
             guard let node = presenter.views[id] else { continue }
             gates[id] = [node.isHidden, node.routeInert, node.props["inert"] == "true", node.props["accessibilityElementsHidden"] == "true"]

@@ -1,7 +1,7 @@
 // `prefer`'s facts by their names (agent-prefer.mjs `preferGroups`): a fact answers to its near spellings
 // (LLP 1116.007 D3.5: `prefer color-scheme dark`), and an unknown fact or value is still refused.
 import { test, expect } from 'bun:test';
-import { preferGroups, preferWeb } from './agent-prefer.mjs';
+import { PREFERENCES, mediaHeard, preferGroups, preferWeb } from './agent-prefer.mjs';
 import { MalformedOperation } from './agent-keys.mjs';
 import { pageReporter } from '../host/web/navigation.js';
 
@@ -62,4 +62,64 @@ test('page preference refusals omit the malformed property', () => {
   catch (error) { expect(error.message).toContain('not a page fact'); expect(Object.hasOwn(error, 'malformed')).toBe(false); }
   try { prefer({ banana: true }); throw new Error('expected malformed input'); }
   catch (error) { expect(error.malformed).toBe(true); }
+});
+
+test('pointer and hover are media facts, emulated in Chrome by its touch screen (LLP 1132 D10)', async () => {
+  expect(preferGroups({ pointer: 'coarse', hover: 'none' }).media).toEqual({ pointer: 'coarse', hover: 'none' });
+  expect(() => preferGroups({ pointer: 'pen' })).toThrow(/^prefer: pointer pen: expected .*pointer coarse\|fine\|none/);
+  const drive = media => {
+    const calls = [];
+    const done = preferWeb({ media, page: {}, emulated: {}, call: async (method, params) => calls.push([method, params]), frame: async () => {}, evaluate: async () => ({}) });
+    return done.then(() => calls, error => { throw Object.assign(error, { calls }); });
+  };
+  expect(await drive({ pointer: 'coarse' })).toEqual([['Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 }]]);
+  expect(await drive({ pointer: 'fine', hover: 'hover' })).toEqual([['Emulation.setTouchEmulationEnabled', { enabled: false }]]);
+  expect(await drive({ hover: 'none', 'prefers-color-scheme': 'dark' })).toEqual([
+    ['Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 }],
+    ['Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'dark' }] }],
+  ]);
+  for (const media of [{ pointer: 'none' }, { pointer: 'coarse', hover: 'hover' }, { pointer: 'fine', hover: 'none' }]) {
+    const error = await drive(media).catch(e => e);
+    expect(error.message).toMatch(/^Chrome prefer cannot emulate .*: its touch emulation pairs pointer coarse with hover none/);
+    expect(error.calls).toEqual([]);
+  }
+});
+
+test('a media prefer waits in the page for each query it flips before the next step (the authored media flake)', async () => {
+  // preferWeb: arm the page's wait, emulate, await that wait, then the frames; a document gone meanwhile is said.
+  const steps = [];
+  const drive = (heard = true) => preferWeb({ media: { 'prefers-reduced-motion': 'reduce' }, page: {}, emulated: {},
+    call: async (method) => steps.push(method), frame: async () => steps.push('frame'),
+    evaluate: async (expression) => { steps.push(expression.includes('__exactMediaHeard?.[') ? 'await' : expression.includes('function mediaHeard') ? 'arm' : 'read'); return expression.includes('__exactMediaHeard?.[') ? (heard ? true : 'gone') : {}; } });
+  await drive();
+  expect(steps).toEqual(['arm', 'Emulation.setEmulatedMedia', 'await', 'frame', 'read']);
+  await expect(drive(false)).rejects.toThrow('prefer: the page changed documents while its media changed: prefer again');
+
+  // mediaHeard, on a stand-in page whose queries flip when told: only queries whose truth changes are waited on,
+  // a range feature's lower values included (color-gamut p3 to srgb flips p3's), and none at all is no wait.
+  const saved = { matchMedia: globalThis.matchMedia, heard: globalThis.__exactMediaHeard };
+  const matches = new Map(), lists = new Map();
+  globalThis.matchMedia = (query) => {
+    if (!lists.has(query)) { const listeners = new Set(); lists.set(query, { get matches() { return matches.get(query) ?? false; }, addEventListener: (_, f) => listeners.add(f), removeEventListener: (_, f) => listeners.delete(f), listeners }); }
+    return lists.get(query);
+  };
+  const flip = (query, value) => { matches.set(query, value); for (const f of [...lists.get(query)?.listeners ?? []]) f(); };
+  try {
+    matches.set('(prefers-reduced-motion: no-preference)', true);
+    matches.set('(color-gamut: srgb)', true); matches.set('(color-gamut: p3)', true);
+    mediaHeard({ 'prefers-reduced-motion': 'reduce', 'color-gamut': 'srgb' }, PREFERENCES, 'a');
+    expect([...lists.values()].filter(l => l.listeners.size).length).toBe(3); // reduce, no-preference, p3
+    let done = false;
+    globalThis.__exactMediaHeard.a.then(() => { done = true; });
+    flip('(prefers-reduced-motion: reduce)', true); flip('(prefers-reduced-motion: no-preference)', false);
+    await Bun.sleep(1);
+    expect(done).toBe(false); // p3's query has not been heard yet
+    flip('(color-gamut: p3)', false);
+    await Bun.sleep(1);
+    expect(done).toBe(true);
+    expect([...lists.values()].every(l => l.listeners.size === 0)).toBe(true);
+    // Already so: nothing to hear, settled at once.
+    mediaHeard({ 'prefers-reduced-motion': 'reduce', 'color-gamut': 'srgb' }, PREFERENCES, 'b');
+    expect(await globalThis.__exactMediaHeard.b).toBe(true);
+  } finally { globalThis.matchMedia = saved.matchMedia; globalThis.__exactMediaHeard = saved.heard; }
 });

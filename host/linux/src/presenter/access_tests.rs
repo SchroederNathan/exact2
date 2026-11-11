@@ -9,8 +9,8 @@ use crate::fields::{FieldFace, FieldMetrics};
 use crate::presenter::top::SurfacePainter;
 use exact_runner::{DataError, Value};
 
-/// Shelf's data: a library of `0` books, no works, the clock; and for the
-/// list fixture, 400 rows.
+/// Shelf's data: a library of `0` books, no works, no book for an ISBN, the
+/// clock; and for the list fixture, 400 rows.
 struct Data(usize);
 impl DataSource for Data {
     fn query(&mut self, name: &str, _: &[Value]) -> Result<Value, DataError> {
@@ -28,6 +28,7 @@ impl DataSource for Data {
                 Value::Number(0.0),
                 text(""),
                 text(""),
+                Value::Number(0.0),
             ])
         };
         match name {
@@ -42,6 +43,13 @@ impl DataSource for Data {
                 Value::Bool(true),
                 Value::str(""),
                 Value::list(Vec::new()),
+            ])),
+            "bookByIsbn" => Ok(Value::record(vec![
+                Value::str(""),
+                Value::Bool(false),
+                Value::str(""),
+                Value::str(""),
+                Value::Number(0.0),
             ])),
             "exactTime" => Ok(Value::record(vec![Value::Number(0.0)])),
             "rows" => Ok(Value::list(
@@ -159,6 +167,21 @@ fn boot(source: &str, size: (f32, f32), books: usize) -> Presenter<Data> {
     )
     .unwrap();
     assert!(error.is_none(), "{error:?}");
+    *p.text.borrow_mut() = TextEngine::from_font_files(
+        &[std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/fixtures/fonts/assets"
+        ))],
+        "DejaVu Sans",
+    );
+    // Rebuild measurements made at boot with the local fixture catalog.
+    let kernel = p
+        .host
+        .kernel()
+        .rehydrate(Box::new(Measurer(p.text.clone())));
+    *p.host.runner_mut().kernel_mut() = kernel;
+    assert!(p.resize(size.0, size.1).is_none());
+    p.replaced();
     settle(&mut p);
     p
 }
@@ -281,6 +304,47 @@ fn statement(p: &mut Presenter<Data>) -> Told {
     told(&p.reader_access(1.0, false).expect("a statement"))
 }
 
+fn assert_library_clipping(p: &mut Presenter<Data>, nodes: &[Node]) {
+    let list = nodes
+        .iter()
+        .find(|n| n.view == id(p, "library-list"))
+        .unwrap();
+    let (left, top, width, height) = p.rect_of(list.view).unwrap();
+    let bottom = top + height;
+    let origin = p.chrome().frame;
+    // Paint boxes are in page coordinates; accessibility adds the window origin.
+    assert_eq!(
+        list.rect,
+        [left + origin[0], top + origin[1], width, height]
+    );
+    let access_bottom = list.rect[1] + list.rect[3];
+    assert_eq!(access_bottom, WINDOW.size.1 - 104.0);
+    let mut clipped = 0;
+    let mut hidden = 0;
+    for book in 1..=12 {
+        let view = id(p, &format!("book-seed-{book}"));
+        let (_, y, _, height) = p.rect_of(view).unwrap();
+        let exposed = nodes.iter().find(|n| n.view == view);
+        let shown_top = y.max(top);
+        let shown_bottom = (y + height).min(bottom);
+        if shown_bottom <= shown_top {
+            assert!(exposed.is_none(), "Book {book} is outside the list");
+            hidden += 1;
+        } else {
+            let row = exposed.expect("the intersecting row is exposed");
+            assert_eq!(row.rect[1], shown_top + origin[1]);
+            assert_eq!(row.rect[3], shown_bottom - shown_top);
+            if y + height > bottom {
+                assert_eq!(row.rect[1] + row.rect[3], access_bottom);
+                assert!(row.rect[3] > 0.0 && row.rect[3] < height);
+                clipped += 1;
+            }
+        }
+    }
+    assert_eq!(clipped, 1, "one row crosses the list's bottom edge");
+    assert!(hidden > 0, "the fixture has rows below the list");
+}
+
 #[test]
 fn shelfs_library_is_read_bar_then_page_then_navigation_bar() {
     let _hosting = hosting();
@@ -331,13 +395,7 @@ fn shelfs_library_is_read_bar_then_page_then_navigation_bar() {
         (meter.role, meter.range),
         (role::PROGRESS, [0.0, 100.0, 44.0])
     );
-    // Rows past the navigation bar are not there, and the row it cuts shows
-    // only what is above it.
-    assert!(nodes
-        .iter()
-        .all(|n| n.name != "Book 9 Susanna Clarke 44% · page 120 of 272"));
-    let cut = named(&nodes, "Book 7 Susanna Clarke 44% · page 120 of 272");
-    assert_eq!(cut.rect[1] + cut.rect[3], 916.0 - 104.0);
+    assert_library_clipping(&mut p, &nodes);
     // The navigation bar last: a tablist of three, the first selected.
     let tail = &nodes[nodes.len() - 4..];
     assert_eq!(
@@ -360,6 +418,12 @@ fn shelfs_library_is_read_bar_then_page_then_navigation_bar() {
         assert!(node.rect[1] + node.rect[3] <= 916.0, "{node:?}");
         assert_eq!(nodes.iter().filter(|n| n.id == node.id).count(), 1);
         assert!(node.parent == 0 || nodes.iter().any(|n| n.id == node.parent));
+    }
+    for offset in [32.0, 128.0] {
+        p.scroll_to(id(&p, "library-list"), (0.0, offset)).unwrap();
+        settle(&mut p);
+        let scrolled = read(&mut p);
+        assert_library_clipping(&mut p, &scrolled);
     }
 }
 
@@ -753,4 +817,98 @@ fn a_host_whose_shell_never_asks_builds_nothing() {
         !p.access_act(port as i32, act::FORWARD, 0.0, 0.0),
         "no tree, no node"
     );
+}
+
+#[test]
+fn inline_controls_keep_their_labels_geometry_and_native_actions() {
+    let source = r#"component App
+  state presses: number = 0
+  action reveal
+    presses = presses + 1
+  view
+    column width=320 height=300
+      text testId="paragraph" font-size=16 white-space="pre-wrap"
+        text "Before "
+        text aria-label="Spoiler" press=reveal testId="spoiler"
+          text "secret "
+          text "details"
+        text " after"
+        text " omitted" aria-hidden=true
+      text testId="linked" font-size=16
+        text "Read "
+        text "the documentation" href="https://example.com/docs" testId="link"
+      text `Pressed ${presses}`
+"#;
+    let mut p = boot(source, (320., 300.), 0);
+    let nodes = statement(&mut p).nodes;
+    assert!(nodes
+        .iter()
+        .all(|n| !n.name.contains("secret") && !n.name.contains("omitted")));
+    named(&nodes, "Before Spoiler after");
+    let spoiler = named(&nodes, "Spoiler");
+    assert_eq!(spoiler.role, role::BUTTON);
+    assert_eq!(spoiler.flags & flag::CLICK, flag::CLICK);
+    let [x, y, w, h] = spoiler.rect;
+    assert!(w > 40.0 && h > 10.0);
+    let target = id(&p, "spoiler");
+    assert_eq!(p.hit(x + w / 2., y + h / 2.), Some(target));
+    p.pointer_down(x + w / 2., y + h / 2., 10.).unwrap();
+    p.pointer_up(x + w / 2., y + h / 2., 20.).unwrap();
+    settle(&mut p);
+    named(&read(&mut p), "Pressed 1");
+    assert!(p.access_act(spoiler.id, act::CLICK, 0., 30.));
+    settle(&mut p);
+    named(&read(&mut p), "Pressed 2");
+    assert_eq!(p.set_focus(None, 40.), None);
+    assert_eq!(p.move_focus(false, 40.), None);
+    assert_eq!(p.focus, Some(target));
+    p.key_down("Enter", 41.);
+    settle(&mut p);
+    named(&read(&mut p), "Pressed 3");
+    assert_eq!(named(&read(&mut p), "the documentation").role, role::LINK);
+    tap(&mut p, "link");
+    assert!(p
+        .host
+        .runner()
+        .journal()
+        .any(|line| line.contains("openURL https://example.com/docs")));
+}
+
+/// LLP 1153 D7.3: a table is ARIA's table of a caption and rows of cells,
+/// a `th` its column's or its row's header by its `scope`, and a `dl` a
+/// description list of terms and definitions; each holds its words.
+#[test]
+fn a_table_and_a_description_list_are_their_roles() {
+    let source = "component App\n  view\n    column\n      table\n        caption\n          text \"Moves\"\n        thead\n          tr\n            th scope=\"col\"\n              text \"Move\"\n            th\n              text \"Power\"\n        tbody\n          tr\n            th scope=\"row\"\n              text \"Tackle\"\n            td\n              text \"40\"\n      dl\n        dt\n          text \"Type\"\n        dd\n          text \"Electric\"\n";
+    let mut p = boot(source, (320., 600.), 0);
+    let nodes = read(&mut p);
+    let said: Vec<_> = nodes.iter().map(|n| (n.role, n.name.as_str())).collect();
+    assert_eq!(
+        said,
+        [
+            (role::TABLE, ""),
+            (role::CAPTION, ""),
+            (role::TEXT, "Moves"),
+            (role::ROW, ""),
+            (role::COLUMN_HEADER, ""),
+            (role::TEXT, "Move"),
+            (role::COLUMN_HEADER, ""),
+            (role::TEXT, "Power"),
+            (role::ROW, ""),
+            (role::ROW_HEADER, ""),
+            (role::TEXT, "Tackle"),
+            (role::CELL, ""),
+            (role::TEXT, "40"),
+            (role::DESCRIPTION_LIST, ""),
+            (role::TERM, ""),
+            (role::TEXT, "Type"),
+            (role::DEFINITION, ""),
+            (role::TEXT, "Electric"),
+        ]
+    );
+    let parent = |name: &str| nodes.iter().find(|n| n.id == named(&nodes, name).parent);
+    assert_eq!(parent("Moves").map(|n| n.role), Some(role::CAPTION));
+    assert_eq!(parent("Tackle").map(|n| n.role), Some(role::ROW_HEADER));
+    assert_eq!(parent("40").map(|n| n.role), Some(role::CELL));
+    assert_eq!(parent("Electric").map(|n| n.role), Some(role::DEFINITION));
 }

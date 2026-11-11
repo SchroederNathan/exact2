@@ -34,6 +34,8 @@ Then four sections:
 Anything that cost time or needed a workaround. For each: what you tried, what
 happened (the error text, if short), roughly how long it cost, what you did
 instead, and what would have helped (a better message, a doc, a missing feature).
+A workaround you write into the app's README or AGENTS.md ("if … fails, delete …
+and rerun") is feedback too: put it here as well.
 
 ### Lean in
 What was unusually pleasant or powerful, and that Exact should do more of.
@@ -67,6 +69,7 @@ Rough entry. Leave out steps you didn't reach.
 - iOS build
 - macOS build
 - driving the app (`exact.mjs agent`, `exact.mjs test`)
+- properties (`contract verify app.contract`; keep its receipt unchanged)
 - deploy
 
 Write `smooth` whenever a step went smoothly, even with nothing else to say. That is
@@ -114,6 +117,12 @@ Then act on their answer:
   that you sent it.
 - **Never:** `bun exact.mjs feedback never`. Keep no diary and don't ask again for
   this project.
+
+If they said yes or always and the app's README (or what you wrote in AGENTS.md)
+holds a workaround, ask separately whether to attach it: `bun exact.mjs feedback`
+shows the passages that read as workarounds first, then the whole text, redacted as
+the diary is. Only on a yes, send with `bun exact.mjs feedback send --yes --readme`.
+It is the app's own text, so the diary's yes does not cover it.
 
 `send` adds the command log, replaces the home directory, the app's directory, name
 and bundle id with placeholders, and blanks anything that looks like a credential.

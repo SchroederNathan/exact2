@@ -10,20 +10,21 @@
 // `EXACT_WEB_LINK=all`, as conformance builds it for its synthetic plans) the same drive runs a compiled plan on both
 // targets, whose glue (host/web/glue.js `writeValue`) and runtime must then agree.
 import { test, expect } from 'bun:test';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { Cdp, open } from '../../../scripts/agent.mjs';
-import { chromium } from '../../../scripts/agent-launch.mjs';
+import { open } from '../../../scripts/agent.mjs';
+import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';
 import { need } from '../../../scripts/coverage.mjs';
 import { readyPage } from './page.mjs';
 import { standIns } from './stand-ins.mjs';
 
 const ROOT = resolve(new URL('../../..', import.meta.url).pathname);
+const compiler = resolve(process.env.CARGO_TARGET_DIR ?? resolve(ROOT, 'target'), 'debug', process.platform === 'win32' ? 'contract.exe' : 'contract');
 const WEB_JS = resolve(ROOT, 'host/web-js');
-const { executable: chrome, unavailable } = chromium();
+const { unavailable } = chromium();
 const check = need('chrome', unavailable);
 
 // A field the app rewrites in lower case as it hears it, and what it heard: the app `hosted_tests.rs` gives Android.
@@ -50,7 +51,7 @@ const page = `<!doctype html><meta charset="utf-8"><div id="exact-root">
   window.tell = v => commit(() => W(told, v));
   window.ready = true;
 </script>`;
-const REAL = ['rt.js', 'font-family.js', 'grid.js', 'overlay.js', 'roster.js', 'router.js', 'schedule.js', 'budget.js', 'shape.js'];
+const REAL = ['rt.js', 'held.js', 'font-family.js', 'grid.js', 'overlay.js', 'roster.js', 'router.js', 'route-pattern.js', 'schedule.js', 'budget.js', 'shape.js', 'elements.js'];
 const STUBS = standIns(REAL);
 const module = name => REAL.includes(name) ? readFileSync(resolve(WEB_JS, name))
   : STUBS.get(name) ?? null;
@@ -64,13 +65,9 @@ async function inChrome(drive) {
     res.writeHead(200, { 'content-type': 'text/javascript' }); res.end(body);
   });
   await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
-  const profile = mkdtempSync(resolve(tmpdir(), 'exact-compose-hold-'));
-  const child = spawn(chrome, ['--headless=new', '--remote-debugging-pipe', '--window-size=600,400', `--user-data-dir=${profile}`,
-    '--no-sandbox', '--no-first-run', '--disable-background-networking', 'about:blank'], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+  const suite = await cdpBrowser({ args: ['--window-size=600,400'] }), { cdp } = suite;
   try {
-    const cdp = new Cdp(child.stdio[3], child.stdio[4]);
-    const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    const { sessionId } = await suite.page();
     const call = (method, params) => cdp.send(method, params, sessionId);
     const evaluate = async (expression) => {
       const reply = await call('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
@@ -80,9 +77,8 @@ async function inChrome(drive) {
     await readyPage(cdp, sessionId, `http://127.0.0.1:${server.address().port}/`);
     await drive(evaluate, call);
   } finally {
-    child.kill();
+    await suite.close();
     server.close();
-    rmSync(profile, { recursive: true, force: true });
   }
 }
 
@@ -145,7 +141,7 @@ for (const [target, dist] of Object.entries(dists)) {
     try {
       const source = resolve(tmp, 'hold.contract'), plan = resolve(tmp, 'hold.plan');
       writeFileSync(source, CONTRACT);
-      const c = spawnSync('cargo', ['run', '-q', '-p', 'contract', '--', 'build', source, '-o', plan], { cwd: ROOT, encoding: 'utf8' });
+      const c = spawnSync(compiler, ['build', source, '-o', plan], { cwd: ROOT, encoding: 'utf8' });
       if (c.status !== 0) throw new Error('the fixture does not compile: ' + c.stderr);
       const s = await open({ host: 'web', plan, webDist: resolve(dist) });
       try { await lowered(s.carrier.evaluate, s.carrier.call); } finally { await s.close(); }

@@ -136,6 +136,7 @@ package final class ReorderGroupHold {
     private var edgeTimer: Timer?
     private var edgeTime: Double?
     private var landing = false
+    private let pointerDriven: Bool
 
     /// Pin the grip, snapshot its row (before the runner hides it), and lift.
     package init?(_ handle: NodeView, point: CGPoint, ghost drawn: Bool) {
@@ -150,6 +151,7 @@ package final class ReorderGroupHold {
               let (list, group) = handle.reorderGroupList,
               let calls = presenter.reorderGroupCalls ?? presenter.session?.runtime else { return nil }
         self.presenter = presenter; self.handle = handle; self.calls = calls; self.group = group
+        pointerDriven = drawn
         generation = presenter.session?.generation
         pin = presenter.collections.holdPointer(handle.id)
         guard let top = presenter.collections.geometry(list)?.offset else {
@@ -239,7 +241,7 @@ package final class ReorderGroupHold {
     package func finish(cancel: Bool) {
         guard active, let presenter else { return }
         stopEdge()
-        if !cancel { sample() }
+        if !cancel, pointerDriven { sample() }
         let batch = calls.groupEnd(state.token, drop: !cancel && live, now: now)
         Self.apply(batch, presenter)
         observe(ReorderGroupState.last(in: batch))
@@ -269,7 +271,7 @@ package final class ReorderGroupHold {
         // Under the agent the clock is the driver's and a real-time spring
         // never ends between its operations: the ghost lands at once, so a
         // `clock settle` sees the session finish, as the web's does.
-        guard let ghost, let presenter, !ExactEnv.agentMode else { finishSession(); return }
+        guard let ghost, let presenter, !ExactEnv.agentFreezes else { finishSession(); return }
         let row = state.ending == "gone" ? nil : presenter.views[state.row]
         ghost.land(on: row) { [weak self] in self?.finishSession() }
     }

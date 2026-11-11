@@ -10,9 +10,9 @@
 // `tap @t …` / `type @t …` answers it
 // (agent.js). Bundled only for a plan with a file input or one of the
 // commands.
-import { journal, clock, nextTicket, inflight, Hosts, OnHooks, viewId, Views, data } from './rt.js';
+import { journal, clock, nextTicket, inflight, Hosts, OnHooks, viewId, Views, data, painted } from './rt.js';
 import { record } from './pointer.js';
-import { reportPlace } from './navigation.js';
+import { inertAncestor, reportPlace, liveById } from './navigation.js';
 import { appGrantSet, coversPath } from './admission.js';
 
 const say = line => journal.push(`t=${clock.now} ${line}`);
@@ -35,7 +35,7 @@ const glue = () => Glue ??= import(new URL('./picker-glue.js', import.meta.url).
 }));
 const counted = p => { inflight.n++; return Promise.resolve(p).finally(() => inflight.n--); };
 const extension = name => { const e = /\.([^.]*)$/.exec(name)?.[1]?.toLowerCase() ?? ''; return e && e.length <= 8 && /^[a-z0-9]+$/.test(e) ? e : 'bin'; };
-const byId = id => { const el = document.getElementById(id); return el ? { el, view: viewId(el) } : null; };
+const byId = id => { const el = liveById(id); return el ? { el, view: viewId(el) } : null; };
 
 // A file input's `change` payload (picker.rs `Picked::payload`): one line
 // per file, as `Picked` records; null for anything malformed.
@@ -185,7 +185,8 @@ Hosts.share = (title, text, url, files) => {
 // What the person chooses becomes a `doc:/<n>/<name>` path the app reaches
 // through `storage.fs` (the glue's handles; storage-request.js routes it).
 let Docs = null;
-const docs = () => Docs ??= import(new URL('./documents-glue.js', import.meta.url).href).then(() => x().documents.install({
+// An app granted `doc.keep` keeps what the person chooses (LLP 1069.010.000 D3).
+const docs = () => Docs ??= import(new URL('./documents-glue.js', import.meta.url).href).then(() => (x().documents.keeping(data.appId, appGrantSet()), x().documents.install({
   log: say, openFile: () => false,
   dispatch(view, kind, payload) {
     const el = Views.get(view);
@@ -193,26 +194,47 @@ const docs = () => Docs ??= import(new URL('./documents-glue.js', import.meta.ur
     if (kind === 27) el.dispatchEvent(new Event('cancel'));
     else el.dispatchEvent(new CustomEvent('change', { detail: payload }));
   },
-}));
-// Files dropped from outside (DOM's `drop`, studio diary R19): Chromium's
-// handles, asked for while the event lasts (`getAsFileSystemHandle`), else
-// each File read-only; of the types `file_handlers` declares, minted as a
-// picker's choice is, and heard with the `DragEvent` record. A `dragover`
-// that carries files is accepted, or the browser would open them itself.
+})));
+// Files and folders dropped from outside (DOM's `drop`, studio diary R19),
+// of any type: Chromium's handles, asked for while the event lasts
+// (`getAsFileSystemHandle`), else a folder's entry or each File read-only,
+// minted as a picker's choice is and heard with the `DragEvent` record. The
+// innermost element with the handler takes them, over a text field too (its
+// own drop is the default this prevents). A `dragover` that carries files
+// is accepted, or the browser would open them itself.
+const allowed = e => () => !inertAncestor(e) && !e.matches(':disabled'); // a disabled control, never a box (review b5-b 4)
+// The glue fetched after the first paint, so a drag's enter and a paste find it loaded; the agent waits for it (rt.js `pieces`).
+const warm = (then = () => {}) => { const p = painted().then(docs).then(then); OnHooks.loading = Promise.all([OnHooks.loading, p]); return p; };
 OnHooks.drop = (e, f) => {
-  e.addEventListener('dragover', ev => { if (ev.dataTransfer?.types?.includes('Files') && !e.closest('[inert]') && !e.matches(':disabled')) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'copy'; } });
+  warm();
+  e.addEventListener('dragover', ev => { if (ev.dataTransfer?.types?.includes('Files') && allowed(e)()) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'copy'; } });
   e.addEventListener('drop', ev => {
     const dt = ev.dataTransfer;
-    if (!dt?.files?.length || e.closest('[inert]') || e.matches(':disabled')) return; // a disabled control, never a box (review b5-b 4)
+    if (!dt?.types?.includes('Files') || !allowed(e)()) return;
     ev.preventDefault(); ev.stopPropagation();
     const [offsetX, offsetY] = record(e, ev), held = [ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey];
-    const handles = [...dt.items].filter(i => i.kind === 'file').map(i => i.getAsFileSystemHandle?.().catch(() => null) ?? null), files = [...dt.files];
+    const items = [...dt.items].filter(i => i.kind === 'file');
+    const handles = items.map(i => i.getAsFileSystemHandle?.().catch(() => null) ?? null), entries = items.map(i => i.webkitGetAsEntry?.() ?? null), files = [...dt.files];
     counted(docs().then(async m => {
-      const found = await m.dropped(await Promise.all(handles), files);
-      if (!found.length) return say('drop: refused: no file of a type this app declares');
+      const found = await m.dropped(await Promise.all(handles), files, entries);
+      if (!found.length) return say('drop: refused: the browser handed over no file');
       f([offsetX, offsetY, found, ...held]);
     }));
   });
+};
+// `dragenter` and `dragleave` of a file drag (documents-glue.js `hearDrags`):
+// the point, no files (the DOM's are protected until the drop).
+OnHooks.drag = (e, kind, f) => {
+  warm(() => x().documents.hearDrags(e, kind, allowed(e), ev => f([...record(e, ev).slice(0, 2), [], ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey])));
+};
+// A paste's files (`clipboardData.files`), minted in the paste's own event; none before the glue has loaded.
+OnHooks.pasteWarm = () => warm();
+OnHooks.pasted = ev => {
+  const driver = clock.agent ? x().agentPaste : null;
+  x().agentPaste = null;
+  if (!ev.clipboardData?.files?.length && !driver) return [];
+  if (!x().documents?.pasted) { say('paste: its files came before the page could hold them'); return []; }
+  return x().documents.pasted(ev.clipboardData, driver);
 };
 const PICKERS = { showOpenFilePicker: ['open-file', 'showOpenFilePicker takes (id) or (id, multiple)'], showDirectoryPicker: ['open-directory', 'showDirectoryPicker takes (id)'], showSaveFilePicker: ['save-file', 'showSaveFilePicker takes (id, suggestedName)'] };
 for (const [name, [capability, usage]] of Object.entries(PICKERS)) Hosts[name] = (...args) => {
@@ -238,4 +260,18 @@ for (const [name, [capability, usage]] of Object.entries(PICKERS)) Hosts[name] =
   // The browser's picker is called in the glue, after it loads: a picker
   // needs the activation, which a page that has loaded it already keeps.
   counted(docs().then(m => m.show(r, name)));
+};
+// `requestPermission(id, path, mode)` (LLP 1069.010.000 D7): the browser's
+// own prompt for a kept document after a reload, asked inside the press's
+// activation, as the pickers are; `change` at `id` hears `granted` or `denied`.
+Hosts.requestPermission = (id, path, mode) => {
+  const refuse = why => say(`requestPermission: refused: ${why}`);
+  if (typeof path !== 'string' || !path.startsWith('doc:/')) return refuse('path is not a doc:/ path');
+  if (mode !== 'read' && mode !== 'readwrite') return refuse('mode is "read" or "readwrite"');
+  const found = byId(String(id ?? ''));
+  if (!found) return refuse(`no element with id "${id}"`);
+  const answer = value => { if (found.el.isConnected) found.el.dispatchEvent(new CustomEvent('change', { detail: value })); };
+  // Loaded already on a page whose storage read its kept documents back, so the activation is still live.
+  const ask = () => x().documents.permission(path, mode, answer);
+  counted(x().documents?.permission ? Promise.resolve(ask()) : docs().then(ask));
 };

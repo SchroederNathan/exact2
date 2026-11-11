@@ -83,6 +83,7 @@ pub const STYLE_NAMES: &[(&str, &str, AttrTarget)] = &[
     ("text-overflow", "css CSS Overflow 3", AttrTarget::Styles(&[StyleId::TextOverflow])),
     // @ref LLP 1053 §0 G4 — `normal` and `tabular-nums`; others refused by name.
     ("font-variant-numeric", "css CSS Fonts 4", AttrTarget::Styles(&[StyleId::FontVariantNumeric])),
+    ("font-variant-ligatures", "css CSS Fonts 4", AttrTarget::Styles(&[StyleId::FontVariantLigatures])),
     ("column-width", "css CSS Multi-column Layout 1", AttrTarget::Styles(&[StyleId::ColumnWidth])),
     ("column-fill", "css CSS Multi-column Layout 1", AttrTarget::Styles(&[StyleId::ColumnFill])),
     ("column-rule-style", "css CSS Multi-column Layout 1", AttrTarget::Styles(&[StyleId::ColumnRuleStyle])),
@@ -103,6 +104,13 @@ pub const STYLE_NAMES: &[(&str, &str, AttrTarget)] = &[
     ("font-size", "css CSS Fonts 4", AttrTarget::Styles(&[StyleId::FontSize])),
     ("font-weight", "css CSS Fonts 4", AttrTarget::Styles(&[StyleId::FontWeight])),
     ("font-style", "css CSS Fonts 4", AttrTarget::Styles(&[StyleId::FontStyle])),
+    // @ref LLP 1019 D8
+    ("font-stretch", "css CSS Fonts 4", AttrTarget::Styles(&[StyleId::FontStretch])),
+    // @ref LLP 1019 D9
+    ("font-variation-settings", "css CSS Fonts 4", AttrTarget::Styles(&[StyleId::FontVariationSettings])),
+    // @ref LLP 1019 §13
+    ("font-optical-sizing", "css CSS Fonts 4", AttrTarget::Styles(&[StyleId::FontOpticalSizing])),
+    ("zoom", "css CSS Viewport 1", AttrTarget::Styles(&[StyleId::Zoom])),
     ("font-family", "css CSS Fonts 4", AttrTarget::Styles(&[StyleId::FontFamily])),
     ("color", "css CSS Color 4", AttrTarget::Styles(&[StyleId::TextColor])),
     ("background-color", "css CSS Backgrounds 3", AttrTarget::Styles(&[StyleId::BackgroundColor])),
@@ -120,6 +128,8 @@ pub const STYLE_NAMES: &[(&str, &str, AttrTarget)] = &[
     ("-webkit-text-stroke", "browser webkit bb06bdc9", AttrTarget::Styles(&[StyleId::TextStrokeWidth, StyleId::TextStrokeColor])),
     ("-webkit-text-stroke-width", "browser webkit bb06bdc9", AttrTarget::Styles(&[StyleId::TextStrokeWidth])),
     ("-webkit-text-stroke-color", "browser webkit bb06bdc9", AttrTarget::Styles(&[StyleId::TextStrokeColor])),
+    // @ref LLP 1019 D12
+    ("-webkit-font-smoothing", "browser webkit bb06bdc9", AttrTarget::Styles(&[StyleId::FontSmoothing])),
     ("caret-color", "css CSS UI 4", AttrTarget::Styles(&[StyleId::CaretColor])),
     // @ref LLP 1069.001 D6 — a form control's tint and whether the
     // platform draws it.
@@ -141,6 +151,8 @@ pub const STYLE_NAMES: &[(&str, &str, AttrTarget)] = &[
     // hyphenation (`manual` honours soft hyphens; `auto` adds the
     // language's own points where the host has a dictionary).
     ("text-indent", "css CSS Text 3", AttrTarget::Styles(&[StyleId::TextIndent])),
+    // A table's cell spacing, one length (kernel style/table.rs; HTML's UA 2px unsaid).
+    ("border-spacing", "css CSS 2.1 §17.6.1", AttrTarget::Styles(&[StyleId::BorderSpacing])),
     ("hyphens", "css CSS Text 3", AttrTarget::Styles(&[StyleId::Hyphens])),
     ("line-height", "css CSS Inline 3", AttrTarget::Styles(&[StyleId::LineHeight])),
     ("text-align", "css CSS Text 3", AttrTarget::Styles(&[StyleId::TextAlign])),
@@ -277,6 +289,13 @@ pub const STYLE_NAMES: &[(&str, &str, AttrTarget)] = &[
     ("color-scheme", "css CSS Color Adjustment 1", AttrTarget::Styles(&[StyleId::ColorScheme])),
     // @ref LLP 1061 D1 — host-owned press feedback; not a motion target.
     ("-exact-press-scale", "exact LLP 1061", AttrTarget::Styles(&[StyleId::PressScale])),
+    // @ref LLP 1061 D7 — the author's pressed paint, host-owned as the scale is.
+    ("-exact-press-opacity", "exact LLP 1061 D7", AttrTarget::Styles(&[StyleId::PressOpacity])),
+    ("-exact-press-background-color", "exact LLP 1061 D7", AttrTarget::Styles(&[StyleId::PressBackgroundColor])),
+    ("-exact-press-color", "exact LLP 1061 D7", AttrTarget::Styles(&[StyleId::PressColor])),
+    // @ref LLP 1121 D8 — lowering's row for `:active`'s `opacity`, never an
+    // author's (`nodes.rs` refuses it written).
+    ("-exact-press-opacity-to", "exact LLP 1121 D8", AttrTarget::Styles(&[StyleId::PressOpacityTo])),
     // CSS Animations (LLP 1055 D5): the shorthand is the row; the
     // longhands compose into it before lowering (`svg::compose_animation`).
     ("animation", "css CSS Animations 1", AttrTarget::Styles(&[StyleId::Animation])),
@@ -307,8 +326,26 @@ pub const STYLE_NAMES: &[(&str, &str, AttrTarget)] = &[
     // projected through `shorthands`.
     ("text-box-trim", "css CSS Inline Layout 3", AttrTarget::Styles(&[StyleId::TextBoxTrim])),
     ("text-box-edge", "css CSS Inline Layout 3", AttrTarget::Shorthand),
+    // @ref LLP 1011.002 D3 — a keyword, or a length (`baseline-shift`).
+    ("vertical-align", "css CSS Inline Layout 3", AttrTarget::Shorthand),
     ("text-box", "css CSS Inline Layout 3", AttrTarget::Shorthand),
 ];
+
+/// Why a literal `n` written as `name` is no value of the press family's
+/// numeric rows, if it is not.
+pub(crate) fn press_refusal(rows: &[StyleId], n: f64, name: &str) -> Option<String> {
+    // @ref LLP 1061 D1 — a press that makes a node vanish or flip is a
+    // typo, not a feel.
+    if rows.contains(&StyleId::PressScale) && n <= 0.0 {
+        return Some(format!(
+            "`{name}` takes a positive scale (0.97 is a button's, 1 is none)"
+        ));
+    }
+    // @ref LLP 1061 D7 — a share of the node's own opacity.
+    (rows.contains(&StyleId::PressOpacity) && !(0.0..=1.0).contains(&n)).then(|| {
+        format!("`{name}` takes a share of the node's own opacity, from 0 to 1 (0.65 is iOS's dim, 1 is none)")
+    })
+}
 
 /// The target of a style attribute, if `name` is one.
 pub fn lookup(name: &str) -> Option<AttrTarget> {

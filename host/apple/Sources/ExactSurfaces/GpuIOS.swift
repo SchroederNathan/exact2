@@ -127,9 +127,12 @@ private func composite(_ overlay: UIView, _ shown: Bool) {
 /// module itself loaded once per process (LLP 1031 D12).
 final class CanvasesHost {
     lazy var lifecycle = CanvasLifecycle(self)
+    var editsAdmitted = false
     weak var session: ExactSession?
     /// postMessage events waiting for a live canvas of their surface name.
     var pendingPosts: [(name: String, text: String, at: Double)] = []
+    /// What packages wrote into the canvases' inputs (SensorRings.swift).
+    let sensorRings = SensorRings()
     final class Entry {
         let view: NodeView
         let name: String
@@ -143,6 +146,9 @@ final class CanvasesHost {
         /// The tick whose frame this canvas last drew: one frame a tick,
         /// however many of its drawables land within it.
         var drawnTick = 0
+        /// A render of this canvas drew nothing, as without its drawable, and none has drawn since:
+        /// the frame waiting on it finishes when one draws (LLP 1079.000 §4.6).
+        var waiting = false
         /// `onScreen`'s last answer and the geometry epoch it was given at
         /// (`CanvasesHost.shown`).
         var screenEpoch = -1
@@ -211,6 +217,9 @@ final class CanvasesHost {
     var failed: String?
     var loadedMs: Double?
     var rendered = 0
+    /// Renders that drew, so a display-link callback can tell whether it drew one
+    var drawn = 0
+    var awaitingDrawable: Bool { entries.values.contains { $0.waiting } }
     /// Modules a render recorded into since their last flush (LLP 1009 D7).
     var unflushed: [GpuModule] = []
     /// Captures since launch (LLP 1014 D3).
@@ -255,6 +264,8 @@ final class CanvasesHost {
 
     func destroy(view: UInt32) {
         if let e = entries.removeValue(forKey: view) {
+            if e.waiting { session?.frames.canvasLost() }
+            retainEdits(e)
             e.view.canvasInput = nil
             if e.id != 0 { e.module?.destroy(e.id) }
             releasePublisher(e)
@@ -608,9 +619,10 @@ final class CanvasesHost {
     /// Render every dirty or wanting surface at `now`; whether more is wanted.
     func tick(now: Double) -> Bool {
         guard !modules.isEmpty, visible else { return false }
-        let previous = frameNow
+        let previous = frameNow, waited = awaitingDrawable
         frameNow = now
         defer { frameNow = previous }
+        drainSensors()
         var more = false
         for e in Array(entries.values) where live(e.view.id) === e && e.presentable {
             guard let m = e.module else { continue }
@@ -640,7 +652,7 @@ final class CanvasesHost {
             // presented (gpu/src/acquire.rs): a render now would draw
             // nothing. It draws this tick's frame when the drawable lands
             // (`renderStarved`) — at 120 Hz that is every frame, about 4 ms in.
-            if let landed = m.landed, m.starved?(e.id) == 1, landed(e.id) == 0 { more = true; continue }
+            if let landed = m.landed, m.starved?(e.id) == 1, landed(e.id) == 0 { e.waiting = true; more = true; continue }
             // No starvation guard here (the AppKit presenter pauses a canvas
             // whose render took over 200 ms, a covered window's drawable
             // wait): iOS has no occlusion of that kind — a backgrounded app
@@ -652,6 +664,7 @@ final class CanvasesHost {
         flushRecorded()
         lastTickNow = now
         ticks += 1
+        settleWaits(waited)
         captureIfNeeded()
         return more
     }
@@ -667,8 +680,9 @@ final class CanvasesHost {
         e.picture = nil
         // A render that went without a drawable recorded nothing: no frame
         // to submit for it, and its tick's frame is still to draw.
-        let drew = m.starved?(e.id) != 1
-        if drew { recorded(m); e.drawnTick = tick }
+        let drew = m.drew.map { $0(e.id) != 0 } ?? (m.starved?(e.id) != 1)
+        if drew { recorded(m); e.drawnTick = tick; drawn += 1 }
+        e.waiting = !drew
         // A module that cannot say when a first frame is shown (`gpu_seen`):
         // the frame just recorded is presented by this tick's flush.
         if drew, metal.awaitingFirstFrame, m.seen == nil, r < 2 { DispatchQueue.main.async { metal.reveal() } }
@@ -693,7 +707,7 @@ final class CanvasesHost {
     /// within the frame, instead of the main thread waiting at the tick.
     func renderStarved() {
         guard !modules.isEmpty, visible, !settling, let now = lastTickNow else { return }
-        let previous = frameNow
+        let previous = frameNow, waited = awaitingDrawable
         frameNow = now
         defer { frameNow = previous }
         for e in Array(entries.values) where live(e.view.id) === e && e.presentable {
@@ -707,6 +721,17 @@ final class CanvasesHost {
             renderNow(m, e, metal, now, tick: ticks - 1)
         }
         flushRecorded()
+        settleWaits(waited)
+    }
+
+    /// After a pass, a waiting canvas the last tick did not judge on screen will not draw, and the
+    /// frame waiting on it never finishes. Once none waits, the frame waiting on their renders has
+    /// drawn.
+    private func settleWaits(_ waited: Bool) {
+        let left = entries.values.filter { $0.waiting && !(live($0.view.id) === $0 && $0.presentable && $0.shownTick == ticks - 1) }
+        for e in left { e.waiting = false }
+        if !left.isEmpty { session?.frames.canvasLost() }
+        if waited, !awaitingDrawable { session?.frames.canvasDrawn() }
     }
 }
 #endif

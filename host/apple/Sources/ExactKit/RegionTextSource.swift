@@ -21,8 +21,7 @@ final class RegionFontOwner: @unchecked Sendable {
 struct RegionFont: Sendable {
     let owner: RegionFontOwner
     var value: CTFont { owner.value }
-    let above: CGFloat
-    let below: CGFloat
+    let box: TextLineBox
 }
 
 struct RegionTextRun: Sendable {
@@ -35,6 +34,9 @@ struct RegionTextRun: Sendable {
     let fixedInk: Bool
     let underline: Bool
     let strike: Bool
+    /// A decorating box's colour for a line its own colour does not draw (`Run.propagate`).
+    let underlineColor: CGColor?
+    let strikeColor: CGColor?
     let href: String
     let range: NSRange
 }
@@ -49,6 +51,9 @@ final class RegionTextSource: Sendable {
     let overflowWrap: Int
     /// CSS `text-wrap-style: balance` (`Spec.balance`).
     let balance: Bool
+    /// CSS `white-space` (`Spec.whiteSpace`): what of a line's trailing spaces
+    /// its width counts (`TextEngine.uncountedTrailingWidth`).
+    let whiteSpace: Int
     /// CSS `text-box`: `Spec`'s trim, over and under edges.
     let textBox: (trim: Int, over: Int, under: Int)
     /// A preserved tab's stop interval (CSS `tab-size: 8`), as the engine's
@@ -68,8 +73,7 @@ final class RegionTextSource: Sendable {
         let start = ProcessInfo.processInfo.systemUptime
         func font(_ run: Run) -> RegionFont {
             let f = engine.font(size: run.size, weight: run.weight, family: run.family, italic: run.italic)
-            let (above, below) = CSSLineBox.extents(f as CTFont, height: run.lineHeight)
-            return RegionFont(owner: RegionFontOwner(f as CTFont), above: above, below: below)
+            return RegionFont(owner: RegionFontOwner(f as CTFont), box: TextLineBox(f as CTFont, height: run.lineHeight))
         }
         var offset = 0
         runs = spec.runs.map { run in
@@ -79,8 +83,11 @@ final class RegionTextSource: Sendable {
                                  letterSpacing: run.letterSpacing,
                                  color: TextEngine.color(run.color ?? spec.color).cgColor,
                                  fixedInk: run.fixedInk && run.color != nil,
-                                 underline: run.underlined,
-                                 strike: run.decoration.contains("line-through"), href: run.href,
+                                 underline: run.underlined || run.underlineColor != nil,
+                                 strike: run.decoration.contains("line-through") || run.strikeColor != nil,
+                                 underlineColor: run.underlined ? nil : run.underlineColor.map { TextEngine.color($0).cgColor },
+                                 strikeColor: run.decoration.contains("line-through") ? nil : run.strikeColor.map { TextEngine.color($0).cgColor },
+                                 href: run.href,
                                  range: NSRange(location: offset, length: count))
         }
         let base = spec.strut ?? spec.runs.first
@@ -88,6 +95,7 @@ final class RegionTextSource: Sendable {
         align = spec.align; direction = spec.direction; lineClamp = spec.lineClamp; overflowWrap = spec.overflowWrap
         textBox = (spec.textBoxTrim, spec.textBoxOver, spec.textBoxUnder)
         balance = spec.balance
+        whiteSpace = spec.whiteSpace
         text = spec.runs.map(\.text).joined()
         tabInterval = spec.preserves && text.contains("\t") ? base.map { TextEngine.tabInterval(font($0).value, letterSpacing: $0.letterSpacing) } : nil
         utf16Count = offset
@@ -134,6 +142,8 @@ final class RegionTextSource: Sendable {
             if run.fixedInk { attributes[.exactFixedInk] = true }
             if run.underline { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
             if run.strike { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+            if let c = run.underlineColor { attributes[NSAttributedString.Key(kCTUnderlineColorAttributeName as String)] = c }
+            if let c = run.strikeColor { attributes[.strikethroughColor] = c }
             value.append(NSAttributedString(string: run.text, attributes: attributes))
         }
         TextEngine.setBaseDirection(value, direction: direction)

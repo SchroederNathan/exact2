@@ -6,17 +6,73 @@ use super::Em;
 use crate::style;
 use exact_kernel::PropId;
 use exact_kernel::{NodeType, StyleId};
-use exact_plan::{BindingKind, BindingsRow};
+use exact_plan::{BindingKind, BindingsRow, NodesId};
 use exact_web::host::template::Parts;
 use std::fmt::Write as _;
 
+#[path = "text_style.rs"]
+mod text_style;
+
 impl Em<'_> {
+    /// Clock ticks format cached instants without evaluating app code.
+    pub(super) fn live_time(
+        &mut self,
+        i: u32,
+        element: &str,
+        e: &str,
+        scope: &crate::code::Scope,
+    ) -> Result<(), String> {
+        let plan = self.plan;
+        let row = &plan.node(NodesId(i));
+        if element == "time"
+            || (element == "progress"
+                && row
+                    .bindings
+                    .iter()
+                    .any(|b| plan.binding(b).id == PropId::Start as u16))
+        {
+            let mut values = Vec::new();
+            for prop in [
+                PropId::Datetime,
+                PropId::TimeFormat,
+                PropId::Start,
+                PropId::End,
+            ] {
+                let value = row
+                    .bindings
+                    .iter()
+                    .map(|b| plan.binding(b))
+                    .find(|b| b.kind == BindingKind::Prop && b.id == prop as u16);
+                values.push(match value {
+                    Some(b) => format!("({})()", self.bound(i, e, &b, scope)?),
+                    None => "null".into(),
+                });
+            }
+            let live = self.uses.rt("liveTime");
+            let inline = row
+                .parent
+                .is_some_and(|p| plan.node(p).node_type == NodeType::Text as u8);
+            let reserve = !inline
+                && !row.bindings.iter().map(|b| plan.binding(b)).any(|b| {
+                    b.kind == BindingKind::Style
+                        && (b.id == StyleId::Width as u16 || b.id == StyleId::MaxWidth as u16)
+                });
+            let _ = write!(
+                self.out,
+                "{live}({e},()=>[{}],{reserve});",
+                values.join(",")
+            );
+        }
+        Ok(())
+    }
+
     /// Whether image `i` needs symbols.js — it draws a symbol, its source is
     /// bound, or its source is an `app:/` file, which symbols.js resolves
     /// (`data-app-src`, LLP 1069.002 D7) — and whether its source is bound.
     pub(super) fn image_piece(&self, i: u32, parts: &Parts) -> Option<bool> {
         let plan = self.plan;
-        let bound = plan.nodes[i as usize]
+        let bound = plan
+            .node(NodesId(i))
             .bindings
             .iter()
             .map(|b| plan.binding(b))
@@ -103,9 +159,10 @@ impl Em<'_> {
         parts: &Parts,
         e: &str,
         f: &str,
+        scope: &crate::code::Scope,
     ) -> Result<(), String> {
         let plan = self.plan;
-        let row = &plan.nodes[i as usize];
+        let row = &plan.node(NodesId(i));
         let press = parts.css.contains("--exact-press:");
         let binding = |id: StyleId| {
             row.bindings
@@ -122,16 +179,40 @@ impl Em<'_> {
         let kind = NodeType::from_wire(row.node_type).ok_or("unknown node type")?;
         // @ref LLP 1115.002 D6 — a metric the binding may name is its value
         // in the web's column before the row's own map sees it.
-        let metric =
-            style::metric_map(plan, plan.code(b.expr)).map(|m| format!("()=>({m})(({f})())"));
+        let metric = style::metric_map(plan, plan.code(b.expr))
+            .map(|m| format!("()=>{}(({f})())", self.uses.share('m', m)));
         let f = metric.as_deref().unwrap_or(f);
+        // @ref LLP 1121 D7 — a length or number token a bound value names is
+        // its CSS, or its property's `var()` where the page declares one.
+        let attribute = exact_web::host::template::attribute_rows(kind)
+            .iter()
+            .any(|(r, _)| *r == id);
+        // A node with children reads no varying type or family token: they
+        // would inherit it (the runner refuses it as an invalid value).
+        // (Asked only where one varies: a map's name stays as it was.)
+        let container = self.answers.varying && !self.sites.of_node(i).is_empty();
+        let measured = if crate::measures::row(id) {
+            self.answers.map(id, attribute, container)
+        } else {
+            None
+        };
+        let measure = measured.map(|m| {
+            let bases = !crate::base_scale::named(plan).is_empty();
+            let name = crate::measures::map_name(id, attribute, container, bases);
+            let map = self.uses.constant(&name, || m.to_string());
+            format!("()=>{map}(({f})())")
+        });
+        let f = measure.as_deref().unwrap_or(f);
         // A list on a corner is the elliptical radius no row holds, which
         // the browser would draw: refused whole, as the kernel refuses it.
         let corner = (exact_kernel::style::sides::FAMILIES[8].contains(&id)
             && style::literal(plan, plan.code(b.expr)).is_none())
         .then(|| {
             self.uses.rt("say");
-            format!("()=>({})(({f})())", style::corner_list(id))
+            format!(
+                "()=>{}(({f})())",
+                self.uses.share('m', style::corner_list(id))
+            )
         });
         let f = corner.as_deref().unwrap_or(f);
         if let Some((_, name)) = exact_web::host::template::attribute_rows(kind)
@@ -165,10 +246,73 @@ impl Em<'_> {
             let _ = write!(self.out, "{p}({e},\"data-x-pin\",{f});");
             return Ok(());
         }
+        // Mark bound rows while they hold a value: grouped separators yield to
+        // authored edges and images (LLP 1084 D7), and a native button's floor
+        // yields to authored size and padding. Literal rows use data-exact-said.
+        let button = kind == NodeType::Control && parts.props.contains_key("data-button-style");
+        let mark = match id {
+            StyleId::BorderWidthTop if b.written => Some("data-exact-top-width"),
+            StyleId::BorderStyleTop if b.written => Some("data-exact-top-style"),
+            StyleId::BorderWidthBottom if b.written => Some("data-exact-bottom-width"),
+            StyleId::BorderStyleBottom if b.written => Some("data-exact-bottom-style"),
+            StyleId::BackgroundImage if b.written => Some("data-exact-background-image"),
+            StyleId::Display
+                if parts.props.contains_key("data-groupedrowseparator")
+                    || parts.props.contains_key("data-native") =>
+            {
+                Some("data-exact-hidden")
+            }
+            StyleId::Width if b.written && button => Some("data-exact-width"),
+            StyleId::Height if b.written && button => Some("data-exact-height"),
+            StyleId::PaddingTop if b.written && button => Some("data-exact-padding-top"),
+            StyleId::PaddingRight if b.written && button => Some("data-exact-padding-right"),
+            StyleId::PaddingBottom if b.written && button => Some("data-exact-padding-bottom"),
+            StyleId::PaddingLeft if b.written && button => Some("data-exact-padding-left"),
+            _ => None,
+        };
+        if let Some(name) = mark {
+            let p = self.uses.rt("P");
+            let when = if id == StyleId::Display {
+                "v===\"none\"?\"\":null"
+            } else {
+                "v==null||v===\"\"?null:\"\""
+            };
+            let _ = write!(
+                self.out,
+                "{p}({e},\"{name}\",()=>{{const v=({f})();return {when}}});"
+            );
+        }
         let refuse = |why: &str| Err(format!("node {i}: {why} is not in the JS target"));
+        // @ref LLP 1077 D13 — a bound colour may name a system colour, which
+        // the literal path resolved in the kernel. And a CSS-text row that
+        // may name one inside it. The plan's colour map: one module constant
+        // every such site shares.
+        use exact_kernel::StyleCodec as C;
+        let cm = matches!(
+            id.codec(),
+            C::ColorValue
+                | C::KeywordColor
+                | C::Paint
+                | C::BackgroundImage
+                | C::MaskImage
+                | C::BoxShadow
+                | C::TextShadow
+                | C::Filter
+        )
+        .then(|| self.uses.constant("$cm", || style::color_map(plan)));
         // (name, unit, map): a map is JavaScript of the value (`null` writes none).
         let one = |name: &str, map: Option<String>| vec![(name.to_string(), String::new(), map)];
-        let writes: Vec<(String, String, Option<String>)> = match id {
+        let mut writes: Vec<(String, String, Option<String>)> = match id {
+            // Safari selects by WebKit's prefixed property alone; `auto` and a
+            // clear write nothing, as css.rs writes them (css/selection.rs,
+            // css/clears.rs).
+            StyleId::UserSelect => {
+                let unsaid = || Some("v=>/^\\s*(auto|initial|unset)\\s*$/i.test(v)?null:v".to_string());
+                vec![
+                    ("-webkit-user-select".into(), String::new(), unsaid()),
+                    ("user-select".into(), String::new(), unsaid()),
+                ]
+            }
             // @ref LLP 1077 D8 — the `rotate` and `translate` attributes bind
             // these with the same value: the angle's and xy's declaration
             // writes the author's whole text.
@@ -188,7 +332,7 @@ impl Em<'_> {
                 if id == StyleId::TextStrokeColor {
                     return Ok(());
                 }
-                one("-webkit-text-stroke", Some(style::color_map(plan)))
+                one("-webkit-text-stroke", Some(self.uses.constant("$cm", || style::color_map(plan))))
             }
             // @ref LLP 1077 D8 — 0 is `none`, as css.rs writes it.
             StyleId::Perspective => one(
@@ -249,6 +393,26 @@ impl Em<'_> {
                 let _ = write!(self.out, "{press}();");
                 one("--exact-press-haptic", Some("v=>v==null||v===\"none\"?null:v".into()))
             }
+            // @ref LLP 1061 D7 — the pressed paint: the custom properties
+            // input-glue.js reads from the element's own style (css.rs).
+            StyleId::PressOpacity
+            | StyleId::PressOpacityTo
+            | StyleId::PressBackgroundColor
+            | StyleId::PressColor => {
+                let press = self.uses.rt("pressFeedback");
+                let _ = write!(self.out, "{press}();");
+                let name = match id {
+                    StyleId::PressOpacity => "--exact-press-opacity",
+                    StyleId::PressOpacityTo => "--exact-press-opacity-to",
+                    StyleId::PressBackgroundColor => "--exact-press-background-color",
+                    _ => "--exact-press-color",
+                };
+                let none = "v==null||/^\\s*unset\\s*$/i.test(v)?null:";
+                one(name, Some(match &cm {
+                    Some(cm) => format!("v=>{none}{cm}(v)"),
+                    None => format!("v=>{none}v"),
+                }))
+            }
             // @ref LLP 1116.001 D1.4 — what navigation.js `fitText` reads, inline.
             StyleId::Fit => {
                 let fit = self.uses.rt("fitTexts");
@@ -275,6 +439,10 @@ impl Em<'_> {
                     ),
                 ]
             }
+            StyleId::FontSize if parts.tag != "img" => {
+                let styles = self.answers.styles();
+                text_style::font_size(plan, row, parts, styles, &mut |map| self.uses.share('m', map))
+            }
             StyleId::FontSize | StyleId::FontWeight if parts.tag == "img" => {
                 let size = id == StyleId::FontSize;
                 let mut writes = vec![(if size { "font-size" } else { "font-weight" }.into(), if size { "px" } else { "" }.into(), None)];
@@ -282,6 +450,7 @@ impl Em<'_> {
                 writes
             }
             StyleId::FontVariantNumeric => one("font-variant-numeric", None),
+            StyleId::FontVariantLigatures => one("font-variant-ligatures", None),
             // SVG's transform grammar, restated as CSS's (kernel TransformList).
             StyleId::Transform => {
                 let t = self.uses.rt("svgTransform");
@@ -311,23 +480,25 @@ impl Em<'_> {
                 "transition",
                 Some(pressed_transition_map()),
             ),
-            _ => style::style_writes(b.id, timeline)
+            // GitHub #809: what the kernel writes for each value the code
+            // can push (style.rs `layout_transitions`); presence follows it
+            // (rt.js `lt`, below). Another value is unset.
+            StyleId::LayoutTransition => {
+                let values = style::layout_transitions(plan, plan.code(b.expr));
+                let (say, view) = (self.uses.rt("say"), self.uses.rt("viewId"));
+                one("--exact-layout-transition", Some(style::layout_transition_map(&values, &format!("{view}({e})"), &say)))
+            }
+            // A side is the author's when they wrote it or the other of its
+            // pair (css.rs `unsaid_side`): only a side the sheet alone sets mirrors.
+            _ => style::style_writes(b.id, timeline, b.written || style::other_side(id).and_then(binding).is_some_and(|o| o.written))
                 .map_err(|x| format!("node {i}: {x}"))?
                 .into_iter()
                 .map(|w| {
-                    // @ref LLP 1077 D13 — a bound colour may name a system
-                    // colour, which the literal path resolved in the kernel.
-                    // And a CSS-text row that may name one inside it.
-                    use exact_kernel::StyleCodec as C;
-                    let colors = matches!(
-                        id.codec(),
-                        C::ColorValue | C::KeywordColor | C::Paint | C::BackgroundImage | C::MaskImage | C::BoxShadow | C::TextShadow | C::Filter
-                    );
                     // Composed with the row's own map (`accent-color` has one).
-                    let map = match w.map {
-                        Some(m) if colors => Some(format!("v=>({m})(({})(v))", style::color_map(plan))),
-                        Some(m) => Some(m.to_string()),
-                        None => colors.then(|| style::color_map(plan)),
+                    let map = match (w.map, &cm) {
+                        (Some(m), Some(cm)) => Some(format!("v=>({m})({cm}(v))")),
+                        (Some(m), None) => Some(m.to_string()),
+                        (None, cm) => cm.clone(),
                     };
                     // A computed image the native hosts refuse is dropped
                     // here too, and journaled as they journal it, so the web
@@ -350,6 +521,61 @@ impl Em<'_> {
                 })
                 .collect(),
         };
+        // A progress's or canvas's alignment, and its parent's (sized.rs).
+        let sized = crate::sized::writes(id, parts);
+        if !sized.is_empty() {
+            self.uses.rt("normal");
+        }
+        writes.extend(sized);
+        if matches!(id, StyleId::FontWeight | StyleId::LineHeight) {
+            let normal = self.uses.rt("normal");
+            // The marker depends on both rows: either can expose an inherited value.
+            let start = if parts.props.contains_key("data-fontshorthand") {
+                binding(StyleId::FontSize)
+                    .filter(|b| style::literal(plan, plan.code(b.expr)).is_none())
+                    .map(|b| {
+                        let size = self.bound(i, e, &b, scope)?;
+                        let styles = self.answers.styles();
+                        let map = self.uses.share(
+                            'm',
+                            text_style::style_map(styles, &style::TEXT_STYLE_ROWS[0]),
+                        );
+                        Ok::<_, String>(format!("({map})(({size})())"))
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            text_style::longhand(plan, row, parts, id, &normal, start.as_deref(), &mut writes);
+        }
+        // @ref LLP 1084 D7 — a grouped row's separator stands below its
+        // bottom padding (the page's sheet, as `element::host_css_of` says).
+        if id == StyleId::PaddingBottom && parts.props.contains_key("data-groupedrowseparator") {
+            if let Some((_, unit, map)) = writes.first().cloned() {
+                // A length; a percentage, which a background cannot reach,
+                // is none (`element::host_css_of`).
+                let inner = map.unwrap_or_else(|| "v=>v".into());
+                let px = format!(
+                    "v=>{{const t=({inner})(v);return t!=null&&/%/.test(String(t))?\"0px\":t}}"
+                );
+                writes.push(("--exact-padding-bottom".into(), unit, Some(px)));
+            }
+        }
+        if id == StyleId::Appearance && b.written {
+            self.said_appearance(e, f, parts.props.get("data-exact-said"));
+        }
+        // Right to left, the sides of a pair different hands say (sides.rs).
+        let other = style::other_side(id).and_then(binding);
+        self.side_writes(
+            i,
+            e,
+            scope,
+            b,
+            other.as_ref(),
+            &parts.css,
+            timeline,
+            &mut writes,
+        )?;
         // A reference (`url(#…)`) names an element by its authored id, which
         // the kernel scopes to the instance (LLP 1055.000 D3): resolved at
         // run time from the node (`Sr`).
@@ -367,8 +593,20 @@ impl Em<'_> {
         // so its `--exact-accent` naming one that names the accent would name
         // itself: that token's colour stands by tuple (`data-x-accent`), as
         // css.rs leaves a self-reference out; a clear there writes nothing.
+        // A bound `color` that decides a symbol's ink (style.rs
+        // `symbol_marks`) keeps whether its binding has a value now, a clear
+        // included, whatever its map writes: symbols.js `inked` reads it.
+        let inked = (id == StyleId::TextColor
+            && parts.props.get("data-exact-ink").is_some_and(|w| w != "b"))
+        .then(|| format!("()=>{{const v=({f})();{e}.$ink=v!=null;return v}}"));
+        let f = inked.as_deref().unwrap_or(f);
+        // A blank text row clears its start; `none` leaves that start exposed.
+        let clear = matches!(id, StyleId::FontWeight | StyleId::LineHeight).then(|| {
+            format!("()=>{{const v=({f})();return typeof v===\"string\"&&!v.trim()?\"unset\":v}}")
+        });
+        let f = clear.as_deref().unwrap_or(f);
         for (name, unit, map) in writes {
-            let modes = crate::modes::active(plan);
+            let modes = self.answers.modes;
             let channel = crate::modes::CHANNELS
                 .iter()
                 .position(|(_, p)| {
@@ -378,7 +616,7 @@ impl Em<'_> {
             let map = match map {
                 Some(m) if modes && name == "--exact-accent" => Some(format!(
                     "v=>{{v=({m})(v);if(!{e}.hasAttribute(\"data-x-b\"))return v;{e}.removeAttribute(\"data-x-accent\");if(v==null||/^\\s*(unset|inherit)?\\s*$/i.test(v))return null;const n={}.find(p=>v.includes(`var(${{p}})`));if(n){{{e}.setAttribute(\"data-x-accent\",n);return null}}return v}}",
-                    serde_json::to_string(&crate::modes::accent_properties(plan)).unwrap()
+                    self.answers.accent()
                 )),
                 map => map,
             };
@@ -396,20 +634,48 @@ impl Em<'_> {
                 }
             }
         }
+        // The values that declare it, which presence asks of the binding
+        // before each commit's tree update (rt.js `lt`).
+        if id == StyleId::LayoutTransition {
+            let values = style::layout_transitions(plan, plan.code(b.expr));
+            let declaring: Vec<&String> = values
+                .held
+                .iter()
+                .filter(|(_, css)| css.is_some())
+                .map(|(v, _)| v)
+                .collect();
+            let lt = self.uses.rt("lt");
+            let _ = write!(
+                self.out,
+                "{lt}({e},{},{f});",
+                serde_json::to_string(&declaring).unwrap()
+            );
+        }
         Ok(())
     }
 
     /// A Markdown text field is the web host's own editor (LLP 1045 D5:
-    /// markup-editor.js over its wasm), which replaces it once loaded.
+    /// markup-editor.js over its wasm), which replaces it once loaded; a
+    /// plain one with `decorations` keeps its textarea and is painted.
     pub(super) fn editor(&mut self, i: u32, element: &str, e: &str) -> Result<(), String> {
         let plan = self.plan;
-        let row = &plan.nodes[i as usize];
+        let row = &plan.node(NodesId(i));
         let markup = row
             .bindings
             .iter()
             .map(|b| plan.binding(b))
             .find(|b| b.kind == BindingKind::Prop && b.id == PropId::Markup as u16);
         if element == "textarea" {
+            if row
+                .bindings
+                .iter()
+                .map(|b| plan.binding(b))
+                .any(|b| b.kind == BindingKind::Prop && b.id == PropId::Decorations as u16)
+            {
+                // Paint only (LLP 1114.007): decorations.js, no editor wasm.
+                let decorate = self.uses.rt("decorate");
+                let _ = write!(self.out, "{decorate}({e});");
+            }
             match markup.map(|b| style::literal(plan, plan.code(b.expr))) {
                 Some(Some(v)) if v.as_str() == Some("markdown") => {
                     self.editor = true;
@@ -436,7 +702,8 @@ impl Em<'_> {
         scope: &crate::code::Scope,
     ) -> Result<(), String> {
         let plan = self.plan;
-        let Some(b) = plan.nodes[i as usize]
+        let Some(b) = plan
+            .node(NodesId(i))
             .bindings
             .iter()
             .map(|b| plan.binding(b))
@@ -446,7 +713,7 @@ impl Em<'_> {
         };
         let value = match style::literal(plan, plan.code(b.expr)) {
             Some(v) => format!("()=>{}", super::value_js(&v)),
-            None => self.f(b.expr, scope)?,
+            None => self.bound(i, e, &b, scope)?,
         };
         self.flow = true;
         let wf = self.uses.rt("wf");
@@ -459,7 +726,7 @@ impl Em<'_> {
         let plan = self.plan;
         let mut at = Some(i);
         while let Some(n) = at {
-            let row = &plan.nodes[n as usize];
+            let row = &plan.node(NodesId(n));
             if NodeType::from_wire(row.node_type) == Some(NodeType::SvgSymbol) {
                 return true;
             }
@@ -471,7 +738,7 @@ impl Em<'_> {
     /// Node `i`'s parent node, through regions' arms.
     pub(super) fn parent_of(&self, i: u32) -> Option<u32> {
         let plan = self.plan;
-        let row = &plan.nodes[i as usize];
+        let row = &plan.node(NodesId(i));
         match (row.parent, row.arm) {
             (Some(p), _) => Some(p.0),
             (None, Some(a)) => {
@@ -489,23 +756,20 @@ impl Em<'_> {
         }
     }
 
-    /// A node's authored `id`, named for `Sr` in a plan whose rows can
-    /// reference an element.
+    /// Preserve literal authored IDs for URL references and for drag bindings
+    /// when the template rewrites an SVG element's DOM ID.
     pub(super) fn exact_id(&self, i: u32) -> Option<String> {
         let plan = self.plan;
-        if !self.refs {
+        let node = &plan.node(NodesId(i));
+        if !self.refs && !NodeType::from_wire(node.node_type).is_some_and(|t| t.is_svg_element()) {
             return None;
         }
-        plan.nodes[i as usize]
-            .bindings
-            .iter()
-            .map(|b| plan.binding(b))
-            .find_map(|b| {
-                (b.kind == BindingKind::Prop && b.id == PropId::Id as u16)
-                    .then(|| style::literal(plan, plan.code(b.expr)))
-                    .flatten()
-                    .and_then(|v| v.as_str().map(str::to_string))
-            })
+        node.bindings.iter().map(|b| plan.binding(b)).find_map(|b| {
+            (b.kind == BindingKind::Prop && b.id == PropId::Id as u16)
+                .then(|| style::literal(plan, plan.code(b.expr)))
+                .flatten()
+                .and_then(|v| v.as_str().map(str::to_string))
+        })
     }
 }
 
@@ -552,6 +816,11 @@ pub(super) fn presence_decls(css: &mut String) -> String {
             // D14), which input-glue.js reads from the element's own style.
             "--exact-press:",
             "--exact-press-haptic:",
+            // The pressed paint (LLP 1061 D7), read the same way.
+            "--exact-press-opacity:",
+            "--exact-press-opacity-to:",
+            "--exact-press-background-color:",
+            "--exact-press-color:",
             // A fitted text's (LLP 1116.001 D1.4), which navigation.js finds by it.
             "--exact-fit:",
         ]
@@ -647,17 +916,23 @@ pub(super) fn attributes(
                     attrs.push(("data-autofocus".into(), "false".into()));
                 }
             }
-            // The app's own file (LLP 1069.002 D7): symbols.js shows it
-            // through an object URL, media.js plays it (podcast F19); the
-            // browser has no `app:` scheme.
+            // The app's own file (LLP 1069.002 D7), or a frame's page given
+            // one (LLP 1020.001 D7): symbols.js shows it through an object
+            // URL, media.js plays it (podcast F19); the browser has no `app:`.
             "src"
-                if matches!(element, "img" | "video" | "audio" | "iframe")
-                    && value.starts_with("app:/") =>
+                if matches!(element, "img" | "video" | "audio") && value.starts_with("app:/")
+                    || element == "iframe"
+                        && exact_web::host::document::frame_app_source(value) =>
             {
                 attrs.push(("data-app-src".into(), value.clone()));
             }
             "poster" if element == "video" && value.starts_with("app:/") => {
                 attrs.push(("data-app-poster".into(), value.clone()));
+            }
+            // A package's scheme (LLP 1133.019 D11 item 1): pictures.js
+            // asks its implementation; the browser never fetches it.
+            "src" if element == "img" && package_scheme(value) => {
+                attrs.push(("data-exact-picture".into(), value.clone()));
             }
             "src" if element == "img" && value.starts_with("symbol:") => {
                 attrs.push((
@@ -716,7 +991,36 @@ pub(super) fn attributes(
             _ => attrs.push((name.clone(), value.clone())),
         }
     }
+    // Off the page's thread, so an arrival does not hold a frame (LLP 1145 D3).
+    attrs.extend((element == "img").then(|| ("decoding".into(), "async".into())));
+    // A role the element has natively is not restated, as the live host leaves it off.
+    let implicit = exact_web::host::implicit_role(element, |name| {
+        attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    });
+    if implicit.is_some() {
+        attrs.retain(|(k, v)| !(k == "role" && Some(v.as_str()) == implicit));
+    }
     (attrs, content, css)
+}
+
+/// Whether `src` begins with a scheme a package may serve: a lowercase word
+/// that is neither a web scheme nor a host's own (LLP 1133.019 D11 item 1;
+/// the bake's `HOST_SCHEMES`).
+fn package_scheme(src: &str) -> bool {
+    let Some((scheme, _)) = src.split_once(':') else {
+        return false;
+    };
+    scheme.starts_with(|c: char| c.is_ascii_lowercase())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && ![
+            "http", "https", "data", "blob", "app", "doc", "symbol", "asset", "file", "about",
+        ]
+        .contains(&scheme)
 }
 
 /// A frame's literal `data:` source (refused alone, shown in an opaque
@@ -742,12 +1046,65 @@ fn sandboxed_source<'a>(
 pub(crate) fn pressed_transition_map() -> String {
     format!(
                     "v=>{{if(v==null)return v;{}const o=p.map(t=>t.replace(/^scale(?=\\s)/,\"--exact-scale\")),m=p.filter(t=>/^(scale|all)(\\s|$)/.test(t)).pop();if(m)o.push(\"scale 0s\",m.replace(/^(scale|all)/,\"--exact-scale\"));return o.join(\",\")||\"none\"}}",
-                    crate::style::TRANSITION_ENTRIES
+                    crate::style::TRANSITION_ENTRIES.as_str()
                 )
 }
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn data_names_added_by_attribute_and_canvas_writers_are_reserved() {
+        let plan = contract::compile(
+            "component App\n  view\n    canvas bitmap-width=16 bitmap-height=16 color-space=\"display-p3\" color-type=\"float16\"\n",
+        )
+        .unwrap();
+        let mut attrs = Vec::new();
+        for node in plan.nodes.iter() {
+            attrs.extend(crate::style::canvas_bitmap(&plan, &node).unwrap());
+        }
+        let mut props = exact_kernel::SortedMap::default();
+        props.insert("src".into(), "app:/movie.mp4".into());
+        props.insert("poster".into(), "app:/poster.png".into());
+        props.insert("autofocus".into(), "false".into());
+        for tag in ["img", "video", "audio", "iframe", "input"] {
+            attrs.extend(super::attributes(tag, &props).0);
+        }
+        let names: std::collections::BTreeSet<_> = attrs
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| name.starts_with("data-"))
+            .collect();
+        let mut picture = exact_kernel::SortedMap::default();
+        picture.insert("src".into(), "swatch:red".into());
+        let picture_attrs = super::attributes("img", &picture).0;
+        assert!(picture_attrs.contains(&("decoding".into(), "async".into())));
+        assert!(
+            !picture_attrs.iter().any(|(name, _)| name == "src"),
+            "a package's scheme is never fetched"
+        );
+        let names: std::collections::BTreeSet<_> = names
+            .into_iter()
+            .chain(picture_attrs.iter().map(|(n, _)| n.as_str()))
+            .filter(|name| name.starts_with("data-"))
+            .collect();
+        for name in [
+            "data-app-poster",
+            "data-color-space",
+            "data-color-type",
+            "data-exact-picture",
+        ] {
+            assert!(names.contains(name), "writer did not emit {name}");
+        }
+        let mut unreserved = Vec::new();
+        for name in names {
+            let source = format!("component App\n  view\n    column {name}=\"x\"\n");
+            match contract::compile(&source) {
+                Err(error) if error.id == "lower-data-word" => {}
+                _ => unreserved.push(name),
+            }
+        }
+        assert!(unreserved.is_empty(), "not reserved: {unreserved:?}");
+    }
+
     #[test]
     fn a_native_buttons_bound_display_preserves_the_semantic_grid() {
         let plan = contract::compile(
@@ -799,6 +1156,8 @@ mod tests {
         assert!(js.contains(",\"src\",()=>\"data:text/html,a\")"), "{js}");
         assert!(!js.contains("()=>\"data:text/html,b\""), "{js}");
         assert!(!js.contains("()=>\"https://e.dev/c\""), "{js}");
+        // Each frame grants its guest fullscreen (LLP 1020.002 D5).
+        assert_eq!(js.matches(r#""allow":"fullscreen *""#).count(), 3, "{js}");
     }
 
     #[test]
@@ -826,6 +1185,7 @@ mod tests {
                 "none"
             ])
         );
+        crate::style::tests::assert_spring_transitions(&super::pressed_transition_map());
     }
 
     use crate::style::{
@@ -834,7 +1194,8 @@ mod tests {
     };
 
     /// A bound `filter` (LLP 1095 D1) is written through the colour map:
-    /// the emitted binding wraps its value in `color_map(plan)`, which turns
+    /// the emitted binding wraps its value in `color_map(plan)`, a module
+    /// constant every colour site shares (`$cm`), which turns
     /// a role into its CSS, an admitted `-exact-platform-color()` literal into its
     /// fallback, and refuses one the plan does not hold.
     #[test]
@@ -861,8 +1222,20 @@ mod tests {
             "the plan admits the literal"
         );
         assert!(
-            js.contains(&format!(",\"filter\",\"\",()=>({map})(blank((")),
+            js.contains(&format!("const $cm={map};\n"))
+                && js.contains(",\"filter\",\"\",()=>($cm)(blank(("),
             "the bound filter is not mapped:\n{js}"
+        );
+        // One constant, however many sites; none where no site maps a colour.
+        assert_eq!(js.matches("const $cm=").count(), 1);
+        let plain = contract::compile(
+            "component App\n  state on = false\n  view\n    text \"Plain\" opacity=(on ? 0.5 : 1)\n",
+        )
+        .unwrap();
+        let plain = crate::emit::emit(&plain, false, false).unwrap().js;
+        assert!(
+            plain.contains("\"opacity\"") && !plain.contains("$cm"),
+            "{plain}"
         );
         assert_eq!(
             run(
@@ -922,17 +1295,20 @@ mod tests {
                 .unwrap_or_else(|| panic!("no bound {row} names a metric"));
             crate::style::metric_map(&plan, plan.code(binding.expr)).unwrap()
         };
-        // The row starts at its text, after a symbol where one is shown.
+        // The row's content starts at its text, after a symbol where one is
+        // shown: its padding, the row spanning its card (LLP 1084 D7).
         assert_eq!(
             run(
-                &named("margin_left"),
+                &named("padding_left"),
                 &[
                     "-exact-grouped-row-inset",
                     "-exact-grouped-row-inset-symbol",
+                    "-exact-grouped-button-padding-start",
                     "12px"
                 ]
             ),
-            serde_json::json!([16, 56, "12px"])
+            // A ramp's value is the 16-point body's in `rem`, so it follows the root size.
+            serde_json::json!([16, "3.4375rem", 16, "12px"])
         );
         // Red when destructive, by its role; the label's colour is no metric.
         assert_eq!(
@@ -942,11 +1318,11 @@ mod tests {
             ),
             serde_json::json!(["-exact-system-red", "-exact-label"])
         );
-        // The Mac's push button's padding is no row on the web.
+        // The Mac's push button's margin is no row on the web.
         assert_eq!(
             run(
-                &named("padding_left"),
-                &["-exact-grouped-button-padding-start", "unset"]
+                &named("margin_left"),
+                &["-exact-grouped-button-margin-inline", "unset"]
             ),
             serde_json::json!([null, "unset"])
         );
@@ -1004,7 +1380,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let page = dir.join("col.html");
         let cursor_writes =
-            crate::style::style_writes(exact_kernel::StyleId::Cursor as u16, false).unwrap();
+            crate::style::style_writes(exact_kernel::StyleId::Cursor as u16, false, true).unwrap();
         let cursor_map = cursor_writes[0].map.unwrap();
         let html = format!(
             r#"<!doctype html><meta charset="utf-8"><style>#flow{{column-count:3;width:320px}}button{{cursor:default}}</style><div id="flow">column</div><div style="cursor:grab"><button id="cursor">Cursor</button></div><pre id="out"></pre><script>

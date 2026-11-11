@@ -11,6 +11,75 @@ final class TableListMacTests: XCTestCase {
     private var fixture: TableFixture?
     override func tearDown() { fixture?.close(); fixture = nil; super.tearDown() }
 
+    func testARowExitSurvivesTheTablesReloadUntilItsDestroy() throws {
+        let f = try TableFixture(count: 0, source: Self.plain)
+        fixture = f
+        let row = try f.node("row-0")
+        XCTAssertTrue(row.superview is TableRowCell)
+        let before = row.convert(row.bounds, to: f.document)
+        f.presenter.apply(wireBatch([["op": "exit", "id": row.id]]))
+        f.table.reloadData()
+        f.table.layoutSubtreeIfNeeded()
+        XCTAssertTrue(row.window === f.window, "a leaving row must outlive its table cell")
+        XCTAssertEqual(row.convert(row.bounds, to: f.document), before)
+        XCTAssertTrue(row.inert)
+        XCTAssertTrue(row.accessibilityHiddenWritten)
+        XCTAssertTrue(f.presenter.leaving[row.id]?.view === row)
+        f.presenter.apply(wireBatch([["op": "destroy", "id": row.id]]))
+        XCTAssertNil(row.superview)
+        XCTAssertNil(f.presenter.leaving[row.id])
+    }
+
+    func testARowThatLeavesItsCellKeepsItsRank() throws {
+        let f = try TableFixture(count: 0, source: Self.plain)
+        fixture = f
+        // Three rows ranked before they leave, checked against the table, whose cells hold the live rows, and against
+        // the list's badge (LLP 1083.000 §4, item 4)
+        let (plain, raised, lowered, badge) = try (f.node("row-0"), f.node("row-1"), f.node("row-2"), f.node("badge"))
+        XCTAssertTrue([plain, raised, lowered].allSatisfy { $0.superview is TableRowCell })
+        raised.setRank(10)
+        lowered.setRank(-4)
+        badge.setRank(4)
+        f.presenter.apply(wireBatch([plain, raised, lowered].map { ["op": "exit", "id": $0.id] }))
+        f.table.reloadData()
+        f.table.layoutSubtreeIfNeeded()
+        let table = f.table.layer?.zPosition ?? 0
+        XCTAssertEqual([plain, raised, lowered].map(\.paintRank), [1, 10, -4])
+        XCTAssertGreaterThan(plain.paintZPosition, table, "at ½ over the rows in the table's cells")
+        XCTAssertLessThan(plain.paintZPosition, badge.paintZPosition, "under a sibling of a higher rank")
+        XCTAssertGreaterThan(raised.paintZPosition, badge.paintZPosition, "a higher rank over it")
+        XCTAssertLessThan(lowered.paintZPosition, table, "a negative rank under the table")
+    }
+
+    func testANestedExitKeepsItsRowsOpacityTransformAndClip() throws {
+        let f = try TableFixture(count: 0, source: Self.plain)
+        fixture = f
+        let row = try f.node("row-0"), child = try f.node("title-0")
+        row.applyStyle(["overflow_x": "hidden", "overflow_y": "hidden"])
+        f.presenter.apply(wireBatch([
+            ["op": "present", "id": row.id, "property": "opacity", "x": 0.5],
+            ["op": "present", "id": row.id, "property": "translate", "x": 12.0, "y": 4.0],
+        ]))
+        let parent = try XCTUnwrap(child.superview)
+        let before = child.convert(child.bounds, to: f.document)
+        XCTAssertTrue(row.overflowClips)
+        XCTAssertEqual(row.alphaValue, 0.5)
+        XCTAssertFalse(row.layer?.affineTransform().isIdentity ?? true)
+        f.presenter.apply(wireBatch([["op": "exit", "id": child.id]]))
+        XCTAssertTrue(child.superview === parent, "a nested ghost still inherits its authored ancestors")
+        XCTAssertTrue(child.isDescendant(of: row))
+        XCTAssertEqual(child.convert(child.bounds, to: f.document), before)
+        f.table.reloadData()
+        f.table.layoutSubtreeIfNeeded()
+        XCTAssertTrue(child.isDescendant(of: row))
+        XCTAssertTrue(child.window === f.window)
+        XCTAssertTrue(row.overflowClips)
+        XCTAssertEqual(row.alphaValue, 0.5)
+        f.presenter.apply(wireBatch([["op": "destroy", "id": child.id]]))
+        XCTAssertNil(child.superview)
+        XCTAssertTrue(row.window === f.window)
+    }
+
     /// A page of lists, one of each kind the rule tells apart.
     private static let kinds = """
     component Lists

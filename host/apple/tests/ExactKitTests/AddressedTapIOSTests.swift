@@ -61,6 +61,27 @@ final class AddressedTapIOSTests: XCTestCase {
         return (session, Agent(session: session), { defer { pressed = [] }; return pressed })
     }
 
+    func testANamedDateTapAimsAtItsCompactControlInsideAWiderBox() throws {
+        let (session, agent, _) = rows(), p = session.presenter
+        p.apply(wireBatch([
+            ["op": "create", "id": 10, "kind": "control", "props": ["type": "date", "value": "2026-10-22"], "handlers": ["change"]],
+            ["op": "children", "id": 1, "ids": [10]],
+            ["op": "frame", "id": 10, "x": 10.0, "y": 200.0, "w": 380.0, "h": 44.0],
+        ]))
+        p.viewport.layoutIfNeeded()
+        let node = try XCTUnwrap(p.views[10]), control = try XCTUnwrap(p.controls.controls[10]), window = try XCTUnwrap(window)
+        let b = agent.box(node), cb = agent.box(control)
+        XCTAssertFalse(cb.contains(CGPoint(x: b.midX, y: b.midY)), "the authored box's middle is beside the compact picker")
+        switch agent.addressedPoint(node, box: b, in: window) {
+        case .refused(let refusal): XCTFail("\(refusal)")
+        case .at(let point, _):
+            XCTAssertTrue(cb.contains(point), "a named tap reaches the compact picker: \(point), picker \(cb)")
+        }
+        let unsupported = agent.tap(["id": 10])
+        XCTAssertEqual(unsupported["delivery"] as? String, "unsupported")
+        XCTAssertTrue((unsupported["reason"] as? String ?? "").contains("an iOS simulator can use --touch platform"), "\(unsupported)")
+    }
+
     func testARowWithItsOwnPressIsPressedBesideTheCardAtItsMiddle() throws {
         let (_, agent, presses) = rows()
         let reply = agent.tap(["id": 2])
@@ -108,6 +129,398 @@ final class AddressedTapIOSTests: XCTestCase {
         XCTAssertNil(reply["error"], "\(reply)")
         XCTAssertTrue(reply["pressed"] is NSNull, "a disabled row's tap presses nothing: \(reply)")
         XCTAssertEqual(presses(), [])
+    }
+
+    /// A field and a checkbox take a touch themselves (UIKit's controls), so
+    /// the agent's walks press no ancestor from them, as a real touch does
+    /// not; text beside them still presses it, and a native button's action
+    /// still presses the nearest handler.
+    func testAFieldOrAControlTakesTheTapAndPressesNoAncestor() throws {
+        let (session, agent, presses) = rows(), p = session.presenter
+        p.apply(wireBatch([
+            ["op": "create", "id": 21, "kind": "input", "props": ["value": "draft"]],
+            ["op": "create", "id": 22, "kind": "control", "props": ["type": "checkbox"]],
+            ["op": "create", "id": 23, "kind": "control", "props": ["type": "button"]],
+            ["op": "create", "id": 24, "kind": "textarea", "props": ["value": "notes"]],
+            ["op": "create", "id": 25, "kind": "text", "props": ["text": "Beside the controls"]],
+            ["op": "children", "id": 1, "ids": [2]], ["op": "children", "id": 2, "ids": [21, 22, 23, 24, 25]],
+            ["op": "frame", "id": 2, "x": 0, "y": 0, "w": 400, "h": 500],
+        ] + (21...25).map { ["op": "frame", "id": $0, "x": 20, "y": ($0 - 21) * 60 + 20, "w": 240, "h": 40] }))
+        let ancestor = try XCTUnwrap(p.views[2]), win = try XCTUnwrap(window)
+        func point(_ node: NodeView) -> CGPoint { node.convert(CGPoint(x: node.bounds.midX, y: node.bounds.midY), to: nil) }
+        for id: UInt32 in [21, 22, 24] {
+            let node = try XCTUnwrap(p.views[id])
+            XCTAssertNil(node.activationTarget(at: point(node)), "\(id)")
+            XCTAssertNil(node.activate(at: point(node)), "\(id)")
+            XCTAssertNil(agent.fingerReach(node, at: point(node)).action, "\(id)")
+            if case .control(let owner)? = agent.pressReach(node, at: point(node), in: win) {
+                XCTAssertTrue(owner === node, "\(id)")
+            } else { XCTFail("the addressed walk stops at \(id)") }
+        }
+        XCTAssertEqual(presses(), [], "no ancestor press from a field or a control")
+        let plain = try XCTUnwrap(p.views[25]), button = try XCTUnwrap(p.views[23])
+        XCTAssertTrue(plain.activate(at: point(plain)) === ancestor)
+        XCTAssertTrue(button.activationTarget(at: point(button)) === ancestor, "a native button's action presses the nearest handler")
+        XCTAssertEqual(presses(), [2])
+    }
+
+    func testACheckboxPaddingPressesItsAncestorAsARealTouchDoes() throws {
+        let (session, agent, presses) = rows(), p = session.presenter
+        p.apply(wireBatch([
+            ["op": "create", "id": 21, "kind": "control", "props": ["type": "checkbox"]],
+            ["op": "children", "id": 1, "ids": [2]], ["op": "children", "id": 2, "ids": [21]],
+            ["op": "frame", "id": 21, "x": 20, "y": 20, "w": 240, "h": 40],
+        ]))
+        p.viewport.layoutIfNeeded()
+        let node = try XCTUnwrap(p.views[21]), ancestor = try XCTUnwrap(p.views[2]), win = try XCTUnwrap(window)
+        let padding = CGPoint(x: 10, y: node.bounds.midY), point = node.convert(padding, to: nil)
+        XCTAssertTrue(win.hitTest(point, with: nil) === node, "the padding lands on the node, outside the centred checkbox's hit area")
+        XCTAssertTrue(node.activationTarget(at: point) === ancestor)
+        XCTAssertTrue(node.activate(at: point) === ancestor)
+        XCTAssertEqual(presses(), [2])
+        let reach = agent.fingerReach(node, at: point)
+        XCTAssertTrue(reach.action?.node === ancestor)
+        XCTAssertTrue(agent.stillPresses(reach) === ancestor)
+        if case .node(let target)? = agent.pressReach(node, at: point, in: win) {
+            XCTAssertTrue(target === ancestor)
+        } else { XCTFail("the addressed tap on padding must reach the ancestor") }
+        XCTAssertEqual(agent.lift(reach, at: point, held: "")["pressed"] as? Int, 2)
+        XCTAssertEqual(presses(), [2])
+        let touch = PaddingTouch(node, at: padding)
+        node.touchesBegan([touch], with: nil)
+        XCTAssertTrue(ancestor.pressed)
+        node.touchesEnded([touch], with: nil)
+        XCTAssertFalse(ancestor.pressed)
+        XCTAssertEqual(presses(), [2], "the real touch and the agent press the same ancestor")
+
+        let centre = node.convert(CGPoint(x: node.bounds.midX, y: node.bounds.midY), to: nil)
+        let control = try XCTUnwrap(p.controls.controls[21])
+        XCTAssertTrue(win.hitTest(centre, with: nil) === control)
+        XCTAssertNil(node.activationTarget(at: centre))
+        XCTAssertNil(node.activate(at: centre))
+        let centreReach = agent.fingerReach(control, at: centre)
+        XCTAssertNil(centreReach.action)
+        if case .control(let owner)? = agent.pressReach(node, at: centre, in: win) {
+            XCTAssertTrue(owner === node)
+        } else { XCTFail("the centre belongs to the native checkbox") }
+        XCTAssertTrue(agent.lift(centreReach, at: centre, held: "")["pressed"] is NSNull)
+        XCTAssertEqual(presses(), [])
+
+        let paddingReply = agent.tap(["id": 21, "at": [10.0, 20.0]])
+        XCTAssertNil(paddingReply["error"], "\(paddingReply)")
+        XCTAssertEqual(paddingReply["pressed"] as? Int, 2)
+        XCTAssertEqual(presses(), [2])
+        XCTAssertNil(paddingReply["native"], "a tap on padding is no host activation of the checkbox")
+        let viewportPoint = p.client(point)
+        let viewportReply = agent.tap(["id": 21, "x": Double(viewportPoint.x), "y": Double(viewportPoint.y)])
+        XCTAssertNil(viewportReply["error"], "\(viewportReply)")
+        XCTAssertEqual(viewportReply["pressed"] as? Int, 2)
+        XCTAssertEqual(presses(), [2])
+        XCTAssertNil(viewportReply["native"], "viewport coordinates on padding must use the same point as native hit testing")
+        for request: [String: Any] in [["id": 21, "at": [120.0, 20.0]], ["id": 21]] {
+            let reply = agent.tap(request)
+            XCTAssertNil(reply["error"], "\(reply)")
+            XCTAssertEqual(reply["native"] as? String, "control", "an explicit centre and a tap without a point are the checkbox's own")
+            XCTAssertEqual(presses(), [])
+        }
+    }
+
+    private final class PaddingTouch: UITouch {
+        let target: UIView, point: CGPoint
+        init(_ target: UIView, at point: CGPoint) { self.target = target; self.point = point; super.init() }
+        override var view: UIView? { target }
+        override func location(in view: UIView?) -> CGPoint { target.convert(point, to: view) }
+    }
+
+    private func heldPressPage() -> (Presenter, Agent) {
+        let session = ExactApp.shared.makeSession(label: "held-in-page-press")
+        self.session = session
+        let p = session.presenter
+        // This wire tree has no runner plan; layout and focus callbacks must not apply one.
+        p.session = nil
+        p.onIntrinsic = nil; p.onCovers = nil; p.onClipboard = nil; p.onClose = nil
+        p.onPress = nil; p.onFocus = nil; p.onBlur = nil; p.onFocusEvent = nil; p.onKey = nil
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let window = scene.map { UIWindow(windowScene: $0) } ?? UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
+        window.frame = CGRect(x: 0, y: 0, width: 400, height: 800)
+        window.rootViewController = UIViewController()
+        window.makeKeyAndVisible()
+        self.window = window
+        p.viewport.frame = window.bounds
+        window.rootViewController?.view.addSubview(p.viewport)
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "view"],
+            ["op": "create", "id": 2, "kind": "view", "handlers": ["press", "focus"]],
+            ["op": "create", "id": 3, "kind": "view"],
+            // Text, not empty views: a childless view with no handlers is a flat leaf, no NodeView.
+            ["op": "create", "id": 4, "kind": "text", "props": ["text": "Inner"]],
+            ["op": "create", "id": 5, "kind": "view", "handlers": ["focus"]],
+            ["op": "create", "id": 6, "kind": "view"],
+            ["op": "create", "id": 7, "kind": "text", "props": ["text": "Elsewhere"]],
+            ["op": "children", "id": 6, "ids": [7]],
+            ["op": "children", "id": 1, "ids": [2, 5, 6]],
+            ["op": "children", "id": 2, "ids": [3]],
+            ["op": "children", "id": 3, "ids": [4]],
+            ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0, "y": 0, "w": 400, "h": 800],
+            ["op": "frame", "id": 2, "x": 20, "y": 60, "w": 240, "h": 120],
+            ["op": "frame", "id": 3, "x": 20, "y": 20, "w": 180, "h": 80],
+            ["op": "frame", "id": 4, "x": 20, "y": 20, "w": 120, "h": 40],
+            ["op": "frame", "id": 5, "x": 20, "y": 300, "w": 100, "h": 40],
+            ["op": "frame", "id": 6, "x": 20, "y": 500, "w": 300, "h": 200],
+            ["op": "frame", "id": 7, "x": 10, "y": 10, "w": 100, "h": 30],
+        ]))
+        p.viewport.layoutIfNeeded()
+        return (p, Agent(session: session))
+    }
+
+    /// A real touch's contact begins after `pointerdown`: a target its own
+    /// handler disables and restores there still presses, held or tapped.
+    func testAPointerdownThatDisablesAndRestoresTheTargetStillPresses() throws {
+        let (p, agent) = heldPressPage()
+        let target = try XCTUnwrap(p.views[2])
+        target.handlers = ["press", "focus", "pointerdown"]
+        let local = CGPoint(x: 10, y: 10), at = p.client(target.convert(local, to: nil))
+        var presses: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        p.onPointer = { id, phase, _ in
+            guard id == target.id, phase == .down else { return }
+            p.apply(wireBatch([["op": "props", "id": target.id, "set": ["disabled": "true"]]]))
+            p.apply(wireBatch([["op": "props", "id": target.id, "clear": ["disabled"]]]))
+        }
+        let tap = agent.tap(["id": Int(target.id), "x": Double(at.x), "y": Double(at.y)])
+        XCTAssertEqual(tap["pressed"] as? Int, Int(target.id), "\(tap)")
+        let down = agent.tap(["id": Int(target.id), "phase": "down", "x": Double(at.x), "y": Double(at.y)])
+        XCTAssertNil(down["error"], "\(down)")
+        let up = agent.tap(["phase": "up"])
+        XCTAssertEqual(up["pressed"] as? Int, Int(target.id), "\(up)")
+        XCTAssertEqual(presses, [target.id, target.id])
+    }
+
+    /// A target its `pointerdown` leaves disabled is cancelled for good, as a
+    /// contact that begins on a disabled node is: restored before the up, it
+    /// still does not press.
+    func testAPointerdownThatLeavesTheTargetDisabledCancelsThePress() throws {
+        let (p, agent) = heldPressPage()
+        let target = try XCTUnwrap(p.views[2])
+        target.handlers = ["press", "focus", "pointerdown"]
+        let at = p.client(target.convert(CGPoint(x: 10, y: 10), to: nil))
+        var presses: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        p.onPointer = { id, phase, _ in
+            guard id == target.id, phase == .down else { return }
+            p.apply(wireBatch([["op": "props", "id": target.id, "set": ["disabled": "true"]]]))
+        }
+        let down = agent.tap(["id": Int(target.id), "phase": "down", "x": Double(at.x), "y": Double(at.y)])
+        XCTAssertNil(down["error"], "\(down)")
+        p.apply(wireBatch([["op": "props", "id": target.id, "clear": ["disabled"]]]))
+        let up = agent.tap(["phase": "up"])
+        XCTAssertTrue(up["pressed"] is NSNull, "\(up)")
+        XCTAssertEqual(presses, [])
+    }
+
+    private func heldPressRestored(_ property: String?, onAncestor: Bool = false,
+                                  file: StaticString = #filePath, line: UInt = #line) throws {
+        let (p, agent) = heldPressPage()
+        let target = try XCTUnwrap(p.views[2]), keeper = try XCTUnwrap(p.views[5])
+        let source = try XCTUnwrap(p.views[onAncestor ? 4 : 2])
+        let changed = try XCTUnwrap(p.views[onAncestor ? 3 : 2])
+        let local = CGPoint(x: 10, y: 10), point = source.convert(local, to: nil), at = p.client(point)
+        let expected: [UInt32] = property == nil ? [target.id] : []
+        var presses: [UInt32] = [], focuses: [UInt32] = [], touchPresses: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        p.onFocus = { focuses.append($0) }
+        for synthetic in [false, true] {
+            let label = synthetic ? "agent" : "touch"
+            XCTAssertTrue(keeper.becomeFirstResponder(), label, file: file, line: line)
+            presses = []; focuses = []
+            XCTAssertTrue(window?.hitTest(point, with: nil) === source, label, file: file, line: line)
+            let touch = PaddingTouch(source, at: local)
+            if synthetic {
+                let down = agent.tap(["id": Int(source.id), "phase": "down", "x": Double(at.x), "y": Double(at.y)])
+                XCTAssertNil(down["error"], "\(down)", file: file, line: line)
+                XCTAssertEqual(down["phase"] as? String, "down", file: file, line: line)
+                XCTAssertEqual(down["delivery"] as? String, "recognized", file: file, line: line)
+                XCTAssertTrue(agent.panContact?.reach?.action?.node === target, file: file, line: line)
+            } else {
+                source.touchesBegan([touch], with: nil)
+            }
+            XCTAssertTrue(target.pressed, label, file: file, line: line)
+            XCTAssertEqual(presses, [], "down presses nothing: \(label)", file: file, line: line)
+            XCTAssertEqual(focuses, [], "down moves no focus: \(label)", file: file, line: line)
+            if let property {
+                p.apply(wireBatch([["op": "props", "id": changed.id, "set": [property: "true"]]]))
+                XCTAssertFalse(target.pressed, "cancelled feedback clears before up: \(label)", file: file, line: line)
+                p.apply(wireBatch([["op": "props", "id": changed.id, "clear": [property]]]))
+                XCTAssertNil(changed.props[property], file: file, line: line)
+            }
+            if synthetic {
+                let up = agent.tap(["phase": "up"])
+                XCTAssertNil(up["error"], "\(up)", file: file, line: line)
+                XCTAssertEqual(up["phase"] as? String, "up", file: file, line: line)
+                XCTAssertEqual(up["delivery"] as? String, "recognized", file: file, line: line)
+                if property == nil {
+                    XCTAssertEqual(up["pressed"] as? Int, Int(target.id), "\(up)", file: file, line: line)
+                } else {
+                    XCTAssertTrue(up["pressed"] is NSNull, "\(up)", file: file, line: line)
+                }
+                XCTAssertNil(agent.panContact, file: file, line: line)
+            } else {
+                source.touchesEnded([touch], with: nil)
+                touchPresses = presses
+            }
+            XCTAssertEqual(presses, expected, label, file: file, line: line)
+            XCTAssertEqual(focuses, expected, label, file: file, line: line)
+            XCTAssertTrue((property == nil ? target : keeper).isFirstResponder, label, file: file, line: line)
+            XCTAssertFalse(target.pressed, label, file: file, line: line)
+            if synthetic { XCTAssertEqual(presses, touchPresses, "agent and touch agree", file: file, line: line) }
+        }
+    }
+
+    func testAHeldInPagePressStaysCancelledAfterTheTargetIsDisabledAndRestored() throws {
+        try heldPressRestored("disabled")
+    }
+
+    func testAHeldInPagePressStaysCancelledAfterAnAncestorIsDisabledAndRestored() throws {
+        try heldPressRestored("disabled", onAncestor: true)
+    }
+
+    func testAHeldInPagePressStaysCancelledAfterTheTargetIsInertAndRestored() throws {
+        try heldPressRestored("inert")
+    }
+
+    func testAHeldInPagePressStaysCancelledAfterAnAncestorIsInertAndRestored() throws {
+        try heldPressRestored("inert", onAncestor: true)
+    }
+
+    func testAHeldInPagePressWithoutChangesPressesOnce() throws {
+        try heldPressRestored(nil)
+    }
+
+    func testFocusDisablingAndRestoringThePressTargetCancelsItsActivation() throws {
+        let (p, agent) = heldPressPage()
+        let target = try XCTUnwrap(p.views[2]), keeper = try XCTUnwrap(p.views[5])
+        var presses: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        p.onFocus = { id in
+            if id == target.id {
+                p.apply(wireBatch([["op": "props", "id": id, "set": ["disabled": "true"]]]))
+                p.apply(wireBatch([["op": "props", "id": id, "clear": ["disabled"]]]))
+            }
+        }
+        for synthetic in [false, true] {
+            XCTAssertTrue(keeper.becomeFirstResponder())
+            let point = CGPoint(x: 10, y: 10), at = p.client(target.convert(point, to: nil))
+            if synthetic {
+                XCTAssertNil(agent.tap(["id": 2, "phase": "down", "x": Double(at.x), "y": Double(at.y)])["error"])
+                XCTAssertTrue(agent.tap(["phase": "up"])["pressed"] is NSNull)
+            } else {
+                let touch = PaddingTouch(target, at: point)
+                target.touchesBegan([touch], with: nil); target.touchesEnded([touch], with: nil)
+            }
+            XCTAssertEqual(presses, [], synthetic ? "agent" : "touch")
+        }
+    }
+
+    func testAFocusOnlyContactStaysCancelledAfterDisableAndRestore() throws {
+        let (p, agent) = heldPressPage()
+        let target = try XCTUnwrap(p.views[2]), keeper = try XCTUnwrap(p.views[5])
+        target.handlers = ["focus"]
+        for synthetic in [false, true] {
+            XCTAssertTrue(keeper.becomeFirstResponder())
+            let touch = PaddingTouch(target, at: CGPoint(x: 10, y: 10))
+            let at = p.client(touch.location(in: nil))
+            if synthetic { XCTAssertNil(agent.tap(["id": 2, "phase": "down", "x": Double(at.x), "y": Double(at.y)])["error"]) }
+            else { target.touchesBegan([touch], with: nil) }
+            p.apply(wireBatch([["op": "props", "id": 2, "set": ["disabled": "true"]]]))
+            p.apply(wireBatch([["op": "props", "id": 2, "clear": ["disabled"]]]))
+            if synthetic { XCTAssertNil(agent.tap(["phase": "up"])["error"]) }
+            else { target.touchesEnded([touch], with: nil) }
+            XCTAssertTrue(keeper.isFirstResponder, synthetic ? "agent" : "touch")
+        }
+    }
+
+    func testAHeldInPagePressSurvivesReparentingByItsOwnFocus() throws {
+        let (p, agent) = heldPressPage()
+        let target = try XCTUnwrap(p.views[2]), keeper = try XCTUnwrap(p.views[5])
+        let destination = try XCTUnwrap(p.views[6]), original = try XCTUnwrap(target.superview)
+        var presses: [UInt32] = [], focuses: [UInt32] = []
+        p.onPress = { presses.append($0) }
+        p.onFocus = { id in
+            focuses.append(id)
+            if id == target.id { destination.addSubview(target) }
+        }
+        for source in [target, try XCTUnwrap(p.views[4])] {
+            var touchPresses: [UInt32] = []
+            for synthetic in [false, true] {
+                XCTAssertTrue(keeper.becomeFirstResponder())
+                original.addSubview(target)
+                presses = []; focuses = []
+                let local = CGPoint(x: 10, y: 10), point = source.convert(local, to: nil), at = p.client(point)
+                XCTAssertTrue(window?.hitTest(point, with: nil) === source)
+                let touch = PaddingTouch(source, at: local)
+                if synthetic {
+                    let down = agent.tap(["id": Int(source.id), "phase": "down", "x": Double(at.x), "y": Double(at.y)])
+                    XCTAssertNil(down["error"], "\(down)")
+                    XCTAssertEqual(down["delivery"] as? String, "recognized", "\(down)")
+                    XCTAssertTrue(agent.panContact?.reach?.action?.node === target)
+                } else {
+                    source.touchesBegan([touch], with: nil)
+                }
+                XCTAssertTrue(target.pressed)
+                XCTAssertEqual(presses, [])
+                XCTAssertEqual(focuses, [])
+                XCTAssertTrue(target.superview === original)
+                let epoch = target.pressEpoch
+                if synthetic {
+                    let up = agent.tap(["phase": "up"])
+                    XCTAssertNil(up["error"], "\(up)")
+                    XCTAssertEqual(up["phase"] as? String, "up", "\(up)")
+                    XCTAssertEqual(up["delivery"] as? String, "recognized", "\(up)")
+                    XCTAssertEqual(up["pressed"] as? Int, Int(target.id), "\(up)")
+                    XCTAssertNil(agent.panContact)
+                } else {
+                    source.touchesEnded([touch], with: nil)
+                    touchPresses = presses
+                }
+                XCTAssertEqual(focuses, [target.id])
+                XCTAssertTrue(target.superview === destination, "the press's focus moved its target")
+                XCTAssertNotEqual(target.pressEpoch, epoch, "the move invalidated the captured epoch")
+                XCTAssertFalse(target.pressInside(at: point), "the original hit owns the lift after focus moves the target")
+                XCTAssertEqual(presses, [target.id])
+                XCTAssertFalse(target.pressed)
+                if synthetic { XCTAssertEqual(presses, touchPresses, "agent and touch agree") }
+            }
+        }
+    }
+
+    func testAControlWithItsOwnPressTakesItBeforeConsumingTheTap() throws {
+        let (session, agent, presses) = rows(), p = session.presenter
+        p.apply(wireBatch([
+            ["op": "create", "id": 21, "kind": "input", "props": ["value": "draft"], "handlers": ["press"]],
+            ["op": "create", "id": 22, "kind": "control", "props": ["type": "checkbox"], "handlers": ["press"]],
+            ["op": "children", "id": 1, "ids": [2]], ["op": "children", "id": 2, "ids": [21, 22]],
+            ["op": "frame", "id": 21, "x": 20, "y": 20, "w": 240, "h": 40],
+            ["op": "frame", "id": 22, "x": 20, "y": 80, "w": 240, "h": 40],
+        ]))
+        let win = try XCTUnwrap(window)
+        for id: UInt32 in [21, 22] {
+            let node = try XCTUnwrap(p.views[id])
+            let point = node.convert(CGPoint(x: node.bounds.midX, y: node.bounds.midY), to: nil)
+            XCTAssertTrue(node.activationTarget(at: point) === node, "\(id)")
+            XCTAssertTrue(node.activate(at: point) === node, "\(id)")
+            XCTAssertEqual(presses(), [id])
+            XCTAssertTrue(agent.stillPresses(FingerReach(reached: HeldNode(node), action: HeldNode(node))) === node)
+            if case .node(let target)? = agent.pressReach(node, at: point, in: win) {
+                XCTAssertTrue(target === node)
+            } else { XCTFail("the control's own handler takes the tap: \(id)") }
+            // The agent toggles a checkbox through its own action (host activation), as before.
+            guard id == 21 else { continue }
+            let reply = agent.tap(["id": Int(id)])
+            XCTAssertNil(reply["error"], "\(reply)")
+            XCTAssertEqual(reply["pressed"] as? Int, Int(id))
+            XCTAssertEqual(presses(), [id], "the ancestor never presses")
+        }
     }
 
     /// What a press there would deliver counts, a text editor's focus too;

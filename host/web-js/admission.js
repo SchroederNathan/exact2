@@ -1,5 +1,6 @@
 import { admitsNetwork, admitsSecret, coversPath, createGrantSet, grantError, hasGrant, rawGrantText, scopedGrantSet, unionGrantSets } from '../web/grant-admission.js';
 import { faultMessage, takeFault } from '../web/faults.js';
+import { redirectFor, reachRefusal } from '../web/address-space.js';
 export { admitsNetwork, admitsSecret, coversPath, createGrantSet, grantError, hasGrant, rawGrantText, sameGrantDeclaration, scopedGrantSet, unionGrantSets } from '../web/grant-admission.js';
 
 // Captured while the entry graph loads. App source injection never replaces
@@ -40,7 +41,7 @@ function ceilingOf(init) {
 // (LLP 1109 D3: a response over its size limit is `refused` on every host).
 // A failed read lets both branches go at once: a branch's cancel settles only
 // when the other's does, so awaiting one would wait on a body that never ends.
-async function within(response, limit) {
+export async function within(response, limit) {
   const reader = response.clone().body?.getReader();
   if (!reader) return;
   let size = 0;
@@ -72,11 +73,20 @@ export function ownWithout(init, skip) {
   return copy;
 }
 
-export async function fetchWith(set, input, init = {}, expires = null, redirect = redirectOf(input, init)) {
-  let value, asset, deadline, signal;
+/** Where a request takes the deadline of the `AbortSignal.timeout` it carries (ts-fetch.js sets `arm`): called with
+ * the signal the request reads and its `exactTimeout`, `arm` answers the function that ends that deadline once the
+ * request is done, or nothing when the request has no such deadline. */
+export const signalDeadline = { arm: null };
+
+// `read`: how the body is taken before the fetch answers, within the deadline (`exactBodyTo`'s writes it to a file).
+// `origin`: who asked it (LLP 1133.036 D6); a tool's, a wake's or the device's reach to a less public space is checked.
+// `decided`: `fetchOf` has already armed the signal's deadline before the file work, or found the request has none
+// (ts-fetch.js), so it is not weighed again.
+export async function fetchWith(set, input, init = {}, expires = null, redirect = redirectOf(input, init), read = within, origin = 'app', decided = false) {
+  let value, asset, deadline, signal, own, armed;
   init ??= {};
   deadline = deadlineOf(init);
-  const until = expires ?? (deadline ? { at: performance.now() + deadline.ms, ms: deadline.ms } : null);
+  let until = expires ?? (deadline ? { at: performance.now() + deadline.ms, ms: deadline.ms } : null);
   const ceiling = ceilingOf(init);
   try {
     asset = hostAsset(input, init);
@@ -89,11 +99,19 @@ export async function fetchWith(set, input, init = {}, expires = null, redirect 
   if (!asset && !admitsNetwork(set, value, 'fetch')) throw new FetchError('Refused', refusal('net.fetch'));
   // @ref LLP 1103 D1, D2 — a driver fault: the refused connection's failure, never sent.
   if (!asset && takeFault(value)) throw new FetchError('Network', faultMessage(value));
+  const unreached = asset ? null : reachRefusal(value, origin);
+  if (unreached) throw new FetchError('Refused', `NotAllowedError: ${unreached}`);
+  redirect = redirectFor(origin, redirect);
   try {
-    const rest = ownWithout(init, ['exactTimeout', 'exactIndependentHttp', 'redirect']);
-    // The caller's signal, from `init` or the input `Request` (`null`
-    // clears the Request's, `undefined` keeps it, as `fetch` has them).
-    const own = rest.signal !== undefined ? rest.signal : typeof Request === 'function' && input instanceof Request ? input.signal : undefined;
+    const rest = ownWithout(init, ['exactTimeout', 'exactIndependentHttp', 'redirect', 'signal']);
+    // The caller's signal, read once by name, as `fetch` reads its init's members (an inherited one too), else the
+    // input `Request`'s (`null` clears the Request's, `undefined` keeps it, as `fetch` has them).
+    const given = init.signal;
+    if (given !== undefined) rest.signal = given;
+    own = given !== undefined ? given : typeof Request === 'function' && input instanceof Request ? input.signal : undefined;
+    if (!decided) armed = signalDeadline.arm?.(own, deadline?.ms);
+    // The signal's deadline replaces an `exactTimeout` no earlier, as natively (prelude.js `timers.left`)
+    if (armed) deadline = until = null;
     // The deadline reaches the request only until its body is read: a
     // response that arrived in time stays readable after the deadline.
     let relay;
@@ -118,17 +136,20 @@ export async function fetchWith(set, input, init = {}, expires = null, redirect 
     // (`failure(x)`'s `offline`, LLP 1109 D3); one over its ceiling is
     // Refused, and the response is let go. The response keeps its URL,
     // type and null body, and its own read is served from what the clone took.
-    await within(response, ceiling);
+    await read(response, ceiling);
     if (deadline) deadline.signal.removeEventListener('abort', relay);
     return response;
   }
   catch (error) {
     if (error instanceof FetchError) throw error;
     if (deadline && signal?.aborted && signal.reason === deadline.signal.reason) throw new FetchError('Timeout', `the request timed out after ${deadline.ms} ms`);
-    // The caller's own abort is the native executor's `Aborted`, not a lost connection.
+    // The caller's own abort rejects with its signal's reason, as Fetch and the native prelude do: an
+    // `AbortError` for a bare `abort()`, or the very value the app gave it.
+    if (own?.aborted) throw own.reason;
     if (error?.name === 'AbortError') throw new FetchError('Aborted', error?.message ?? error);
     throw new FetchError('Network', error?.message ?? error);
   }
+  finally { armed?.cancel(); }
 }
 
 export function fetchHostAsset(input, init = {}) {
@@ -175,6 +196,13 @@ export const inOverlay = api => {
   return e;
 };
 const effect = api => { if (overlaying.on) throw inOverlay(api); };
+// The `secret.keep` names whose line carries a presence policy (LLP 1133.010 D4), each with whether the person may
+// leave it plain (`optional`). The web keeps no locked secret (D15): a name that must be locked is never kept here.
+const mustLock = (set, name) => (set?.entries ?? []).some(([, source, grant]) => {
+  const words = source.split(/\s+/);
+  return grant?.[0] === 'secret-keep' && words[1] === String(name) && words.length > 2 && words[3] !== 'optional';
+});
+const unsupported = name => Object.assign(new Error(`NotSupportedError: ${name} is kept locked, and the web keeps no locked secret`), { name: 'NotSupportedError', code: 'NotSupportedError' });
 export function createSecretFacade(store, admitted, keys) {
   const refused = name => {
     const parse = grantError(admitted);
@@ -189,9 +217,14 @@ export function createSecretFacade(store, admitted, keys) {
       effect('store.get()');
       if (String(name).startsWith('exact.kept.')) return null;
       seen.read = true;
-      return admitsSecret(admitted, name) ? store.get(name) ?? null : null;
+      return admitsSecret(admitted, name) && !mustLock(admitted, name) ? store.get(name) ?? null : null;
     },
-    set(name, value) { effect('store.set()'); allowed(name); store.set(name, String(value)); },
+    has(name) { return seen.get(name) !== null; },
+    locked(name) { effect('store.locked()'); seen.read = true; return false; },
+    unlock(name) { try { return Promise.resolve(seen.get(name)); } catch (e) { return Promise.reject(e); } },
+    protect(name) { return overlaying.on ? Promise.reject(inOverlay('store.protect()')) : Promise.reject(unsupported(name)); },
+    unprotect() { return overlaying.on ? Promise.reject(inOverlay('store.unprotect()')) : Promise.resolve(); },
+    set(name, value) { effect('store.set()'); allowed(name); if (mustLock(admitted, name)) throw unsupported(name); store.set(name, String(value)); },
     forget(name) { effect('store.forget()'); allowed(name); store.set(name, null); },
     keepKey(name, pair) { if (overlaying.on) return Promise.reject(inOverlay('store.keepKey()')); allowed(name); const handle = 'exact.key:' + crypto.randomUUID(); store.set(name, handle); return keys().then(service => service.put(handle, pair)); },
     key(name) { if (overlaying.on) return Promise.reject(inOverlay('store.key()')); const handle = seen.get(name); return handle == null ? Promise.resolve(null) : keys().then(service => service.get(handle) ?? null); },

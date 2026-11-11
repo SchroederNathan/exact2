@@ -9,12 +9,12 @@ edition = "2021"
 version = "0.1.0"
 license = "MIT"
 
-# Snapback4 0.4.29 release source: 59fb4ead1ba18569369523bba55b56713cc275e9.
+# Snapback4 0.4.33 release source: 3653cae823145170df3e720f5e321bd1b5b4d79d.
 # Match the published CLI and browser device, without a mutable sibling checkout.
 [workspace.dependencies]
-snapback4-core = { git = "https://github.com/expo/snapback.git", rev = "59fb4ead1ba18569369523bba55b56713cc275e9", version = "=0.4.29", default-features = false }
-snapback4-device = { git = "https://github.com/expo/snapback.git", rev = "59fb4ead1ba18569369523bba55b56713cc275e9", version = "=0.4.29", default-features = false }
-snapback4-lang = { git = "https://github.com/expo/snapback.git", rev = "59fb4ead1ba18569369523bba55b56713cc275e9", version = "=0.4.29" }
+snapback4-core = { git = "https://github.com/expo/snapback.git", rev = "3653cae823145170df3e720f5e321bd1b5b4d79d", version = "=0.4.33", default-features = false }
+snapback4-device = { git = "https://github.com/expo/snapback.git", rev = "3653cae823145170df3e720f5e321bd1b5b4d79d", version = "=0.4.33", default-features = false }
+snapback4-lang = { git = "https://github.com/expo/snapback.git", rev = "3653cae823145170df3e720f5e321bd1b5b4d79d", version = "=0.4.33" }
 
 [patch.crates-io]
 taffy = { path = "../vendor/taffy" }
@@ -48,3 +48,11 @@ codegen-units = 1
 panic = "abort"
 incremental = false
 strip = true
+
+# Build scripts and proc macros load as dylibs, and Xcode 27's strip leaves
+# them unloadable under a deployment target, which every Mac cargo call of
+# exact2's tooling carries (scripts/filesystem.mjs, withHostDeployment).
+# Nothing of theirs ships. Release strips debuginfo by default and `wasm`
+# strips all, inheriting this (the root's release.build-override, here).
+[profile.release.build-override]
+strip = false

@@ -59,6 +59,10 @@ in the UI, and no app JavaScript runs before the first pixel.
 > repository, `exact2`, is a rebuild of an earlier one ("exact1"). Its design documents
 > are imported under `llp/research/` as research, never as authority.
 
+Upgrade note (2026-10-16): Snapback mutation replies with `ok: false` now throw
+`refused(why)` and expose `failure(slot)`; see the
+[before/after and inherited-app commands](snapback4/README.md#updating-an-inherited-app).
+
 ## Contents
 
 - [Three principles](#three-principles)
@@ -297,7 +301,7 @@ bun scripts/exact.mjs new ../hello          # or run `bun link` once, then `exac
 cd ../hello
 bun exact.mjs contract types app.contract -o app.contract.d.ts   # first run builds the compiler
 bun exact.mjs web                           # the dev loop, at http://127.0.0.1:8765/
-bun exact.mjs test web tests/*.test.contract # app.test.contract, or the test files named
+bun exact.mjs test web tests/*.test.contract # the app's *.test.contract, or the files named
 bun exact.mjs mac --run                     # this Mac
 bun exact.mjs ios --run                     # an iOS Simulator
 ```
@@ -484,7 +488,7 @@ This list lives in memory. To keep it across launches, give `app.ts` a grant lik
   executed the same way on four hosts.
 - **No escape hatch; access hatches.** Nothing steps outside the plan. Where an app
   needs a platform widget, it uses a *native module*: a hyphenated tag like
-  `native-map`, backed by Swift or Rust, laid out by the kernel like any other box.
+  `exact-map`, backed by Swift, Kotlin or Rust, laid out by the kernel like any other box.
   Where it needs the platform object Exact itself built (a `UIView`, a navigation
   controller, a DOM element), it marks the node `hatch="word"` and its native code is
   handed that object: an *access hatch*, the panel a machine is built with so its
@@ -530,7 +534,7 @@ and paint their own colours and sizes, so take their structure, not their style:
 | [Caltrain](apps/caltrain) | A Rust data crate, authored tests, routes, an optional GPU module |
 | [Weatherlight](apps/weatherlight) | TypeScript with `fetch` and grants |
 | [Fieldnotes](apps/fieldnotes) | Storage: SQLite, files, backup and restore |
-| [Recorder](apps/recorder) | Localized strings and native modules |
+| [Recorder](apps/recorder) | The microphone through `@exact/media-capture` and `@exact/recording` |
 
 <table>
   <tr>
@@ -600,7 +604,7 @@ and paint their own colours and sizes, so take their structure, not their style:
 | [Fieldnotes](apps/fieldnotes) | A local notebook with pins, search, SQLite storage, and JSON backup and restore | TypeScript + Rust |
 | [Messages](apps/messages) | A port of Expo's chat demo, talking to models through OpenRouter | Needs `bun apps/messages/service.ts` and an OpenRouter key |
 | [Type Tour](apps/typetour) | Phone-OS screens as a type specimen for the Expose fonts | No JavaScript at all |
-| [Recorder](apps/recorder), [Map Demo](apps/map-demo) | Native modules: a microphone waveform, MapKit on Apple and OpenStreetMap on the web | |
+| [Map Demo](apps/map-demo) | Native modules: MapKit on Apple and OpenStreetMap on the web | |
 | [Carousel](apps/carousel) | A horizontal virtualized list of 25,000 cards | |
 | [Motion Gallery](apps/motion-gallery) | Animated GIF and WebP images and CSS keyframes, compared across hosts | |
 | [Update Lab](apps/update-lab) | Live replacement of Contract, TypeScript, and Rust in a running app | Hand-testing lab |
@@ -650,7 +654,10 @@ else here was admitted because a real app needed it.
   renderer, then adopted in place instead of hydrated
   ([LLP 1048](llp/1048-rendering-across-the-curve.rfc.md)).
 - **Delivery.** `scripts/deploy.mjs` publishes the web root and signed update bundles,
-  which installed apps fetch after first pixel. TypeScript and Rust logic can be
+  which installed apps fetch after first pixel. Apple apps check every fifteen
+  minutes while active under every activation policy; `deploy.check.interval`
+  overrides the interval in seconds. Checks stage a candidate; `deploy.activate`
+  controls when it applies. TypeScript and Rust logic can be
   replaced live in development. Every web build gets an install page, and
   `exact release` signs and notarizes a Mac app
   ([LLP 1030](llp/1030-delivery-unified.rfc.md)).
@@ -745,6 +752,6 @@ install page, and the stress harnesses. They're in
 
 The workspace is MIT-licensed (`Cargo.toml`).
 
-Exact’s Snapback4 adapter uses published **0.4.29** with the matching immutable
-Rust source revision `59fb4ead1ba18569369523bba55b56713cc275e9`.
+Exact’s Snapback4 adapter uses published **0.4.33** with the matching immutable
+Rust source revision `3653cae823145170df3e720f5e321bd1b5b4d79d`.
 See [the adapter guide](snapback4/README.md) for wiring and device rebuilds.

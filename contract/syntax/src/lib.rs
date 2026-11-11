@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod anatomy;
 pub mod ast;
 mod clock;
 mod colours;
@@ -25,14 +26,22 @@ pub mod fmt;
 pub mod idioms;
 pub mod inline;
 pub mod lexer;
+pub mod members;
 mod midi;
+pub mod migrate;
+mod module_decl;
 mod notfound;
+pub mod params;
 pub mod parser;
 mod part;
 pub mod scope;
 pub mod sequence;
 mod share;
 mod spans;
+pub mod state;
+mod tap;
+mod test_steps;
+pub mod tool;
 
 pub use ast::*;
 pub use clock::{resolve_clock_timelines, resolve_clock_timelines_in};
@@ -42,8 +51,12 @@ pub use inline::{
 };
 pub use lexer::{Lexer, Token, TokenKind};
 pub use midi::MidiStep;
+pub use module_decl::{ModuleDecl, ModuleKind, PlatformWords};
 pub use notfound::implicit_notfound;
-pub use parser::{is_launch, parse, parse_source, parse_source_all, same_launch, SyntaxError};
+pub use parser::{
+    is_launch, is_reserved, parse, parse_source, parse_source_all, parse_source_partial,
+    same_launch, Partial, SyntaxError,
+};
 pub use sequence::Sequence;
 pub use share::share_calls;
 pub use spans::VisitSpans;
@@ -106,9 +119,31 @@ pub const HOST_COMMANDS: &[&str] = &[
     // screen, as HTML's Element.requestFullscreen(); `fullscreenchange` says
     // when it did and when it left.
     "requestFullscreen",
+    // `requestPictureInPicture("id")`: the `image` with that HTML id floats
+    // in the platform's picture-in-picture window, which shows each picture
+    // its `src` names next; `enterpictureinpicture` and
+    // `leavepictureinpicture` say when it did and when it left (LLP 1042 §9).
+    "requestPictureInPicture",
+    // `exitPictureInPicture()`: the app's floating image leaves the window,
+    // as HTML's document.exitPictureInPicture(); no id, as one image floats
+    // at a time.
+    "exitPictureInPicture",
     // `reload()`: the development host boots the app again, as its dev
     // menu's Reload does; a host without a dev menu refuses it.
+    // `reload(id)`, `reload(id, ignoreCache=true)`: that iframe's page
+    // again (LLP 1020.002 D3), as `close(id)` is a dialog's.
     "reload",
+    // @ref LLP 1020.002 D3 — an iframe's guest moved by the Navigation
+    // API's and WebDriver BiDi's names, by the frame's `id`.
+    "navigate",
+    "traverseHistory",
+    "stopLoading",
+    // @ref LLP 1020.002 D7 — WebDriver BiDi's `browsingContext.captureScreenshot`:
+    // a picture of the frame's guest into an `app:/` file, answered by `capture=`.
+    "captureScreenshot",
+    // @ref LLP 1020.002 D11 — Electron's `<webview>.openDevTools()`: the
+    // platform's inspector for the frame's guest, in a window of its own.
+    "openDevTools",
     "relaunch",
     "removeAllRanges",
     "selectText",
@@ -126,6 +161,15 @@ pub const HOST_COMMANDS: &[&str] = &[
     "setMode",
     // @ref LLP 1069.002 D2 — `HTMLInputElement.showPicker()` on a file input.
     "showPicker",
+    // `startTrace_EXPERIMENTAL()` records the display link's callbacks until
+    // `stopTrace_EXPERIMENTAL()`, which puts the trace on the clipboard as JSON
+    // (`stopTrace_EXPERIMENTAL(maxBytes)`: cut to that size; tvOS, with no
+    // clipboard, only saves the file): Save Trace's frames, from an app's own
+    // control, in a production build too (Apple; web and Linux refuse it in
+    // the journal). Experimental: the names say so while the trace's
+    // fields may still change.
+    "startTrace_EXPERIMENTAL",
+    "stopTrace_EXPERIMENTAL",
     // @ref LLP 1101.001 P5 — `HTMLDialogElement.showModal()` by the dialog's
     // `id`, from an action; `close(id)` closes it (bare `close()` is still
     // the window's).
@@ -134,17 +178,15 @@ pub const HOST_COMMANDS: &[&str] = &[
     "hidePopover",
     "togglePopover",
     "share",
-    // Local notifications by the Notification API's names (rules/DEFERRED.md,
-    // 2026-10-04): `showNotification(title=, body=, tag=, showTrigger=, navigate=)` and
-    // `closeNotification(tag)`.
-    "showNotification",
-    "closeNotification",
     // @ref LLP 1069.010 D3 — export: the host copies an `app:/` file out.
     "saveFile",
     // @ref LLP 1069.010 D2 — the File System Access API's pickers.
     "showOpenFilePicker",
     "showDirectoryPicker",
     "showSaveFilePicker",
+    // @ref LLP 1069.010.000 D7 — `requestPermission(id, path, mode)`: a kept
+    // document's access asked for again under a press; `change` at `id`.
+    "requestPermission",
     // @ref LLP 1070.000 — a virtualized list's row brought into view, by key.
     "scrollIntoView",
     // @ref LLP 1101.004 R3 — `Element.scrollBy(x, y)` by the scroller's
@@ -196,5 +238,18 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::Option(t, _) => write!(f, "option<{t}>"),
             TypeExpr::List(t, _) => write!(f, "{t}[]"),
         }
+    }
+}
+
+/// The event a handler's payload and record are typed by, on a node whose
+/// [`ast::payload_control`] is `control`: a text field's `selectionchange` is
+/// its `beforeinput`'s (an `InputEvent`), and an iframe's `navigate` is
+/// `framenavigate`, a `FrameNavigation` with no location (LLP 1020.002 D2).
+/// Every other event is itself.
+pub fn typed_event<'a>(event: &'a str, control: Option<&str>) -> &'a str {
+    match event {
+        "selectionchange" if ast::edits_text(control) => "beforeinput",
+        "navigate" if control == Some("iframe") => "framenavigate",
+        _ => event,
     }
 }

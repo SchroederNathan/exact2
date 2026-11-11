@@ -85,9 +85,6 @@ pub enum Capability {
     /// A navigation root's tabs (LLP 1075.003 §3.7): a plan that binds
     /// `aria-controls`. The web's document shows each tab's stack.
     Tabs,
-    /// `showNotification` and `closeNotification` (rules/DEFERRED.md,
-    /// 2026-10-04): a plan whose code runs one.
-    Notifications,
     /// A native grouped list: a `list` whose appearance is `auto`, which
     /// Contract marks with `listStyle` (LLP 1084 D2). A native host draws it
     /// with the platform's list; the web draws its authored nodes, so the web
@@ -129,7 +126,7 @@ pub enum Capability {
 
 impl Capability {
     /// Every capability, in bit order.
-    pub const ALL: [Capability; 30] = [
+    pub const ALL: [Capability; 29] = [
         Capability::Markdown,
         Capability::Motion,
         Capability::Collections,
@@ -152,7 +149,6 @@ impl Capability {
         Capability::Segments,
         Capability::Dataset,
         Capability::Tabs,
-        Capability::Notifications,
         Capability::GroupedLists,
         Capability::Io,
         Capability::Transitions,
@@ -187,7 +183,6 @@ impl Capability {
             Capability::Segments => "segments",
             Capability::Dataset => "dataset",
             Capability::Tabs => "tabs",
-            Capability::Notifications => "notifications",
             Capability::GroupedLists => "grouped_lists",
             Capability::Io => "io",
             Capability::Transitions => "transitions",
@@ -272,7 +267,7 @@ pub fn uses(plan: &Plan) -> Uses {
     // A segment length is a value, not a row: any string of the plan's
     // naming one (a literal, a template's piece) can reach a dimension row,
     // so the set is never smaller than what a run can reach.
-    if plan.strings.iter().any(|s| names_segment(s)) {
+    if plan.strings.iter().any(names_segment) {
         uses = uses.with(Capability::Segments);
     }
     if !plan.surfaces.is_empty()
@@ -286,10 +281,10 @@ pub fn uses(plan: &Plan) -> Uses {
     let can_be = |binding: &exact_plan::BindingsRow, used: &dyn Fn(&str) -> bool| {
         constant_str(plan, plan.code(binding.expr)).is_none_or(used)
     };
-    for binding in &plan.bindings {
+    for binding in plan.bindings.iter() {
         match binding.kind {
             BindingKind::Prop => match PropId::from_wire(binding.id) {
-                Some(PropId::Markup) if can_be(binding, &|v| v == "markdown") => {
+                Some(PropId::Markup) if can_be(&binding, &|v| v == "markdown") => {
                     uses = uses.with(Capability::Markdown);
                 }
                 Some(PropId::HeightDragFor | PropId::TransformDragFor | PropId::ReorderFor) => {
@@ -306,11 +301,11 @@ pub fn uses(plan: &Plan) -> Uses {
                 Some(PropId::ListStyle) => uses = uses.with(Capability::GroupedLists),
                 Some(PropId::Dataset) => uses = uses.with(Capability::Dataset),
                 Some(PropId::AccessibilityControls) => uses = uses.with(Capability::Tabs),
-                Some(PropId::Type) if can_be(binding, &|v| v == "file") => {
+                Some(PropId::Type) if can_be(&binding, &|v| v == "file") => {
                     uses = uses.with(Capability::Picker);
                 }
                 Some(PropId::Type)
-                    if can_be(binding, &|v| {
+                    if can_be(&binding, &|v| {
                         matches!(v, "date" | "time" | "datetime-local")
                     }) =>
                 {
@@ -371,7 +366,7 @@ pub fn uses(plan: &Plan) -> Uses {
                     uses = uses.with(Capability::Grid);
                 }
                 if StyleId::from_bit(u32::from(binding.id)) == Some(StyleId::Transition)
-                    && can_be(binding, &|v| v.contains("spring"))
+                    && can_be(&binding, &|v| v.contains("spring"))
                 {
                     uses = uses.with(Capability::Motion);
                 }
@@ -379,7 +374,7 @@ pub fn uses(plan: &Plan) -> Uses {
                 if matches!(
                     StyleId::from_bit(u32::from(binding.id)),
                     Some(StyleId::Transition | StyleId::LayoutTransition)
-                ) && can_be(binding, &|v| !matches!(v.trim(), "" | "none"))
+                ) && can_be(&binding, &|v| !matches!(v.trim(), "" | "none"))
                 {
                     uses = uses.with(Capability::Transitions);
                 }
@@ -397,8 +392,11 @@ pub fn uses(plan: &Plan) -> Uses {
             | EventKind::Reorderdrop => {
                 uses = uses.with(Capability::Motion).with(Capability::Drag);
             }
-            // Dropped files become `doc:` handles (studio diary R19).
-            EventKind::Drop => uses = uses.with(Capability::Documents),
+            // Dropped and pasted files become `doc:` handles (studio diary
+            // R19); the web's file drag is heard beside its drop (files.js).
+            EventKind::Drop | EventKind::Dragenter | EventKind::Dragleave | EventKind::Paste => {
+                uses = uses.with(Capability::Documents)
+            }
             _ => {}
         }
     }
@@ -413,15 +411,12 @@ pub fn uses(plan: &Plan) -> Uses {
     if format {
         uses = uses.with(Capability::Format);
     }
-    // `toLowerCase` maps through the same case tables (LLP 1088 D2).
+    // `toLowerCase` and `toUpperCase` map through the same case tables (LLP 1088 D2).
     if lowercase {
         uses = uses.with(Capability::TextTransform);
     }
     if runs_command(plan, &["share"]) {
         uses = uses.with(Capability::Share);
-    }
-    if runs_command(plan, &["showNotification", "closeNotification"]) {
-        uses = uses.with(Capability::Notifications);
     }
     if runs_command(
         plan,
@@ -430,6 +425,7 @@ pub fn uses(plan: &Plan) -> Uses {
             "showOpenFilePicker",
             "showDirectoryPicker",
             "showSaveFilePicker",
+            "requestPermission",
         ],
     ) {
         uses = uses.with(Capability::Documents);
@@ -511,7 +507,7 @@ pub fn svg_filters(plan: &Plan) -> bool {
 }
 
 /// Whether any code range calls a `format` entry, whether any reads
-/// geometry (`frame`, `measure`, `elementFromPoint`), and whether any calls `toLowerCase`: each
+/// geometry (`frame`, `measure`, `elementFromPoint`), and whether any calls `toLowerCase` or `toUpperCase`: each
 /// validated body walked whole, so no call a run can reach is missed.
 fn stdlib_calls(plan: &Plan) -> (bool, bool, bool) {
     let (mut format, mut geometry, mut lowercase) = (false, false, false);
@@ -523,16 +519,18 @@ fn stdlib_calls(plan: &Plan) -> (bool, bool, bool) {
                         Stdlib::FormatDate
                         | Stdlib::FormatNumber
                         | Stdlib::ToFixed
-                        | Stdlib::FormatDecimal,
+                        | Stdlib::FormatDecimal
+                        | Stdlib::FormatDay,
                     ) => format = true,
                     Some(
                         Stdlib::Frame
+                        | Stdlib::RangeFrame
                         | Stdlib::Measure
                         | Stdlib::ElementFromPoint
                         | Stdlib::ElementsFromPoint
                         | Stdlib::QuerySelectorAll,
                     ) => geometry = true,
-                    Some(Stdlib::ToLowerCase) => lowercase = true,
+                    Some(Stdlib::ToLowerCase | Stdlib::ToUpperCase) => lowercase = true,
                     _ => {}
                 }
             }
@@ -566,10 +564,16 @@ pub fn uses_midi(plan: &Plan) -> bool {
                 .iter()
                 .any(|h| plan.handler(h).event == exact_plan::EventKind::Midimessage)
         })
-        || plan
-            .sequences
-            .iter()
-            .any(|q| constant_str(plan, plan.code(q.clock_out)) != Some(""))
+        || plan.sequences.iter().any(|q| {
+            constant_str(plan, plan.code(q.clock_out)) != Some("")
+                || constant_str(plan, plan.code(q.clock)) != Some("")
+        })
+}
+
+/// Whether the plan floats an image in picture in picture (LLP 1042 §9),
+/// which the video arm carries on Apple.
+pub fn uses_picture_in_picture(plan: &Plan) -> bool {
+    runs_command(plan, &["requestPictureInPicture"])
 }
 
 /// Whether the runner keeps a MIDI queue the agent shows (`state.midi`):

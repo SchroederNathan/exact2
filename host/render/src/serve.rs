@@ -72,6 +72,22 @@ pub struct Server {
 #[derive(Clone)]
 pub struct Stopper(Arc<AtomicBool>, SocketAddr);
 
+/// Moves every armed render deadline to now, for the deadline thread to fire
+/// as it fires one that passes (LLP 1048.000 D10): the source call each
+/// render is running, or its next, is stopped, and the render ends as one
+/// stopped at its deadline does. For a test that ends a render once it has
+/// seen what it waits for, not on the wall clock (docs/testing.md); it
+/// reaches every render in the process.
+#[doc(hidden)]
+pub fn expire_renders() {
+    let deadlines = crate::Deadlines::get();
+    let now = std::time::Instant::now();
+    for armed in &mut deadlines.armed.lock().unwrap().1 {
+        armed.until = armed.until.min(now);
+    }
+    deadlines.changed.notify_one();
+}
+
 impl Stopper {
     /// Start draining: the flag, then a connection that wakes the blocking
     /// accept to read it.
@@ -182,8 +198,14 @@ impl Server {
         });
         let hints = crate::stream::preload_paths(&shell);
         let js = page::is_js(&shell);
+        // The build's analyzed sheet (LLP 1048.007 D4).
+        let rules = std::fs::read_to_string(serve.dist.join(".gen/page-style.json")).ok();
         let early = lang.filter(|_| js).and_then(|(lang, dir)| {
             let at = page::Js::of(&shell).ok()?;
+            let at = match &rules {
+                Some(rules) => at.with_rules(rules),
+                None => at,
+            };
             let heads =
                 [true, false].map(|preload| page::head_js(&shell, &at, &lang, dir, preload, false));
             Some((at, heads))
@@ -1159,8 +1181,7 @@ fn document<D: DataSource + 'static>(
     // @ref LLP 1071 D6 — the early flush (crate::stream): a browser's
     // navigation gets the page's head now; its rest follows the render.
     let js = shared.js && !notfound && request.method == "GET";
-    let preload = route_at(&shared.plan, location)
-        .is_none_or(|route| route.activate != exact_plan::ActivatePolicy::Interaction);
+    let preload = crate::page::preloads_early(&shared.plan, location);
     let mut early = early.filter(|_| js);
     if let Some(out) = early.as_deref_mut().filter(|_| request.cdn && preload) {
         crate::stream::hint(out, &shared.hints);
@@ -1235,7 +1256,10 @@ fn document<D: DataSource + 'static>(
                         !preload && crate::page::activate_js(rendered.activate) != "interaction";
                     head.clone() + &crate::page::body_js(&shared.shell, at, &rendered, late, false)
                 }
-                None => page(&shared.shell, &rendered)?,
+                None => match &shared.early {
+                    Some((at, _)) => crate::page::page_with(&shared.shell, at, &rendered),
+                    None => page(&shared.shell, &rendered)?,
+                },
             };
             if html.len() > MAX_PAGE {
                 return Err(format!("the page is {} bytes", html.len()));
@@ -1248,8 +1272,9 @@ fn document<D: DataSource + 'static>(
     let (rendered, html) = match rendered {
         Ok(done) => done,
         Err(error) => {
-            println!("render {location} 500 {ms:.1}ms error={error:?}");
-            let _ = std::io::stdout().flush();
+            crate::log(format_args!(
+                "render {location} 500 {ms:.1}ms error={error:?}"
+            ));
             if let Some((mut flush, _, _)) = flush {
                 flush.send(UNAVAILABLE_AFTER_HEAD.as_bytes());
                 flush.end();
@@ -1271,7 +1296,7 @@ fn document<D: DataSource + 'static>(
         }
     };
     let status = rendered.status(notfound);
-    println!(
+    crate::log(format_args!(
         "render {location} {status} {ms:.1}ms answers={} pending={} bytes={}{}",
         rendered.state.answers.len(),
         rendered.state.pending.len(),
@@ -1281,8 +1306,7 @@ fn document<D: DataSource + 'static>(
             (true, false) => " flushed",
             _ => "",
         }
-    );
-    let _ = std::io::stdout().flush();
+    ));
     let streamed = flush.is_some();
     if let Some((mut flush, head, _)) = flush.take() {
         if !streamed_body {
@@ -1376,7 +1400,7 @@ fn sitemap<D: DataSource + 'static>(shared: &Shared, data: fn() -> D) -> Respons
         match listed {
             Ok(found) => locations.extend(found),
             Err(error) => {
-                println!("sitemap 503 error={error:?}");
+                crate::log(format_args!("sitemap 503 error={error:?}"));
                 return Response::text(503, "the sitemap's pages didn't answer\n")
                     .header("Cache-Control", "no-store")
                     .header("Retry-After", "1");
@@ -1443,51 +1467,9 @@ fn hex(bytes: &[u8]) -> String {
         })
 }
 
-/// The pages' Content-Security-Policy (D11): scripts only from the app's
-/// origin (the only inline scripts are inert data), the wasm, and fetches
-/// and sockets to the origins the app's grants name.
-fn csp(grants: &str, dist: &Path) -> String {
-    let mut connect = String::from("'self'");
-    for line in grants.lines() {
-        let mut words = line.split_whitespace();
-        if !matches!(words.next(), Some("net.fetch" | "net.websocket")) {
-            continue;
-        }
-        if let Some(target) = words.next() {
-            // An origin is scheme://host[:port]: the target up to its path.
-            let origin = target.split_once("://").map(|(scheme, rest)| {
-                format!("{scheme}://{}", rest.split('/').next().unwrap_or(""))
-            });
-            if let Some(origin) = origin {
-                connect.push(' ');
-                connect.push_str(&origin);
-            }
-        }
-    }
-    // The admitted TypeScript module and its host prelude run in a private
-    // same-origin realm. Admit their exact baked bytes, never arbitrary inline JS.
-    // A document's one inline script, the host's capture script, likewise.
-    use sha2::{Digest, Sha256};
-    let hash = |bytes: &[u8]| exact_data::envelope::base64(&Sha256::digest(bytes));
-    // The JavaScript runtime's capture script too (LLP 1071): its pages carry
-    // that one; and the script a boot document's page removes it with (LLP
-    // 1048.005).
-    let mut scripts = format!(
-        "'self' 'wasm-unsafe-eval' 'sha256-{}' 'sha256-{}' 'sha256-{}' 'sha256-{}'",
-        hash(crate::page::capture().as_bytes()),
-        hash(crate::page::capture_js().as_bytes()),
-        hash(crate::page::scroll_document_js().as_bytes()),
-        hash(crate::direct::boot_swap_js().as_bytes())
-    );
-    for file in ["module-prelude.js", "app.js"] {
-        if let Ok(bytes) = std::fs::read(dist.join(file)) {
-            let _ = write!(scripts, " 'sha256-{}'", hash(&bytes));
-        }
-    }
-    format!(
-        "default-src 'self'; script-src {scripts}; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob: https:; font-src 'self' data:; connect-src {connect}; worker-src 'self' blob:; frame-src 'self' https:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"
-    )
-}
+#[path = "csp.rs"]
+mod csp;
+use csp::csp;
 
 #[cfg(test)]
 #[path = "serve_tests.rs"]

@@ -353,7 +353,10 @@ fn forms_outside_the_grammar_are_refused_by_name() {
         // Zero too: inside a math function it is a number, not a length.
         ("max(0, 10px)", "zero too"),
         ("max(env(safe-area-inset-top) - 20px, 0)", "zero too"),
-        ("max(1rem, env(safe-area-inset-bottom))", "rem and em"),
+        (
+            "max(1em, env(safe-area-inset-bottom))",
+            "em is not supported",
+        ),
         ("max(env(safe-area-inset-middle), 1px)", "env() names"),
         ("max(var(--inset), 1px)", "the functions are"),
         ("max(attr(x), 1px)", "the functions are"),
@@ -1261,7 +1264,7 @@ fn a_substitution_is_tokens_the_row_reads_as_its_own() {
         Dimension::Points(50.0)
     );
     let mut style = StyleProps::default();
-    style.column_width = Dimension::Percent(50.0);
+    style.rare.column_width = Dimension::Percent(50.0);
     style.mask.set(ColumnWidth);
     let bytes = exact_kernel::wire::frame::encode(
         1,
