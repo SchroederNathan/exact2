@@ -1,5 +1,5 @@
-//! Input: evdev, read directly — pointer motion, buttons, wheels, keys —
-//! with a US keymap for typing. No libinput (nothing to link), so no
+//! Input: evdev, read directly — pointer motion, buttons, wheels, keys,
+//! gamepads — with a US keymap for typing. No libinput (nothing to link), so no
 //! pointer acceleration, touchpad gestures, or hotplug: the trades LLP 1015
 //! §7 declares.
 //!
@@ -12,6 +12,10 @@ use evdev::{
 };
 use std::os::fd::AsRawFd;
 
+mod pad;
+pub use crate::gamepad::Reading as PadReading;
+pub use pad::MAX_PADS;
+
 /// One thing the user did.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
@@ -22,16 +26,28 @@ pub enum InputEvent {
     Absolute(Option<f32>, Option<f32>),
     /// The primary button went down (`true`) or up.
     Button(bool),
-    /// The secondary (2) or middle (4) button, by its `PointerEvent.buttons`
-    /// bit, went down (`true`) or up: a canvas's alone.
+    /// The secondary (2), middle (4), back (8) or forward (16) button, by
+    /// its `PointerEvent.buttons` bit, went down (`true`) or up. Back and
+    /// Forward are the last two's default action on their release (LLP
+    /// 1115.000 D5.5).
     Aux(u32, bool),
-    /// A mouse's back button went down (LLP 1115.000 D5.4): the app goes Back.
-    Back,
     /// Carrier/device loss cancels without manufacturing a successful release.
     Cancel,
     /// A wheel: (dx, dy) in points, the web's sign (a positive `dy` scrolls
     /// down).
     Wheel(f32, f32),
+    /// A gamepad's whole state in the W3C Gamepad API's standard mapping,
+    /// when it changed; `connected: false` when the pad went away.
+    Pad {
+        /// The pad's index, in the order the pads were opened.
+        index: u8,
+        /// False once the pad is gone.
+        connected: bool,
+        /// Its buttons and axes.
+        reading: PadReading,
+        /// When the device reported it, in the host's clock (milliseconds).
+        at: f64,
+    },
     /// A keyboard edge. Translate US codes at dispatch, keeping the queue compact.
     Key {
         /// Physical evdev key code, also used by VNC's US mapping.
@@ -92,10 +108,19 @@ pub const LINE: f32 = 40.0;
 /// An absolute device's (min, max) per axis, x then y.
 type Ranges = [(i32, i32); 2];
 
-/// Every device that points or types.
+/// A pad's identity and motors, as the registry takes them.
+type Registering = (crate::pads::Identity, Option<Box<dyn crate::pads::Output>>);
+
+/// Every device that points, types or plays.
 pub struct Input {
     devices: Vec<(Device, Option<Ranges>)>,
+    // A pad, its index, its state, and whether its connection was reported.
+    pads: Vec<(Device, crate::gamepad::Opened)>,
+    /// Each pad's identity and motors, for the registry (`crate::pads`)
+    /// when it is first read, by index; `None` once it is there.
+    to_register: Vec<Option<Registering>>,
     keyboard: Keyboard,
+    touch_only: bool,
 }
 
 impl Input {
@@ -103,8 +128,28 @@ impl Input {
     /// Devices that cannot be opened (no permission — the `input` group) are
     /// skipped.
     pub fn open() -> Input {
-        let mut devices = Vec::new();
-        for (_, d) in evdev::enumerate() {
+        let (mut devices, mut pads, mut pointing) = (Vec::new(), Vec::new(), Vec::new());
+        let mut to_register = Vec::new();
+        for (path, d) in evdev::enumerate() {
+            // A pad's sticks are ABS_X/ABS_Y too: it is a pad, not a pointer.
+            if pad::is_pad(&d) {
+                if pads.len() < MAX_PADS {
+                    nonblocking(&d);
+                    let state = pad::open(&path, &d);
+                    to_register.push(Some((pad::identity(&path, &d), pad::motors(&path, &d))));
+                    let index = pads.len() as u8;
+                    let announced = false;
+                    pads.push((
+                        d,
+                        crate::gamepad::Opened {
+                            index,
+                            state,
+                            announced,
+                        },
+                    ));
+                }
+                continue;
+            }
             let pointer = d.supported_events().contains(EventType::RELATIVE);
             // An absolute pointer: ABS_X/ABS_Y with their ranges (a KVM's
             // mouse, a tablet, a USB touchscreen). Multitouch slots are
@@ -128,41 +173,103 @@ impl Input {
             if !(pointer || absolute.is_some() || keyboard) {
                 continue;
             }
-            // SAFETY: fcntl on a file descriptor this process owns; the
-            // flags are read and written whole.
-            unsafe {
-                let fd = d.as_raw_fd();
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                if flags >= 0 {
-                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
-            }
+            let keys = d.supported_keys();
+            pointing.push(crate::presenter::Pointing {
+                relative: pointer,
+                absolute: absolute.is_some(),
+                touch: keys.is_some_and(|k| k.contains(evdev::KeyCode::BTN_TOUCH)),
+                left: keys.is_some_and(|k| k.contains(evdev::KeyCode::BTN_LEFT)),
+            });
+            nonblocking(&d);
             devices.push((d, absolute));
         }
         Input {
             devices,
+            pads,
+            to_register,
             keyboard: Keyboard::default(),
+            touch_only: crate::presenter::touch_only(&pointing),
         }
+    }
+
+    /// Whether a touch screen is the only pointing device open
+    /// ([`crate::presenter::touch_only`]).
+    pub fn touch_only(&self) -> bool {
+        self.touch_only
     }
 
     /// How many devices are open.
     pub fn len(&self) -> usize {
-        self.devices.len()
+        self.devices.len() + self.pads.len()
     }
 
     /// Whether none opened.
     pub fn is_empty(&self) -> bool {
-        self.devices.is_empty()
+        self.len() == 0
     }
 
     /// The descriptors to poll.
     pub fn fds(&self) -> Vec<i32> {
-        self.devices.iter().map(|(d, _)| d.as_raw_fd()).collect()
+        let pads = self.pads.iter().map(|(d, ..)| d);
+        let devices = self.devices.iter().map(|(d, _)| d);
+        devices.chain(pads).map(|d| d.as_raw_fd()).collect()
     }
 
-    /// Everything that arrived since the last read.
-    pub fn read(&mut self) -> Vec<InputEvent> {
+    /// Each pad's changes since the last read (`gamepad::read`), at their
+    /// reports' times moved into the host's clock by `now_ms`, its time at
+    /// this read.
+    fn read_pads(&mut self, now_ms: f64, out: &mut Vec<InputEvent>) {
+        use crate::gamepad::{change, Fetch};
+        let epoch_ms = |t: std::time::SystemTime| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map_or(0., |d| d.as_secs_f64() * 1000.)
+        };
+        let now = (epoch_ms(std::time::SystemTime::now()), now_ms);
+        let readings = crate::gamepad::read(&mut self.pads, now, |d| match d.fetch_events() {
+            Ok(events) => Fetch::Changes(
+                events
+                    .filter_map(|e| {
+                        let at = epoch_ms(e.timestamp());
+                        Some((change(e.event_type().0, e.code(), e.value())?, at))
+                    })
+                    .collect(),
+            ),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Fetch::Nothing
+            }
+            Err(_) => Fetch::Gone,
+        });
+        for (index, reading, at) in readings {
+            // The registry a package reads has the same pads by index.
+            match (reading, self.to_register.get_mut(index as usize)) {
+                (Some(r), Some(waiting)) => {
+                    if let Some((identity, motors)) = waiting.take() {
+                        crate::pads::connect(index, identity, motors);
+                    }
+                    crate::pads::read(index, r);
+                }
+                (None, _) => crate::pads::disconnect(index),
+                _ => {}
+            }
+            out.push(InputEvent::Pad {
+                index,
+                connected: reading.is_some(),
+                reading: reading.unwrap_or_default(),
+                at,
+            });
+        }
+    }
+
+    /// Everything that arrived since the last read; `now_ms` is the host's
+    /// clock at this read.
+    pub fn read(&mut self, now_ms: f64) -> Vec<InputEvent> {
         let mut out = Vec::new();
+        self.read_pads(now_ms, &mut out);
         let mut gone = Vec::new();
         for (index, (d, absolute)) in self.devices.iter_mut().enumerate() {
             let events = match d.fetch_events() {
@@ -248,14 +355,11 @@ impl Input {
                             // BTN_RIGHT, BTN_MIDDLE.
                             0x111 => out.push(InputEvent::Aux(2, down)),
                             0x112 => out.push(InputEvent::Aux(4, down)),
-                            // BTN_SIDE, a mouse's back (thumb) button, and
-                            // BTN_BACK, as some mice report it: Back at the
-                            // press. Its release is nothing.
-                            0x113 | 0x116 => {
-                                if value == 1 {
-                                    out.push(InputEvent::Back);
-                                }
-                            }
+                            // BTN_SIDE and BTN_EXTRA, a mouse's back and
+                            // forward (thumb) buttons, and BTN_BACK and
+                            // BTN_FORWARD, as some mice report them.
+                            0x113 | 0x116 => out.push(InputEvent::Aux(8, down)),
+                            0x114 | 0x115 => out.push(InputEvent::Aux(16, down)),
                             _ => {
                                 if let Some(event) = self.keyboard.event(code, value, None) {
                                     out.push(event);
@@ -275,6 +379,18 @@ impl Input {
             self.devices.remove(index);
         }
         coalesce(out)
+    }
+}
+
+fn nonblocking(d: &Device) {
+    // SAFETY: fcntl on a file descriptor this process owns; the flags are
+    // read and written whole.
+    unsafe {
+        let fd = d.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 }
 
@@ -402,6 +518,7 @@ pub(crate) fn key(code: u16, shift: bool) -> Option<(&'static str, &'static str)
         126 => ("MetaRight", "Meta", "Meta"),
         // KEY_BACK, a keyboard's own Back key, by the web's name for it.
         158 => ("BrowserBack", "BrowserBack", "BrowserBack"),
+        159 => ("BrowserForward", "BrowserForward", "BrowserForward"),
         _ => return None,
     };
     Some((code, if shift { shifted } else { plain }))

@@ -10,11 +10,11 @@ import { createHash, randomUUID, verify } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { browserDiagnosticNoise, open as openAgent, render, runTests as runAgentTests } from './agent.mjs';
-import { driveStore } from './agent-launch.mjs';
-import { HOST_DEV, resolveApp, withAppFixture } from './app.mjs';
-import { agree, explainNode, hostSections, httpFrameSmoke, poolingDrive, rebooted } from './smoke-inspect.mjs';
+import { driveStore, pollUntil } from './agent-launch.mjs';
+import { HOST_DEV, authoredTests, resolveApp, withAppFixture } from './app.mjs';
+import { agree, explainNode, hostSections, httpFrameSmoke, formControlsSmoke, poolingDrive, messageKeys, rebooted } from './smoke-inspect.mjs';
 import { DirectoryOrigin, parseWebRoot, webReleasePath, webRootPath } from './origin.mjs';
 import { jsTargetBuild, readStaticFile, serveStatic } from '../host/web/serve.mjs';
 import { canonicalBytes, publicKeyFromRaw, webRelease } from './deploy.mjs';
@@ -51,8 +51,8 @@ const transcript = () => {
 };
 const pinned = resolve(ROOT, 'scripts/fixtures/transcript.txt');
 if (argv.includes('--record')) { writeFileSync(pinned, transcript()); console.log(`recorded ${pinned.replace(ROOT + '/', '')}`); process.exit(0); }
-const host = argv[0] === 'macos' || argv[0] === 'mac' ? 'macos' : argv[0] === 'web' ? 'web' : argv[0] === 'ios' ? 'ios' : argv[0] === 'linux' ? 'linux' : argv[0] === 'host' ? 'host' : argv[0] === 'host-ios' ? 'host-ios' : argv[0] === 'deploy' ? 'deploy' : argv[0] === 'svg' ? 'svg' : argv[0] === 'canvas' ? 'canvas' : argv[0] === 'motion' ? 'motion' : argv[0] === 'duo' ? 'duo' : null;
-if (!host) { console.error('usage: bun scripts/smoke.mjs <web|macos|ios|linux|host|host-ios|deploy|svg|canvas|motion|duo> [--app <name>] [--shot <png>] [--hosts linux,macos,ios] | --record'); process.exit(2); }
+const host = argv[0] === 'macos' || argv[0] === 'mac' ? 'macos' : argv[0] === 'web' ? 'web' : argv[0] === 'ios' ? 'ios' : argv[0] === 'linux' ? 'linux' : argv[0] === 'host' ? 'host' : argv[0] === 'host-ios' ? 'host-ios' : argv[0] === 'deploy' ? 'deploy' : argv[0] === 'svg' ? 'svg' : argv[0] === 'canvas' ? 'canvas' : argv[0] === 'motion' ? 'motion' : argv[0] === 'duo' ? 'duo' : argv[0] === 'shortcuts' ? 'shortcuts' : null;
+if (!host) { console.error('usage: bun scripts/smoke.mjs <web|macos|ios|linux|host|host-ios|deploy|svg|canvas|motion|duo|shortcuts> [--app <name>] [--shot <png>] [--hosts linux,macos,ios] | --record'); process.exit(2); }
 
 // The two Apple presenters share one Canvases: children captured through the
 // surface, placements (LLP 1014 D2, D5) — what the canvas steps below assert.
@@ -67,6 +67,7 @@ const check = (ok, what) => { if (!ok) failures.push(what); return ok; };
 const t0 = Date.now();
 const byTestId = (t, id) => t.nodes.find((n) => n.props.testId === id);
 const box = (l, id) => l.nodes.find((n) => n.testId === id);
+if (host === 'shortcuts') { /* LLP 1132 D11: a world's focused canvas never hears a shown button's shortcut, each host's run of the fixture's proof (continuous, Save and FreshGame on linux and web) */ const simulator = process.platform === 'darwin' && /\((?:iPhone|iPad)|^\s+(?:iPhone|iPad)/m.test(spawnSync('xcrun', ['simctl', 'list', 'devices', 'available'], { encoding: 'utf8' }).stdout ?? ''); if (process.platform === 'darwin' && !argv.includes('--hosts') && !simulator) console.log('shortcuts smoke: ios skipped: no available iOS simulator (xcrun simctl list devices available)'); const hosts = (argv.includes('--hosts') ? argv[argv.indexOf('--hosts') + 1] : process.platform === 'darwin' ? `linux,web,macos${simulator ? ',ios' : ''}` : 'linux,web').split(','); for (const h of hosts) check(spawnSync(process.execPath, [resolve(ROOT, 'game/games/shortcut-fixture/proof.mjs'), h, ...(['linux', 'web'].includes(h) ? ['--paranoid'] : [])], { stdio: 'inherit' }).status === 0, `shortcut fixture on ${h}`); console.log(`shortcuts smoke: ${failures.length ? `${failures.length} failure(s)` : 'ok'} in ${((Date.now() - t0) / 1000).toFixed(1)} s`); for (const f of failures) console.error('  ' + f); process.exit(failures.length ? 1 : 0); }
 if (host === 'duo') { const { duoSmoke } = await import('./smoke-duo.mjs'); const r = await duoSmoke({ open: (o) => openAgent({ device, phone, ...o }), check }); console.log(`duo smoke: ${r === 'unsupported' ? 'unsupported' : failures.length ? `${failures.length} failure(s)` : 'ok'} in ${((Date.now() - t0) / 1000).toFixed(1)} s`); for (const f of failures) console.error('  ' + f); process.exit(failures.length ? 1 : 0); }
 
 // A source-checkout invariant for destructive-looking smokes: names,
@@ -344,7 +345,6 @@ if (host === 'deploy') {
   if (failures.length) { for (const f of failures) console.error('  ' + f); process.exit(1); }
   process.exit(0);
 }
-
 // The sample host (LLP 1031 D10): a native macOS app that is not Exact's,
 // hosting two sessions of the one plan. What the fixture holds, driven
 // through the same carrier with each request routed by session label: two
@@ -353,12 +353,12 @@ if (host === 'deploy') {
 // (unmounted, alive) and pops it (remounted) with both intact; a bad
 // candidate plan is refused and the running apps kept; a session destroyed
 // under the other is refused by name after, and the other still answers.
-// The recorder's sample host (LLP 1067.000 Q6): two sessions, two recorders.
-if ((host === 'host' || host === 'host-ios') && app.modules.tags.includes('waveform-view')) {
+// The recorder's sample host (LLP 1133.009 D6): two sessions over one capture.
+if ((host === 'host' || host === 'host-ios') && app.id === 'com.exact.recorder') {
   const { recorderSessions } = await import('./smoke-recorder.mjs');
   const failures = await recorderSessions({ host, open });
   for (const f of failures) console.log('  ' + f);
-  console.log(`${host} smoke: ${failures.length ? `${failures.length} failure(s)` : 'ok'} in ${((Date.now() - t0) / 1000).toFixed(1)} s — two sessions, each its own recorder, one outliving the other`);
+  console.log(`${host} smoke: ${failures.length ? `${failures.length} failure(s)` : 'ok'} in ${((Date.now() - t0) / 1000).toFixed(1)} s — two sessions, over one capture, one recording on after the other ends`);
   process.exit(failures.length ? 1 : 0);
 }
 if (host === 'host' || host === 'host-ios') {
@@ -452,9 +452,9 @@ component App
         let shown = 0;
         for (let i = 0; i < 40 && !(shown > 0); i++) { await sleep(50); shown = (await s.layout()).env['keyboard-inset-height']; }
         s.session = 'a';
-        // Its ground, a point at its top left: a plain tap names `main`, which has no press, and is refused when its
-        // middle holds a control (LLP 1012 §1) — the departure card a finger there would press.
-        await s.tap('caltrain-main', { at: [2, 2] });
+        // The page's left padding below the host's bar, whose scroll-edge
+        // view covers its top left. The reported inset includes that bar.
+        await s.tap('caltrain-main', { at: [2, laBack.env['safe-area-inset-top'] + 20] });
         s.session = 'b';
         const kept = (await s.layout()).env['keyboard-inset-height'];
         const sb3 = await s.state();
@@ -475,6 +475,7 @@ component App
     hcheck(byTestId(await s.tree(), 'station-search') != null, 'b kept its state after a refused candidate');
     const logs = await s.logs();
     hcheck(logs.host.some((l) => /apply .*refused/.test(l)), `the host reported the refusal: ${logs.host.filter((l) => /apply/.test(l)).join(' | ')}`);
+    if (host === 'host') await (await import('./smoke-leave.mjs')).leaveChecks({ s, say, settle: settleHost, check: hcheck }); // 4a
     // 5. Destroy a under b: a's handle is refused by name; b still answers.
     say('destroy a');
     await settleHost(500);
@@ -485,6 +486,8 @@ component App
     s.session = 'b';
     const tbAfter = await s.tree();
     hcheck(byTestId(tbAfter, 'station-search') != null, 'b still answers, its state intact, after a was destroyed');
+    // The blur assertion is complete; leave the editor before pressing the page's header again.
+    if (host === 'host-ios') { await s.type('station-search', { key: 'Tab' }); await s.clock('settle'); }
     await s.tap('scheme-light');
     await s.clock('settle');
     const logs2 = await s.logs();
@@ -497,7 +500,6 @@ component App
   console.log(`${host} smoke: ok in ${((Date.now() - t0) / 1000).toFixed(1)} s — two sessions of one plan, interleaved, one pushed under a native screen and back, a bad plan refused, one destroyed under the other`);
   process.exit(0);
 }
-
 // Materialize the selected app once, as it ships (the JS target when it takes it, LLP 1071;
 // it stages nothing), into this smoke's private dist before its many sessions. Another
 // build cannot swap a different app under the run; agent.open proves its identity.
@@ -515,7 +517,7 @@ if (host === 'web') {
 }
 
 // A fresh named store admits app storage without sharing another drive's profile or port.
-const appDrive = host === 'web' ? { storage: `smoke-${randomUUID()}`, env: { EXACT_AGENT_EPHEMERAL_PORT: '1' } } : {};
+const appDrive = host === 'web' ? { storage: `smoke-${randomUUID()}`, env: { EXACT_AGENT_EPHEMERAL_PORT: '1' } } : app.name === 'messages' ? { storage: `smoke-${randomUUID()}`, touch: host === 'ios' ? 'platform' : 'agent' } : app.name === 'recorder' ? { storage: `smoke-${randomUUID()}` } : {};
 const s = await open({ host, browser: 'chrome', ...appDrive });
 // A web artifact's staged capabilities (LLP 1047.000 §9): the page boots
 // without them, and the first agent call loads inspection before it asks.
@@ -560,24 +562,21 @@ try {
   }
   await agree(s, `${app.name}: first frame`, { host, check }); // 7a (LLP 1080.001 D5)
   if (byTestId(tree, 'feed-far') && host === 'ios') await poolingDrive(s, { host, check });
-
+  if (apple) await messageKeys(s, { host, check, app: app.name });
   // 2a. The iframe parity oracle and Apple arm (@ref LLP 1020 M1/M2): load
   // and message enter the runner, the guest joins tree/input, and the
   // screenshot carries its pixels. Loading is host I/O, so poll it. The
-  // deck lab is Caltrain's fixture — a driven app without it (EXACT_APP_DIR)
-  // skips these steps instead of dying at the tap; unlike the check()
-  // assertions above, a missing tap target throws.
+  // Caltrain requires the deck entry; apps without the fixture skip it.
+  if (host === 'macos' && caltrainFixture) check(!!byTestId(tree, 'open-deck'), 'Caltrain fixture missing testId open-deck');
   if ((host === 'web' || apple) && byTestId(tree, 'open-deck')) {
     await s.tap('open-deck');
     await s.clock('settle');
-    let frameNode, deckState;
-    for (let i = 0; i < 40; i++) {
-      tree = await s.tree();
-      deckState = await s.state();
-      frameNode = byTestId(tree, 'deck-frame');
-      if (frameNode?.loading === false && deckState.slots.deckLoaded === true && deckState.slots.deckMessage === 'deck-ready') break;
-      await sleep(50);
-    }
+    const loaded = await pollUntil(async () => {
+      const tree = await s.tree(), deckState = await s.state();
+      return { tree, deckState, frameNode: byTestId(tree, 'deck-frame') };
+    }, ({ frameNode, deckState }) => frameNode?.loading === false && deckState.slots.deckLoaded === true && deckState.slots.deckMessage === 'deck-ready');
+    tree = loaded.tree;
+    let { frameNode, deckState } = loaded;
     check(frameNode?.type === 'WebView' && frameNode.url === '/deck/index.html', `the iframe tree node is ${JSON.stringify(frameNode)}`);
     check(frameNode?.loading === false, `the iframe is still loading: ${JSON.stringify(frameNode)}`);
     check(deckState?.slots.deckLoaded === true, `load did not record its flag: ${JSON.stringify(deckState?.slots)}`);
@@ -600,6 +599,7 @@ try {
       let cyan = 0;
       for (let i = 0; i < region.data.length; i += 4) if (region.data[i] < 190 && region.data[i + 1] > 150 && region.data[i + 2] > 190) cyan++;
       check(cyan > 5, `the iframe screenshot has ${cyan} guest-blue pixels in ${region.width}×${region.height}`);
+      if (host === 'macos') console.log(`macos deck: ${cyan} guest-blue pixels in ${region.width}×${region.height}`);
     } catch (error) {
       failures.push(`the iframe parity oracle stopped: ${error.message}`);
     } finally {
@@ -745,7 +745,6 @@ try {
   check(moved === 300, `a wheel of 300 over the content scrolled it by ${moved}`);
   check(innerMoved !== pageMoved, `one scroll container takes a wheel: inner moved ${innerMoved}, page moved ${pageMoved}`);
   await agree(s, 'caltrain: after the wheel', { host, check }); // 7a
-
   }
 
   // 6. The pixels when asked, and the GPU module where the host renders it
@@ -789,7 +788,6 @@ try {
   await s.close();
   if (appDrive.storage) rmSync(driveStore(app, appDrive.storage, appDrive.env).profile, { recursive: true, force: true });
 }
-
 // 8. The nested case (LLP 1010, the scroll fixture): a scroll node that
 // overflows on a page that overflows. A wheel over the node scrolls it; at
 // its edge the wheel chains to the page.
@@ -805,15 +803,15 @@ if (apple && !device) await httpFrameSmoke({ host, open, check });
   writeFileSync(resolve(tmp, 'strings/en.json'), '{"greeting":"Hello"}');
   writeFileSync(resolve(tmp, 'strings/fr.json'), '{"greeting":"Bonjour"}');
   writeFileSync(resolve(tmp, 'strings/ar.json'), '{"greeting":"مرحبا"}');
-  writeFileSync(source, 'shape Time\n  locale: string\n  resolvedLocale: string\n  timeZone: string\n  seed: number\n  epochAtZero: number\n  utcOffset: number\ncomponent App\n  resource time = exactTime() as shape Time\n  state minute = 0\n  action tick\n    minute = time.epochAtZero + performanceNow()\n  task minutes mount\n    every(60000, tick)\n  view\n    column\n      text `${time.locale}|${time.resolvedLocale}|${time.timeZone}|${time.seed}` testId="place"\n      text `${time.epochAtZero}|${time.utcOffset}|${minute}` testId="date"\n      text t("greeting") testId="greeting"\n');
+  writeFileSync(source, 'shape Time\n  locale: string\n  formatLocale: string\n  resolvedLocale: string\n  timeZone: string\n  seed: number\n  epochAtZero: number\n  utcOffset: number\ncomponent App\n  resource time = exactTime() as shape Time\n  state minute = 0\n  action tick\n    minute = time.epochAtZero + performanceNow()\n  task minutes mount\n    every(60000, tick)\n  view\n    column\n      text `${time.locale}|${time.resolvedLocale}|${time.timeZone}|${time.seed}|${time.formatLocale}` testId="place"\n      text `${time.epochAtZero}|${time.utcOffset}|${minute}` testId="date"\n      text t("greeting") testId="greeting"\n');
   const compiled = spawnSync('cargo', ['run', '-q', '--profile', HOST_DEV, '-p', 'contract', '--', 'build', source, '-o', plan], {cwd:ROOT, encoding:'utf8'});
   check(compiled.status === 0, 'launch facts fixture compiles: ' + compiled.stderr);
-  if (compiled.status === 0) for (const options of [{}, {}, {seed:42, locale:'fr-CA', timeZone:'America/Toronto', epoch:'2026-09-21T14:13:20Z'}, {seed:42, locale:'ar-EG', timeZone:'UTC'}, {epoch:'now'}]) {
+  if (compiled.status === 0) for (const options of [{}, {}, {seed:42, locale:'fr-CA', timeZone:'America/Toronto', epoch:'2026-09-21T14:13:20Z'}, {seed:42, locale:'ar-EG', timeZone:'UTC'}, {epoch:'now'}, {locale:'en-US', formatLocale:'en-KR'}]) {
     const launched = Date.now(), f = await open({host, browser: 'chrome', plan, ...options});
     try {
-      const lang = options.locale === 'ar-EG' ? 'ar' : options.locale ? 'fr' : 'en';
+      const lang = options.locale === 'ar-EG' ? 'ar' : options.locale?.startsWith('fr') ? 'fr' : 'en';
       const dir = lang === 'ar' ? 'rtl' : 'ltr';
-      const expected = `${options.locale ?? 'en-US'}|${lang}|${options.timeZone ?? 'UTC'}|${options.seed ?? 1}`;
+      const expected = `${options.locale ?? 'en-US'}|${lang}|${options.timeZone ?? 'UTC'}|${options.seed ?? 1}|${options.formatLocale ?? options.locale ?? 'en-US'}`; // the Region's format: the drive's, else the locale
       const tree = await f.tree();
       check(byTestId(tree, 'place')?.props.text === expected, `launch facts: expected ${expected}, got ${byTestId(tree, 'place')?.props.text}`);
       // LLP 1027.000.000 D3: the drive's epoch and its zone's offset; the agent clock moves the date.
@@ -843,6 +841,7 @@ if (apple && !device) await httpFrameSmoke({ host, open, check });
   rmSync(tmp, {recursive:true, force:true});
   console.log(`${host} launch facts: date, defaults, repeated drive, overrides, translation, lang/dir${host === 'web' ? ', reload' : ''}`);
 }
+if (!device) await formControlsSmoke({ host, open, check });
 
 const tmp = mkdtempSync(resolve(tmpdir(), 'exact-smoke-'));
 const plan = resolve(tmp, 'scroll.plan');
@@ -939,7 +938,7 @@ if (caltrainFixture) {
       if (host === 'web') { let g = await f.gpuMs(); for (let i = 0; i < 60 && g == null; i++) { await sleep(50); g = await f.gpuMs(); } }
       await sleep(150); // one frame of the surface after its first capture
       const shotPath = resolve(tmp, 'canvas.png');
-      await f.screenshot(shotPath, true);
+      await f.screenshot(shotPath, true, host === 'ios' ? 'app' : undefined); // iOS: the app's drawing, as the reference was, not the display
       const image = decodePng(readFileSync(shotPath));
       const scale = image.width / l.viewport.w;
       // iOS's screen also has a bottom safe area; use its reported viewport
@@ -954,8 +953,10 @@ if (caltrainFixture) {
       const plainSize = existsSync(plainRef) ? decodePng(readFileSync(plainRef)) : null;
       const reference = !plainSize || (plainSize.width === region.width && plainSize.height === region.height) ? plainRef
         : resolve(ROOT, `scripts/fixtures/canvas-sky.${host}.${region.width}x${region.height}.png`);
+      const references = readdirSync(resolve(ROOT, 'scripts/fixtures')).filter(name => name.startsWith(`canvas-sky.${host}.`) && name.endsWith('.png')).sort().join(', ') || '(none)';
+      console.log(`${host} canvas references: ${references}; selected ${reference.replace(ROOT + '/', '')}`);
       if (recordCanvas) { writeFileSync(reference, encodePng(region)); console.log(`recorded ${reference.replace(ROOT + '/', '')} (${region.width}×${region.height})`); }
-      else if (!existsSync(reference)) failures.push(`no reference picture ${reference.replace(ROOT + '/', '')}: bun scripts/smoke.mjs ${host} --record-canvas`);
+      else if (!existsSync(reference)) failures.push(`no reference picture ${reference.replace(ROOT + '/', '')}; available: ${references}; record with bun scripts/smoke.mjs ${host} --record-canvas`);
       else {
         const d = diff(region, decodePng(readFileSync(reference)));
         check(d.differing <= 0.01, `the canvas differs from its reference: ${(d.differing * 100).toFixed(2)}% of pixels beyond the band, mean ${d.mean.toFixed(2)} (${d.size})`);
@@ -1052,7 +1053,7 @@ if (deckFixture) {
   const c = spawnSync('cargo', ['run', '-q', '--profile', HOST_DEV, '-p', 'contract', '--', 'build', resolve(ROOT, 'contract/corpus/motion.contract'), '-o', plan], { cwd: ROOT, encoding: 'utf8' });
   if (c.status !== 0) failures.push('the motion fixture did not compile: ' + c.stderr);
   else {
-    const w = (l, id) => box(l, id)?.w;
+    const w = (l, id) => box(l, id)?.w, x = (l, id) => box(l, id)?.x, both = l => [w(l, 'timed'), x(l, 'slid') - x(l, 'linear')]; // `slid`: 0 to 100 right of `linear` (unscaled here) under its layout transition
     const near = (a, b, tol = 0.05) => Math.abs(a - b) <= tol;
     const m = await open({ host, browser: 'chrome', plan });
     try {
@@ -1087,13 +1088,13 @@ if (deckFixture) {
     // born at the timer's due time either way.
     const once = await open({ host, browser: 'chrome', plan });
     let oneShot;
-    try { await once.clock(1250); oneShot = [w(await once.layout(), 'timed')]; await once.clock(1500); oneShot.push(w(await once.layout(), 'timed')); } finally { await once.close(); }
+    try { await once.clock(1250); oneShot = both(await once.layout()); await once.clock(1500); oneShot.push(...both(await once.layout())); } finally { await once.close(); }
     const steps = await open({ host, browser: 'chrome', plan });
     let stepwise;
-    try { await steps.clock(1000); stepwise = [w(await steps.layout(), 'timed')]; await steps.clock(1250); stepwise.push(w(await steps.layout(), 'timed')); await steps.clock(1500); stepwise.push(w(await steps.layout(), 'timed')); } finally { await steps.close(); }
-    check(oneShot[0] === 75 && oneShot[1] === 100, `one seek to 1250 then 1500 across the timer: ${oneShot.join(', ')} (expected 75, 100)`);
-    check(stepwise[0] === 50 && stepwise[1] === 75 && stepwise[2] === 100, `stepping 1000, 1250, 1500: ${stepwise.join(', ')} (expected 50, 75, 100)`);
-    console.log(`${host} motion: linear 75 at 125 ms, spring in flight, settle a fixed point; across the timer one seek = steps (${oneShot.join('/')} vs ${stepwise.slice(1).join('/')})`);
+    try { await steps.clock(1000); stepwise = both(await steps.layout()); await steps.clock(1250); stepwise.push(...both(await steps.layout())); await steps.clock(1500); stepwise.push(...both(await steps.layout())); } finally { await steps.close(); }
+    check(oneShot.join() === '75,50,100,100', `one seek to 1250 then 1500 across the timer, the scaled box's width and the slid box's offset: ${oneShot.join(', ')} (expected 75, 50, 100, 100)`);
+    check(stepwise.join() === '50,0,75,50,100,100', `stepping 1000, 1250, 1500: ${stepwise.join(', ')} (expected 50, 0, 75, 50, 100, 100)`);
+    console.log(`${host} motion: linear 75 at 125 ms, spring in flight, settle a fixed point; across the timer one seek = steps, a scale and a layout transition (${oneShot.join('/')} vs ${stepwise.slice(2).join('/')})`);
   }
   rmSync(tmp, { recursive: true, force: true });
 }
@@ -1105,8 +1106,8 @@ if (deckFixture) {
 // on the row's button is the pan's once past the slop, never the swipe's (rule
 // 3: a press keeps a contact from a swipe, not from a pan; kanban F6); a tap
 // presses it. The
-// same numbers on every host that can hold a contact; iOS, which holds none
-// (LLP 1080.000 P3), answers `unsupported`, said so, not faked.
+// same numbers on every host; a contact a carrier cannot hold (iOS on the row, which
+// only UIKit could give to the swipe or the pan) answers `unsupported`, said, not faked.
 {
   const tmp = mkdtempSync(resolve(tmpdir(), 'exact-smoke-'));
   const plan = resolve(tmp, 'precedence.plan');
@@ -1125,19 +1126,19 @@ if (deckFixture) {
         await g.clock('settle');
         return true;
       };
-      if (!await drag('row', [200, 50], [[20, 0], [100, 0]])) {
-        console.log(`${host} precedence: unsupported (this carrier holds no contact); unverified here`);
-      } else {
-        check(await slots() === '1/0/0', `a horizontal drag on the row: replies/panned/pressed ${await slots()}, expected the swipe alone (1/0/0)`);
-        await drag('row', [200, 50], [[0, 10], [0, 20]]);
-        check(await slots() === '1/30/0', `a vertical drag on the row: ${await slots()}, expected the surface's pan (1/30/0)`);
-        await drag('button', [40, 20], [[0, 10], [0, 20]]);
-        check(await slots() === '1/60/0', `a drag from the row's button: ${await slots()}, expected the surface's pan and no press (1/60/0)`);
-        await g.tap('button');
-        await g.clock('settle');
-        check(await slots() === '1/60/1', `a tap on the button: ${await slots()}, expected its press (1/60/1)`);
-        console.log(`${host} precedence: swipe inside pan ${await slots()} (replies/panned/pressed)`);
+      // What a carrier cannot hold is said, not counted: on iOS the row's two drags (only UIKit could give them to the swipe or the pan).
+      const n = [0, 0, 0], unheld = [];
+      for (const [what, target, at, moves, adds, expected] of [
+        ['a horizontal drag on the row', 'row', [200, 50], [[20, 0], [100, 0]], [1, 0, 0], 'the swipe alone'],
+        ['a vertical drag on the row', 'row', [200, 50], [[0, 10], [0, 20]], [0, 30, 0], "the surface's pan"],
+        ["a drag from the row's button", 'button', [40, 20], [[0, 10], [0, 20]], [0, 30, 0], "the surface's pan and no press"],
+        ['a tap on the button', 'button', null, null, [0, 0, 1], 'its press']]) {
+        if (!(moves ? await drag(target, at, moves) : (await g.tap(target), await g.clock('settle'), true))) { unheld.push(what); continue; }
+        adds.forEach((v, i) => { n[i] += v; });
+        check(await slots() === n.join('/'), `${what}: replies/panned/pressed ${await slots()}, expected ${expected} (${n.join('/')})`);
       }
+      const skips = host === 'ios' ? ['a horizontal drag on the row', 'a vertical drag on the row'] : []; check(unheld.join() === skips.join() && await slots() === (skips.length ? '0/30/1' : '1/60/1'), `precedence: unsupported [${unheld.join(', ')}], expected [${skips.join(', ')}]; ${await slots()}`);
+      console.log(`${host} precedence: swipe inside pan ${await slots()} (replies/panned/pressed)${unheld.length ? `; unsupported, unverified here: ${unheld.join(', ')}` : ''}`);
     } catch (error) {
       failures.push(`the precedence fixture stopped: ${error.message}`);
     } finally {
@@ -1210,11 +1211,11 @@ if (deckFixture) {
         check(kb === 0 && note.y === noteBefore.y, `no software keyboard here: keyboard-inset-height ${kb}, the field at ${note.y} (was ${noteBefore.y})`);
         console.log(`${host} insets: env ${JSON.stringify(env)}; the viewport ${l.viewport.w}×${l.viewport.h}; no keyboard`);
       }
-      // A finger lands only where the target is seen: the strip at the
-      // page's bottom is under the software keyboard, so the tap is refused,
-      // having pressed nothing and kept the editor and its keyboard.
+      // A finger lands only where the target is seen: a tap at a point in the strip under the
+      // keyboard is refused, pressing nothing and keeping the editor and its keyboard (a plain
+      // `tap under` scrolls the strip above the keyboard first, as a person would, and presses it).
       if (host === 'ios') {
-        const under = await f.tap('under').then(() => null, (e) => e.message);
+        const under = await f.tap('under', { at: [l.viewport.w / 2, 4] }).then(() => null, (e) => e.message);
         st = await f.state();
         check(/under the software keyboard/.test(under ?? '') && st.slots.under === 0 && st.slots.focused === true && st.keyboard?.visible === true, `a tap under the keyboard is refused and changes nothing: ${under}, ${JSON.stringify(st.slots)}, keyboard ${JSON.stringify(st.keyboard)}`);
       }
@@ -1284,16 +1285,16 @@ if (deckFixture) {
       await f.tap('dismiss');
       for (let i = 0; i < 40; i++) { l = await f.layout(); if (l.env['keyboard-inset-height'] === 0) break; await sleep(50); }
       check(l.viewport.h === viewport0.h && l.env['safe-area-inset-bottom'] === bottom0 && box(l, 'bar').y === bar0.y, `after the keyboard went everything is back: ${JSON.stringify(l.viewport)}, inset ${l.env['safe-area-inset-bottom']}, the bar at ${box(l, 'bar').y} (was ${bar0.y})`);
-      // A tap on plain text — nothing focusable, nothing pressable — blurs
-      // the field, as a tap on a page's ground does, and the keyboard goes
-      // (the web and iOS; the Linux host's `type` never focused).
+      // Plain text keeps a Mac field's editor. On the web and iOS it blurs
+      // the field and dismisses the keyboard; Linux's `type` never focused.
       if (host !== 'linux') {
         await f.type('note', 'again');
         for (let i = 0; i < 40; i++) { l = await f.layout(); if (host !== 'ios' || l.env['keyboard-inset-height'] > 0) break; await sleep(50); }
         await f.tap('title');
         let st = await f.state();
         for (let i = 0; i < 40; i++) { l = await f.layout(); if (l.env['keyboard-inset-height'] === 0) break; await sleep(50); }
-        check(st.slots.focused === false && l.env['keyboard-inset-height'] === 0 && l.viewport.h === viewport0.h, `a tap on the title blurred the field and sent the keyboard away: ${JSON.stringify(st.slots)}, keyboard ${l.env['keyboard-inset-height']}, viewport ${JSON.stringify(l.viewport)}`);
+        const keepsEditor = host === 'macos';
+        check(st.slots.focused === keepsEditor && l.env['keyboard-inset-height'] === 0 && l.viewport.h === viewport0.h, `a title click ${keepsEditor ? 'keeps the Mac editor' : 'blurs the field'} with no keyboard or viewport change: ${JSON.stringify(st.slots)}, keyboard ${l.env['keyboard-inset-height']}, viewport ${JSON.stringify(l.viewport)}`);
       }
     } catch (error) {
       failures.push(`the keyboard-bar fixture stopped: ${error.message}`);
@@ -1316,8 +1317,6 @@ if ((host === 'web' || apple || host === 'linux') && !argv.includes('--app-only'
     const f = await open({host, browser: 'chrome', plan, ...(host === 'macos' ? {env:{EXACT_DEV_PLAN:plan}} : {})});
     try {
       let t = await f.tree();
-      // Apple hosts focus a launch autofocus the turn after the first frame, which may follow `ready`.
-      for (let i = 0; i < 40 && byTestId(t, 'first')?.focused !== true; i++) { await sleep(25); t = await f.tree(); }
       check(byTestId(t, 'first')?.focused === true, 'autofocus takes focus after mount');
       const axName = async (id) => { const ax = (await f.tree(null, {ax: true})).ax; return ax.unavailable ? (host === 'linux' ? 'unavailable' : null) : ax.elements.find(e => e.testId === id)?.name; }; // LLP 1080.002
       check(await axName('first') === (host === 'linux' ? 'unavailable' : 'Increment'), 'button name is its text, as the platform exposes it'); check(host === 'linux' || await axName('labelled') === '20 sheckles', 'a label names a text, as the platform exposes it');
@@ -1326,8 +1325,10 @@ if ((host === 'web' || apple || host === 'linux') && !argv.includes('--app-only'
       await f.tap('first');
       t = await f.tree();
       check(byTestId(t, 'live-count')?.props.text === 'Count 1', 'live text changes through an action');
-      await f.tap('other');
-      check(byTestId(await f.tree(), 'other')?.focused === true, 'a text update does not steal focus back');
+      // AppKit button activation keeps the old responder; Tab moves focus for this autofocus-retention check.
+      if (host === 'macos') { await f.type('first', { key: 'Tab' }); check(byTestId(await f.tree(), 'other')?.focused === true, 'Other owns focus before the update'); }
+      await f.tap('other'); t = await f.tree();
+      check(byTestId(t, 'live-count')?.props.text === 'Count 2', 'Other activates the text update'); check(byTestId(t, 'other')?.focused === true, 'a text update does not steal focus back');
       check(byTestId(t, 'pressed')?.props.accessibilityPressed === 'true' && byTestId(t, 'mixed')?.props.accessibilityPressed === 'mixed', `aria-pressed is in the tree: ${JSON.stringify([byTestId(t, 'pressed')?.props, byTestId(t, 'mixed')?.props])}`); await f.clock('+1000'); check(byTestId(await f.tree(), 'pressed')?.props.accessibilityPressed === 'false', 'aria-pressed follows its bool'); await f.clock('+1000');
       t = await f.tree();
       check(byTestId(t, 'other')?.focused === true, 'remount does not steal focus from Other');
@@ -1417,13 +1418,12 @@ if ((host === 'web' || apple || host === 'linux') && !argv.includes('--app-only'
   rmSync(tmp, {recursive:true, force:true});
 }
 
-// 13. The resolved app's own tests (LLP 1017 P7), when it declares them:
+// 13. The resolved app's own tests (LLP 1017 P7; app.mjs `authoredTests`), when it declares them:
 // its `test` blocks driven through a fresh session by the same operations.
-const appTests = resolve(app.dir, 'app.test.contract');
-if (existsSync(appTests)) {
-  const t = await runTests({ host, file: appTests });
+for (const file of authoredTests(app.dir)) {
+  const t = await runTests({ host, file }).catch((e) => ({ passed: 0, failed: 1, results: [{ name: basename(file), failures: [e.message] }] }));
   for (const r of t.results) for (const f of r.failures) check(false, `test "${r.name}": ${f}`);
-  console.log(`${host} tests: ${t.passed} passed, ${t.failed} failed (${app.name}/app.test.contract)`);
+  console.log(`${host} tests: ${t.passed} passed, ${t.failed} failed${t.skipped ? `, ${t.skipped} skipped` : ''} (${app.name}/${basename(file)})`);
 }
 
 // 14. Native modules (LLP 1024 D8): the fixture's whole seam, when the app is it.
@@ -1434,8 +1434,8 @@ if (app.modules.tags.includes('exact-fixture') && ['web', 'macos', 'ios'].includ
 // A painting host loads no module; the fixture's hatches run there (LLP 1075.003.000.001 §8 stage 4).
 if (app.modules.tags.includes('exact-fixture') && host === 'linux') await (await import('./smoke-native.mjs')).paintingHatchSmoke({ host, open, check });
 if (app.modules.tags.includes('exact-swatch') && ['macos', 'ios'].includes(host)) await (await import('./smoke-tamber.mjs')).tamberSmoke({ host, open, check }); // LLP 1121 D12
-// 15. The recorder (LLP 1067.000): one native object, a view and functions.
-if (app.modules.tags.includes('waveform-view') && ['web', 'macos', 'ios'].includes(host)) {
+// 15. The recorder (LLP 1133.009 §11): the microphone through the standard packages.
+if (app.id === 'com.exact.recorder' && ['web', 'macos', 'ios'].includes(host)) {
   const { recorderSmoke } = await import('./smoke-recorder.mjs');
   await recorderSmoke({ host, open, check });
 }
@@ -1477,7 +1477,6 @@ if (host === 'macos' && app.manifest.file_handlers?.length && [app.manifest.laun
     console.log(`${host} documents: ${seen?.windows?.map((w) => `${w.session} "${w.title}"`).join(', ')}; the second session's first pixel ${second?.firstPixelMs} ms, footprint ${((seen?.footprint - second?.footprintBefore) / 1048576).toFixed(1)} MB since it was asked for`);
   } catch (error) { check(false, `documents: ${error.message}`); } finally { await d.close(); }
 }
-
 // 17. Answers that keep coming (LLP 1069.004 slice 2): Exact Live's job
 // progress over server-sent events, against the fixture started above.
 if (streamFixture) {

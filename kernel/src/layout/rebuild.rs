@@ -11,7 +11,7 @@ impl LayoutTree {
         arena.clear_taffy();
         let slots: Vec<u32> = arena
             .iter_live()
-            .filter(|s| !arena.is_inline_run(*s))
+            .filter(|s| !arena.in_paragraph(*s))
             .collect();
         for slot in &slots {
             let node = tree.new_leaf(
@@ -21,7 +21,7 @@ impl LayoutTree {
             );
             arena.set_taffy(*slot, Some(node));
             if arena.has_alert_prefix(*slot) {
-                tree.new_alert_prefix(*slot);
+                tree.new_alert_prefix(*slot, arena.grouped_alert(*slot));
             }
         }
         for slot in &slots {
@@ -37,6 +37,7 @@ impl LayoutTree {
                 tree.set_children(node, &children);
             }
         }
+        tree.tables.find(arena, &slots);
         tree
     }
 
@@ -62,7 +63,7 @@ impl LayoutTree {
             .collect();
         for &slot in &slots {
             if arena.has_alert_prefix(slot) {
-                tree.new_alert_prefix(slot);
+                tree.new_alert_prefix(slot, arena.grouped_alert(slot));
             }
         }
         for slot in slots {
@@ -76,6 +77,8 @@ impl LayoutTree {
             });
             tree.set_children(node, &children);
         }
+        let slots: Vec<u32> = nodes.keys().copied().collect();
+        tree.tables.find(arena, &slots);
         (tree, nodes)
     }
 
@@ -91,7 +94,7 @@ impl LayoutTree {
         let before = if arena.has_alert_prefix(parent) {
             match self.alert_prefixes.get(&parent).copied() {
                 Some(prefix) => Some(prefix),
-                None => Some(self.new_alert_prefix(parent)),
+                None => Some(self.new_alert_prefix(parent, arena.grouped_alert(parent))),
             }
         } else {
             None

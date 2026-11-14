@@ -48,14 +48,19 @@
 //!   on a live clock one past at a fill is late. So an edit of `offset`
 //!   itself may play a step twice or not at all within the change's size,
 //!   a declared limit.
+//! - **Clock in** (D9): `clock=` follows an input's MIDI clock instead
+//!   ([`clock`]): the sequence is `waiting` until Start, its segments come
+//!   from the ticks, and it fills only as deliveries arrive.
 //!
-//! @ref LLP 1125 D2–D5, D7
+//! @ref LLP 1125 D2–D5, D7, D9
 
 use crate::agent::num;
 use crate::midi::{Midi, Queued, HOLD, TICKS_PER_SECOND};
-use crate::sound::{Added, Sounds};
-use exact_plan::{ActionsId, Plan, Value};
+use crate::sound::{Added, By, Cut, Sounds};
+use exact_plan::{ActionsId, Plan, Value, HAPTIC_KINDS};
 use std::collections::VecDeque;
+
+pub mod clock;
 
 /// Reserved resource source, answered by the runner.
 pub const SOURCE: &str = "exactTransport";
@@ -84,25 +89,14 @@ pub const SHORTEST: f64 = 1.0 / 1048576.0;
 /// cannot, and past 2^53 a loop index no longer steps by 1. A finite track
 /// with fewer loops is never iterated there (its last loop is behind).
 pub const EXACT: f64 = 4503599627370496.0;
-/// A step's `haptic` kinds: `haptic()`'s (LLP 1077 D14).
-pub const HAPTIC_KINDS: [&str; 10] = [
-    "selection",
-    "impact",
-    "impact-light",
-    "impact-medium",
-    "impact-heavy",
-    "impact-soft",
-    "impact-rigid",
-    "success",
-    "warning",
-    "error",
-];
 
 /// What the transport is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     /// Nothing plays.
     Stopped,
+    /// Following a clock that has not started, or has stopped (D9).
+    Waiting,
     /// Beats below 0: the count-in.
     CountIn,
     /// Beat 0 and on.
@@ -114,6 +108,7 @@ impl State {
     pub fn word(self) -> &'static str {
         match self {
             State::Stopped => "stopped",
+            State::Waiting => "waiting",
             State::CountIn => "countin",
             State::Playing => "playing",
         }
@@ -176,6 +171,8 @@ struct Play {
     bpm: f64,
     from: f64,
     count_in: Vec<Step>,
+    /// The input followed (D9), or empty.
+    clock: String,
     clock_out: String,
 }
 
@@ -198,6 +195,9 @@ enum Fill {
     Edit,
     /// Its own wake: late on a live clock.
     Wake,
+    /// A clock in's delivery (D9): played at the delivery's time, never
+    /// skipped.
+    Clock,
 }
 
 /// The outputs a fill issues into: the voice table and the MIDI queue.
@@ -305,7 +305,7 @@ impl Play {
                 .enumerate()
                 .filter_map(|(j, s)| {
                     let label = format!("{label} step {}", j + 1);
-                    step(plan, s, length, &output, &label, log)
+                    step(plan, s, length, Some(&output), &label, log)
                 })
                 .collect();
             tracks.push(Track {
@@ -325,7 +325,7 @@ impl Play {
                         plan,
                         s,
                         -from,
-                        "",
+                        None,
                         &format!("sequence {name}: count-in step {}", j + 1),
                         log,
                     )
@@ -334,7 +334,15 @@ impl Play {
         } else {
             Vec::new()
         };
+        let clock = text(args.get(4));
         let mut clock_out = text(args.get(5));
+        if !clock.is_empty() && !clock_out.is_empty() {
+            // Rulings #4: a sequence that follows a clock sends none.
+            log.push(format!(
+                "sequence {name}: clock out ignored: it follows {clock}"
+            ));
+            clock_out.clear();
+        }
         if !clock_out.is_empty() && bpm * 24.0 / 60.0 > TICKS_PER_SECOND {
             log.push(format!(
                 "sequence {name}: clock out dropped: bpm {} is more than {} ticks a second",
@@ -348,6 +356,7 @@ impl Play {
             bpm,
             from,
             count_in,
+            clock,
             clock_out,
         })
     }
@@ -373,6 +382,7 @@ impl Play {
         };
         n(self.bpm, other.bpm)
             && n(self.from, other.from)
+            && self.clock == other.clock
             && self.clock_out == other.clock_out
             && steps(&self.count_in, &other.count_in)
             && self.tracks.len() == other.tracks.len()
@@ -464,13 +474,14 @@ impl Play {
 }
 
 /// One step read from its record, or why not (journaled); a step with no
-/// sample, no note its track sends (`output`) and no haptic plays nothing
-/// here and is left out unsaid.
+/// sample, no note and no haptic plays nothing here and is left out
+/// unsaid. `output` is its track's (`""`, no output, whose notes go only
+/// into `sent`, LLP 1125 D6); the count-in has none and sends no note.
 fn step(
     plan: &Plan,
     v: &Value,
     length: f64,
-    output: &str,
+    output: Option<&str>,
     label: &str,
     log: &mut Vec<String>,
 ) -> Option<Step> {
@@ -524,7 +535,7 @@ fn step(
         log.push(format!("{label} dropped: {why}"));
         return None;
     }
-    if src.is_empty() && haptic.is_empty() && (note == -1.0 || output.is_empty()) {
+    if src.is_empty() && haptic.is_empty() && (note == -1.0 || output.is_none()) {
         return None;
     }
     Some(Step {
@@ -532,7 +543,7 @@ fn step(
         src,
         gain,
         group: text(f.get(3)),
-        note: if output.is_empty() { -1.0 } else { note },
+        note: if output.is_none() { -1.0 } else { note },
         velocity,
         channel,
         duration,
@@ -553,10 +564,10 @@ pub(crate) struct Seen {
 /// What `exactTransport()` answers, by field.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Answer {
-    /// `stopped`, `countin` or `playing`.
+    /// `stopped`, `waiting`, `countin` or `playing`.
     pub state: State,
-    /// Why it last stopped: `gate`, `ended`, `background` or `bpm`; empty
-    /// while it plays, or before it ever did.
+    /// Why it last stopped: `gate`, `ended`, `background`, `bpm` or
+    /// `clock`; empty while it plays, or before it ever did.
     pub reason: &'static str,
     /// The tempo, beats a minute (0 before anything played).
     pub bpm: f64,
@@ -564,6 +575,8 @@ pub struct Answer {
     pub anchor_at: f64,
     /// The beat at `anchor_at`.
     pub anchor_beat: f64,
+    /// `internal`, or `midi` for a sequence that follows a clock (D9).
+    pub clock: &'static str,
 }
 
 impl Answer {
@@ -575,7 +588,7 @@ impl Answer {
             "bpm" => Value::Number(self.bpm),
             "anchorAt" => Value::Number(self.anchor_at),
             "anchorBeat" => Value::Number(self.anchor_beat),
-            "clock" => Value::str("internal"),
+            "clock" => Value::str(self.clock),
             _ => return None,
         })
     }
@@ -615,6 +628,22 @@ pub struct Transport {
     /// A background stop the commit of `set_page`'s call that stands
     /// applies; the call clears it if none does.
     pub(crate) suspend: bool,
+    /// The clock the playing sequence follows (D9).
+    follow: Option<clock::Follow>,
+    /// The last sequence armed followed a clock: `exactTransport` answers
+    /// what [`clock::Published`] holds.
+    clocked: bool,
+    published: clock::Published,
+    /// Where a clock in's hits are issued to: past the last delivery.
+    clock_to: f64,
+    /// Following a clock, the hits issued and not taken back at or after
+    /// [`Transport::hits_floor`], by `(beat, track, step)` and their step's
+    /// time: a refill issues none of them again, whichever segment timed
+    /// them.
+    clock_hits: Vec<(f64, usize, usize, f64)>,
+    /// Following a clock, one beat behind the ticks counted: no hit before
+    /// it is issued.
+    hits_floor: f64,
 }
 
 impl Transport {
@@ -643,11 +672,34 @@ impl Transport {
                 .collect(),
             pending: None,
             suspend: false,
+            follow: None,
+            clocked: false,
+            published: clock::Published {
+                state: State::Stopped,
+                reason: "",
+                bpm: 0.0,
+                at: 0.0,
+                beat: 0.0,
+            },
+            clock_to: 0.0,
+            clock_hits: Vec::new(),
+            hits_floor: f64::NEG_INFINITY,
         }
     }
 
     /// What `exactTransport()` answers now.
     pub fn answer(&self) -> Answer {
+        if self.clocked {
+            let p = self.published;
+            return Answer {
+                state: p.state,
+                reason: p.reason,
+                bpm: p.bpm,
+                anchor_at: p.at,
+                anchor_beat: p.beat,
+                clock: "midi",
+            };
+        }
         let seg = self.segments.back().copied().unwrap_or(Segment {
             at: 0.0,
             beat: 0.0,
@@ -659,6 +711,7 @@ impl Transport {
             bpm: seg.bpm,
             anchor_at: seg.at,
             anchor_beat: seg.beat,
+            clock: "internal",
         }
     }
 
@@ -688,10 +741,16 @@ impl Transport {
     }
 
     /// The beat at `t` while a sequence plays, by the segment that holds
-    /// it; −1 while stopped (LLP 1125 D8, rulings #13).
+    /// it; −1 while stopped or waiting for a clock (LLP 1125 D8, rulings
+    /// #13).
     pub fn beat_at(&self, t: f64) -> f64 {
-        if self.owner.is_none() {
+        if self.owner.is_none() || self.state == State::Waiting {
             return -1.0;
+        }
+        // Following a clock, by the one segment hits are issued under: its
+        // segments do not join (D9).
+        if self.follow.is_some() {
+            return self.segments.back().map_or(-1.0, |g| g.beat_at(t));
         }
         self.segments
             .iter()
@@ -725,13 +784,21 @@ impl Transport {
         for (i, s) in seen.into_iter().enumerate() {
             let (was_on, was_key) = std::mem::replace(&mut self.gates[i], (s.on, s.key.clone()));
             let rising = s.on && (!was_on || s.key != was_key);
+            // The input followed changed (D9): a restart, as a key's (rulings #13).
+            let clock = s
+                .args
+                .get(4)
+                .filter(|v| v.is_str())
+                .map_or("", |v| v.text());
+            let refollow = self.play.as_ref().is_some_and(|p| p.clock != clock);
             if self.owner == Some(i) {
                 if !s.on {
                     self.stop(plan, out, t, "gate", log);
-                } else if s.key != was_key {
+                } else if s.key != was_key || refollow {
                     // A restart: Stop, then Start at its new beat 0 (rulings #9).
-                    out.sounds.batch(|so| so.retract_seq(t, log));
-                    out.midi.retract_seq(t, log);
+                    out.sounds
+                        .batch(|so| so.retract_seq(t, Cut::At(t), By::Edit, log));
+                    out.midi.retract_seq(t, Cut::At(t), "edit", log);
                     out.midi.end_seq(t, log);
                     self.arm(plan, out, i, t, live, s.args, log);
                 } else if self.raw.len() != s.args.len()
@@ -776,13 +843,40 @@ impl Transport {
                 return;
             }
         };
+        self.owner = Some(i);
+        self.raw = args;
+        (self.issued_to, self.skip, self.unsent_told) = (t, 0, false);
+        if !play.clock.is_empty() {
+            // Clock in (D9): waiting, no segment and no fill until Start.
+            log.push(format!(
+                "sequence {name} waits for clock from {}",
+                play.clock
+            ));
+            if !self.clocked {
+                let a = self.answer();
+                self.published = clock::Published {
+                    state: a.state,
+                    reason: a.reason,
+                    bpm: a.bpm,
+                    at: a.anchor_at,
+                    beat: a.anchor_beat,
+                };
+            }
+            out.midi.clock_to("", 0.0, t, log);
+            self.follow = Some(clock::Follow::new(&play.clock, play.bpm, play.from));
+            (self.clock_hits, self.hits_floor) = (Vec::new(), f64::NEG_INFINITY);
+            (self.clocked, self.state, self.reason) = (true, State::Waiting, "");
+            (self.refill_due, self.phase_due, self.ended_due) =
+                (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            self.play = Some(play);
+            return;
+        }
+        (self.follow, self.clocked) = (None, false);
         log.push(format!(
             "sequence {name} starts at beat {}, bpm {}",
             num(play.from),
             num(play.bpm)
         ));
-        self.owner = Some(i);
-        self.raw = args;
         self.segment(Segment {
             at: t,
             beat: play.from,
@@ -797,9 +891,6 @@ impl Transport {
         out.midi
             .clock_to(&play.clock_out, (play.from * 24.0).ceil(), t, log);
         self.play = Some(play);
-        self.issued_to = t;
-        self.skip = 0;
-        self.unsent_told = false;
         self.timing(t);
         self.fill(plan, out, t, live, Fill::Arm, log);
     }
@@ -826,11 +917,22 @@ impl Transport {
         if self.play.as_ref().is_some_and(|p| p.same(&play)) {
             return;
         }
+        // Following a clock (D9) `bpm=` is the prior, so no segment starts;
+        // while waiting there is nothing issued to take back.
+        let following = self.follow.is_some();
+        if let Some(f) = self.follow.as_mut() {
+            (f.prior, f.from) = (play.bpm, play.from);
+            if self.state == State::Waiting {
+                log.push(format!("sequence {name} edited"));
+                self.play = Some(play);
+                return;
+            }
+        }
         let seg = *self
             .segments
             .back()
             .expect("a playing sequence has a segment");
-        if play.bpm.to_bits() != seg.bpm.to_bits() {
+        if !following && play.bpm.to_bits() != seg.bpm.to_bits() {
             log.push(format!("sequence {name} edited: bpm {}", num(play.bpm)));
             self.segment(Segment {
                 at: t,
@@ -840,8 +942,10 @@ impl Transport {
         } else {
             log.push(format!("sequence {name} edited"));
         }
-        out.sounds.batch(|s| s.retract_seq(t, log));
-        out.midi.retract_seq(t, log);
+        out.sounds
+            .batch(|s| s.retract_seq(t, Cut::At(t), By::Edit, log));
+        out.midi.retract_seq(t, Cut::At(t), "edit", log);
+        self.clock_hits.retain(|e| e.3 < t);
         let first = (seg.beat_at(t) * 24.0).ceil();
         out.midi.clock_to(&play.clock_out, first, t, log);
         self.play = Some(play);
@@ -883,7 +987,7 @@ impl Transport {
     }
 
     /// Stop at `t`, journaled with `reason`: the sequence's voices end as
-    /// `stopSounds()` ends them (LLP 1125 D4).
+    /// `stopSounds()` ends them (LLP 1125 D4), and it no longer plays.
     pub(crate) fn stop(
         &mut self,
         plan: &Plan,
@@ -892,7 +996,29 @@ impl Transport {
         reason: &'static str,
         log: &mut Vec<String>,
     ) {
-        let Some(i) = self.owner.take() else {
+        if self.owner.is_none() {
+            return;
+        }
+        self.silence(plan, out, t, reason, log);
+        self.owner = None;
+        self.play = None;
+        self.raw.clear();
+        self.follow = None;
+        // Stopped, it answers as its own clock again.
+        self.clocked = false;
+    }
+
+    /// [`Transport::stop`]'s sound: the sequence stays the owner (a clock's
+    /// Stop leaves it waiting, D9).
+    fn silence(
+        &mut self,
+        plan: &Plan,
+        out: &mut Out<'_>,
+        t: f64,
+        reason: &'static str,
+        log: &mut Vec<String>,
+    ) {
+        let Some(i) = self.owner else {
             return;
         };
         let name = plan.str(plan.sequences[i].name);
@@ -901,8 +1027,6 @@ impl Transport {
         out.midi.stop_seq(t, log);
         self.state = State::Stopped;
         self.reason = reason;
-        self.play = None;
-        self.raw.clear();
         self.refill_due = f64::INFINITY;
         self.phase_due = f64::INFINITY;
         self.ended_due = f64::INFINITY;
@@ -943,6 +1067,7 @@ impl Transport {
         self.state = State::Stopped;
         self.reason = "ended";
         self.play = None;
+        (self.follow, self.clocked) = (None, false);
         self.raw.clear();
         self.refill_due = f64::INFINITY;
         self.phase_due = f64::INFINITY;
@@ -964,12 +1089,18 @@ impl Transport {
             self.state = State::Playing;
         }
         if self.refill_due <= at {
-            self.fill(plan, out, at, live, Fill::Wake, log);
+            // Following a clock, only a full queue's wake comes here.
+            let how = if self.follow.is_some() {
+                Fill::Clock
+            } else {
+                Fill::Wake
+            };
+            self.fill(plan, out, at, live, how, log);
         }
     }
 
-    /// Issue the hits in `[issued_to, at + LOOKAHEAD)`, and clock out's
-    /// ticks before its end. On a live clock an output more than [`REFILL`]
+    /// Issue the hits in `[issued_to, at + LOOKAHEAD)` (following a clock,
+    /// to past its last delivery), and clock out's ticks before its end. On a live clock an output more than [`REFILL`]
     /// past at its own wake (a stall's) is skipped, and said once; one less
     /// past starts now. Never on a seek. `how` places an output before `at`
     /// (the module's rule).
@@ -1010,16 +1141,32 @@ impl Transport {
             return;
         };
         let from = self.issued_to;
-        let to = at + LOOKAHEAD;
+        // Following a clock, to past the last delivery, under its one
+        // segment (`clock`).
+        let following = self.follow.is_some();
+        let to = if following {
+            self.clock_to.max(from)
+        } else {
+            at + LOOKAHEAD
+        };
         let late_before = if live { at } else { f64::NEG_INFINITY };
         let end = play.end_beat();
         out.midi
             .ticks(|b| seg.time(b), to, end, late_before, at, log);
-        let mut hits = self.hits(&play, from, to);
+        let mut hits = if following {
+            play.hits(&seg, from, to)
+        } else {
+            self.hits(&play, from, to)
+        };
         // When beat `b` of a hit at `at` falls: in the hit's own segment, or a
         // later one the beat reaches (a note's end past a tempo edit), never
-        // across a restart, whose beat goes back.
-        let segs: Vec<Segment> = self.segments.iter().copied().collect();
+        // across a restart, whose beat goes back. Following a clock, in its
+        // one segment: its segments do not join.
+        let segs: Vec<Segment> = if following {
+            vec![seg]
+        } else {
+            self.segments.iter().copied().collect()
+        };
         let time_of = |hit_at: f64, b: f64| {
             let mut j = segs.iter().rposition(|g| g.at <= hit_at).unwrap_or(0);
             while j + 1 < segs.len() && segs[j + 1].beat <= b && segs[j + 1].beat >= segs[j].beat {
@@ -1043,15 +1190,23 @@ impl Transport {
         hits.drain(..skipped);
         let (mut late, mut unsent) = (0, None);
         let midi = &mut *out.midi;
+        // Following a clock, a hit issued already (kept at a re-anchor) is
+        // not issued again (`clock_hits`).
+        let (kept, floor) = (std::mem::take(&mut self.clock_hits), self.hits_floor);
+        let mut fresh = Vec::new();
         let full = out.sounds.batch(|s| {
             for (k, hit) in hits.iter().enumerate() {
+                let id = (hit.beat, hit.track, hit.step);
+                if following && (hit.beat < floor || kept.iter().any(|e| (e.0, e.1, e.2) == id)) {
+                    continue;
+                }
                 let (offset, output) = play.track(hit);
                 // Where an output before `at` goes: played now at the arming,
                 // skipped at an edit, late at a stalled live wake.
                 let place = |when: f64, late: &mut usize| -> Option<f64> {
                     if when >= at {
                         Some(when)
-                    } else if how == Fill::Arm {
+                    } else if how == Fill::Arm || how == Fill::Clock {
                         Some(at)
                     } else if how == Fill::Edit {
                         None
@@ -1117,9 +1272,14 @@ impl Transport {
                 }
                 // A hit is late once, however many of its outputs were.
                 late += usize::from(counted > late);
+                if following {
+                    fresh.push((id.0, id.1, id.2, hit.at));
+                }
             }
             None
         });
+        self.clock_hits = kept;
+        self.clock_hits.extend(fresh);
         if late > 0 {
             log.push(format!("sequence {name}: {late} steps late, skipped"));
         }
@@ -1153,7 +1313,12 @@ impl Transport {
             None => {
                 self.issued_to = to;
                 self.issued = (seg.beat_at(to), 0);
-                self.refill_due = to - REFILL;
+                // Following a clock, the next delivery fills.
+                self.refill_due = if following {
+                    f64::INFINITY
+                } else {
+                    to - REFILL
+                };
             }
         }
         self.play = Some(play);

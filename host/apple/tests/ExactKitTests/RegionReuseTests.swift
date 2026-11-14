@@ -434,8 +434,9 @@ import XCTest
         DispatchQueue(label: "reuse-selection-reference").async {
             let layout = RegionWorkerLayout.shape(s,width: 320), p = layout.metadata
             let dense = RegionParagraph(source: s,sourceSHA256: p.sourceSHA256,lines: layout.lines,baselines: p.baselines,
-                width: p.width,height: p.height,lineBottoms: p.lineBottoms,offeredWidth: p.offeredWidth)
+                width: p.width,height: p.height,lineBottoms: p.lineBottoms,offeredWidth: p.offeredWidth,attributed: layout.preparation.attributed)
             reference.rectangles = dense.selectionRects(NSRange(location: 0,length: 12),in: box,dirty: box)
+            XCTAssertEqual(layout.selectionRects(NSRange(location: 0, length: 12), in: box), reference.rectangles)
             completed.signal()
         }
         completed.wait()
@@ -644,6 +645,7 @@ private final class RegionReuseGate: @unchecked Sendable {
             profile: profile,format: CGImageAlphaInfo.premultipliedLast.rawValue,
             background: [1,1,1,1],selectionColor: [0.2,0.4,0.8,0.45])
         guard case .raster(let value) = perform(.raster(request)) else { preconditionFailure("expected raster") }
+        XCTAssertTrue(CapturePixels.hasPaint(CapturePixels.bytes(value.image())), "the raster draws")
         return value
     }
 }

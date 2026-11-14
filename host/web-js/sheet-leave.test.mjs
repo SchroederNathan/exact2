@@ -1,0 +1,144 @@
+// A sheet the JS runtime removes slides down first (navigation.js `sheetLeaves`, LLP 1115.000 D4.8): a keyed row that
+// is a sheet the look draws stays, leaving, until its animation ends, whether the loop keeps a row beside it or
+// replaces all it holds (the runtime's fast path empties such a parent at once). It keeps its ids while it leaves, and
+// a focus the same commit asks for by an id it shares lands on the live route's. Build exact-web-js once before
+// running this test (docs/testing.md).
+import { test, expect } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { suiteBrowser } from '../../scripts/agent-launch.mjs';
+import { withLook } from '../web/look.mjs';
+
+const SOURCE = `component App
+  state stack = ["a", "sheet"]
+  derive top = match stack.at(-1) { case some(r) => r, case none => "" }
+  action replace
+    stack = ["b"]
+  action pop
+    stack = ["a"]
+  action save
+    stack = ["b"]
+    focus("name")
+  view
+    column
+      button "Replace" press=replace testId="replace"
+      button "Pop" press=pop testId="pop"
+      button "Save" press=save testId="save"
+      main navigationKey=top navigationBack="" position="relative" height=300
+        for r in stack key=r
+          column navigationKey=r navigationPresentation=(r == "sheet" ? "modal" : "") testId=\`route-\${r}\` position="absolute" top=0 right=0 bottom=0 left=0
+            text r
+            if r != "a"
+              input id="name" testId=\`name-\${r}\` aria-label="Name"
+`;
+
+// A field's decorations are its runtime's to clear as the commit ends the field's scope, before the sheet is asked to
+// leave: a sheet holding one the browser paints closes at once.
+const DECORATED = `decoration mention color="red"
+
+component App
+  state stack = ["a", "sheet"]
+  derive top = match stack.at(-1) { case some(r) => r, case none => "" }
+  derive ranges = TextDecorations(value="hi @al", spans=[TextDecorationSpan(name="mention", start=3, end=6)])
+  action pop
+    stack = ["a"]
+  view
+    column
+      button "Pop" press=pop testId="pop"
+      main navigationKey=top navigationBack="" position="relative" height=300
+        for r in stack key=r
+          column navigationKey=r navigationPresentation=(r == "sheet" ? "modal" : "") testId=\`route-\${r}\` position="absolute" top=0 right=0 bottom=0 left=0
+            text r
+            if r != "a"
+              textarea testId="field" aria-label="Field" value="hi @al" decorations=ranges width=200 height=60
+`;
+
+/** Presses `testId`'s button and reads the sheet as the commit leaves it, in the frame it lands: `null` once it is
+ * gone, else whether its exit animates, the animation paused so that no later step sees it end. (The sheet covers the
+ * page, so the press is the button's own click.) */
+const press = (page, testId) => page.evaluate(async (testId) => {
+  document.querySelector(`[data-testid="${testId}"]`).click();
+  for (let frame = 0; frame < 60; frame++) {
+    const sheet = document.querySelector('[data-testid="route-sheet"]');
+    if (!sheet || sheet.hasAttribute('data-exiting')) {
+      const animations = sheet?.getAnimations() ?? [];
+      for (const a of animations) a.pause();
+      return sheet && animations.length > 0;
+    }
+    await new Promise((r) => requestAnimationFrame(r));
+  }
+  return 'the sheet stayed';
+}, testId);
+
+/** `source` compiled for the JS target and served with the shell's style: `run(url, browser)`. */
+async function served(source, run) {
+  const root = resolve(import.meta.dir, '../..');
+  const target = resolve(root, 'target');
+  mkdirSync(target, { recursive: true });
+  const dir = mkdtempSync(resolve(target, 'sheet-leave-'));
+  const style = withLook(readFileSync(resolve(root, 'host/web/index.html'), 'utf8')).match(/<style>([\s\S]*?)<\/style>/)[1];
+  let server, browser;
+  try {
+    writeFileSync(resolve(dir, 'app.contract'), source);
+    const compiled = spawnSync(resolve(target, 'debug/exact-web-js'), ['js', resolve(dir, 'app.contract'), '-o', dir], { encoding: 'utf8' });
+    expect(compiled.status, compiled.stderr).toBe(0);
+    server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch(request) {
+      const path = new URL(request.url).pathname.slice(1);
+      if (!path) return new Response(`<style>${style}</style><link rel="stylesheet" href="/app.css">
+        <div id="exact-root"></div><script type="module">import app from '/app.js';app();</script>`,
+      { headers: { 'content-type': 'text/html' } });
+      // A module that re-exports the host's own reaches it through `../web/`.
+      const bases = path.startsWith('web/') ? [resolve(root, 'host')] : [dir, import.meta.dir, resolve(root, 'host/web')];
+      const file = bases.map(base => resolve(base, path)).find(existsSync);
+      return file ? new Response(Bun.file(file)) : new Response('Not found', { status: 404 });
+    } });
+    browser = await suiteBrowser();
+    await run(server.url.href, browser);
+  } finally {
+    await browser?.close();
+    server?.stop(true);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('a sheet the JS runtime removes slides down, beside a kept row and when the loop replaces every row', () => served(SOURCE, async (url, browser) => {
+  for (const [button, kept] of [['pop', 'route-a'], ['replace', 'route-b'], ['save', 'route-b']]) for (const reducedMotion of ['no-preference', 'reduce']) {
+    const context = await browser.newContext({ viewport: { width: 400, height: 700 }, reducedMotion });
+    const page = await context.newPage();
+    await page.goto(url);
+    await page.getByTestId('route-sheet').waitFor({ state: 'attached' });
+    const leaving = await press(page, button);
+    await page.getByTestId(kept).waitFor({ state: 'attached' });
+    expect([button, reducedMotion, leaving]).toEqual([button, reducedMotion, reducedMotion === 'reduce' ? null : true]);
+    if (button === 'save') expect([reducedMotion, await page.evaluate(() => document.activeElement?.dataset.testid)]).toEqual([reducedMotion, 'name-b']);
+    const gone = await page.evaluate(async () => {
+      await Promise.all(document.querySelector('[data-testid="route-sheet"]')?.getAnimations().map((a) => (a.finish(), a.finished)) ?? []);
+      await new Promise((r) => setTimeout(r));
+      return document.querySelector('[data-testid="route-sheet"]') === null;
+    });
+    expect([button, reducedMotion, gone]).toEqual([button, reducedMotion, true]);
+    await context.close();
+  }
+}), 120000);
+
+test('a sheet the JS runtime removes, holding a field whose decorations the browser paints, closes at once', () => served(DECORATED, async (url, browser) => {
+  const page = await (await browser.newContext({ viewport: { width: 400, height: 700 }, reducedMotion: 'no-preference' })).newPage();
+  await page.goto(url);
+  await page.waitForFunction(() => document.querySelector('[data-testid="field"]')?.exactDecorations?.applied);
+  const painted = await page.evaluate(() => document.querySelector('[data-testid="field"]').exactDecorations.painted);
+  expect([painted, await press(page, 'pop')]).toEqual([true, null]);
+}), 120000);
+
+test('a sheet in an ordinary list survives whole-loop replacement until its exit ends', () => served(SOURCE.replace('main navigationKey', 'list appearance="none" navigationKey'), async (url, browser) => {
+  const page = await (await browser.newContext({ viewport: { width: 400, height: 700 }, reducedMotion: 'no-preference' })).newPage();
+  await page.goto(url);
+  await page.getByTestId('route-sheet').waitFor({ state: 'attached' });
+  expect(await press(page, 'replace')).toBe(true);
+  await page.getByTestId('route-b').waitFor({ state: 'attached' });
+  expect(await page.evaluate(async () => {
+    const sheet = document.querySelector('[data-testid="route-sheet"]');
+    await Promise.all(sheet.getAnimations().map(a => (a.finish(), a.finished)));
+    return document.querySelector('[data-testid="route-sheet"]') === null;
+  })).toBe(true);
+}), 120000);

@@ -201,3 +201,28 @@ fn a_literal_size_of_zero_and_a_string_are_refused_by_the_compiler() {
         );
     }
 }
+
+/// LLP 1021 §5.3.1: `setPageZoom(factor)` takes one number above 0.
+#[test]
+fn a_page_zoom_is_one_factor_above_zero() {
+    for good in ["setPageZoom(1.25)", "setPageZoom(n)"] {
+        let source = format!(
+            "component App\n  action pick(n: number)\n    {good}\n  view\n    text \"x\"\n"
+        );
+        assert!(contract::compile(&source).is_ok(), "{good}");
+    }
+    for bad in [
+        "setPageZoom(0)",
+        "setPageZoom(\"125%\")",
+        "setPageZoom()",
+        "setPageZoom(1, 2)",
+    ] {
+        let source =
+            format!("component App\n  action pick(n: number)\n    {bad}\n  view\n    text \"x\"\n");
+        let errors = contract::compile(&source).unwrap_err();
+        assert!(
+            format!("{errors:?}").contains("type-page-zoom"),
+            "{bad}: {errors:?}"
+        );
+    }
+}

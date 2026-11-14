@@ -75,6 +75,10 @@ fn a_test_id_resolves_on_the_selected_route_and_covered_screens_are_flagged() {
     let thread = by_test_id(&tree, "route-thread");
     assert_eq!(field(home, "inactive"), "true");
     assert!(!thread.contains("\"inactive\""), "{thread}");
+    // LLP 1153 D8: and not shown, which `hidden` says, to its last node.
+    assert_eq!(field(home, "hidden"), "true");
+    assert_eq!(field(by_test_id(&tree, "only-home"), "hidden"), "true");
+    assert!(!thread.contains("\"hidden\""), "{thread}");
     let dups: Vec<&str> = nodes(&tree)
         .into_iter()
         .filter(|n| n.contains("\"testId\":\"dup\""))
@@ -102,6 +106,41 @@ fn a_test_id_resolves_on_the_selected_route_and_covered_screens_are_flagged() {
     assert_eq!(
         field(nodes(&found)[0], "parent"),
         field(by_test_id(&tree, "route-home"), "id")
+    );
+}
+
+/// LLP 1153 D8: a screen a sheet covers stays shown beneath it, so it is
+/// `inactive` and not `hidden`; the sheet's own nodes are neither.
+#[test]
+fn a_screen_a_sheet_covers_is_inactive_and_not_hidden() {
+    let src = "routes nav
+  tab home \"/\"
+    compose \"/compose\"
+
+component App
+  view
+    main navigationKey=`${top(nav).id}` navigationBack=\"back\"
+      for e in stack(nav) key=e.id
+        column navigationKey=`${e.id}` testId=`route-${e.name}` navigationPresentation=(e.name == \"compose\" ? \"modal\" : \"auto\")
+          text e.name testId=`text-${e.name}`
+";
+    let plan = contract::compile(src).unwrap();
+    let r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/compose",
+    )
+    .unwrap();
+    let tree = agent::tree(&r);
+    let home = by_test_id(&tree, "text-home");
+    assert_eq!(field(home, "inactive"), "true");
+    assert!(!home.contains("\"hidden\""), "{home}");
+    let sheet = by_test_id(&tree, "text-compose");
+    assert!(
+        !sheet.contains("\"inactive\"") && !sheet.contains("\"hidden\""),
+        "{sheet}"
     );
 }
 
@@ -147,6 +186,7 @@ fn a_test_id_resolves_on_the_selected_tab_and_the_other_tabs_are_flagged() {
     let tree = agent::tree(&r);
     let (a, b) = (by_test_id(&tree, "panel-a"), by_test_id(&tree, "panel-b"));
     assert_eq!(field(a, "inactive"), "true");
+    assert_eq!(field(a, "hidden"), "true");
     assert!(!b.contains("\"inactive\""), "{b}");
     let hellos: Vec<&str> = nodes(&tree)
         .into_iter()
@@ -214,5 +254,63 @@ fn the_head_follows_the_selected_tabs_top_screen() {
         r.act(action, args).unwrap();
         assert_eq!(&r.head(), expected, "after {action}");
         assert_eq!(&r.document_tree().unwrap().head(), expected, "document");
+    }
+}
+
+#[test]
+fn a_large_plan_tagged_agent_tree_preserves_sites_and_navigation_flags() {
+    use exact_kernel::{NodeType, PropId};
+    use exact_plan::{asm::Asm, builder::PlanBuilder, BindingKind, BindingsRow};
+    let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
+    let key = b.constant(&Value::str("active"));
+    let back = b.constant(&Value::str("back"));
+    let body = b.code(Asm::new());
+    b.action("back", &[], &[], body);
+    let bind = |id: PropId, expr| BindingsRow {
+        kind: BindingKind::Prop,
+        id: id as u16,
+        expr,
+        written: true,
+    };
+    let root = b.node(
+        NodeType::View as u8,
+        None,
+        None,
+        0,
+        &[
+            bind(PropId::NavigationKey, key),
+            bind(PropId::NavigationBack, back),
+        ],
+        &[],
+        None,
+    );
+    let active = b.node(
+        NodeType::View as u8,
+        Some(root),
+        None,
+        0,
+        &[bind(PropId::NavigationKey, key)],
+        &[],
+        None,
+    );
+    for i in 0..50_000 {
+        b.node(NodeType::View as u8, Some(active), None, i, &[], &[], None);
+    }
+    let plan = b.finish().unwrap();
+    let r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let tree: serde_json::Value =
+        serde_json::from_str(&agent::handle(&r, r#"{"op":"tree","plan":true}"#)).unwrap();
+    let nodes = tree["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 50_002);
+    for node in nodes {
+        assert!(node["site"].is_number());
+        assert!(node["inactive"].is_null());
     }
 }

@@ -435,6 +435,7 @@ fn run<D: DataSource + Default>(
     std::env::set_var("EXACT_SCALE", scale.to_string());
     let mut config = crate::app::Config::from_env_static(plan, compat);
     config.scale = scale;
+    config.clock_started = Some(started);
     let booted = trace(c"exact boot", || {
         crate::app::boot_presenter::<D>(&mut config, viewport)
     });
@@ -548,22 +549,11 @@ fn run<D: DataSource + Default>(
         // a fling) runs once that frame is out, as a scrolled list's
         // collection turn does: it shows a frame later instead of making
         // this one late.
-        let mut advance_after = false;
-        if vsync.arrived.get() && p.host().wants_frames() {
-            last_tick = now;
-            if let Some(e) = trace(c"exact animation frame", || p.animation_frame(now)) {
-                log(&format!("exact: {e}"));
-            }
-        } else if p
-            .timer_or_scroll_due_ms()
-            .is_some_and(|due| due <= now && now - last_tick >= frame_ms * 0.5)
-        {
-            last_tick = now;
-            if vsync.arrived.get() && p.dirty() {
-                advance_after = true;
-            } else if let Some(e) = trace(c"exact advance", || p.advance(now)) {
-                log(&format!("exact: {e}"));
-            }
+        let (advance_after, error) = trace(c"exact advance", || {
+            p.android_clock(now, vsync.arrived.get(), &mut last_tick, frame_ms)
+        });
+        if let Some(e) = error {
+            log(&format!("exact: {e}"));
         }
         if vsync.arrived.get() && trace(c"exact needs frame", || p.needs_animation_frame()) {
             trace(c"exact tick", || p.tick(now));
@@ -571,7 +561,8 @@ fn run<D: DataSource + Default>(
         // Decodes that finished since: only when the image fd woke the loop
         // (a frame's picture sync polls them too); every iteration polled
         // every picture's state twice a frame.
-        if images_woke {
+        // (Or a load to send, or a failed download to ask again for, due.)
+        if images_woke || p.image_turn_due_in_ms().is_some_and(|ms| ms <= 0.0) {
             trace(c"exact poll images", || p.poll_images());
         }
         let mut painted = false;
@@ -616,6 +607,9 @@ fn run<D: DataSource + Default>(
                 log(&format!("exact: {e}"));
             }
         }
+        // A picture that landed in this turn's syncs (the cache's, at once)
+        // sends its load now: its decode woke nothing.
+        trace(c"exact image loads", || p.deliver_image_loads());
         if p.module_pending() {
             p.first_pixel();
         }
@@ -636,10 +630,12 @@ fn run<D: DataSource + Default>(
                 )
             };
         }
-        let timeout = match p.timer_or_scroll_due_ms() {
+        let timeout = match p.wake_due_ms() {
             Some(due) => ((due - wall()).max(0.0).ceil() as c_int).min(1000),
             None => 1000,
         };
+        let timeout =
+            (p.image_turn_due_in_ms()).map_or(timeout, |ms| timeout.min(ms.ceil() as c_int));
         let timeout = if wants && vsync.arrived.get() {
             0
         } else {

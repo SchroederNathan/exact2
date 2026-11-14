@@ -1,6 +1,8 @@
 //! Whole-set grant admission, sharing ibex2's pure grammar.
 //! @ref LLP 1016 D6 / LLP 1018 D3. Presenter and device grants remain
 //! with their owning executors, exactly as `io_grants` treats them.
+pub use exact_grants::{is_service_type, DEVELOPMENT, LOCAL_NETWORK};
+
 /// A grant spec that parsed: its lines, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grants<'a> {
@@ -22,6 +24,14 @@ impl<'a> Grants<'a> {
                 .then(|| words.next())
                 .flatten()
         })
+    }
+
+    /// The `secret.keep` names that carry a presence policy (LLP 1133.010
+    /// D4), in declaration order.
+    pub fn presence(&self) -> impl Iterator<Item = (&'a str, exact_grants::Presence)> + '_ {
+        self.lines
+            .iter()
+            .filter_map(|line| exact_grants::line_presence(line))
     }
 }
 
@@ -50,7 +60,14 @@ pub fn parse_with(spec: &str, link: GrantsLink) -> Result<Grants<'_>, Vec<String
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if own(line) {
+        if let Some(why) = own(line).then(|| listen_refusal(line)).flatten() {
+            errors.push(format!("line {}: {why}", index + 1));
+        } else if exact_grants::process::is_process_line(line) {
+            match exact_grants::process::validate(line) {
+                Ok(()) => lines.push(line),
+                Err(error) => errors.push(format!("line {}: {error}", index + 1)),
+            }
+        } else if own(line) {
             lines.push(line);
         } else {
             let read = match link {
@@ -67,11 +84,60 @@ pub fn parse_with(spec: &str, link: GrantsLink) -> Result<Grants<'_>, Vec<String
             }
         }
     }
+    if let Some(twice) = exact_grants::process::named_twice(spec) {
+        errors.push(twice);
+    }
     if errors.is_empty() {
         Ok(Grants { lines })
     } else {
         Err(errors)
     }
+}
+
+/// The line that admits a request to `url`, of the app's grants `spec`
+/// narrowed by a source's `scope` (which may only select lines the app
+/// has): the first `net.websocket` line for a `ws:` or `wss:` URL, as every
+/// executor opens one, else the first `net.fetch` line. `state.streams`
+/// names it (LLP 1016.000 D7).
+pub fn admitting<'a>(spec: &'a str, scope: Option<&'a str>, url: &str) -> Option<&'a str> {
+    use exact_grants::{GrantSet, Operation};
+    // A listener's line, by its path as written (LLP 1133.005 D11).
+    if let Ok(path) = crate::listen::unix_path(url) {
+        return crate::listen::admitting(spec, scope, path, str::to_string);
+    }
+    let origin = exact_grants::origin_of(url).ok()?;
+    let operation = if matches!(origin.scheme.as_str(), "ws" | "wss") {
+        Operation::WebSocket { origin }
+    } else {
+        Operation::Fetch { origin }
+    };
+    let lines = |text: &'a str| text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let mut candidates = lines(scope.unwrap_or(spec));
+    if scope.is_some_and(|scope| lines(scope).any(|l| !lines(spec).any(|a| a == l))) {
+        return None;
+    }
+    candidates.find(|line| {
+        matches!(
+            line.split_whitespace().next(),
+            Some("net.fetch" | "net.websocket")
+        ) && GrantSet::parse(line).is_ok_and(|set| set.permits(&operation))
+    })
+}
+
+/// The line that admits a stream `request` under its scope, as
+/// [`admitting`] for a URL; for a child process, the first `process.spawn`
+/// line that names its program (LLP 1133.007 D2's `state.streams`).
+pub fn admitting_request<'a>(spec: &'a str, request: &'a crate::Request) -> Option<&'a str> {
+    let scope = request.grants.as_deref();
+    if !request.is_process() {
+        return admitting(spec, scope, &request.url);
+    }
+    let program = crate::process::summary(&request.body).1?;
+    let lines = |text: &'a str| text.lines().map(str::trim).filter(|l| !l.is_empty());
+    if scope.is_some_and(|scope| lines(scope).any(|l| !lines(spec).any(|a| a == l))) {
+        return None;
+    }
+    exact_grants::process::admitting(scope.unwrap_or(spec), &program)
 }
 
 /// What a reader says of a set that did not parse, as the native executor
@@ -83,14 +149,36 @@ pub fn refusal(errors: &[String]) -> String {
 /// Whether a trimmed line is one of exact2's own grants: enforced by the
 /// presenter (`surface.*`), by the OS and the capability that asks
 /// (`device.*`, LLP 1069.008 D3), by the OS's hardened runtime (`runtime.*`,
-/// D9) and by the host's auth arm (`auth.*`, LLP 1069.006), never by the I/O
-/// executor.
+/// D9), by the host's auth arm (`auth.*`, LLP 1069.006), by the host's
+/// kept documents (`doc.keep`, LLP 1069.010.000 D7), by the module
+/// admission of `@exact/browser-automation`'s names (`browser.automation`,
+/// LLP 1020.002 D9), of `@exact/local-network`'s service types
+/// (`net.dns-sd <type>`, LLP 1133.036 D7) and of `@exact/payments`'s
+/// (`payment.*`, LLP 1133.034 D13), never by the I/O executor's grammar;
+/// and the desktop-process lines (`process.spawn`, `env.read login:`,
+/// `secret.hold`, LLP 1133.007 §6), which the runner and the data executor
+/// read with `exact_grants::process`, and `net.listen`, which the listener
+/// checks (LLP 1133.005 D11).
 pub(crate) fn own(line: &str) -> bool {
-    line.starts_with("surface.read ")
+    line == "doc.keep"
+        || exact_grants::process::is_process_line(line)
+        || line.starts_with("net.dns-sd ")
+        || line.split_whitespace().next() == Some("net.listen")
+        || line == "browser.automation"
+        || line == "payment.google-pay"
+        || line.starts_with("payment.apple-pay ")
+        || line.starts_with("surface.read ")
         || line.starts_with("surface.write ")
         || crate::device::is_device_line(line)
         || crate::hardened::is_runtime_line(line)
         || line.starts_with("auth.")
+}
+
+/// Why an own line naming `net.listen` is not one, if it is not.
+fn listen_refusal(line: &str) -> Option<String> {
+    (line.split_whitespace().next() == Some("net.listen"))
+        .then(|| crate::listen::grant_refusal(line))
+        .flatten()
 }
 
 /// One declaration in the browser-facing form. `source` retains every
@@ -172,10 +260,14 @@ fn quote(text: &str, out: &mut String) {
 fn grant_json(grant: &exact_grants::Grant, out: &mut String) {
     use exact_grants::Grant;
     match grant {
-        Grant::Fetch(origin) | Grant::FetchSubdomains(origin) | Grant::WebSocket(origin) => {
+        Grant::Fetch(origin)
+        | Grant::FetchSubdomains(origin)
+        | Grant::WebSocket(origin)
+        | Grant::WebSocketSubdomains(origin) => {
             let kind = match grant {
                 Grant::Fetch(_) => "fetch",
                 Grant::FetchSubdomains(_) => "fetch-subdomains",
+                Grant::WebSocketSubdomains(_) => "websocket-subdomains",
                 _ => "websocket",
             };
             out.push('[');
@@ -186,6 +278,30 @@ fn grant_json(grant: &exact_grants::Grant, out: &mut String) {
             quote(&origin.host, out);
             out.push(',');
             out.push_str(&origin.port.to_string());
+            out.push(']');
+        }
+        Grant::FetchLocalNetwork { loopback } | Grant::WebSocketLocalNetwork { loopback } => {
+            out.push('[');
+            let kind = match grant {
+                Grant::FetchLocalNetwork { .. } => "fetch-local-network",
+                _ => "websocket-local-network",
+            };
+            quote(kind, out);
+            if *loopback {
+                out.push(',');
+                quote(exact_grants::DEVELOPMENT, out);
+            }
+            out.push(']');
+        }
+        Grant::FetchScheme(scheme) | Grant::WebSocketScheme(scheme) => {
+            let kind = match grant {
+                Grant::FetchScheme(_) => "fetch-scheme",
+                _ => "websocket-scheme",
+            };
+            out.push('[');
+            quote(kind, out);
+            out.push(',');
+            quote(scheme, out);
             out.push(']');
         }
         Grant::FsRead(prefix) | Grant::FsWrite(prefix) | Grant::SqliteOpen(prefix) => {
@@ -293,8 +409,11 @@ mod tests {
     #[test]
     fn normalized_output_keeps_exact_lines_comments_and_bad_parent_sources() {
         let json = normalized_json(
-            "# app\nauth.session https://login.test\nnet.fetch https://API.example\nsecret.keep camelCase",
+            "# app\nauth.session https://login.test\nnet.fetch https://API.example\nsecret.keep camelCase\ndoc.keep",
         );
+        assert!(json.contains(r#"[5,"doc.keep",null,null]"#), "{json}");
+        assert!(super::parse("fs.read doc:/\ndoc.keep").is_ok());
+        assert_eq!(crate::io_grants("fs.read doc:/\ndoc.keep"), "fs.read doc:/");
         assert!(json.contains("# app"), "{json}");
         assert!(json.contains("auth.session https://login.test"), "{json}");
         assert!(
@@ -303,6 +422,92 @@ mod tests {
         );
         assert!(json.contains("line 4: `camelCase`"), "{json}");
         assert!(json.contains("\"seal\":\""), "{json}");
+    }
+
+    /// The desktop-process lines (LLP 1133.007 §6) are the runner's own:
+    /// read whole here, never handed to the I/O grammar, and a name is
+    /// kept or held, not both.
+    #[test]
+    fn process_lines_are_own_lines_read_whole() {
+        let spec = "process.spawn path:ssh\nenv.read login:PATH\nsecret.hold ssh.password\nfs.read home:/.ssh";
+        assert_eq!(super::parse(spec).unwrap().lines().len(), 4);
+        assert_eq!(crate::io_grants(spec), "fs.read home:/.ssh");
+        assert!(super::parse("process.spawn path:a/b").unwrap_err()[0].starts_with("line 1: "));
+        let twice = super::parse("secret.keep ssh.password\nsecret.hold ssh.password").unwrap_err();
+        assert!(twice[0].starts_with("secret-name-twice"), "{twice:?}");
+        assert!(super::parse("fs.read home:/").unwrap_err()[0].contains("home-grant-whole"));
+    }
+
+    /// `browser.automation` is the runner's own line and names no target
+    /// (LLP 1020.002 D9): with a word after it, it is no such line, and the
+    /// I/O grammar refuses it.
+    #[test]
+    fn browser_automation_is_an_own_line_with_no_target() {
+        let spec = "browser.automation\nnet.fetch https://a.test";
+        assert!(super::parse(spec).is_ok());
+        assert_eq!(crate::io_grants(spec), "net.fetch https://a.test");
+        assert!(super::parse("browser.automation tab-1").is_err());
+        assert!(super::parse("browser.automations").is_err());
+    }
+
+    #[test]
+    fn a_scheme_line_normalizes_to_its_family_and_scheme_and_names_what_it_admits() {
+        let spec = "net.fetch HTTPS:\nnet.websocket wss://feed.example\nnet.websocket ws:";
+        let json = normalized_json(spec);
+        assert!(json.contains(r#"["fetch-scheme","https"]"#), "{json}");
+        assert!(json.contains(r#"["websocket-scheme","ws"]"#), "{json}");
+        let admitting = |url| super::admitting(spec, None, url);
+        assert_eq!(
+            admitting("https://10.0.0.1:8443/x"),
+            Some("net.fetch HTTPS:")
+        );
+        assert_eq!(
+            admitting("ws://127.0.0.1:3773/ws"),
+            Some("net.websocket ws:")
+        );
+        assert_eq!(
+            admitting("wss://feed.example/s"),
+            Some("net.websocket wss://feed.example")
+        );
+        assert_eq!(admitting("wss://other.example/s"), None);
+        assert_eq!(admitting("http://127.0.0.1/"), None);
+        // A source's scope narrows the lines; one beyond the app's admits nothing.
+        assert_eq!(
+            super::admitting(spec, Some("net.fetch HTTPS:"), "ws://127.0.0.1/"),
+            None
+        );
+        assert_eq!(
+            super::admitting(spec, Some("net.websocket ws:"), "ws://127.0.0.1/"),
+            Some("net.websocket ws:")
+        );
+        assert_eq!(
+            super::admitting(spec, Some("net.websocket ws://a"), "ws://a/"),
+            None
+        );
+    }
+
+    #[test]
+    fn websocket_subdomains_normalize_and_name_the_admitting_line() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../host/web/tests/fixtures/grants.json"))
+                .unwrap();
+        for case in cases.as_array().unwrap() {
+            let spec = case["spec"].as_str().unwrap();
+            if !spec.starts_with("net.websocket ") || !spec.contains("://*.") {
+                continue;
+            }
+            let json: serde_json::Value = serde_json::from_str(&normalized_json(spec)).unwrap();
+            let valid = case["ok"].as_bool().unwrap();
+            assert_eq!(json["error"].is_null(), valid, "{spec}");
+            if valid {
+                assert_eq!(json["entries"][0][2][0], "websocket-subdomains", "{spec}");
+            }
+            for probe in case["websocket"].as_array().into_iter().flatten() {
+                let url = probe[0].as_str().unwrap();
+                let expected = probe[1].as_bool().unwrap().then_some(spec);
+                assert_eq!(super::admitting(spec, None, url), expected, "{spec}: {url}");
+            }
+        }
     }
 
     #[test]

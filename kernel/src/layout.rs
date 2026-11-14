@@ -9,27 +9,34 @@
 //!
 //! An engine fault is never a panic: it is recorded, reported as
 //! [`LayoutError::Engine`], and the kernel rebuilds the tree from the columns.
+mod absolute;
+#[cfg(test)]
+mod absolute_tests;
 mod alert;
 mod buttons;
 #[cfg(test)]
 mod containment_tests;
 #[cfg(test)]
 mod differential_tests;
+#[cfg(test)]
+mod digest;
 mod fields;
 mod fit;
 mod hoist;
+mod inline_images;
 #[cfg(test)]
 mod memo_tests;
 mod order;
 mod publication;
 mod rebuild;
+mod table;
 pub use publication::compute;
 
 use crate::id::{IdMap, IdSet};
-use crate::shared_style::Interner;
+use crate::shared_style::{engine_hash, Interner};
 use std::rc::Rc;
 use taffy::prelude::{AvailableSpace, NodeId, Size, TaffyTree};
-use taffy::tree::{Baselines, LayoutInput};
+use taffy::tree::{Baselines, LayoutInput, RequestedAxis};
 use taffy::util::{MaybeResolve, ResolveOrZero};
 use taffy::TraversePartialTree;
 
@@ -92,7 +99,7 @@ fn from_available(space: AvailableSpace) -> AxisOffer {
 const LEAF_OFFERS: usize = 16;
 
 // @ref LLP 1043.000 §3 D3 — keep the proof with Taffy's measured leaf.
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 struct MeasureContext {
     slot: u32,
     kind: alert::Kind,
@@ -109,7 +116,7 @@ struct MeasureContext {
     fit_natural: Option<f32>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Measurement {
     width: AxisOffer,
     height: AxisOffer,
@@ -119,6 +126,8 @@ struct Measurement {
 }
 
 /// The engine tree. Measured leaves retain their height proof and bounded offers.
+/// A copy is a trial's (`Kernel::measure_block`): laid out and dropped.
+#[derive(Clone)]
 pub struct LayoutTree {
     taffy: TaffyTree<MeasureContext>,
     pass: u64,
@@ -138,6 +147,9 @@ pub struct LayoutTree {
     // hidden or not under the root); empty between layouts.
     walks: IdMap<NodeId, Option<Option<NodeId>>>,
     offers: IdMap<NodeId, Offer>,
+    /// Each table row's or row group's displacement as publication last
+    /// placed what it holds by (`table::displacement`), by slot.
+    pub(super) displacements: IdMap<u32, (f32, f32)>,
     #[cfg(test)]
     pub(crate) publication_visits: usize,
     /// Since the tree was made: nodes publication visited, and leaves the
@@ -155,12 +167,15 @@ pub struct LayoutTree {
     flowing: IdSet<u32>,
     pub(crate) unsettled: IdSet<u32>,
     // Equal engine styles are one allocation (`shared_style`).
-    shared: Interner<taffy::Style, ()>,
+    shared: Interner<taffy::Style>,
     // @ref LLP 1074 T1 — the absolutely positioned boxes, and whether the
     // engine's record of which containing block holds each one that is not its
     // parent's is stale: a position or a child list changed since it was made.
     absolutes: IdSet<NodeId>,
     hoists_stale: bool,
+    // What changed since the last layout that decides whether a change is
+    // confined to absolutely positioned boxes (`absolute.rs`).
+    absolute: absolute::Changes,
     // The static boxes between such a box and its containing block. None is
     // a replay boundary: laying its subtree out alone would not place a box
     // that something above it contains. `hoist_paths_prior` holds the record
@@ -171,6 +186,8 @@ pub struct LayoutTree {
     hoist_paths_prior: IdSet<NodeId>,
     // The fitted paragraphs measured since they last stopped fitting (`fit`).
     fitting: IdSet<u32>,
+    // @ref LLP 1153 D7.3 — the tables laid out as grids.
+    tables: table::Tables,
 }
 
 // A non-visible overflow on both axes establishes a formatting context and
@@ -189,31 +206,10 @@ fn boundary_style(s: &taffy::Style) -> bool {
         )
 }
 
-/// A hash of the rows most styles differ in; equality decides the rest.
-fn engine_hash(s: &taffy::Style) -> u64 {
-    use std::hash::Hasher;
-    let mut h = crate::id::IdHasher::default();
-    let mut len = |l: taffy::CompactLength| {
-        h.write_u64(((l.tag() as u64) << 32) | u64::from(l.value().to_bits()));
-    };
-    len(s.size.width.into_raw());
-    len(s.size.height.into_raw());
-    len(s.min_size.width.into_raw());
-    len(s.min_size.height.into_raw());
-    len(s.flex_basis.into_raw());
-    len(s.margin.left.into_raw());
-    len(s.margin.top.into_raw());
-    len(s.padding.left.into_raw());
-    len(s.padding.top.into_raw());
-    len(s.gap.width.into_raw());
-    h.write_u64(u64::from(s.flex_grow.to_bits()) << 32 | u64::from(s.flex_shrink.to_bits()));
-    h.write_u64(
-        (s.display as u64)
-            | (s.position as u64) << 8
-            | (s.flex_direction as u64) << 16
-            | (s.box_sizing as u64) << 24,
-    );
-    h.finish()
+/// Whether the engine keeps a box's final layout to replay: a clipping box's,
+/// and a positioned one's, which contains absolutely positioned boxes.
+fn replayable(s: &taffy::Style) -> bool {
+    boundary_style(s) || s.position != taffy::Position::Static
 }
 
 impl Default for LayoutTree {
@@ -272,10 +268,17 @@ impl LayoutMirror for LayoutTree {
     }
 
     fn restyle(&mut self, arena: &NodeArena, slot: u32, node: NodeId) {
-        self.set_style(node, taffy_style(arena, slot));
+        self.restyle_with(arena, slot, node);
+        // The title's box follows its alert's grouping (layout/alert.rs)
+        if let Some(prefix) = self.alert_prefixes.get(&slot).copied() {
+            self.write_style(prefix, alert::prefix_style(arena.grouped_alert(slot)));
+        }
     }
 
     fn sync_children(&mut self, arena: &NodeArena, parent: u32, node: NodeId) -> usize {
+        if self.tables.holds(arena, parent) {
+            return 0; // made before the next layout (`table.rs`)
+        }
         if !arena.node_type(parent).lays_out_children() {
             LayoutTree::set_children(self, node, &[]);
             return 0;
@@ -364,6 +367,11 @@ impl LayoutTree {
         self.taffy.multicol_bounds(node)
     }
 
+    /// Where a grid last placed `node`'s box from, in the grid's coordinates (patch 69).
+    pub(crate) fn grid_origin(&self, node: NodeId) -> Option<taffy::geometry::Point<f32>> {
+        self.taffy.grid_origin(node)
+    }
+
     /// An empty tree.
     pub fn new() -> Self {
         // Frames are CSS pixel geometry, not a host's raster grid. Rounding
@@ -384,6 +392,7 @@ impl LayoutTree {
             deferred: IdMap::default(),
             walks: IdMap::default(),
             offers: IdMap::default(),
+            displacements: IdMap::default(),
             #[cfg(test)]
             publication_visits: 0,
             #[cfg(test)]
@@ -396,9 +405,11 @@ impl LayoutTree {
             shared: Interner::default(),
             absolutes: IdSet::default(),
             hoists_stale: false,
+            absolute: Default::default(),
             hoist_paths: IdSet::default(),
             hoist_paths_prior: IdSet::default(),
             fitting: IdSet::default(),
+            tables: table::Tables::default(),
         }
     }
 
@@ -419,9 +430,9 @@ impl LayoutTree {
     /// One allocation for every engine style equal to `style`.
     fn share(&mut self, style: taffy::Style) -> Rc<taffy::Style> {
         let hash = engine_hash(&style);
-        match self.shared.get(hash, |_, held| *held == style) {
+        match self.shared.get(hash, |held| *held == style) {
             Some(found) => found,
-            None => self.shared.insert(hash, (), style),
+            None => self.shared.insert(hash, style),
         }
     }
 
@@ -456,7 +467,7 @@ impl LayoutTree {
 
     /// Allocate a leaf; `measured` leaves carry their slot for the measure closure.
     pub fn new_leaf(&mut self, style: taffy::style::Style, slot: u32, measured: bool) -> NodeId {
-        let boundary = boundary_style(&style);
+        let boundary = replayable(&style);
         let absolute = style.position == taffy::Position::Absolute;
         let style = self.share(style);
         let result = if measured {
@@ -473,6 +484,7 @@ impl LayoutTree {
         match result {
             Ok(node) => {
                 self.slots.insert(node, slot);
+                self.made(node);
                 self.taffy.track_layout_input(node, boundary);
                 if absolute {
                     self.absolutes.insert(node);
@@ -497,7 +509,11 @@ impl LayoutTree {
         self.deferred.remove(&node);
         self.walks.remove(&node);
         if let Some(slot) = self.slots.remove(&node) {
+            if let Some(anon) = self.tables.forget(slot) {
+                self.remove(anon);
+            }
             self.flowing.remove(&slot);
+            self.displacements.remove(&slot);
             if let Some(prefix) = self.alert_prefixes.remove(&slot) {
                 self.remove(prefix);
             }
@@ -545,9 +561,10 @@ impl LayoutTree {
                 self.absolutes.remove(&node);
             }
             self.hoists_stale = true;
+            self.repositioned(node);
         }
         self.clear_measurements(node);
-        self.taffy.track_layout_input(node, boundary_style(&style));
+        self.taffy.track_layout_input(node, replayable(&style));
         let style = self.share(style);
         self.taffy.set_style_unmarked(node, style);
         self.deferred.insert(node, true);
@@ -625,6 +642,7 @@ impl LayoutTree {
     /// Replace a node's ordered children. A child taken from another parent
     /// invalidates both at once; otherwise this is the parent's content.
     pub fn set_children(&mut self, parent: NodeId, children: &[NodeId]) {
+        self.children_changing(parent);
         self.hoists_stale |= !self.absolutes.is_empty();
         self.clear_measurements(parent);
         if self.taffy.set_children_unmarked(parent, children) {
@@ -644,6 +662,7 @@ impl LayoutTree {
 
     /// Mark a node (and its ancestors) dirty.
     pub fn mark_dirty(&mut self, node: NodeId) {
+        self.dirtied(node);
         self.clear_measurements(node);
         self.deferred.entry(node).or_insert(false);
     }
@@ -755,12 +774,25 @@ impl LayoutTree {
         // first: one stopping at a box a local walk had already cleared would
         // leave that box's ancestors clean.
         let mut boundaries = IdSet::default();
+        let mut blocks = IdSet::default();
         let mut contained = Vec::new();
+        // A source under another root waits for that root's layout, where it
+        // may stay local, unless the hoists moved (their prior paths go now).
+        let keep = self.hoist_paths_prior.is_empty();
+        let mut others = Vec::new();
         for &node in deferred.keys() {
-            match local
+            if keep && self.under_another(node, root) {
+                others.push((node, deferred[&node]));
+                continue;
+            }
+            let held = local
                 .then(|| self.boundary_for(node, root, &deferred, &mut walks))
-                .flatten()
-            {
+                .flatten();
+            let block = (local && held.is_none())
+                .then(|| self.absolute_boundary(node, root, &deferred))
+                .flatten();
+            blocks.extend(block);
+            match held.or(block) {
                 Some(boundary) => {
                     contained.push((node, boundary));
                     boundaries.insert(boundary);
@@ -776,8 +808,12 @@ impl LayoutTree {
         }
         deferred.clear();
         walks.clear();
+        deferred.extend(others);
         self.deferred = deferred;
         self.walks = walks;
+        if self.deferred.is_empty() {
+            self.absolute.clear();
+        }
         // An unrelated source may have invalidated the root (a list whose
         // rows moved, a change no box contains): the root pass that follows
         // handles those, and each boundary is still replayed first. Its
@@ -804,8 +840,7 @@ impl LayoutTree {
         let mut replays: Vec<(usize, NodeId, LayoutInput, taffy::tree::LayoutOutput)> = boundaries
             .into_iter()
             .filter_map(|node| {
-                self.taffy
-                    .last_layout_input(node)
+                self.replay_record(node, blocks.contains(&node))
                     .map(|(input, output)| (depth(node), node, input, output))
             })
             .collect();
@@ -866,6 +901,7 @@ impl LayoutTree {
     ) -> Result<(), LayoutError> {
         // Resolve percentage trees under this layout's environment.
         let _env = crate::style::LayoutEnv::set(arena.env());
+        self.refresh_tables(arena, node_for);
         self.prepare_fields(root, arena, measurer)?;
         let buttons = self.prepare_buttons(root, arena, measurer)?;
         // Percentage padding uses the containing block's final width. Settle
@@ -896,10 +932,10 @@ impl LayoutTree {
         if let Some(fault) = &self.fault {
             return Err(LayoutError::Engine(fault.clone()));
         }
-        // @ref LLP 1043.000 §3 D3 — invalidate only the text whose height
-        // proof matters to live wrapping contexts. Clean roots retain their
-        // cached proof; hidden, detached and other-root exclusions do no work.
-        if self.is_dirty(root) && !arena.exclusion_slots.is_empty() {
+        // @ref LLP 1043.000 §3 D3 — changed offers can mix cached intrinsic heights
+        // with fresh layout. Invalidate contributing leaves to rebuild their proof.
+        let changed = self.is_dirty(root) || self.last_offer(root) != Some(offer);
+        if changed && !arena.exclusion_slots.is_empty() {
             let mut contexts = crate::sorted::SlotSet::default();
             for slot in arena.exclusion_slots.iter() {
                 let mut at = Some(slot);
@@ -1009,8 +1045,6 @@ impl LayoutTree {
                 record.parent_width = inputs.parent_size.width;
             }
 
-            // Patch 2's separate API is unnecessary: the upstream callback owns
-            // LayoutOutput, including baselines in border-box coordinates.
             let inset = style
                 .padding
                 .resolve_or_zero(inputs.parent_size.width, crate::style::resolve_calc)
@@ -1045,13 +1079,15 @@ impl LayoutTree {
                     let Some(context) = context else {
                         return Size::ZERO;
                     };
-                    // Clear on the first actual measurement of this pass. A cache
-                    // hit retains the proof of the pass that produced that layout.
-                    if context.pass != pass {
-                        context.pass = pass;
-                        context.height_measured = false;
+                    // Width probes leave a cached layout's height proof intact. Reset
+                    // on the first height measurement, keeping dependence through stretching.
+                    if inputs.axis != RequestedAxis::Horizontal {
+                        if context.pass != pass {
+                            context.pass = pass;
+                            context.height_measured = false;
+                        }
+                        context.height_measured |= !height_known;
                     }
-                    context.height_measured |= !height_known;
                     let slot = context.slot;
                     if let Some((size, metrics)) = alert::measure(
                         arena,
@@ -1066,9 +1102,15 @@ impl LayoutTree {
                         line_height = metrics.height;
                         return size;
                     }
-                    if let Some(size) =
-                        crate::replaced::measure(arena, slot, style, inset, known, space)
-                    {
+                    if let Some(size) = crate::replaced::measure(
+                        arena,
+                        slot,
+                        style,
+                        inset,
+                        known,
+                        space,
+                        inputs.sizing_mode,
+                    ) {
                         return size;
                     }
                     if let Some(record) = buttons.get(&slot).and_then(|n| button_records.get_mut(n))
@@ -1098,7 +1140,8 @@ impl LayoutTree {
                         // @ref LLP 1069.001 D3 — the platform's size for its
                         // control (CSS leaves it to the UA), each axis
                         // overridden by a known one; until the host
-                        // reports, the kind's default. Native modules use the
+                        // reports, a mark's last report, else the kind's
+                        // default. Native modules use the
                         // same non-ratio seam, with no default content size
                         // (LLP 1024 D4). A determinate `progress` is `10em`
                         // by `1em` whatever its host's bar reports (LLP
@@ -1107,7 +1150,8 @@ impl LayoutTree {
                         let (iw, ih) = if kind == Some(crate::ControlKind::ProgressBar) {
                             crate::control::progress_size(arena, slot)
                         } else {
-                            arena.intrinsic(slot).unwrap_or_else(|| {
+                            let shared = || crate::control::shared_size(arena, slot);
+                            arena.intrinsic(slot).or_else(shared).unwrap_or_else(|| {
                                 kind.map_or((0.0, 0.0), |kind| {
                                     let font = crate::generated::StyleId::FontSize;
                                     kind.default_size(arena.computed_source(slot, font).font_size)
@@ -1133,7 +1177,7 @@ impl LayoutTree {
                     };
                     // @ref LLP 1093 D1 — a multi-column `text` breaks its
                     // lines at the column width; its height is the columns'.
-                    let width = match (style.multicol, known.width) {
+                    let width = match (style.rare.multicol, known.width) {
                         (Some(m), Some(u)) => AxisOffer::Definite(m.columns(u).1),
                         _ => width,
                     };
@@ -1155,7 +1199,7 @@ impl LayoutTree {
                         // its own.
                         runs_slot = None;
                         let natural = &mut context.fit_natural;
-                        let Some((metrics, scale)) =
+                        let Some((mut metrics, scale)) =
                             fit::measure(arena, slot, measurer, &mut runs, natural, width, height)
                         else {
                             return Size::ZERO;
@@ -1163,6 +1207,7 @@ impl LayoutTree {
                         if context.measurements.len() == LEAF_OFFERS {
                             context.measurements.remove(0);
                         }
+                        crate::time::reserve(arena, slot, measurer, &mut metrics);
                         let m = Measurement {
                             width,
                             height,
@@ -1179,7 +1224,7 @@ impl LayoutTree {
                                 context.flow.is_empty() || !matches!(width, AxisOffer::Definite(_))
                             })
                             .and_then(|stamp| measurer.measure_known(stamp, width, height));
-                        let metrics = if let Some(metrics) = known {
+                        let mut metrics = if let Some(metrics) = known {
                             metrics
                         } else {
                             // A pass borrows an immutable arena. Consecutive offers
@@ -1192,9 +1237,6 @@ impl LayoutTree {
                             if runs.is_empty() {
                                 return Size::ZERO;
                             }
-                            // Direction and alignment inherit (a paragraph inside a
-                            // centred column centres, as in CSS); the rest are its own.
-                            let paragraph = arena.paragraph(slot);
                             // @ref LLP 1043.000 §8 — an admitted auto-height leaf is
                             // measured around its settled shapes, in content space as
                             // the painters flow it. Intrinsic probes stay unobstructed:
@@ -1207,13 +1249,7 @@ impl LayoutTree {
                                     .collect(),
                                 _ => Vec::new(),
                             };
-                            let request = TextMeasureRequest {
-                                exclusions: &shapes,
-                                runs: &runs,
-                                paragraph,
-                                width,
-                                height,
-                            };
+                            let request = fit::request(arena, slot, &runs, &shapes, width, height);
                             fields::text(arena, slot, measurer, stamp.as_ref(), &request)
                         };
                         if !metrics.is_valid() {
@@ -1223,6 +1259,7 @@ impl LayoutTree {
                         if context.measurements.len() == LEAF_OFFERS {
                             context.measurements.remove(0);
                         }
+                        crate::time::reserve(arena, slot, measurer, &mut metrics);
                         context.measurements.push(Measurement {
                             width,
                             height,
@@ -1232,7 +1269,7 @@ impl LayoutTree {
                         metrics
                     };
                     let mut metrics = metrics;
-                    if let Some(h) = style.multicol.and_then(|m| m.used_height) {
+                    if let Some(h) = style.rare.multicol.and_then(|m| m.used_height) {
                         metrics.height = h;
                     }
                     if arena.node_type(slot) == NodeType::TextInput
@@ -1277,7 +1314,13 @@ impl LayoutTree {
                 .compute_boundary_with_measure(node, input, &mut measure);
             // Both axes clip here; the changed internal extent is published on
             // this box but cannot contribute to an ancestor's scrollable extent.
-            output.scrollable_overflow_rect = previous.scrollable_overflow_rect;
+            // A containing block that does not clip (`absolute.rs`) contributes
+            // only where its overflow passes its border box.
+            if self.taffy.style(node).is_ok_and(boundary_style)
+                || absolute::same_reach(&output, &previous)
+            {
+                output.scrollable_overflow_rect = previous.scrollable_overflow_rect;
+            }
             if baselines_unread.contains(&node) {
                 output.baselines = previous.baselines;
             }

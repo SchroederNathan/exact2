@@ -71,26 +71,23 @@ pub fn case(seed: u64, size: &Size) -> Case {
         (source, g.events(), g.called)
     };
     let (mut source, mut events, called) = written(true);
-    // A call among statements that the compiler refuses (a read another
-    // frame made stale, LLP 1089 D3, or a second send through calls, D6) is
-    // written again with calls only in bodies that only call, so the sweep
-    // keeps its size.
-    if called
-        && contract::compile(&source).is_err_and(|e| {
-            matches!(
-                e.id.as_ref(),
-                "analyze-call-stale-read" | "analyze-send-twice"
-            )
-        })
-    {
+    // A call among statements that the compiler refuses (a second send
+    // through calls, LLP 1089 D6) is written again with calls only in
+    // bodies that only call, so the sweep keeps its size. A read another
+    // frame made stale is a warning since LLP 1035.005.002 C2, and such a
+    // case runs: the semantics and both executors read the snapshot alike.
+    if called && contract::compile(&source).is_err_and(|e| e.id == "analyze-send-twice") {
         (source, events, _) = written(false);
     }
     Case {
+        seed: None,
         name: format!("gen-{seed}"),
         source,
         events,
         path: None,
         stored: true,
+        prerendered: false,
+        launch: Default::default(),
     }
 }
 
@@ -179,8 +176,8 @@ pub(crate) struct Gen<'s> {
     pub(crate) uses: u64,
     /// Whether this program declares `routes nav` (its router slot `nav`).
     pub(crate) routes: bool,
-    /// Whether this program's strings may use `formatTime`, `formatDate`
-    /// and `formatNumber`.
+    /// Whether this program's strings may use `formatTime`, `formatDate`,
+    /// `formatDay` and `formatNumber`.
     pub(crate) formats: bool,
     /// The root action the mutation's `then` names.
     pub(crate) then: Option<usize>,
@@ -204,8 +201,11 @@ pub(crate) struct Gen<'s> {
     pub(crate) persist: Rng,
 }
 
+/// `length` among them: a record's field `x.length` reads, beside a list's
+/// count (LLP 1116.015 D2, amended 2026-10-17).
 const FIELDS: &[&str] = &[
     "id", "name", "n", "flag", "tag", "items", "sub", "score", "label", "note", "on", "at",
+    "length",
 ];
 
 impl<'s> Gen<'s> {
@@ -385,4 +385,13 @@ impl<'s> Gen<'s> {
 
 fn number_text(n: f64) -> String {
     format!("{n}")
+}
+
+/// Text inputs from the same distribution as generated scripts.
+pub(crate) fn input(rng: &mut Rng) -> String {
+    if rng.chance(1, 4) {
+        exact_runner::stdlib::format_number(rng.below(2000) as f64 / 4.0 - 100.0)
+    } else {
+        rng.pick(STRINGS).to_string()
+    }
 }

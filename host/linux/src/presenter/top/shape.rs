@@ -4,7 +4,7 @@
 //! **An alert** (LLP 1115 D6) is an `alertdialog`, a `dialog` or a popover,
 //! whose rows are explanatory text, actions (a `button` with a `press` that
 //! also closes it) and one cancel (a closing `button` with no `press`), with
-//! at most three buttons: the rule the Apple hosts follow
+//! at most three buttons (the cancel alone is the one-button alert): the rule the Apple hosts follow
 //! (`ConfirmationShape.swift`, `AlertsMac.swift`'s `plan`). Its title is the
 //! `aria-label`, else its first line; its message is the rest.
 //!
@@ -119,6 +119,32 @@ fn text_of(kernel: &Kernel, node: &NodeRef<'_>) -> String {
         .join(" ")
 }
 
+/// A confirmation's rows: its children, read through the `message` box of
+/// texts and the `actions` box of buttons the compiler groups an alert into
+/// (`alertPart`, contract/lower/src/alert_parts.rs) so a host that draws it
+/// can scroll its message. A box holding anything else stays a row of its
+/// own, which no confirmation's shape admits.
+fn confirmation_rows<'k>(kernel: &'k Kernel, pop: &NodeRef<'k>) -> Vec<NodeRef<'k>> {
+    let node = |id| kernel.node(id);
+    (pop.children().into_iter().filter_map(node))
+        .flat_map(|row| {
+            let rows: Vec<NodeRef<'k>> = row.children().into_iter().filter_map(node).collect();
+            let all = |keep: fn(&NodeRef<'_>) -> bool| rows.iter().all(keep);
+            let crossed = row.node_type == NodeType::View
+                && match row.props.str(PropId::AlertPart) {
+                    Some("message") => all(|r| r.node_type == NodeType::Text),
+                    Some("actions") => all(is_button),
+                    _ => false,
+                };
+            if crossed {
+                rows
+            } else {
+                vec![row]
+            }
+        })
+        .collect()
+}
+
 /// A button's row: its face's title, else its label, else its text.
 pub(in crate::presenter) fn row(kernel: &Kernel, node: &NodeRef<'_>, cancel: bool) -> Row {
     let face = kernel.press_face(node.id).unwrap_or_default();
@@ -154,9 +180,7 @@ pub fn alert(
     {
         return None;
     }
-    let children: Vec<NodeRef<'_>> = (pop.children().into_iter())
-        .filter_map(|id| kernel.node(id))
-        .collect();
+    let children = confirmation_rows(kernel, &pop);
     let button = |n: &&NodeRef<'_>| is_button(n);
     let actions: Vec<&NodeRef<'_>> = (children.iter().filter(button))
         .filter(|n| pressed(n.id))
@@ -168,9 +192,11 @@ pub fn alert(
         .filter(|n| n.node_type == NodeType::Text)
         .collect();
     let enabled = |n: &&NodeRef<'_>| n.props.bool(PropId::Disabled) != Some(true);
+    // With no action it is the one-button alert, which tells; with actions,
+    // one must be choosable.
     if children.len() != actions.len() + cancels.len() + texts.len()
         || !actions.iter().all(|n| closes(kernel, n, &pop, modal))
-        || !actions.iter().any(enabled)
+        || !(actions.is_empty() || actions.iter().any(enabled))
     {
         return None;
     }
@@ -230,13 +256,6 @@ pub fn menu(kernel: &Kernel, pop: ViewId, pressed: &dyn Fn(ViewId) -> bool) -> O
     (!entries.is_empty()).then_some(Plan::Menu(entries))
 }
 
-/// Admission for the retained desktop alert path. Windows keep their own kinds.
-pub(crate) fn neutral_alert(kernel: &Kernel, id: ViewId, pressed: &dyn Fn(ViewId) -> bool) -> bool {
-    crate::paint::look::neutral()
-        && kernel.node(id).is_some_and(|n| {
-            n.parent.is_some()
-                && n.props.str(PropId::SemanticTag) == Some("dialog")
-                && n.props.get(PropId::NavigationKey).is_none()
-        })
-        && alert(kernel, id, pressed, true).is_some()
-}
+#[cfg(test)]
+#[path = "shape_tests.rs"]
+mod tests;

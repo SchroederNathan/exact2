@@ -1,5 +1,7 @@
 //! The abstract syntax tree.
 pub use crate::colours::{ColorProfileDecl, DesignSource, ThemeDecl};
+pub use crate::tap::TapForm;
+pub use crate::test_steps::{Step, TestDecl};
 use crate::Span;
 use std::collections::BTreeMap;
 /// Identifier ranges that are distinct from their AST construct's diagnostic span.
@@ -35,6 +37,14 @@ pub struct File {
     pub shapes: Vec<ShapeDecl>,
     /// `style` declarations, in order (LLP 1017 P6).
     pub styles: Vec<StyleDecl>,
+    /// Named textarea decoration rows (LLP 1114.007).
+    pub decorations: Vec<StyleDecl>,
+    /// Loaded files' visible decoration aliases, by source identity.
+    pub decoration_scopes: BTreeMap<u32, Vec<(String, String)>>,
+    /// `atom` declarations: the inline atoms' source forms (LLP 1045.000 D3).
+    pub atoms: Vec<StyleDecl>,
+    /// Loaded files' visible atom aliases, by source identity.
+    pub atom_scopes: BTreeMap<u32, Vec<(String, String)>>,
     /// `keyframes` declarations, in order (LLP 1055 D5): CSS `@keyframes`,
     /// scoped to their file as in CSS Modules (LLP 1091 D5).
     pub keyframes: Vec<KeyframesDecl>,
@@ -47,17 +57,37 @@ pub struct File {
     pub theme: Option<ThemeDecl>,
     /// The app's design, `app.tamber` (LLP 1121 D2), set by the driver.
     pub design: Option<DesignSource>,
+    /// The designs of the packages the app's sources link (LLP 1121 D11),
+    /// each `<name>.tamber` beside its package's entry, set by the driver.
+    pub package_designs: Vec<DesignSource>,
+    /// The identities of the exported library components (LLP 1139 D0):
+    /// each component a private package that ships a design declares in
+    /// its entry, or re-exports there; set by the driver.
+    pub library: Vec<String>,
+    /// The names of the app's library packages (LLP 1139 D0): each linked
+    /// package that is `"private": true` and ships a design; set by the
+    /// driver.
+    pub library_packages: Vec<String>,
     /// `fn` declarations, in order (LLP 1017 P5).
     pub fns: Vec<FnDecl>,
+    /// Native modules' sources and sends, read from packages (LLP 1133.001).
+    pub modules: Vec<crate::ModuleDecl>,
     /// `test` declarations, in order (LLP 1017 P7) — normally in a file of
     /// their own beside the app, `app.test.contract`.
     pub tests: Vec<TestDecl>,
+    /// Properties checked against test observations, never compiled.
+    pub properties: Vec<PropertyDecl>,
     /// A test file's launch lines (`size`, `epoch`, `time-zone`, `locale`,
     /// `seed`, `before data`), which every test in the file opens with unless it names its
     /// own (habits F7, calendar F13).
     pub launch: Vec<Step>,
     /// `component` declarations, in order. The first is the root.
     pub components: Vec<Component>,
+    /// A members file's `members Name` block (LLP 1091.002 D2): members of
+    /// the component `Name`, which lists this file.
+    pub members: Option<Component>,
+    /// Refusals left to the loader (LLP 1091.002).
+    pub deferred: Vec<crate::members::Deferred>,
 }
 impl File {
     /// Describe an unknown component and the merged declarations in source order.
@@ -106,12 +136,13 @@ pub struct RouteDecl {
     /// Where.
     pub span: Span,
 }
-/// A declared font family. Faces are static in v1: one path, weight, style.
+/// A declared font family: its faces, each one file at a weight or a weight
+/// range, and a style.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FontDecl {
     /// The Contract alias; hosts bind this name to these bytes.
     pub name: String,
-    /// Its static faces.
+    /// Its faces.
     pub faces: Vec<FontFaceDecl>,
     /// Where.
     pub span: Span,
@@ -125,11 +156,13 @@ pub struct SoundDecl {
     /// Where.
     pub span: Span,
 }
-/// One static face in a [`FontDecl`].
+/// One face in a [`FontDecl`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct FontFaceDecl {
-    /// CSS weight 1–1000.
-    pub weight: u16,
+    /// CSS weights 1–1000, low and high, as `@font-face`'s `font-weight`
+    /// descriptor: one weight is both. `None` is the descriptor's `auto`, the
+    /// file's own range (`font "Name" = "path"`).
+    pub weight: Option<[u16; 2]>,
     /// Italic, rather than normal.
     pub italic: bool,
     /// App-relative TTF/OTF source.
@@ -137,380 +170,97 @@ pub struct FontFaceDecl {
     /// Where.
     pub span: Span,
 }
-/// `test "name"` with steps: the agent API's own operations (LLP 1012) and
-/// `expect` lines that read their replies — compiled to a script the agent
-/// driver runs against the real hosts; never a second evaluator (LLP 1017 P7).
+/// A property in a test file (LLP 1148 D1).
 #[derive(Debug, Clone, PartialEq)]
-pub struct TestDecl {
-    /// The name.
-    pub name: String,
-    /// The steps, in order.
-    pub steps: Vec<Step>,
-    /// Where.
+pub struct PropertyDecl {
+    /// Declaration location.
     pub span: Span,
+    /// When this property is checked.
+    pub kind: PropertyKind,
+    /// Authored name; for `never refuses`, the action's name.
+    pub name: String,
+    /// Predicates in source order.
+    pub lines: Vec<PropertyLine>,
 }
-/// One step of a `test`.
+/// The observations a property quantifies over.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Step {
-    /// `tap "testId"`, or one of the driver's other forms of it
-    /// (`modifiers "Shift"` for a press with keys held).
-    Tap {
-        /// The node, by `testId`.
-        target: String,
-        /// Which input: a press, unless the step names another.
-        form: TapForm,
-        /// `modifiers "Shift+Meta"`: the keys held through a press (empty
-        /// for none; gallery F20).
-        modifiers: String,
-        /// Where.
-        span: Span,
-    },
-    /// `tap "testId" drag dx dy [from x y] [mouse] [press ms] [over ms]
-    /// [hold ms] [during "op" …]`: one whole drag from the node's middle, or
-    /// from `from` in its box, a finger's or the left button's; the driver's
-    /// `tap … drag` (kanban F18, files diary F10). `tap "A" drag to "B" [at x y] …`
-    /// ends at B's middle, or at `at` from its top left (LLP 1094 D12).
-    /// `during` is last: quoted reads or `clock` while the finger is down,
-    /// after the move and before the hold (drums R8).
-    Drag {
-        /// The node, by `testId`.
-        target: String,
-        /// Points across (0 for a drag `to` a node).
-        dx: f64,
-        /// Points down (0 for a drag `to` a node).
-        dy: f64,
-        /// The node it ends on, by `testId`, and where in its box.
-        to: Option<(String, Option<(f64, f64)>)>,
-        /// Where it starts, an offset from the node's top left; its middle when `None`.
-        from: Option<(f64, f64)>,
-        /// The left button rather than a finger, where a carrier has both.
-        mouse: bool,
-        /// Milliseconds held before the move.
-        press: Option<f64>,
-        /// Milliseconds the move takes.
-        over: Option<f64>,
-        /// Milliseconds held after the move.
-        hold: Option<f64>,
-        /// Quoted ops run while the finger is down, after the move, before
-        /// the hold. Empty when the step names none.
-        during: Vec<String>,
-        /// Where.
-        span: Span,
-    },
-    /// `size 1200x800`: the viewport the test's session opens at, its first
-    /// step (the driver's `--size`; kanban F18, paint F5).
-    Size {
-        /// Points across.
-        width: f64,
-        /// Points down.
-        height: f64,
-        /// Where.
-        span: Span,
-    },
-    /// `epoch "2026-09-21T12:00:00Z"` (or Unix milliseconds, or `now`): the
-    /// date at the session clock's zero, the driver's `--epoch` (habits F7).
-    Epoch {
-        /// An ISO date, whole milliseconds or `now`, as the driver takes it.
-        value: String,
-        /// Where.
-        span: Span,
-    },
-    /// `time-zone "America/New_York"`: the session's IANA zone, `--time-zone`.
-    TimeZone {
-        /// The zone.
-        zone: String,
-        /// Where.
-        span: Span,
-    },
-    /// `locale "fr-FR"`: the session's BCP 47 locale, `--locale`.
-    Locale {
-        /// The tag.
-        tag: String,
-        /// Where.
-        span: Span,
-    },
-    /// `before data`: the test's first step does not wait for the app's
-    /// data. Without it the driver waits, as `clock data` does, so a store
-    /// opened at launch is open before the first step (habits, pomodoro).
-    /// What has landed without the wait is the host's: a native app runs on
-    /// real time before the driver connects, the web page on the agent's.
-    BeforeData {
-        /// Where.
-        span: Span,
-    },
-    /// `fail fetch "https://api.example.com/" [times 2]` (LLP 1103): every
-    /// later fetch whose URL starts with the prefix fails as a refused
-    /// connection does, or the next `times` of them. Leading a test's steps
-    /// (or at a file's top level) it is armed before the app's first data
-    /// load, as a launch line; later it is a step.
-    FailFetch {
-        /// What a matching fetch's URL starts with.
-        prefix: String,
-        /// How many matching fetches fail; `None`, every one until `pass`.
-        times: Option<u32>,
-        /// Where.
-        span: Span,
-    },
-    /// `pass fetch "…"`: the prefix stops failing (LLP 1103).
-    PassFetch {
-        /// The prefix a `fail fetch` armed.
-        prefix: String,
-        /// Where.
-        span: Span,
-    },
-    /// `request POST "/items" {"title": "Bread"} as grace [expect 409]` (LLP 1116.006
-    /// D8): the driver writes through the app's server as another person.
-    Request {
-        /// `GET`, `POST`, `PUT`, `PATCH` or `DELETE`.
-        method: String,
-        /// Under the server URL the app calls (`/items`), or a whole URL.
-        path: String,
-        /// The body, as JSON text.
-        body: Option<String>,
-        /// Whose bearer token it carries.
-        persona: Option<String>,
-        /// `expect 409` (LLP 1116.010 D3): the refusal's status; `None`: any 2xx.
-        status: Option<u16>,
-        /// Where.
-        span: Span,
-    },
-    /// `fresh` or `fresh "seed.json"`: before the test opens, the Snapback
-    /// dev server the app fetches is emptied (`POST /dev/reset`), and seeded
-    /// with the file's `[{table, row}]` when one is named (a path from the
-    /// test file). At a file's top level, before every test in it (the
-    /// author's ruling of 2026-10-12, via the sb4 app farm).
-    Fresh {
-        /// The seed file, as written.
-        seed: Option<String>,
-        /// Where.
-        span: Span,
-    },
-    /// `seed 7`: the session's `exactTime().seed`, `--seed`.
-    Seed {
-        /// A whole number from 0 through 2^32 − 1.
-        seed: f64,
-        /// Where.
-        span: Span,
-    },
-    /// `type "testId" "text"`, or `… append`.
-    Type {
-        /// The field, by `testId`.
-        target: String,
-        /// The text.
-        text: String,
-        /// `append`: after the field's value, not in place of it (feed F8).
-        append: bool,
-        /// Where.
-        span: Span,
-    },
-    /// `type "testId" key "Enter"`, or `down`, `up`, or `for <ms>` (platformer R7).
-    Key {
-        /// The field, by `testId`.
-        target: String,
-        /// The key's web name.
-        key: String,
-        /// `down` or `up`; `None` is a press (down and up).
-        phase: Option<String>,
-        /// Milliseconds the key stays down, on the virtual clock. Not with `phase`.
-        duration: Option<f64>,
-        /// Where.
-        span: Span,
-    },
-    /// `pick "id" "path"…` / `pick "id" cancel`: answer the device request
-    /// held at the node whose `id` (or `testId`) a picker named, or the one
-    /// hold with that capability (`open-directory`, `pick`, `export`, …),
-    /// whatever its ticket (files F11). Paths are the test file's.
-    Pick {
-        /// The node the answer arrives at, or a capability.
-        target: String,
-        /// The files or folders chosen; empty for `cancel`.
-        paths: Vec<String>,
-        /// Where.
-        span: Span,
-    },
-    /// `type "testId" copy`, `… cut`, `… paste "text"`: the clipboard's
-    /// event at the node, a paste carrying `text` as the clipboard's.
-    Clipboard {
-        /// The node, by `testId`.
-        target: String,
-        /// `copy`, `cut` or `paste`.
-        edit: String,
-        /// A paste's text; empty for copy and cut.
-        text: String,
-        /// Where.
-        span: Span,
-    },
-    /// `clock settle`, `clock data`, `clock +ms`, `clock +ms real`, `clock ms`.
-    Clock {
-        /// The argument as the agent takes it.
-        arg: String,
-        /// Where.
-        span: Span,
-    },
-    /// `resize 800x600`: the window (a desktop's, the browser's), mid-test,
-    /// as the driver's `resize` (reader: repagination on resize).
-    Resize {
-        /// Points.
-        width: f64,
-        /// Points.
-        height: f64,
-        /// Where.
-        span: Span,
-    },
-    /// `screenshot "file.png"`.
-    Screenshot {
-        /// The file.
-        path: String,
-        /// Where.
-        span: Span,
-    },
-    /// `expect tree has "testId"` / `expect tree missing "testId"`.
-    ExpectTree {
-        /// The node, by `testId`.
-        target: String,
-        /// Present, or absent.
-        present: bool,
-        /// Where.
-        span: Span,
-    },
-    /// `expect disabled "testId"` / `expect enabled "testId"` (LLP 1116.010 D3): whether
-    /// the control the node names is disabled (its `disabled` attribute).
-    ExpectDisabled {
-        /// The node, by `testId`.
-        target: String,
-        /// `disabled`, or `enabled`.
-        disabled: bool,
-        /// Where.
-        span: Span,
-    },
-    /// `expect text "testId" == "value"`: the node's text — its `text` prop,
-    /// else its descendants' text in order (the web's `textContent`), else a
-    /// field's value.
-    ExpectText {
-        /// The node, by `testId`.
-        target: String,
-        /// The text.
-        value: String,
-        /// Where.
-        span: Span,
-    },
-    /// `reload`: the app restarts on the scratch store it had, so what it
-    /// kept is what it reads (mail F19, kanban F25, weather F3).
-    Reload {
-        /// Where.
-        span: Span,
-    },
-    /// `close`: the window's close button, as ⌘W or the red button press
-    /// it, asking its `beforeunload` first (the driver's `close`, studio
-    /// diary R17); a window a handler keeps stays, and the test goes on.
-    Close {
-        /// Where.
-        span: Span,
-    },
-    /// `back`: the platform's Back, as a person takes it (LLP 1116.006 D4):
-    /// an open dialog's cancel (Escape), else the top sheet dismissed (its
-    /// swipe down), else the pushed route popped (iOS's Back button, the
-    /// browser's Back, ⌘[). With nothing to go back from, the step fails.
-    Back {
-        /// Where.
-        span: Span,
-    },
-    /// `expect state name == literal`: a slot, derive, or resource from the
-    /// `state` reply, or a field of one (`name.field.field`, feed F10), or a
-    /// list index (`rows.0`, drums R7), compared to a number (negative
-    /// included), string, bool, or `none`.
-    ExpectState {
-        /// The declaration's name, then fields and list indexes, joined by `.`.
+pub enum PropertyKind {
+    /// Every printed configuration.
+    Always,
+    /// An input committing this handler, followed by its landing.
+    After(String),
+    /// A clock advance or an independent landing.
+    Clock,
+    /// Every attempted commit of the named action.
+    NeverRefuses,
+}
+/// One predicate and its authored location.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyLine {
+    /// Line location.
+    pub span: Span,
+    /// Parsed predicate.
+    pub form: PropertyForm,
+}
+/// A property line's parsed form.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyForm {
+    /// A whole root state or derive value.
+    Hold {
+        /// Bare root name.
         name: String,
-        /// The literal.
-        value: Expr,
-        /// Where.
-        span: Span,
+        /// Test of its observation.
+        test: PropertyTest,
     },
-    /// `expect mediasession FIELD == "value"` (LLP 1098 D10): a field of
-    /// `state.mediaSession`, the owner by its testId; `none` for no owner.
-    ExpectMediaSession {
-        /// `owner`, `title`, `artist`, `album`, `artwork` or `playbackState`.
-        field: String,
-        /// The value; `None` is `none`.
-        value: Option<String>,
-        /// Where.
-        span: Span,
-    },
-    /// `expect mediasession has|missing "action"` (LLP 1098 D10): whether
-    /// the session's owner offers it to the platform.
-    ExpectMediaSessionAction {
-        /// `play`, `pause`, or one of the six.
-        action: String,
-        /// `has`, or `missing`.
-        present: bool,
-        /// Where.
-        span: Span,
-    },
-    /// `expect sound has|missing "src" [at N] [gain N] [ends N]
-    /// [playbackRate N] [pan N] [by word]`
-    /// (LLP 1096 D10): a voice in the runner's record of that source that
-    /// matches every clause given, or none that does.
-    ExpectSound {
-        /// The declared sound, by its path.
-        src: String,
-        /// `has`, or `missing`.
-        present: bool,
-        /// Its effective start, in runner milliseconds.
-        at: Option<f64>,
-        /// Its gain.
-        gain: Option<f64>,
-        /// Its end, in runner milliseconds.
-        ends: Option<f64>,
-        /// Its playback rate (LLP 1125 D10); a voice without one has 1.
-        playback_rate: Option<f64>,
-        /// Its pan; a voice without one has 0.
-        pan: Option<f64>,
-        /// How it ended: `end`, `group`, `cut`, `stop` or `cancelled` (D4).
-        by: Option<String>,
-        /// Where.
-        span: Span,
-    },
-    /// MIDI's steps (LLP 1125 §4): `prefer midi.…`, `tap midi`, `expect midi`.
-    Midi {
-        /// Which.
-        step: crate::MidiStep,
-        /// Where.
-        span: Span,
+    /// Every changed root slot belongs to this set; empty means `writes none`.
+    OnlyWrites(Vec<String>),
+    /// A host command emitted by the step or pair.
+    Command {
+        /// Command name.
+        name: String,
+        /// Literal arguments in order.
+        args: Vec<PropertyValue>,
     },
 }
-/// Which input a `tap` step gives: the driver's `tap` forms (LLP 1012).
+/// A literal in the property vocabulary.
 #[derive(Debug, Clone, PartialEq)]
-pub enum TapForm {
-    /// A press: down and up at the node's middle.
-    Press,
-    /// `hover`: a pointer over it.
-    Hover,
-    /// `dblclick`: two presses, the second a double click (feed F10).
-    Dblclick,
-    /// `contextmenu`: a secondary press.
-    Contextmenu,
-    /// `into "key"`: a virtualized list's row brought into view by its key
-    /// (LLP 1070.000 §5), so a row outside the rendered window can be tapped.
-    Into(String),
-    /// `pinch <scale> [at x y]`: two fingers about the node's middle, or
-    /// about `at` in its box (stocks: the agent's pinch, in a test file).
-    Pinch {
-        /// How far the fingers spread, greater than 0. `1` is no change.
-        scale: f64,
-        /// Where the pinch is centred, in the node's box; its middle when `None`.
-        at: Option<(f64, f64)>,
-    },
-    /// `mediasession "action" [seconds]`: the media element's session
-    /// action, as the platform's handler would call it (LLP 1098 D10);
-    /// never a press.
-    MediaSession {
-        /// `play`, `pause`, or one of the six actions.
-        action: String,
-        /// A seek's `seekOffset` (else the element's own), `seekto`'s
-        /// `seekTime` (required there).
-        seconds: Option<f64>,
-    },
+pub enum PropertyValue {
+    /// A binary64 number.
+    Number(f64),
+    /// A string.
+    String(String),
+    /// A boolean.
+    Bool(bool),
+    /// An absent option.
+    None,
+    /// Any present option; admitted only in `in`.
+    Some,
+    /// An empty list.
+    EmptyList,
+}
+/// A test of one value, optionally against its previous observation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyTest {
+    /// Exact printed value.
+    Equal(PropertyValue),
+    /// Exact previous printed value.
+    Old,
+    /// Previous number plus this number, in binary64.
+    Add(f64),
+    /// Previous number minus this number, in binary64.
+    Subtract(f64),
+    /// Negation of the previous boolean.
+    NotOld,
+    /// Membership by value or option kind.
+    In(Vec<PropertyValue>),
+    /// IEEE greater than or equal.
+    AtLeast(f64),
+    /// IEEE less than or equal.
+    AtMost(f64),
+    /// A finite integer.
+    Whole,
+    /// Once this value is seen, the next observation retains it.
+    Stays(PropertyValue),
 }
 /// `fn name(param: type, …): type = expr` — a pure function written in
 /// Contract: one expression over its parameters and the roster, expanded
@@ -684,8 +434,16 @@ pub struct Component {
     pub tasks: Vec<Task>,
     /// `sequence` declarations (LLP 1125 D2), the root's only.
     pub sequences: Vec<crate::sequence::Sequence>,
+    /// `tool` lines (LLP 1111 D2), the root's only.
+    pub tools: Vec<crate::tool::Tool>,
     /// The view's top-level nodes.
     pub view: Vec<Node>,
+    /// The `params` section and the component's identity (LLP 1121 D15).
+    pub params: crate::params::Params,
+    /// Its parts and the nodes named as them (LLP 1139 D2).
+    pub anatomy: crate::anatomy::Anatomy,
+    /// Its `members` lines (LLP 1091.002).
+    pub members: crate::members::Members,
     /// Where.
     pub span: Span,
 }
@@ -728,14 +486,16 @@ pub struct Binding {
     /// Where.
     pub span: Span,
 }
-/// `resource name = source(args) [with context, …] as shape T [else source(args)]`.
+/// `resource name = source(args) [with context, …] as shape T [else source(args)]`,
+/// or `resource name = source(args) for x in list [key=k] as shape T`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResourceDecl {
     /// Name.
     pub name: String,
     /// The data source's name.
     pub source: String,
-    /// Call arguments followed by request context expressions.
+    /// Call arguments followed by request context expressions. Over a list,
+    /// they read the element by [`ResourceEach::item`].
     pub args: Vec<Expr>,
     /// Number of call arguments when `with` is present; otherwise all
     /// arguments identify the answer. @ref LLP 1027.005 D6.
@@ -745,7 +505,24 @@ pub struct ResourceDecl {
     /// `else source(args)` (LLP 1048.003 D6): what shows while the source
     /// hasn't answered.
     pub placeholder: Option<Placeholder>,
+    /// `for x in list [key=k]`: one request for each element (LLP 1017.000
+    /// P4c, amended 2026-11-04).
+    pub each: Option<ResourceEach>,
     /// Where.
+    pub span: Span,
+}
+/// A resource's `for x in list [key=k]`: the element's name, the list, and
+/// the key that identifies an element's request, the element itself when
+/// none is written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceEach {
+    /// The element's name, which the arguments and the key read.
+    pub item: String,
+    /// The list, read in the root's scope.
+    pub list: Expr,
+    /// `key=`.
+    pub key: Option<Expr>,
+    /// Where `for` is written.
     pub span: Span,
 }
 /// A resource's placeholder: a source call, as a resource's value is (a
@@ -995,6 +772,8 @@ pub struct Task {
     pub key: Option<Expr>,
     /// `(ms, action)` and the entry's span.
     pub timer: (Expr, String, Span),
+    /// Named scheduling options, validated by lowering.
+    pub options: Vec<(String, Expr, Span)>,
     /// Where.
     pub span: Span,
 }
@@ -1163,22 +942,27 @@ pub fn input_control(tag: &str, attrs: &[Attr]) -> Option<&'static str> {
 /// [`input_control`], or `Some("field")` for a text field whose `select`
 /// is HTML's (x2apps codeedit #2): an `input` that is no control, or a
 /// `textarea` that is not the Markdown editor (no `markup`, or literally
-/// `none`), whose `select` carries the field's `InputEvent`; the editor's
-/// carries its `MarkdownSelection`. What a handler's payload is typed by.
+/// `none`), whose `select` carries the field's `InputEvent`; or
+/// `Some("markdown")` for a textarea that may be the editor, whose `select`
+/// carries its `MarkdownSelection` and whose other field events are a text
+/// field's, over its source (LLP 1045 D6). What a handler's payload is typed by.
 pub fn payload_control(tag: &str, attrs: &[Attr]) -> Option<&'static str> {
-    let field = match tag {
-        "input" => input_control(tag, attrs).is_none(),
-        "textarea" => attrs
-            .iter()
-            .find(|a| a.name == "markup")
-            .is_none_or(|a| matches!(&a.value, Expr::Str(m, _) if m == "none")),
-        _ => false,
-    };
-    if field {
-        Some("field")
-    } else {
-        input_control(tag, attrs)
+    match tag {
+        "iframe" => Some("iframe"), // its `navigate=` is the guest's (LLP 1020.002 D2)
+        "input" if input_control(tag, attrs).is_none() => Some("field"),
+        "textarea" => Some(match attrs.iter().find(|a| a.name == "markup") {
+            Some(a) if !matches!(&a.value, Expr::Str(m, _) if m == "none") => "markdown",
+            _ => "field",
+        }),
+        _ => input_control(tag, attrs),
     }
+}
+
+/// Whether a [`payload_control`] edits text: a text field's or the
+/// Markdown editor's `input`, `selectionchange` and `beforeinput` carry the
+/// field's `InputEvent`.
+pub fn edits_text(control: Option<&str>) -> bool {
+    matches!(control, Some("field" | "markdown"))
 }
 
 /// The control an `input`'s literal `type` names; `None` for a text field's
@@ -1337,8 +1121,8 @@ pub enum Expr {
         span: Span,
     },
     /// `(item, index) => body`: a callback, only ever the second argument
-    /// of `map` or `filter` (LLP 1017.003 D1). Its zero to two parameters
-    /// are the item and its index.
+    /// of `map`, `filter` or `sortBy` (LLP 1017.003 D1, LLP 1116.016 §5). Its
+    /// zero to two parameters are the item and its index.
     Arrow {
         /// Parameter names, in order.
         params: Vec<String>,
@@ -1375,44 +1159,6 @@ pub enum TemplatePart {
     Text(String),
     /// `${expr}`.
     Expr(Expr),
-}
-
-impl Step {
-    /// Where: the step's line.
-    pub fn span(&self) -> Span {
-        match self {
-            Step::Tap { span, .. }
-            | Step::Drag { span, .. }
-            | Step::Size { span, .. }
-            | Step::Epoch { span, .. }
-            | Step::TimeZone { span, .. }
-            | Step::Locale { span, .. }
-            | Step::Seed { span, .. }
-            | Step::Fresh { span, .. }
-            | Step::BeforeData { span }
-            | Step::FailFetch { span, .. }
-            | Step::PassFetch { span, .. }
-            | Step::Request { span, .. }
-            | Step::Type { span, .. }
-            | Step::Key { span, .. }
-            | Step::Pick { span, .. }
-            | Step::Clipboard { span, .. }
-            | Step::Clock { span, .. }
-            | Step::Reload { span, .. }
-            | Step::Close { span }
-            | Step::Back { span }
-            | Step::Resize { span, .. }
-            | Step::Screenshot { span, .. }
-            | Step::ExpectTree { span, .. }
-            | Step::ExpectDisabled { span, .. }
-            | Step::ExpectText { span, .. }
-            | Step::ExpectState { span, .. }
-            | Step::ExpectSound { span, .. }
-            | Step::Midi { span, .. }
-            | Step::ExpectMediaSession { span, .. }
-            | Step::ExpectMediaSessionAction { span, .. } => *span,
-        }
-    }
 }
 
 impl Expr {

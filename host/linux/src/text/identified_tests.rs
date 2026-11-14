@@ -108,6 +108,7 @@ fn request(k: &Kernel, engine: Shared, id: u32, width: AxisOffer) -> TextMetrics
     let n = k.node(id).unwrap();
     let runs = n.text_runs();
     let req = TextMeasureRequest {
+        atoms: Default::default(),
         exclusions: &[],
         runs: &runs,
         paragraph: exact_kernel::text::Paragraph::from_style(
@@ -131,6 +132,7 @@ fn paint(p: &mut Painter, k: &Kernel) -> crate::paint::Frame {
             images: &BTreeMap::new(),
             focus: None,
             selection: None,
+            caret_upstream: false,
             pointer: None,
             controls: &BTreeMap::new(),
             chosen: &BTreeMap::new(),
@@ -191,6 +193,7 @@ fn identified_exact_offers_share_anonymous_geometry_without_hot_source_work() {
         let n = k.node(2).unwrap();
         let runs = n.text_runs();
         let req = TextMeasureRequest {
+            atoms: Default::default(),
             exclusions: &[],
             runs: &runs,
             paragraph: exact_kernel::text::Paragraph::from_style(
@@ -563,13 +566,19 @@ mod owned_spec {
             weight: 400,
             family: 0,
             italic: false,
+            stretch: 100.,
+            variations: Default::default(),
+            optical_sizing: true,
             line_height: None,
             letter_spacing: 0.,
             font_variant_numeric: 0,
+            font_variant_ligatures: 0,
             indent: 0.,
             hang: false,
             mark: 0,
             href: String::new(),
+            bold_text: false,
+            inline: None,
         }
     }
     fn spec(text: &str) -> Spec {
@@ -667,6 +676,7 @@ mod owned_spec {
         let stamp = n.paragraph_stamp().unwrap();
         let runs = n.text_runs();
         let req = TextMeasureRequest {
+            atoms: Default::default(),
             exclusions: &[],
             runs: &runs,
             paragraph: exact_kernel::text::Paragraph::from_style(

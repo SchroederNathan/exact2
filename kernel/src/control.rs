@@ -52,7 +52,11 @@ impl ControlKind {
         }
         Some(match props.str(PropId::Type) {
             Some("button") => ControlKind::Button,
-            Some("progress") if props.get(PropId::Value).is_some() => ControlKind::ProgressBar,
+            Some("progress")
+                if props.get(PropId::Value).is_some() || props.get(PropId::Start).is_some() =>
+            {
+                ControlKind::ProgressBar
+            }
             Some("progress") => ControlKind::Progress,
             Some("file") => ControlKind::File,
             Some("select") => ControlKind::Select,
@@ -127,6 +131,33 @@ impl ControlKind {
             _ => true,
         }
     }
+}
+
+/// The kind and font size of a mark its host draws one size for every node
+/// of a font size: a checkbox's, a radio's and a switch's, shown natively.
+pub(crate) fn mark_key(arena: &crate::arena::NodeArena, slot: u32) -> Option<(ControlKind, u32)> {
+    let kind = ControlKind::of(arena.node_type(slot), arena.props(slot))?;
+    let mark = matches!(
+        kind,
+        ControlKind::Checkbox | ControlKind::Radio | ControlKind::Switch
+    );
+    let font = arena.computed_source(slot, StyleId::FontSize).font_size;
+    (mark && arena.style(slot).appearance != crate::Appearance::None)
+        .then(|| (kind, font.to_bits()))
+}
+
+/// The size `slot`'s host last reported for a mark of its kind and font
+/// size, which stands for it until it reports its own. The kind's default
+/// (LLP 1069.001 D3) is the look's, and an Apple host's checkbox is not:
+/// every new list row with one was laid out at 13 points, reported 22 and
+/// laid out again, in a batch of its own.
+pub(crate) fn shared_size(arena: &crate::arena::NodeArena, slot: u32) -> Option<(f32, f32)> {
+    let key = mark_key(arena, slot)?;
+    arena
+        .mark_sizes
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|&(_, size)| size)
 }
 
 fn digits(s: &str, n: usize) -> Option<u32> {
@@ -335,11 +366,22 @@ pub struct Choice {
     pub disabled: bool,
 }
 
+/// A native face's raster image and its decoded natural size, in points.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ButtonRasterImage {
+    /// The authored image receives intrinsic-size reports even though it has no native view.
+    pub view: ViewId,
+    /// The authored source, resolved by the host's image pipeline.
+    pub source: String,
+    /// The decoded natural dimensions; unknown until the host reports them.
+    pub size: Option<(f32, f32)>,
+}
+
 /// A button's face (LLP 1069.011.000 D1): what every host projection shows
 /// of it — a toolbar item, a tab, a menu row, a swipe action, a shortcut —
 /// read live from its direct children, a custom `button` (`Pressable`) and a
 /// native one (`ControlKind::Button`) alike.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PressFace {
     /// Its first `text` child's text, white space collapsed; a blank title is
     /// none.
@@ -354,6 +396,8 @@ pub struct PressFace {
     /// Whether that image child is a raster instead (the projection keeps its
     /// own path for it).
     pub raster: bool,
+    /// Raster source and geometry beside the projection's raster flag.
+    pub image: Option<ButtonRasterImage>,
     /// Whether the image comes before the title (the inline start).
     pub leading: bool,
     /// Its `aria-label`.

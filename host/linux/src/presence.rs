@@ -3,9 +3,10 @@
 //! A node with a `-exact-layout-transition` has its laid-out box in its parent
 //! (`Kernel::layout_box`) observed as `Property::Layout` after every layout;
 //! the engine's transition rules apply. What it shows against the laid-out
-//! box is an offset and scale the painter applies outermost, from the box's
-//! top-left corner (`Presented::layout`), so a moving parent carries its
-//! children and nothing is laid out per frame. A node that gains the row is
+//! box is an offset, which the painter applies outermost, and a size
+//! difference, which only its surface and the clip on its children take, from
+//! the box's top-left corner (`Presented::layout`), so a moving parent carries
+//! its children and nothing is laid out per frame. A node that gains the row is
 //! seeded with the box it had before the commit's layout, so its first move
 //! after gaining it animates.
 //!
@@ -30,6 +31,11 @@ pub(super) struct Presence {
     refused_flights: bool,
     /// A resize lays out next: positions are taken, not animated.
     pub(super) snap: bool,
+    /// The next `observe_layout` is for a host's fact, not an app's commit
+    /// (an inset, the text size, a picture's size): a box it finds moved
+    /// takes its place unless it is moving already, as on the web, where a
+    /// layout transition plays only what a commit moved.
+    pub(super) unauthored: bool,
 }
 
 impl<D: DataSource> Host<D> {
@@ -53,13 +59,54 @@ impl<D: DataSource> Host<D> {
         }
     }
 
+    /// An agent's jump to `to`, stopping after a timer that sends
+    /// ([`exact_runner::Runner::advance_until_request`]). The engine hears
+    /// each commit of a jump at its timer's due time (LLP 1002 D3), but the
+    /// kernel holds only the jump's last tree, laid out at its end: a box a
+    /// timer moved inside the jump would start its layout transition there.
+    /// While a node declares a layout transition, the jump lays out at each
+    /// due time, as real frames would; only a request stops it short of `to`,
+    /// so these stops spend none of the agent's request stops.
+    pub(super) fn advance_in_layout_steps(&mut self, to: f64) -> Option<String> {
+        if self.presence.layout.is_empty() {
+            let a = self.runner.advance_until_request(to);
+            return self.advanced(a).0;
+        }
+        let mut error = None;
+        for _ in 0..LAYOUT_STOPS {
+            let due = self.runner.timer_due_ms().unwrap_or(to);
+            let step = due.max(self.runner.now_ms()).min(to);
+            let a = self.runner.advance_until_request(step);
+            // A commit that sent stops the jump: the next send would drop
+            // its reply (LLP 1016 D5).
+            let stopped = a.error.is_some() || a.stopped_on_request || step >= to;
+            error = error.or(self.advanced(a).0);
+            if stopped || self.presence.layout.is_empty() {
+                break;
+            }
+        }
+        error
+    }
+
+    /// Lay out again for a host's fact and observe it: a box it moved takes
+    /// its place unless it is moving already.
+    pub(super) fn layout_unauthored(&mut self) -> Result<bool, String> {
+        self.presence.unauthored = true;
+        let laid = self.layout();
+        self.observe_layout();
+        laid
+    }
+
     /// Observe every tracked node's box, after a layout.
     pub(super) fn observe_layout(&mut self) {
         let snap = std::mem::take(&mut self.presence.snap);
-        let retired =
-            self.presence
-                .layout
-                .observe_all(self.runner.kernel(), &mut self.engine, snap);
+        let unauthored = std::mem::take(&mut self.presence.unauthored);
+        let (kernel, layout) = (self.runner.kernel(), &mut self.presence.layout);
+        let retired = if unauthored && !snap {
+            layout.observe_all_unauthored(kernel, &mut self.engine)
+        } else {
+            layout.observe_all(kernel, &mut self.engine, snap)
+        };
         self.retire_layout(retired);
     }
 
@@ -71,3 +118,7 @@ impl<D: DataSource> Host<D> {
         }
     }
 }
+
+/// The most layout stops one agent call makes: a frame task's every frame
+/// across ten minutes. The agent's loop calls again past it.
+const LAYOUT_STOPS: usize = 60 * 60 * 10;

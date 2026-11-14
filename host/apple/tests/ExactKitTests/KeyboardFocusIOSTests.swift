@@ -10,6 +10,54 @@ import XCTest
 /// simulator runs it (the command in `FieldCompositionIOSTests`).
 final class KeyboardFocusIOSTests: XCTestCase {
     private var window: UIWindow!
+
+    /// The journal's focus holder is found in one pass over the views,
+    /// counted by the responder queries it makes rather than timed.
+    func testTheFocusHolderIsFoundInOnePassOverTheViews() {
+        final class Counted: UIView {
+            static var asked = 0
+            var held = false
+            override var isFirstResponder: Bool { Counted.asked += 1; return held }
+        }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        var parent: UIView = window, views = 0
+        for _ in 0..<8 {
+            let child = Counted()
+            parent.addSubview(Counted())
+            parent.addSubview(child)
+            parent = child
+            views += 2
+        }
+        let held = Counted()
+        held.held = true
+        parent.addSubview(held)
+        Counted.asked = 0
+        XCTAssertEqual(Presenter.focusHolder(in: window), "Counted")
+        XCTAssertEqual(Counted.asked, views + 1, "each view asked once")
+    }
+
+    /// The tree search the focus holder, an alert's button and a list
+    /// cell's accessory control share asks each view once and passes over a
+    /// pruned view's subtree.
+    func testATreeSearchAsksEachViewOnceAndPassesOverAPrunedSubtree() {
+        let root = UIView(), pruned = UIView(), wanted = UISwitch()
+        var parent = root, views = 1
+        for _ in 0..<8 {
+            let child = UIView()
+            parent.addSubview(UIView())
+            parent.addSubview(child)
+            parent = child
+            views += 2
+        }
+        parent.addSubview(wanted)
+        pruned.addSubview(UISwitch())
+        root.insertSubview(pruned, at: 0)
+        var asked = 0
+        let found = root.firstInTree({ (v: UIView) -> UIControl? in asked += 1; return v as? UIControl }, prune: { $0 === pruned })
+        XCTAssertTrue(found === wanted, "not the switch under the pruned view")
+        XCTAssertEqual(asked, views + 1, "each view asked once")
+    }
+
     func testPassiveAncestorHearsFocusMoveBetweenChildren() {
         let p = Presenter()
         window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
@@ -57,6 +105,25 @@ final class KeyboardFocusIOSTests: XCTestCase {
         ]))
         window.makeKeyAndVisible()
         return p
+    }
+
+    func testPendingNodeFocusKeepsTheResolvedFieldWithoutAUniqueHTMLId() throws {
+        for name: String? in [nil, "", "a"] {
+            let p = focusFields()
+            defer { window.endEditing(true); window.isHidden = true }
+            let node = try XCTUnwrap(p.views[12]), field = try XCTUnwrap(node.field)
+            node.applyProps(set: name.map { ["id": $0] } ?? [:], clear: ["id"])
+            // A sheet's field leaves the window while its controller changes.
+            p.viewport.removeFromSuperview()
+            p.focusNode(node)
+            XCTAssertTrue(p.pendingFocusNode === node, "an unnamed field must wait for its window too")
+            XCTAssertEqual(p.pendingFocusObservation?["target"], name ?? "#12")
+            XCTAssertFalse(field.isFirstResponder)
+            window.addSubview(p.viewport)
+            XCTAssertTrue(field.isFirstResponder)
+            XCTAssertFalse(try XCTUnwrap(p.views[11]?.field).isFirstResponder, "a duplicate id must not redirect focus")
+            XCTAssertNil(p.pendingFocusNode)
+        }
     }
 
     func testReadOnlySelectionSendsFocusAndBlur() throws {
@@ -212,26 +279,30 @@ final class KeyboardFocusIOSTests: XCTestCase {
         button.frame = CGRect(x: 32, y: 200, width: 250, height: 44)
         button.menu = UIMenu(children: [UIAction(title: "Chocolate Glaze") { _ in }, UIAction(title: "Blueberry Spread") { _ in }])
         view.addSubview(button)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
-        XCTAssertTrue(view.becomeFirstResponder())
-        button.performPrimaryAction()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
-        func containsOption(_ node: UIView) -> Bool {
-            (node as? UILabel)?.text == "Blueberry Spread" || node.subviews.contains(where: containsOption)
-        }
-        XCTAssertTrue(containsOption(window), "the real UIKit menu opened")
-        XCTAssertTrue(view.isFirstResponder, "shortcut focus survives opening the menu")
-        // nil lets UIKit request its default keyboard for this responder.
-        // A nontext responder must instead supply input with no height.
-        XCTAssertEqual(view.inputView?.bounds.height, 0, "shortcut focus must not request a system keyboard")
-        button.contextMenuInteraction?.dismissMenu()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
         let shortcut = NodeView(id: 901, kind: "button", presenter: p)
         p.views[shortcut.id] = shortcut
         p.root.addSubview(shortcut)
         shortcut.frame = CGRect(x: 32, y: 350, width: 100, height: 44)
         shortcut.handlers = ["press"]
         shortcut.applyProps(set: ["accessibilityKeyShortcuts": "Meta+g"], clear: [])
+        func until(_ message: String, _ condition: () -> Bool) {
+            let end = Date(timeIntervalSinceNow: 10)
+            while !condition(), Date() < end { RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05)) }
+            XCTAssertTrue(condition(), message)
+        }
+        until("the window is key") { window.isKeyWindow && view.window === window }
+        XCTAssertTrue(view.becomeFirstResponder())
+        button.performPrimaryAction()
+        func containsOption(_ node: UIView) -> Bool {
+            (node as? UILabel)?.text == "Blueberry Spread" || node.subviews.contains(where: containsOption)
+        }
+        until("the real UIKit menu opened") { containsOption(window) && view.isFirstResponder }
+        XCTAssertTrue(view.isFirstResponder, "shortcut focus survives opening the menu")
+        // nil lets UIKit request its default keyboard for this responder.
+        // A nontext responder must instead supply input with no height.
+        XCTAssertEqual(view.inputView?.bounds.height, 0, "shortcut focus must not request a system keyboard")
+        button.contextMenuInteraction?.dismissMenu()
+        until("the menu dismissed and shortcut focus remains") { !containsOption(window) && view.isFirstResponder }
         var pressed: [UInt32] = []
         p.onPress = { pressed.append($0) }
         let command = try XCTUnwrap(view.keyCommands?.first { $0.input == "g" && $0.modifierFlags == .command })
@@ -243,7 +314,7 @@ final class KeyboardFocusIOSTests: XCTestCase {
         let field = UITextField(frame: CGRect(x: 32, y: 300, width: 250, height: 44))
         view.addSubview(field)
         XCTAssertTrue(field.becomeFirstResponder())
-        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        until("the text field owns input") { field.isFirstResponder && view.inputView == nil }
         XCTAssertNil(view.inputView, "text entry must not inherit the shortcut responder’s empty input view")
         field.insertText("Glaze")
         XCTAssertEqual(field.text, "Glaze")
@@ -284,7 +355,7 @@ final class KeyboardFocusIOSTests: XCTestCase {
         button.menu = UIMenu(children: [UIAction(title: "Alice") { _ in }, UIAction(title: "Bob") { _ in }])
         view.addSubview(button)
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
-        XCTAssertTrue(vote.takeTouchFocus(), "the press focuses its button")
+        XCTAssertTrue(vote.becomeFirstResponder(), "the press focuses its button")
         button.performPrimaryAction()
         RunLoop.main.run(until: Date().addingTimeInterval(0.5))
         func containsOption(_ node: UIView) -> Bool { (node as? UILabel)?.text == "Bob" || node.subviews.contains(where: containsOption) }
@@ -378,6 +449,21 @@ final class KeyboardFocusIOSTests: XCTestCase {
         XCTAssertNil(first.focusRing, "the ring leaves with the focus")
         XCTAssertTrue(first.becomeFirstResponder())
         XCTAssertNil(first.focusRing, "a touch's focus shows no ring")
+    }
+
+    /// LLP 1104 D6 (amended 2026-11-05): `outline: none` takes the ring off a
+    /// control Tab reached, which still takes the focus; unset, it is back.
+    func testOutlineNoneShowsNoRingOnAControlTabReached() {
+        let (p, first, _, _, _) = fixture()
+        first.applyStyle(["outline_style": .string("none")])
+        p.moveFocus(backward: false)
+        XCTAssertTrue(first.isFirstResponder)
+        XCTAssertNil(first.focusRing, "no ring for outline: none")
+        first.applyStyle([:])
+        first.showFocusRing(true)
+        XCTAssertNotNil(first.focusRing, "the ring without it")
+        first.applyStyle(["outline_style": .string("none")])
+        XCTAssertNil(first.focusRing, "a restyle takes it off")
     }
 
     /// HTML's `tabindex` (LLP 1088 D7.3): an explicit value makes a plain box

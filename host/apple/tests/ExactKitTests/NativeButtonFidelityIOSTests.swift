@@ -7,6 +7,33 @@ import XCTest
 
 final class NativeButtonFidelityIOSTests: XCTestCase {
     private var window: UIWindow!
+    private func rgba(_ color: UIColor?) -> [CGFloat]? {
+        guard let color else { return nil }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else { return nil }
+        return [r, g, b, a]
+    }
+    func testCompiledActivePropertiesKeepViewlessColorOwnership() throws {
+        let session = try fixture(); defer { session.destroy() }
+        let native = try button(session, "active-properties")
+        let owner = try XCTUnwrap(native.owner)
+        XCTAssertTrue(owner.container.subviews.compactMap { $0 as? NodeView }.isEmpty, "the kernel supplies the viewless face")
+        native.isHighlighted = true
+        native.setNeedsUpdateConfiguration()
+        waitForMainQueue()
+        XCTAssertNotEqual(rgba(native.titleLabel?.textColor.resolvedColor(with: native.traitCollection)), [0, 0, 1, 1], "the title owns its color")
+        XCTAssertEqual(rgba(native.subtitleLabel?.textColor.resolvedColor(with: native.traitCollection)), [0, 0, 1, 1])
+        XCTAssertEqual(rgba(native.configuration?.background.resolvedBackgroundColor(for: native.tintColor).resolvedColor(with: native.traitCollection)), [1, 0, 0, 1])
+        let imageInk = try XCTUnwrap(native.configuration?.imageColorTransformer)
+        XCTAssertEqual(rgba(imageInk(.black).resolvedColor(with: native.traitCollection)), [1, 0, 0, 1], "the symbol owns its tint")
+        try button(session, "g3").sendActions(for: .primaryActionTriggered)
+        waitForMainQueue()
+        XCTAssertTrue(native.isHighlighted)
+        XCTAssertEqual(rgba(native.titleLabel?.textColor.resolvedColor(with: native.traitCollection)), [0, 0, 1, 1], "a class without color leaves the title inheriting")
+        XCTAssertNotEqual(rgba(native.configuration?.background.resolvedBackgroundColor(for: native.tintColor).resolvedColor(with: native.traitCollection)), [1, 0, 0, 1], "none restores the native highlighted background")
+        XCTAssertEqual(owner.alpha, 1)
+        native.isHighlighted = false
+    }
     override func tearDown() { window?.isHidden = true; window = nil; super.tearDown() }
     private func fixture() throws -> ExactSession {
         let path = try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_BUTTONS_PLAN"])
@@ -62,6 +89,23 @@ final class NativeButtonFidelityIOSTests: XCTestCase {
             XCTAssertNotNil(c.preferredSymbolConfigurationForImage, name)
         }
     }
+    /// LLP 1116.019 D1: a symbol with no title is as large as UIKit draws one in a configuration of its own, which
+    /// follows the body text to the accessibility sizes; without a title the label's font is a fixed 17.
+    func testASymbolAloneFollowsTheTextSizeAsUIKitsDoes() throws {
+        for name in ["plain", "gray", "bordered", "filled"] {
+            var face = ButtonFace(); face.symbol = "plus"; face.ios = name
+            var reference = ControlHost.configuration(face).0; reference.image = UIImage(systemName: "plus")
+            let expected = UIButton(configuration: reference), b = UIButton(configuration: ControlHost.configuration(face).0)
+            ButtonConfigurationIOS.apply(face, to: b, traits: b.traitCollection, accent: nil)
+            for button in [expected, b] {
+                button.traitOverrides.preferredContentSizeCategory = .accessibilityExtraExtraExtraLarge
+                button.updateTraitsIfNeeded(); button.sizeToFit(); button.layoutIfNeeded()
+            }
+            let size = try XCTUnwrap(b.imageView?.frame.size)
+            XCTAssertEqual(size, expected.imageView?.frame.size, name)
+            XCTAssertGreaterThan(size.height, 40, "\(name): grown with the text, not 17's")
+        }
+    }
     /// LLP 1116.019 D3: unsaid, the ink on an accent fill is UIKit's on every accent, the pale ones too (a
     /// hand-built filled button keeps white on teal and yellow); an authored colour wins.
     func testAFilledButtonKeepsUIKitsInkOnEveryAccent() throws {
@@ -96,7 +140,7 @@ final class NativeButtonFidelityIOSTests: XCTestCase {
         let node = NodeView(id: 1, kind: "control", presenter: Presenter())
         func given(_ row: BatchValue) -> UIColor? {
             node.applyStyle(["accent_color": row])
-            return ControlHost.platformAccent(node, node.channels("accent_color").map { TextEngine.color($0) }, in: node.traitCollection)
+            return ControlHost.platformAccent(node, node.channels("accent_color").map { TextEngine.color($0) })
         }
         let pair: BatchValue = .array([.array([.number(0), .number(195), .number(208), .number(255)]), .array([.number(0), .number(210), .number(224), .number(255)])])
         XCTAssertEqual(given(.object(["sys": .string("systemTealColor"), "c": pair])), UIColor.systemTeal)
@@ -180,6 +224,36 @@ final class NativeButtonFidelityIOSTests: XCTestCase {
                 XCTAssertTrue(heights.allSatisfy { $0 == heights[0] }, "radius changes drawing, not height-for-width: \(style) \(width)")
             }
         }
+    }
+    /// A count's button answers from the first count measured for its face
+    /// (`ButtonMeasureCache.numeral`), as its configured button measures.
+    func testACountsButtonAnswersAsItsConfiguredButtonMeasures() throws {
+        let session = try fixture(); defer { session.destroy() }
+        let cache = session.buttonMeasurements
+        let traits = session.presenter.viewport.traitCollection
+        func face(_ title: String, _ symbol: String?, style: String) throws -> Data {
+            try JSONSerialization.data(withJSONObject: ["button": true, "title": title, "symbol": symbol ?? NSNull(),
+                                                        "label": "Like, \(title)", "ios": style] as [String: Any])
+        }
+        for (symbol, style) in [("heart", "plain"), (nil, "bordered"), ("message", "filled")] as [(String?, String)] {
+            for kind in [UInt8(2), 1, 0] {
+                _ = cache.answer(face: try face("7", symbol, style: style), widthKind: kind, width: 300)
+                let misses = cache.misses
+                for title in ["0", "1", "4", "11", "12", "19", "88", "100", "111", "999", "1000", "1,234", "41111", "3.5"] {
+                    let data = try face(title, symbol, style: style)
+                    let answered = cache.answer(face: data, widthKind: kind, width: 300)
+                    let measured = cache.measure(ButtonFace(json: data), widthKind: kind, width: 300, traits: traits)
+                    XCTAssertEqual(answered.width, measured.width, accuracy: 0.001, "\(title) \(symbol ?? "-") \(style) \(kind)")
+                    XCTAssertEqual(answered.height, measured.height, accuracy: 0.001, "\(title) \(symbol ?? "-") \(style) \(kind)")
+                }
+                XCTAssertEqual(cache.misses, misses, "no count after the first configures a button")
+            }
+        }
+        // A definite offer the count would not fit is measured.
+        _ = cache.answer(face: try face("7", "heart", style: "plain"), widthKind: 0, width: 60)
+        let misses = cache.misses
+        _ = cache.answer(face: try face("123456789", "heart", style: "plain"), widthKind: 0, width: 60)
+        XCTAssertEqual(cache.misses, misses + 1)
     }
     // Independent use of UIKit's public system-spacing API for the reference column.
     func testMinContentUsesUnbreakableRunsAndTheNativeChrome() throws {

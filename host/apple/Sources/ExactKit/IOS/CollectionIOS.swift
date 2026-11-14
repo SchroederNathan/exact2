@@ -10,6 +10,10 @@ private final class CollectionContact: UIGestureRecognizer {
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         guard contact == nil, let touch = touches.first else { return }
         contact = touch
+        // A finger coming down on a list's port is the reader's gesture
+        // against its `scrollIntoView` (LLP 1070.000 §2.5), reported with the
+        // pin's flush
+        collections?.gestureBegan(around: touch.view, at: touch.timestamp)
         var view = touch.view
         while let current = view {
             if let node = current as? NodeView {
@@ -41,10 +45,13 @@ extension CollectionHost {
     /// port and measured sizes run along x, its cross along y.
     package func geometry(_ id: UInt32) -> CollectionFacts? {
         guard let node = presenter?.views[id], let scroll = node.scroll, !hidden(node) else { return nil }
-        let bounds = scroll.bounds, insets = scroll.adjustedContentInset
+        // Layout's box, not the one drawn on the pixel grid (`PixelGridIOS.swift`): the runner lays rows to it.
+        let bounds = node.layoutBounds, insets = scroll.adjustedContentInset, band = node.pageBand
         let content = node.contentBox()
         let portWidth = max(0, bounds.width - insets.left - insets.right)
-        let portHeight = max(0, bounds.height - insets.top - insets.bottom)
+        // The physical port includes the page bands. Their insets are
+        // padding before and after the rows, not space removed from the port.
+        let portHeight = max(0, bounds.height + band.top + band.bottom - (insets.top - band.top) - (insets.bottom - band.bottom))
         guard portWidth.isFinite, portHeight.isFinite else { return nil }
         let horizontal = entries[id]?.snapshot.horizontal ?? false
         // Animating to a smooth correction: where it is headed is the port
@@ -52,7 +59,7 @@ extension CollectionHost {
         let at = (animating.contains(id) ? owedTargets[id] ?? animationTargets[id] : nil) ?? scroll.contentOffset
         let measured = entries[id]?.snapshot.rows.first.flatMap { crossSize($0.view, horizontal: horizontal) }.map { CGFloat($0) }
         if horizontal {
-            let available = max(0, portHeight - content.minY - (node.bounds.height - content.maxY))
+            let available = max(0, portHeight - content.minY - (node.layoutBounds.height - content.maxY))
             let cross = measured ?? available
             guard cross.isFinite else { return nil }
             let start = max(0, node.padding("left")), end = max(0, node.padding("right"))
@@ -62,13 +69,38 @@ extension CollectionHost {
                 portMain: Double(portWidth), portCross: Double(portHeight), cross: Double(cross),
                 measurements: [], focus: nil, interaction: nil, paddingStart: Double(start), paddingEnd: Double(end))
         }
-        let available = max(0, portWidth - content.minX - (node.bounds.width - content.maxX))
+        let available = max(0, portWidth - content.minX - (node.layoutBounds.width - content.maxX))
         let width = measured ?? available
         guard width.isFinite else { return nil }
-        let start = max(0, node.padding("top")), end = max(0, node.padding("bottom"))
-        return CollectionFacts(offset: Double(max(-start, at.y + insets.top - content.minY)),
+        let start = max(0, node.padding("top")) + band.top, end = max(0, node.padding("bottom")) + band.bottom
+        return CollectionFacts(offset: Double(max(-start, at.y + insets.top - band.top - content.minY)),
             portMain: Double(portHeight), portCross: Double(portWidth), cross: Double(width),
             measurements: [], focus: nil, interaction: nil, paddingStart: Double(start), paddingEnd: Double(end))
+    }
+    /// A smooth correction's native targets move with a page band's inset
+    /// (LLP 1130 D3), as the offset itself does (`NodeView.setPageBand`), and
+    /// so does where the batch found the port: its offset counts the band as
+    /// padding before the first row, so the top of a list the band grew
+    /// under mid-batch is the new band's top.
+    func offsetsMoved(_ id: UInt32, by dy: CGFloat) {
+        animationTargets[id]?.y += dy; owedTargets[id]?.y += dy
+        entries[id]?.batchStart? += Double(dy)
+        offsetDrivers[id]?.moveOffsets(by: dy)
+    }
+    /// What UIKit's bars cover of the list's port at its start and end: its
+    /// page bands (LLP 1130 D3), which `geometry` counts as port and padding.
+    /// The runner aligns a row clear of them, as `scrollToItem(at:at:animated:)`
+    /// aligns within the adjusted content insets.
+    func covered(_ id: UInt32) -> [Double] {
+        guard let band = presenter?.views[id]?.pageBand, entries[id]?.snapshot.horizontal != true else { return [0, 0] }
+        return [Double(band.top), Double(band.bottom)]
+    }
+    /// `covered`, told the runner when it changes, before the report that goes with it.
+    func reportCovered(_ id: UInt32, _ entry: Entry) {
+        let covered = covered(id)
+        guard covered != entry.covered, let runtime = presenter?.session?.runtime else { return }
+        entry.covered = covered
+        runtime.listCovered(id, start: covered[0], end: covered[1])
     }
     /// The insets UIKit adjusts the list's port by, at its start edges. A
     /// safe area its frame changed reaches the scroll view in a layout
@@ -76,7 +108,7 @@ extension CollectionHost {
     func portInsets(_ id: UInt32) -> [Double]? {
         guard let node = presenter?.views[id], let scroll = node.scroll else { return nil }
         node.layoutIfNeeded()
-        return [Double(scroll.adjustedContentInset.top), Double(scroll.adjustedContentInset.left)]
+        return [Double(scroll.adjustedContentInset.top - node.pageBand.top), Double(scroll.adjustedContentInset.left)]
     }
     /// The port back at `top` (`geometry`'s offset), within what it can
     /// reach, unless the reader or a smooth correction is moving it.
@@ -86,19 +118,19 @@ extension CollectionHost {
         let content = node.contentBox(), i = scroll.adjustedContentInset
         var target = scroll.contentOffset
         if entries[id]?.snapshot.horizontal ?? false { target.x = CGFloat(top) + content.minX - i.left }
-        else { target.y = CGFloat(top) + content.minY - i.top }
+        else { target.y = CGFloat(top) + content.minY - i.top + node.pageBand.top }
         target = Self.reachable(target, in: scroll)
         if scroll.contentOffset != target { scroll.setContentOffset(target, animated: false) }
     }
     /// A row wrapper's size across the list: a vertical list's row width,
     /// a row list's item height.
     func crossSize(_ id: UInt32, horizontal: Bool) -> Double? {
-        presenter?.views[id].map { Double(horizontal ? $0.bounds.height : $0.bounds.width) }
+        presenter?.views[id].map { Double(horizontal ? $0.layoutBounds.height : $0.layoutBounds.width) }
     }
     /// A row wrapper's size along the list, what the index measures.
     func size(_ id: UInt32, horizontal: Bool) -> Double? {
         guard let node = presenter?.views[id], !hidden(node) else { return nil }
-        return Double(horizontal ? node.bounds.width : node.bounds.height)
+        return Double(horizontal ? node.layoutBounds.width : node.layoutBounds.height)
     }
     /// An anchor's correction (`CollectionCursor.takeShift`): the offset
     /// moves by `delta` from `start` (where the batch began) in the layout
@@ -119,16 +151,31 @@ extension CollectionHost {
             animateOffset(id, scroll, to: moved)
             return
         }
+        if presenter?.elementScrolls.revealing(scroll) != nil {
+            // An element reveal heads for where its target now is instead (`IntoView.swift`).
+            presenter?.elementScrolls.retarget(scroll)
+            return
+        }
         let insets = scroll.adjustedContentInset
         var target = scroll.contentOffset
         if let start {
             // From where the batch began (`geometry`'s offset): UIKit has
             // already pulled the offset in to content that shrank under it.
             let content = node.contentBox()
-            if horizontal { target.x = CGFloat(start) - insets.left + content.minX } else { target.y = CGFloat(start) - insets.top + content.minY }
+            if horizontal { target.x = CGFloat(start) - insets.left + content.minX } else { target.y = CGFloat(start) - insets.top + node.pageBand.top + content.minY }
         }
         if horizontal { target.x += CGFloat(delta) } else { target.y += CGFloat(delta) }
-        if !(scroll.isTracking || scroll.isDragging || scroll.isDecelerating) {
+        if scroll.isTracking || scroll.isDragging || scroll.isDecelerating {
+            // Past the end under a finger or a fling, a correction back toward
+            // the end that stays past it is UIKit's rubber band coming back on
+            // its own.
+            // Corrected each report, a fling stopped dead at the end (r27's
+            // tasks list).
+            let end = horizontal ? scroll.contentSize.width + insets.right - scroll.bounds.width
+                : scroll.contentSize.height + insets.bottom - scroll.bounds.height
+            let at = horizontal ? scroll.contentOffset.x : scroll.contentOffset.y, to = horizontal ? target.x : target.y
+            if at > end + 0.5, to < at, to >= end - 0.5 { return }
+        } else {
             // At rest the port stays inside the content (under a finger or
             // a fling UIKit's own rubber band owns the overshoot).
             if horizontal {
@@ -139,6 +186,7 @@ extension CollectionHost {
                 target.y = min(maximum, max(-insets.top, target.y))
             }
         }
+        target = PixelGrid.offset(target, in: scroll, clamped: !(scroll.isTracking || scroll.isDragging || scroll.isDecelerating))
         guard scroll.contentOffset != target else { return }
         let moved = horizontal ? target.x - scroll.contentOffset.x : target.y - scroll.contentOffset.y
         scroll.contentOffset = target
@@ -149,12 +197,12 @@ extension CollectionHost {
     private func fit(_ node: NodeView, _ scroll: UIScrollView, extent: Double) {
         let content = node.contentBox()
         if entries[node.id]?.snapshot.horizontal ?? false {
-            let right = node.bounds.width - content.maxX
-            let width = max(scroll.bounds.width, max(CGFloat(extent) + content.minX + right, node.content.width))
+            let right = node.layoutBounds.width - content.maxX
+            let width = max(scroll.bounds.width, PixelGrid.length(max(CGFloat(extent) + content.minX + right, node.content.width), from: node.grid?.origin ?? .zero, vertical: false, scale: presenter?.gridScale ?? 1))
             if scroll.contentSize.width != width { scroll.contentSize.width = width }
         } else {
-            let bottom = node.bounds.height - content.maxY
-            let height = max(node.scrollFloor(scroll), max(CGFloat(extent) + content.minY + bottom, node.content.height))
+            let bottom = node.layoutBounds.height - content.maxY
+            let height = max(node.scrollFloor(scroll), PixelGrid.length(max(CGFloat(extent) + content.minY + bottom, node.content.height), from: node.grid?.origin ?? .zero, vertical: true, scale: presenter?.gridScale ?? 1))
             if scroll.contentSize.height != height { scroll.contentSize.height = height }
         }
     }
@@ -224,10 +272,7 @@ extension CollectionHost {
     }
     /// `target` within the offsets the port can reach now.
     static func reachable(_ target: CGPoint, in scroll: UIScrollView) -> CGPoint {
-        let i = scroll.adjustedContentInset
-        let maxX = max(-i.left, scroll.contentSize.width + i.right - scroll.bounds.width)
-        let maxY = max(-i.top, scroll.contentSize.height + i.bottom - scroll.bounds.height)
-        return CGPoint(x: min(maxX, max(-i.left, target.x)), y: min(maxY, max(-i.top, target.y)))
+        PixelGrid.offset(target, in: scroll)
     }
     private func startOffsetDriver(_ id: UInt32, _ scroll: UIScrollView, to target: CGPoint) {
         let serial = animationSerial[id] ?? beginAnimation(id, to: target)
@@ -250,7 +295,7 @@ extension CollectionHost {
     }
     /// UIKit's batch-update and scroll timing, which Signal's transcript rides.
     static let smoothDuration: TimeInterval = 0.3
-    func correct(_ id: UInt32, top: Double, extent: Double, smooth: Bool = false) {
+    func correct(_ id: UInt32, top: Double, extent: Double, smooth: Bool = false, authored: Bool = false) {
         guard let node = presenter?.views[id], let scroll = node.scroll else { return }
         let content = node.contentBox(), insets = scroll.adjustedContentInset
         let horizontal = entries[id]?.snapshot.horizontal ?? false
@@ -259,8 +304,36 @@ extension CollectionHost {
         // permission to interrupt that animation with setContentOffset (an
         // anchor's correction moves with it instead: `shift`). The next
         // native offset notification supplies the continuing intent.
-        guard !scroll.isTracking, !scroll.isDragging, !scroll.isDecelerating else { return }
-        let target: CGPoint
+        // A `scrollIntoView`'s correction is the exception, as UIKit's own
+        // `scrollToItem` is (LLP 1070.000 §2.6): `setContentOffset(_:animated:
+        // false)` ends a deceleration and lands, and a finger down drags on
+        // from there.
+        let moving = scroll.isTracking || scroll.isDragging || scroll.isDecelerating
+        guard authored || !moving else { return }
+        // Under Reduce Motion a smooth correction lands at once, as an
+        // element's reveal does (LLP 1070.000 §14)
+        var smooth = smooth && !DisplayPreferences.reducedMotion
+        if moving {
+            // What was sampled before it is not the reader's travel after it;
+            // a finger still down drags on, and its next move says so
+            // (`ScrollPump.scrolled`).
+            presenter?.scrollPump.forgetTravel(id)
+            if scroll.isTracking {
+                // Under a dragging finger a smooth one lands at once too:
+                // UIKit's animated call would pull the port from under it.
+                // Under a still finger it runs, as UIKit's does, until the
+                // finger drags (`scrollViewWillBeginDragging`).
+                if scroll.isDragging { smooth = false }
+            } else if smooth {
+                // During a deceleration (`isDragging` stays true through one)
+                // a smooth one first stops it where the port is, then animates
+                // from rest: UIKit's animated call made during a deceleration
+                // came to rest short of its target.
+                if #available(iOS 17.4, tvOS 17.4, *) { scroll.stopScrollingAndZooming() }
+                else { scroll.setContentOffset(scroll.contentOffset, animated: false) }
+            }
+        }
+        var target: CGPoint
         if horizontal {
             let maximum = max(-insets.left, scroll.contentSize.width + insets.right - scroll.bounds.width)
             target = CGPoint(x: min(maximum, max(-insets.left, CGFloat(top) + content.minX - insets.left)),
@@ -268,8 +341,9 @@ extension CollectionHost {
         } else {
             let maximum = max(-insets.top, scroll.contentSize.height + insets.bottom - scroll.bounds.height)
             target = CGPoint(x: scroll.contentOffset.x,
-                y: min(maximum, max(-insets.top, CGFloat(top) + content.minY - insets.top)))
+                y: min(maximum, max(-insets.top, CGFloat(top) + content.minY - insets.top + node.pageBand.top)))
         }
+        target = Self.reachable(target, in: scroll)
         // A smooth correction is UIKit's scroll animation (LLP 1070.000
         // §6.2): the window is already built at the destination; rows in
         // between are not (§11 declares it). Under the agent's frozen clock
@@ -329,21 +403,30 @@ extension CollectionHost {
     func rowsToCover(_ id: UInt32, ahead: CGFloat) -> UInt32 {
         guard ahead != 0, let entry = entries[id], let node = presenter?.views[id], let scroll = node.scroll else { return 0 }
         let horizontal = entry.snapshot.horizontal
-        let frames = entry.snapshot.rows.compactMap { row in presenter?.views[row.view].map { span($0, in: scroll, horizontal: horizontal) } }
-        guard !frames.isEmpty else { return 0 }
-        let mean = frames.map { $0.upperBound - $0.lowerBound }.reduce(0, +) / CGFloat(frames.count)
+        let rows = entry.snapshot.rows.compactMap { row in presenter?.views[row.view].map { (index: row.index, frame: span($0, in: scroll, horizontal: horizontal)) } }
+        guard !rows.isEmpty else { return 0 }
+        let mean = rows.map { $0.frame.upperBound - $0.frame.lowerBound }.reduce(0, +) / CGFloat(rows.count)
         guard mean > 0 else { return 0 }
         let port = horizontal ? scroll.bounds.minX...scroll.bounds.maxX : scroll.bounds.minY...scroll.bounds.maxY
+        // The run of rows that covers the port from its edge: a kept row
+        // (LLP 1010 §6.11) past a gap of unbuilt rows is not in it, so the
+        // list's end row ends the travel only when the run reaches it.
         var shortfall: CGFloat = 0
         if ahead > 0 {
-            if entry.snapshot.rows.last?.index == entry.snapshot.count - 1 { return 0 }
-            var reached = port.lowerBound
-            for frame in frames where frame.lowerBound <= reached + 0.5 { reached = max(reached, frame.upperBound) }
+            var reached = port.lowerBound, last: Int?
+            for row in rows where row.frame.lowerBound <= reached + 0.5 && row.frame.upperBound >= reached {
+                reached = row.frame.upperBound
+                last = row.index
+            }
+            if last == entry.snapshot.count - 1 { return 0 }
             shortfall = port.upperBound + ahead - reached
         } else {
-            if entry.snapshot.rows.first?.index == 0 { return 0 }
-            var reached = port.upperBound
-            for frame in frames.reversed() where frame.upperBound >= reached - 0.5 { reached = min(reached, frame.lowerBound) }
+            var reached = port.upperBound, first: Int?
+            for row in rows.reversed() where row.frame.upperBound >= reached - 0.5 && row.frame.lowerBound <= reached {
+                reached = row.frame.lowerBound
+                first = row.index
+            }
+            if first == 0 { return 0 }
             shortfall = reached - (port.lowerBound + ahead)
         }
         return shortfall > 0 ? UInt32(min(64, (shortfall / mean).rounded(.up))) : 0
@@ -360,6 +443,22 @@ extension CollectionHost {
         port.addGestureRecognizer(recognizer)
         return recognizer
     }
+    /// The reader moves `id`'s port with no finger on it, by a scroll run
+    /// for them with UIKit's animation: a tap on the status bar or on the
+    /// selected tab, a remote's step. As a drag does, the move stops the
+    /// host's animation where the port is, leaves a correction planned before
+    /// it stale, and ends the request under way there (LLP 1070.000 §2.5).
+    func readerMoves(_ id: UInt32) {
+        guard entries[id] != nil else { return }
+        gestureBegan(id)
+        animationEnded(id, dragging: true)
+        userIntent(id, travel: true)
+    }
+    /// The latest request `id` took, under way or ended: 0 for none, or for
+    /// a view that is no list.
+    func lastRequest(_ id: UInt32) -> UInt64 { entries[id]?.snapshot.lastRequest ?? 0 }
+    /// Every list's latest request, by its view (`lastRequest`).
+    func lastRequests() -> [UInt32: UInt64] { entries.mapValues { $0.snapshot.lastRequest } }
     func focusedView() -> UInt32? {
         presenter?.views.values.first(where: {
             $0.isFirstResponder || $0.field?.isFirstResponder == true || $0.textArea?.isFirstResponder == true
@@ -402,6 +501,8 @@ final class OffsetDriver: NSObject {
         began = CACurrentMediaTime()
         FrameClock.shared.want(self, .offsetDriver, rate: FrameClock.full(on: scroll?.window?.screen)) { [weak self] in self?.frame($0) }
     }
+    /// Native offsets move by `dy` under it (a page band's inset, LLP 1130 D3).
+    func moveOffsets(by dy: CGFloat) { from.y += dy; to.y += dy }
     func retarget(_ target: CGPoint, serial: Int) {
         guard let scroll else { return }
         self.serial = serial
@@ -409,7 +510,7 @@ final class OffsetDriver: NSObject {
         // measured row, a report after its estimate, is still its one target
         // (LLP 1010 §6.8). After it, or once the port moved under it (content
         // that shrank clamped it), a fresh ease from what shows.
-        if !drawn, scroll.contentOffset == from {
+        if !drawn, PixelGrid.same(scroll.contentOffset, from, in: scroll) {
             // Folded back onto the port: no motion at all.
             if abs(target.y - from.y) + abs(target.x - from.x) < 0.5 {
                 scroll.contentOffset = target
@@ -436,7 +537,8 @@ final class OffsetDriver: NSObject {
         // toward the edge it can reach; every frame stays inside the range.
         let reached = CollectionHost.reachable(to, in: scroll)
         let here = CollectionHost.reachable(scroll.contentOffset, in: scroll)
-        if reached != to || here != scroll.contentOffset {
+        // (within a hundredth of a pixel: UIKit's read-back is a ULP off the grid; PixelGrid.same)
+        if !PixelGrid.same(reached, to, in: scroll) || !PixelGrid.same(here, scroll.contentOffset, in: scroll) {
             from = here; to = reached; began = link.targetTimestamp; reclamp(reached)
             if here == reached { scroll.contentOffset = here; cancel(); done(serial, true); return }
         }

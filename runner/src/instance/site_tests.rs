@@ -10,7 +10,7 @@ fn reused_frames_preserve_nested_scopes_and_release_rows_on_error() {
     let mut ids = Ids::default();
     let env = Env {
         plan: &plan,
-        strings: &[],
+        strings: &crate::vm::Strings::of([]),
         router: None,
         lists: None,
         format: None,
@@ -116,4 +116,15 @@ fn site_index_keeps_parent_arm_and_stable_mixed_order() {
     );
     assert!(sites.children(Some(left), Some(arms[1])).is_empty());
     assert!(sites.children(Some(right), Some(arms[1])).is_empty());
+}
+
+/// A realized child fits Apple's allocator's 112-byte size class, as does a
+/// `Vec` of one; the next class is 128 bytes.
+#[test]
+fn a_child_fits_in_112_bytes() {
+    assert!(
+        std::mem::size_of::<Child>() <= 112,
+        "{}",
+        std::mem::size_of::<Child>()
+    );
 }

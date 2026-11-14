@@ -117,12 +117,12 @@ fn every_chrome_paint_case_writes_the_kernels_isolated_and_policy_sets() {
     for line in cases.lines().filter(|line| !line.is_empty()) {
         let fields: Vec<_> = line.split('\t').collect();
         let plan = fixture_plan(fields[1], fields[2]);
-        let (host, batch) = boot(&plan);
+        let (mut host, batch) = boot(&plan);
         let mut css = BTreeMap::new();
         apply(&mut css, &batch);
         agrees(&host, &css, fields[0]);
         let document = host.document().unwrap();
-        let tree = host.runner().document_tree().unwrap();
+        let tree = host.runner_mut().document_tree().unwrap();
         let (detached, _) =
             exact_web::document::project_tree(&tree, host.runner(), Default::default()).unwrap();
         assert_eq!(detached.root, document.root, "{}: DocTree", fields[0]);
@@ -248,7 +248,7 @@ fn authored_isolation_auto_yields_to_required_isolation() {
     // Contract. Exercise the live host directly with a literal plan.
     let mut plan = fixture_plan("", "2>1>isolation:auto & 3>2>position:absolute;z-index:1 & 4>1>isolation:isolate & 5>1>isolation:auto & 6>1>opacity:0.5");
     for i in [4, 5] {
-        plan.nodes[i].node_type = NodeType::Canvas as u8;
+        plan.nodes.to_mut()[i].node_type = NodeType::Canvas as u8;
     }
     let (host, batch) = boot(&plan);
     let mut css = BTreeMap::new();
@@ -266,7 +266,7 @@ fn authored_isolation_auto_yields_to_required_isolation() {
 }
 
 #[test]
-fn z_index_is_an_exact_integer_below_the_ghost_and_lift() {
+fn z_index_is_an_exact_integer_below_the_hosts_own_values() {
     use exact_kernel::{paint_order::Z_MAX, StyleProps, StyleValue};
     for z in [
         0,

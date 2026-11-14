@@ -13,6 +13,9 @@ use tiny_skia::Transform;
 
 #[path = "island.rs"]
 mod island;
+#[cfg(test)]
+#[path = "symbol_tests.rs"]
+mod symbol_tests;
 
 /// What a fill or a stroke paints with.
 pub enum Ink<'a> {
@@ -68,35 +71,67 @@ pub struct SvgPaint<'a> {
 }
 
 thread_local! {
-    /// Each role's path, parsed once: the schema's `d` strings are static,
-    /// so the address names the path (a row of icons painted again parsed
-    /// every one, 4% of the easy list's thread).
-    static SYMBOL_PATHS: std::cell::RefCell<std::collections::HashMap<usize, std::rc::Rc<Path>>> =
+    /// Each symbol's path, parsed once: a role's schema `d` or an icon
+    /// token's (LLP 1121 D10), by its text (a row of icons painted again
+    /// parsed every one, 4% of the easy list's thread).
+    static SYMBOL_PATHS: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<Path>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// The parsed path of a schema `d` string.
-fn parsed_symbol(d: &'static str) -> std::rc::Rc<Path> {
+/// The parsed path of a symbol's `d`.
+fn parsed_symbol(d: &str) -> std::rc::Rc<Path> {
     SYMBOL_PATHS.with(|paths| {
-        paths
-            .borrow_mut()
-            .entry(d.as_ptr() as usize)
-            .or_insert_with(|| std::rc::Rc::new(exact_kernel::svg::parse_d(d)))
-            .clone()
+        if let Some(p) = paths.borrow().get(d) {
+            return p.clone();
+        }
+        let p = std::rc::Rc::new(exact_kernel::svg::parse_d(d));
+        let mut paths = paths.borrow_mut();
+        // Bounded: a computed source's paths come and go.
+        if paths.len() >= 1024 {
+            paths.clear();
+        }
+        paths.insert(d.to_string(), p.clone());
+        p
     })
+}
+
+/// The transform that draws a viewBox's units in `rect`, its aspect kept
+/// and centred (SVG's `xMidYMid meet`).
+pub(crate) fn fitted(view_box: &str, (x, y, w, h): Rect4) -> Transform {
+    let [bx, by, bw, bh] = self::view_box(view_box);
+    let scale = (w / bw).min(h / bh);
+    Transform::from_translate(x + (w - bw * scale) / 2.0, y + (h - bh * scale) / 2.0)
+        .pre_scale(scale, scale)
+        .pre_translate(-bx, -by)
+}
+
+/// A viewBox's `min-x min-y width height`; a role's 24-unit box when it
+/// does not read.
+pub(crate) fn view_box(text: &str) -> [f32; 4] {
+    let n: Vec<f32> = text
+        .split([' ', ','])
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    match n[..] {
+        [x, y, w, h] if w > 0.0 && h > 0.0 => [x, y, w, h],
+        _ => [0.0, 0.0, 24.0, 24.0],
+    }
 }
 
 impl Painter {
     /// A portable symbol role (LLP 1035.004 D1) as the web draws it: the
     /// role's path in a 24-unit box at the image's font size, placed by
     /// `object-fit`, stroked `1.1 + (weight − 100) / 400` units with round
-    /// caps and joins (a `-fill` role filled even-odd), in its tint, which
-    /// starts as `AccentColor`. An `sf/` name stays an empty box (LLP 1035.004.000 D4).
+    /// caps and joins (a `-fill` role filled even-odd), in `ink` (its
+    /// presented `color`, or a list sheet's tint) or else its computed `color`
+    /// (LLP 1081 stage 2).
+    /// An icon token draws its path under its viewBox, filled (LLP 1121
+    /// D10); an `sf/` name that is no role's Apple name stays an empty box (LLP 1035.004.000 D4).
     pub(super) fn symbol(
         &mut self,
         node: &NodeRef<'_>,
         content: Rect4,
-        tint: Option<[u8; 4]>,
+        ink: Option<[u8; 4]>,
         ts: Transform,
     ) {
         let Some(role) = node
@@ -109,18 +144,19 @@ impl Painter {
         let style = node.style;
         let size = style.font_size.max(1.0);
         let natural = (size.round().max(1.0) as u32, size.round().max(1.0) as u32);
-        let Some(rect) = super::object_fit(natural, style.object_fit, content) else {
+        // `fill` keeps a symbol's aspect, as the web's `contain` and Apple do.
+        let fit = match style.object_fit {
+            exact_kernel::ObjectFit::Fill => exact_kernel::ObjectFit::Contain,
+            fit => fit,
+        };
+        let Some(rect) = super::object_fit(natural, fit, content) else {
             return;
         };
-        let colour = tint.unwrap_or_else(|| {
-            rgba(
-                style
-                    .tint_color
-                    .unwrap_or_else(|| node.text_color())
-                    .resolve(self.dark),
-            )
-        });
-        self.symbol_face(role, style, rect, colour, ts);
+        let colour = ink.unwrap_or_else(|| rgba(node.text_color().resolve(self.dark)));
+        let face = node.computed_style(exact_kernel::StyleMask::of(
+            exact_kernel::StyleId::FontWeight,
+        ));
+        self.symbol_face(role, &face, rect, colour, ts);
     }
 
     /// A semantic button's symbol shares the portable image painter.
@@ -132,41 +168,58 @@ impl Painter {
         colour: [u8; 4],
         ts: Transform,
     ) {
-        let Some((_, d, filled)) = exact_kernel::generated::symbol(role) else {
+        // A role (in this platform's shape), an icon token's form, or `sf/` a
+        // role's Apple name (LLP 1121 D10, LLP 1115.001 D14).
+        let Some(path) = exact_kernel::symbol_path_in(role, self.symbols) else {
             return;
         };
-        self.glyph_face(d, filled, style, rect, colour, ts);
+        self.glyph_face(path, style, rect, colour, ts);
     }
 
-    /// A 24-unit path in `rect`, stroked as a symbol role is at `style`'s
-    /// weight, or filled.
+    /// A symbol's paths in `rect` under its viewBox (a role's 24 units), each
+    /// stroked as a symbol role is at `style`'s weight, or filled.
     pub(super) fn glyph_face(
         &mut self,
-        d: &'static str,
-        filled: bool,
+        symbol: exact_kernel::SymbolPath<'_>,
         style: &exact_kernel::StyleProps,
         rect: Rect4,
         colour: [u8; 4],
         ts: Transform,
     ) {
         let (x, y, w, h) = rect;
-        let path = parsed_symbol(d);
         let weight = f32::from(style.font_weight).clamp(100.0, 900.0);
-        let paint = SvgPaint {
-            path: &path,
-            fill: filled.then_some(Ink::Solid(colour)),
-            even_odd: true,
-            stroke: (!filled).then_some(Ink::Solid(colour)),
-            order: [0, 1, 2],
-            width: 1.1 + (weight - 100.0) / 400.0,
-            cap: 1,
-            join: 1,
-            miter: 4.0,
-            dash: Vec::new(),
-            phase: 0.0,
+        let ts = ts.pre_concat(fitted(symbol.view_box, (x, y, w, h)));
+        let bw = self::view_box(symbol.view_box)[2];
+        // Each of an icon's paths filled on its own, as its SVG draws them,
+        // a translucent tint once over all of them, as the web's mask is.
+        let group = symbol.d.contains(';') && colour[3] < 255;
+        let colour = if group {
+            self.backend.push_opacity(f32::from(colour[3]) / 255.0);
+            [colour[0], colour[1], colour[2], 255]
+        } else {
+            colour
         };
-        self.backend
-            .svg_path(&paint, ts.pre_translate(x, y).pre_scale(w / 24.0, h / 24.0));
+        for d in symbol.d.split(';') {
+            let path = parsed_symbol(d);
+            let paint = SvgPaint {
+                path: &path,
+                fill: symbol.filled.then_some(Ink::Solid(colour)),
+                even_odd: symbol.even_odd,
+                stroke: (!symbol.filled).then_some(Ink::Solid(colour)),
+                order: [0, 1, 2],
+                // The stroke is in the role's 24 units whatever the box.
+                width: (1.1 + (weight - 100.0) / 400.0) * bw / 24.0,
+                cap: 1,
+                join: 1,
+                miter: 4.0,
+                dash: Vec::new(),
+                phase: 0.0,
+            };
+            self.backend.svg_path(&paint, ts);
+        }
+        if group {
+            self.backend.pop_opacity();
+        }
     }
 
     /// SVG text (LLP 1055.000 D11): each run shaped as a one-line paragraph
@@ -302,6 +355,25 @@ impl Painter {
         }
         self.paint_svg(&scene, clips, rect, content, ts);
         self.svg_layers.clear();
+    }
+
+    /// An SVG image's picture (LLP 1011.001 D3): `scene`, resolved at a
+    /// content box of `css` points, painted by a painter of its own at
+    /// `scale` device pixels per point into a transparent pixmap of
+    /// `css × scale` pixels, as an island is, so the picture and the same
+    /// content inlined never differ on this host.
+    pub(crate) fn svg_picture(
+        text: crate::text::Shared,
+        scene: &exact_kernel::svg::Scene,
+        css: (f32, f32),
+        scale: f32,
+    ) -> Result<tiny_skia::Pixmap, String> {
+        let mut painter = Painter::new(text, scale, Box::new(crate::raster::Raster::transparent()));
+        painter.viewport = css;
+        painter.backend.begin(css.0, css.1, scale);
+        let rect: Rect4 = (0.0, 0.0, css.0, css.1);
+        painter.paint_svg(scene, scene.clip, rect, rect, Transform::identity());
+        painter.backend.finish()
     }
 
     /// A resolved `svg` scene inside its box: clipped to the border box

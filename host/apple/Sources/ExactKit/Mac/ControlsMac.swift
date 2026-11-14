@@ -78,6 +78,23 @@ final class ControlHost: NSObject {
     var menus: [UInt32: SelectMenu] = [:]
     /// A range's last reported value while it moves, so each is sent once.
     var lastRange: [UInt32: String] = [:]
+    /// Each native button's face as the runner last gave it. A face is the
+    /// button's viewless contents, which change only in a batch that says so
+    /// (`Batch.controls`), and its own props, which change only in a batch
+    /// that touches it: `Presenter.apply` drops it then, and the next read
+    /// asks the runner. Every other batch keeps it, so a commit that changes
+    /// no button waits on the owner thread for none, as on iOS.
+    private var faces: [UInt32: ButtonFace] = [:]
+    func face(_ id: UInt32) -> ButtonFace {
+        if let face = faces[id] { return face }
+        let face = presenter.buttonFace?(id) ?? ButtonFace()
+        faces[id] = face
+        return face
+    }
+    /// Asks for the face of `id` again at its next read.
+    func faceChanged(_ id: UInt32) { faces.removeValue(forKey: id) }
+    /// Asks for every face again at its next read.
+    func facesChanged() { faces.removeAll() }
     /// A range's bound value last written into it: written again only when
     /// it changes (LLP 1069.001 D4, amended 2026-10-04).
     var appliedRange: [UInt32: String] = [:]
@@ -138,6 +155,7 @@ final class ControlHost: NSObject {
         for id in Array(controls.keys) where !live.contains(id) && !leaving.contains(id) {
             controls.removeValue(forKey: id)?.removeFromSuperview()
             reported.removeValue(forKey: id)
+            faces.removeValue(forKey: id)
             kinds.removeValue(forKey: id)
             menus.removeValue(forKey: id)
             lastRange.removeValue(forKey: id)
@@ -154,6 +172,9 @@ final class ControlHost: NSObject {
             let mount = owner.controlMount
             if control.superview !== mount { mount.addSubview(control) }
             control.isHidden = owner.cssVisibilityHidden
+            // `outline: none` (LLP 1104 D6): AppKit draws the control no ring.
+            let ring: NSFocusRingType = owner.outlineNone ? .none : .default
+            if control.focusRingType != ring { control.focusRingType = ring; control.noteFocusRingMaskChanged() }
             let accent = owner.channels("accent_color").map { TextEngine.color($0) }
             if let b = control as? NativeButtonMac {
                 configureNative(b, owner, accent: accent)
@@ -174,10 +195,12 @@ final class ControlHost: NSObject {
             }
             if !(control is NativeButtonMac) {
                 control.isEnabled = !owner.disabled
-                control.setAccessibilityLabel(owner.props["accessibilityLabel"])
+                control.setAccessibilityLabel(owner.authoredLabel)
                 control.setAccessibilityIdentifier(owner.props["testId"])
             }
-            let natural = naturalSize(control)
+            // A native button is sized by its node's box and has answered its fitting size already (D11):
+            // its intrinsic size, an AppKit measure on every batch, is read only for the other controls.
+            let natural = control is NativeButtonMac ? .zero : naturalSize(control)
             let box = control is NativeButtonMac ? owner.bounds : owner.contentBox()
             // A slider's track spans its box, as the web's does; a native
             // button fills it, its chrome inside (LLP 1069.011 D6); the
@@ -215,8 +238,13 @@ final class ControlHost: NSObject {
 
     @objc private func changed(_ sender: NSControl) {
         let id = UInt32(sender.tag)
-        guard presenter.views[id] != nil else { return }
-        presenter.checked(id, isOn(sender))
+        guard let node = presenter.views[id] else { return }
+        // Read first: the press's batch syncs a bound control back to `checked`.
+        let on = isOn(sender)
+        // A click on a checkbox is heard before its `input` and `change` (HTML
+        // dispatches `click`, then fires those as its activation behaviour).
+        if node.handlers.contains("press") { presenter.press(id) }
+        presenter.checked(id, on)
         // The committed state is authoritative: an action that refused the
         // toggle snaps the control back (D4).
         if let committed = presenter.views[id]?.props["checked"].map({ $0 == "true" }) { setOn(sender, committed) }
@@ -268,6 +296,7 @@ final class ControlHost: NSObject {
         menus.removeAll()
         lastRange.removeAll()
         appliedRange.removeAll()
+        faces.removeAll()
     }
 }
 

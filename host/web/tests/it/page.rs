@@ -125,6 +125,8 @@ fn a_checkpoint_reads_back_as_the_runner_wrote_it() {
         !json.contains('<') && !json.contains('>') && !json.contains('&'),
         "{json}"
     );
+    // No stream is open, so no `open` is written
+    assert!(!json.contains("\"open\""), "{json}");
     let read = read_checkpoint(&json).unwrap();
     assert_eq!(read, host.runner().document_checkpoint("/said?q=1"));
     assert_eq!(read.answers[0].3, Value::str("</script><!-- & \u{1F4AC}"));
@@ -143,7 +145,7 @@ fn a_checkpoint_reads_back_as_the_runner_wrote_it() {
 fn checkpoint_values_are_json_that_reads_back_exactly() {
     // Every kind of plan value, as `push_value` spells it: text a page's
     // compression matches against the document's own strings.
-    let text = r#"{"location":"/","time":1.5,"logic":null,"answers":[["a","src",["x",{"n":"NaN"}],{"r":[1,-0,2.25,true,null,{},{"s":"y"},["p","q"],{"n":"-Infinity"}]}]],"pending":["b"]}"#;
+    let text = r#"{"location":"/","time":1.5,"logic":null,"answers":[["a","src",["x",{"n":"NaN"}],{"r":[1,-0,2.25,true,null,{},{"s":"y"},["p","q"],{"n":"-Infinity"}]}]],"pending":["b"],"open":["a"]}"#;
     let read = read_checkpoint(text).unwrap();
     let (name, source, args, value) = &read.answers[0];
     assert_eq!((name.as_str(), source.as_str()), ("a", "src"));
@@ -165,6 +167,7 @@ fn checkpoint_values_are_json_that_reads_back_exactly() {
     );
     assert_eq!(fields[8], Value::Number(f64::NEG_INFINITY));
     assert_eq!(read.pending, ["b"]);
+    assert_eq!(read.open, ["a"]);
     assert!(read_checkpoint(&text.replace("{\"s\"", "{\"z\"")).is_err());
 }
 
@@ -283,7 +286,7 @@ fn the_plans_fonts_are_declared_for_a_reader_without_javascript() {
     assert!(family.starts_with("ExactPlanStack"), "{head}");
     assert!(
         head.contains(&format!(
-            r#"<style>@font-face{{font-family:"{family}";src:url("assets/ExcitingLilt-Bold.ttf");font-weight:700;font-style:normal}}</style>"#
+            r#"<style>@font-face{{font-family:"{family}";src:url("assets/ExcitingLilt-Bold.ttf");font-weight:700;font-stretch:100%;font-style:normal}}</style>"#
         )),
         "{head}"
     );
@@ -320,7 +323,7 @@ fn resolved_language_is_published_at_boot_and_after_switching() {
     plan.locale = Some(exact_plan::SlotsId(0));
     for rtl in [false, true] {
         let name = exact_plan::StrId(plan.strings.len() as u32);
-        plan.strings.push(if rtl { "ar" } else { "en" }.into());
+        plan.strings.push(if rtl { "ar" } else { "en" });
         plan.locales.push(exact_plan::LocalesRow {
             name,
             rtl,
@@ -330,7 +333,7 @@ fn resolved_language_is_published_at_boot_and_after_switching() {
     let plan = contract::bake(plan, Says("")).unwrap();
     let (mut host, batch) = Host::boot(&plan.encode(), Says(""), Default::default(), "/").unwrap();
     assert!(batch.contains(r#"{"op":"language","lang":"en","dir":"ltr"}"#));
-    let batch = host.set_place("ar-EG", "UTC", None);
+    let batch = host.set_place("ar-EG", "UTC", None, None);
     assert!(
         batch.contains(r#"{"op":"language","lang":"ar","dir":"rtl"}"#),
         "{batch}"
@@ -338,9 +341,9 @@ fn resolved_language_is_published_at_boot_and_after_switching() {
     let doc = host.document().unwrap();
     assert_eq!((doc.lang.as_str(), doc.dir.as_str()), ("ar", "rtl"));
     assert!(!host
-        .set_place("ar-SA", "UTC", None)
+        .set_place("ar-SA", "UTC", None, None)
         .contains(r#""op":"language""#));
-    let batch = host.set_place("de", "UTC", None);
+    let batch = host.set_place("de", "UTC", None, None);
     assert!(batch.contains(r#"{"op":"language","lang":"en","dir":"ltr"}"#));
 }
 
@@ -354,7 +357,7 @@ fn the_launch_place_and_date_are_the_first_batchs() {
     plan.locale = Some(exact_plan::SlotsId(0));
     for rtl in [false, true] {
         let name = exact_plan::StrId(plan.strings.len() as u32);
-        plan.strings.push(if rtl { "ar" } else { "en" }.into());
+        plan.strings.push(if rtl { "ar" } else { "en" });
         plan.locales.push(exact_plan::LocalesRow {
             name,
             rtl,

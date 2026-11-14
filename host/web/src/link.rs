@@ -17,8 +17,9 @@ use std::cell::Cell;
 /// The capabilities an artifact links: one registration per capability.
 #[derive(Clone, Copy)]
 pub struct Linked {
-    /// Markdown: a source as the batch's `markupPieces` JSON.
-    pub markup: Option<fn(&str) -> String>,
+    /// Markdown: a source, its `atoms` and its `atomFaces` (LLP 1045.000)
+    /// as the batch's `markupPieces` JSON.
+    pub markup: Option<fn(&str, &str, &str) -> String>,
     /// Motion: the spring engine a host holds instead of
     /// [`crate::motion::Still`].
     pub motion: Option<fn() -> Box<dyn crate::motion::Motion>>,
@@ -56,8 +57,6 @@ pub struct Linked {
     pub auth: bool,
     /// `share(…)` (LLP 1069.003).
     pub share: bool,
-    /// `showNotification` and `closeNotification`.
-    pub notifications: bool,
     /// `saveFile` and the file pickers (LLP 1069.010).
     pub documents: bool,
     /// `input type="file"` and `showPicker` (LLP 1069.002): a file input's
@@ -135,11 +134,6 @@ impl Linked {
             } else {
                 None
             },
-            notifications: if self.notifications {
-                all.notifications
-            } else {
-                None
-            },
         }
     }
 
@@ -159,7 +153,6 @@ impl Linked {
         backdrop: None,
         auth: false,
         share: false,
-        notifications: false,
         documents: false,
         picker: None,
         timelines: None,
@@ -216,9 +209,6 @@ impl Linked {
         }
         if self.share {
             uses = uses.with(Capability::Share);
-        }
-        if self.notifications {
-            uses = uses.with(Capability::Notifications);
         }
         if self.documents {
             uses = uses.with(Capability::Documents);
@@ -337,6 +327,8 @@ pub(crate) fn runner_links() -> exact_runner::RunnerLinks {
         // The browser's grants are I/O it does itself (LLP 1047.001).
         grants: exact_runner::RunnerLinks::ALL.grants,
         keyframes: linked().animations.map(|a| a.keyframes),
+        // The browser plays a font axis's CSS transition itself.
+        text_axes: None,
     }
 }
 
@@ -375,7 +367,10 @@ mod tests {
         assert!(exact_runner::uses(&date).has(exact_runner::Capability::Dates));
         assert!(Host::boot(&date.encode(), (), Default::default(), "/").is_ok());
         // So are rolling numerals: the runtime's own text.
-        let rolls = contract::compile("component A\n  view\n    text \"1,234\" -exact-content-transition=\"numeric\"\n").unwrap();
+        let rolls = contract::compile(
+            "component A\n  view\n    text \"1,234\" -exact-content-transition=\"numeric\"\n",
+        )
+        .unwrap();
         assert!(exact_runner::uses(&rolls).has(exact_runner::Capability::Numerals));
         assert!(Host::boot(&rolls.encode(), (), Default::default(), "/").is_ok());
         // LLP 1078 D3: a segment length is linked by use; the fold's fields are the core's.

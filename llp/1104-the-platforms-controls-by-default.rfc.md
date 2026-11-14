@@ -150,7 +150,7 @@ Rows rule 2 admits go to the control. The host does one of three things with eac
 | `text-align` | `textAlignment` | `alignment` | applies |
 | `accent-color`, `caret-color` | `tintColor` | `insertionPointColor` (field editor) | applies |
 | `padding-*` | text-rect insets added to the chrome's | added inside the bezel (cell subclass) | applies |
-| `-exact-control-size` | stand-in (UIKit has no field sizes) | `controlSize` | CSS's absolute `font-size` keyword, as 1069.011.001 D8 |
+| `-exact-control-size` | refused | refused | refused (the row sizes a native button; Contract refuses it on a field, `lower-button-style-attr`) |
 
 The table is a starting point. The build fills in each cell from a measured fixture (§4). A cell that doesn't hold becomes a reported stand-in, never a devolve.
 
@@ -259,7 +259,7 @@ A change (Dynamic Type, legibility weight, control size) goes through `set_env`.
 
 Phase 1 probes the chrome across fonts from 11 to 34pt, two families and constrained heights. The font comes out of the key only if the probes show the insets don't depend on it. A miss is measured on the main thread with a real configured control before the batch is presented, as for buttons. No per-platform guess is written into the schema.
 
-- **Where the text goes:** the host places the text editor in the content box. The node's frame is the control's frame.
+- **Where the text goes:** the host places the text editor in the content box. The node's frame is the control's frame. The glyphs start at the content box's inline start and stand on the line box centred in it, while the field is edited as well (the user's ruling of 2026-11-03). On macOS the field editor sets its glyphs in from its rect by its line fragment padding (2 points), so the chrome a native field measures counts that padding as a textarea's does: a bezeled field's text stays where AppKit puts it, and its content box is 2 points narrower on each side.
 - **Web:** the browser lays out its own `<input>`, `<textarea>` and `<button>`.
 - **Painted hosts:** answer synchronously from their look (D7).
 - **No provisional frame:** each host counts batches it presented while any control's measure was provisional (`state.layout.provisional`). The checks assert zero (§4).
@@ -293,6 +293,12 @@ Phase 1 probes the chrome across fonts from 11 to 34pt, two families and constra
   This is what a browser does after `all: unset` with a focus restore (CSS UI 4 §7.2.2).
 - **Painted hosts** have no OS ring and paint one as part of their look (D7): `field_ring` for fields on Linux, and a new ring for buttons there and in the terminal.
 - **An author takes a field's ring off (Charlie's ruling on #302, 2026-10-08; built 2026-10-12, #459):** the rings above are defaults. `outline="none"` (or `outline-style="none"`, the one value admitted) on a text `input` or a `textarea`, native or bare, draws none on any host: no UA ring or restore on the web, neither AppKit's nor Exact's on macOS, no `field_ring` on Linux. Tab order and the accessibility tree stay, and replacing the look is the author's duty (WCAG 2.4.7); #283 (`focusin`/`focusout`, `issues/20261009-bubbling-focus-events.md`) is how a wrapper hears the focus, on every host. The rest of `outline`, and `outline` on any other element, stay refused (`issues/closed/20261009-field-outline-none.md`).
+
+  > **Amended 2026-11-05 (the user's ruling).** `outline="none"` (or `outline-style="none"`) takes the ring off any
+  > element that takes the focus, not only a text field: a `button`, a `link`, a pressable or `tabindex` box, a native
+  > control. No host draws its ring there (the web's, AppKit's, Exact's on iOS and Linux, Android's); tvOS keeps its
+  > focus effect, which is how a remote moves. Tab order and the accessibility tree stay, and the author draws the
+  > replacement (WCAG 2.4.7). The rest of `outline` stays refused.
 - **Retired:** `fieldStyle` (prop 253) and its `data-fieldstyle` mark. Prop numbers aren't reused.
 
 ### D7 — The painted hosts have a look of their own
@@ -379,7 +385,7 @@ Phase 1 probes the chrome across fonts from 11 to 34pt, two families and constra
    Proposed: the second, because hosting SwiftUI for a text view brings its own focus and measurement paths. Apple's own apps rarely border multi-line text, so this is the field's look extended, not a platform control.
 2. **Field styles.** Should fields get a vocabulary like `buttonStyle` (macOS `borderShape` capsule, a plain borderless platform field)? Proposed: not now.
 3. **`select`** is a `Control` already drawn natively. Should D2–D4 cover it? Proposed: yes, as a follow-up.
-4. **The `border-radius` exception** (D2 rule 2) is James's D15. It keeps Lexy's rounded native buttons, at the price of one CSS deviation under `appearance="auto"`. Charlie agrees; James to confirm.
+4. **The `border-radius` exception** (D2 rule 2) is James's D15. It keeps rounded native buttons, at the price of one CSS deviation under `appearance="auto"`. Charlie agrees; James to confirm.
 
 **Settled:**
 - r5 Q2: D2 makes most self-styled buttons bare with no edit, and the codemod covers the rest.

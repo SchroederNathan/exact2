@@ -216,8 +216,9 @@ impl<D: DataSource> Presenter<D> {
     ///   line height in pixels (0: the font's own) as float bits (the
     ///   weight a count); and the revision, start and end of the selection
     ///   a command last set;
-    /// - three strings: its placeholder, its `autocomplete` and its font's
-    ///   file ([`crate::fields::FieldFace::family`]).
+    /// - four strings: its placeholder, its `autocomplete`, its font's
+    ///   file ([`crate::fields::FieldFace::family`]) and its axes as
+    ///   `font-variation-settings` ([`crate::fields::FieldFace::axes`]).
     ///
     /// A field the reader knew that a statement leaves out is gone.
     pub fn reader_fields(&mut self, scale: f32) -> Option<Vec<i32>> {
@@ -433,6 +434,7 @@ impl<D: DataSource> Presenter<D> {
         requests::string(out, props.str(PropId::Placeholder).unwrap_or(""));
         requests::string(out, props.str(PropId::Autocomplete).unwrap_or(""));
         requests::string(out, &face.family);
+        requests::string(out, &face.axes);
     }
 
     /// Whether `id` is a field the reader hosts and knows at `generation`:
@@ -455,12 +457,16 @@ impl<D: DataSource> Presenter<D> {
         if !self.hosted_live(id, generation) {
             return;
         }
+        if focused {
+            self.hold_input(Some(id)); // a finger on the field lets a hold of it go (presenter/held.rs)
+            self.touched();
+        }
         // Under an open surface of the top layer the page is inert (LLP
         // 1115.001 D10): a field there is not given the focus, whatever
         // made its view take it (a hardware key ends touch mode, and the
         // platform then focuses the window's first focusable view). The
         // shell is told again that no field holds it, which blurs the view.
-        if focused && self.top_open() {
+        if focused && self.page_inert() {
             self.keyboard_changed();
             return;
         }
@@ -476,6 +482,14 @@ impl<D: DataSource> Presenter<D> {
             eprintln!("exact: {e}");
         }
         self.queue_collections();
+    }
+
+    /// The reader's field had real input that may change nothing it says
+    /// otherwise (a finger down in it, a key down): a hold of it lets go.
+    pub fn reader_field_input(&mut self, id: ViewId, generation: u32) {
+        if self.hosted_live(id, generation) {
+            self.hold_input(Some(id));
+        }
     }
 
     /// The reader's field holds `value` after its edit number `seq`, with
@@ -495,6 +509,7 @@ impl<D: DataSource> Presenter<D> {
         if !self.hosted_live(id, generation) {
             return;
         }
+        self.hold_input(Some(id)); // real input on the field lets a hold of it go (presenter/held.rs)
         if let Some(known) = self.hosted.known.get_mut(&id) {
             known.seq = seq;
         }
@@ -538,6 +553,7 @@ impl<D: DataSource> Presenter<D> {
         if !self.hosted_live(id, generation) {
             return;
         }
+        self.hold_input(Some(id)); // real input on the field lets a hold of it go (presenter/held.rs)
         if composing {
             self.hosted.composing.insert(id, value.to_owned());
         } else {
@@ -558,6 +574,7 @@ impl<D: DataSource> Presenter<D> {
         if !self.hosted_live(id, generation) {
             return;
         }
+        self.hold_input(Some(id)); // real input on the field lets a hold of it go (presenter/held.rs)
         let value = self.field_text(id);
         let selection = FieldSelection::clamped(
             start.into(),
@@ -590,6 +607,7 @@ impl<D: DataSource> Presenter<D> {
         if !self.hosted_live(id, generation) || !self.focusable(id) {
             return;
         }
+        self.hold_input(Some(id)); // real input on the field lets a hold of it go (presenter/held.rs)
         if self.focus != Some(id) {
             if let Some(e) = self.set_focus(Some(id), now_ms) {
                 eprintln!("exact: {e}");

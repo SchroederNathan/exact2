@@ -1,20 +1,35 @@
 // LLP 1039 D7: a compiled app reads the browser's display-mode, including
 // transitions, through the same media reporter as the wasm target.
 import { test, expect } from 'bun:test';
-import { chromium } from 'playwright-core';
-import { chromium as browserPath } from '../../../scripts/agent-launch.mjs';
+import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
 const ROOT = resolve(new URL('../../..', import.meta.url).pathname);
-test('display mode agrees with Chrome and media changes reanswer the resource and agent state', async () => {
+test('viewport media changes update resources, rendered text and packed facts', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-display-mode-'));
   let server, browser;
   try {
     writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Display mode', app: { id: 'com.example.displaymode', name: 'Display mode' }, host: { web: {} } }));
-    writeFileSync(resolve(dir, 'app.contract'), 'shape Viewport\n  displayMode: string\n  colorGamut: string\n  dynamicRange: string\n  horizontalViewportSegments: number\n  verticalViewportSegments: number\ncomponent App\n  resource viewport = exactViewport() as shape Viewport\n  view\n    text viewport.displayMode testId="mode"\n');
+    writeFileSync(resolve(dir, 'app.contract'), [
+      'shape Viewport',
+      '  displayMode: string',
+      '  colorGamut: string',
+      '  dynamicRange: string',
+      '  devicePosture: string',
+      '  horizontalViewportSegments: number',
+      '  verticalViewportSegments: number',
+      'component App',
+      '  resource viewport = exactViewport() as shape Viewport',
+      '  view',
+      '    column',
+      '      text viewport.displayMode testId="mode"',
+      '      text viewport.devicePosture testId="posture"',
+      '      text `${viewport.horizontalViewportSegments}/${viewport.verticalViewportSegments}` testId="segments"',
+      '',
+    ].join('\n'));
     const dist = resolve(dir, 'dist');
     const build = spawnSync(process.execPath, ['host/web-js/build.mjs', 'display-mode', '--out', dist, '--render', 'js'], {
       cwd: ROOT, encoding: 'utf8', env: { ...process.env, EXACT_APP_DIR: dir },
@@ -25,7 +40,7 @@ test('display mode agrees with Chrome and media changes reanswer the resource an
       if (path === '/navigation.js') return new Response(Bun.file(resolve(ROOT, 'host/web/navigation.js')));
       return new Response(Bun.file(resolve(dist, path === '/' ? 'index.html' : path.slice(1))));
     } });
-    browser = await chromium.launch({ executablePath: browserPath().executable, headless: true });
+    browser = await suiteBrowser();
     const page = await browser.newPage();
     await page.addInitScript(() => {
       const real = matchMedia.bind(window), lists = [];
@@ -82,15 +97,19 @@ test('display mode agrees with Chrome and media changes reanswer the resource an
       const button = document.createElement('button');
       button.id = 'enter-fullscreen'; button.textContent = 'Enter fullscreen';
       button.onclick = () => document.documentElement.requestFullscreen();
+      window.fullscreenChanged = new Promise(done => document.addEventListener('fullscreenchange', done, { once: true }));
       document.body.append(button);
     });
     await page.locator('#enter-fullscreen').click();
+    // `document.fullscreenElement` is set before the display-mode media changes are sent, and `fullscreenchange` comes after them
+    // (the headless shell changes display-mode to fullscreen; Chrome's full build on macOS keeps browser).
+    await page.evaluate(() => window.fullscreenChanged);
     expect(await page.evaluate(() => !!document.fullscreenElement)).toBe(true);
     // Chrome on macOS may keep display-mode: browser for DOM fullscreen.
     // This fact follows its media query, not document.fullscreenElement.
     const current = () => page.evaluate(() => ['browser', 'fullscreen', 'standalone', 'minimal-ui', 'window-controls-overlay', 'picture-in-picture', 'tabbed'].find(v => matchMedia(`(display-mode: ${v})`).matches));
     await agrees(await current());
-    await page.evaluate(() => document.exitFullscreen());
+    await page.evaluate(() => new Promise(done => { document.addEventListener('fullscreenchange', done, { once: true }); document.exitFullscreen(); }));
     await agrees(await current());
     // Exercise change delivery even on a browser whose real window mode
     // stays browser, and modes that require an installed web application.
@@ -104,6 +123,46 @@ test('display mode agrees with Chrome and media changes reanswer the resource an
       }, { i, mode });
       await agrees(mode);
     }
+
+    // Keep the browser's CSS fold signals while removing both JavaScript interfaces
+    await page.close();
+    const foldPage = await browser.newPage();
+    await foldPage.addInitScript(() => {
+      Object.defineProperty(navigator, 'devicePosture', { value: undefined, configurable: true });
+      Object.defineProperty(window, 'viewport', { value: undefined, configurable: true });
+    });
+    await foldPage.goto(`http://127.0.0.1:${server.port}/?agent`);
+    await foldPage.waitForFunction(() => typeof globalThis.exact?.agentSettled === 'function');
+    const cdp = await foldPage.context().newCDPSession(foldPage);
+    const { width, height } = foldPage.viewportSize();
+    for (const [orientation, cols, rows] of [['vertical', 2, 1], ['horizontal', 1, 2], [null, 1, 1]]) {
+      const offset = Math.floor((orientation === 'vertical' ? width : height) / 2) - 10;
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width, height, deviceScaleFactor: 1, mobile: false,
+        ...(orientation ? { displayFeature: { orientation, offset, maskLength: 20 } } : {}),
+      });
+      await cdp.send('Emulation.setDevicePostureOverride', { posture: { type: orientation ? 'folded' : 'continuous' } });
+      await foldPage.waitForFunction(async expected => {
+        const state = await exact.agentSettled({ op: 'state' });
+        return state.resources.viewport.horizontalViewportSegments === expected.cols
+          && state.resources.viewport.verticalViewportSegments === expected.rows
+          && state.resources.viewport.devicePosture === expected.posture;
+      }, { cols, rows, posture: orientation ? 'folded' : 'continuous' });
+      await foldPage.waitForFunction(expected => document.querySelector('[data-testid="segments"]')?.textContent === expected, `${cols}/${rows}`);
+      const result = await foldPage.evaluate(async () => {
+        const { foldEnv, foldBits } = await import('/navigation.js');
+        const env = foldEnv(), bits = foldBits();
+        return { env, bits: [(bits >>> 9) & 255, (bits >>> 17) & 255, !!(bits & 256)], jsAbsent: !navigator.devicePosture && !window.viewport };
+      });
+      expect(result.jsAbsent).toBe(true);
+      expect(result.bits).toEqual([cols, rows, !!orientation]);
+      const rects = orientation === 'vertical' ? [[0, 0, offset, height], [offset + 20, 0, width - offset - 20, height]]
+        : orientation === 'horizontal' ? [[0, 0, width, offset], [0, offset + 20, width, height - offset - 20]] : [];
+      expect(result.env['viewport-segments']).toEqual(rects);
+    }
+    // A posture-only change must notify the app even when the viewport never resizes
+    await cdp.send('Emulation.setDevicePostureOverride', { posture: { type: 'folded' } });
+    await foldPage.waitForFunction(() => document.querySelector('[data-testid="posture"]')?.textContent === 'folded');
   } finally {
     await browser?.close();
     server?.stop(true);

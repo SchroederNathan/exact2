@@ -5,7 +5,7 @@
 //! §3.4). The web's page does it itself; a native host asks this.
 
 use super::Kernel;
-use crate::generated::{Overflow, PositionType};
+use crate::generated::{Direction, Overflow, PositionType, StyleId};
 use crate::id::{NodeKey, ViewId};
 use crate::layout::LayoutMirror;
 use crate::style::Dimension;
@@ -45,6 +45,10 @@ impl StickyConstraint {
             let (lo, hi) = (self.natural[i], self.natural[i + 2]);
             let mut d = 0.0;
             if let Some(inset) = end {
+                // The sticky view rectangle must contain the border box;
+                // CSS Positioned Layout 3 §3.4 reduces its end inset if needed.
+                let inset =
+                    inset.min(self.port[i + 2] - self.port[i] - start.unwrap_or(0.0) - (hi - lo));
                 let pull =
                     (self.port[i + 2] + scroll - inset - hi).max((self.limit[i] - lo).min(0.0));
                 if pull < 0.0 {
@@ -52,8 +56,8 @@ impl StickyConstraint {
                 }
             }
             if let Some(inset) = start {
-                let push =
-                    (self.port[i] + scroll + inset - lo).min((self.limit[i + 2] - hi).max(0.0));
+                let push = (self.port[i] + scroll + inset - lo - d)
+                    .min((self.limit[i + 2] - hi - d).max(0.0));
                 if push > 0.0 {
                     d += push;
                 }
@@ -88,7 +92,10 @@ impl Kernel {
         let slot = arena.resolve(key)?;
         let style = arena.effective_style(slot);
         // @ref LLP 1093 D10.6 — in a multi-column flow, sticky is relative.
-        if style.position_type != PositionType::Sticky || crate::fragment::in_flow(arena, slot) {
+        // Sticky for layout: a popover's platform start's sticky is not.
+        if crate::style::top_layer::layout_position(arena, slot) != PositionType::Sticky
+            || crate::fragment::in_flow(arena, slot)
+        {
             return None;
         }
         self.laid_out_frame(key)?;
@@ -118,16 +125,33 @@ impl Kernel {
         let content = |slot: u32| {
             let l = tree.layout(arena.taffy(slot)?);
             let [x0, y0, x1, y1] = at(slot);
-            let (p, b) = (l.padding, l.border);
+            let (p, b, gutter) = (l.padding, l.border, l.scrollbar_size);
+            let rtl = arena.computed_source(slot, StyleId::Direction).direction == Direction::Rtl;
             Some([
-                x0 + b.left + p.left,
+                x0 + b.left + p.left + if rtl { gutter.width } else { 0.0 },
                 y0 + b.top + p.top,
-                x1 - b.right - p.right,
-                y1 - b.bottom - p.bottom,
+                x1 - b.right - p.right - if rtl { 0.0 } else { gutter.width },
+                y1 - b.bottom - p.bottom - gutter.height,
             ])
         };
         let margin = tree.layout(arena.taffy(slot)?).margin;
-        let cb = content(parent)?;
+        let mut cb = content(parent)?;
+        // A scroller's own child has the content it scrolls for its
+        // containing block, not the scroller's box: Chrome, Firefox and
+        // WebKit keep such a box stuck through the whole scroll. The extent
+        // is the padding box grown to the content (`NodeArena::content`).
+        if parent == scroller && scroller != slot && scrolls(arena, scroller) {
+            let l = tree.layout(arena.taffy(scroller)?);
+            let (w, h) = arena.content(scroller);
+            cb[3] = cb[3].max(l.border.top + h - l.padding.bottom);
+            if arena
+                .computed_source(scroller, StyleId::Direction)
+                .direction
+                != Direction::Rtl
+            {
+                cb[2] = cb[2].max(l.border.left + w - l.padding.right);
+            }
+        }
         let port = content(scroller)?;
         let (w, h) = (port[2] - port[0], port[3] - port[1]);
         let env = arena.env();
@@ -153,8 +177,8 @@ impl Kernel {
 
 fn scrolls(arena: &crate::arena::NodeArena, slot: u32) -> bool {
     let s = arena.style(slot);
-    s.overflow_x != Overflow::Visible
-        || s.overflow_y != Overflow::Visible
+    !matches!(s.overflow_x, Overflow::Visible | Overflow::Clip)
+        || !matches!(s.overflow_y, Overflow::Visible | Overflow::Clip)
         || (!s.mask.has(crate::generated::StyleId::OverflowY)
             && arena.node_type(slot).scrolls_by_default())
 }

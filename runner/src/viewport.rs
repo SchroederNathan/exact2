@@ -7,7 +7,8 @@ use exact_plan::Value;
 
 /// Reserved resource source, answered before the app data seam.
 pub const SOURCE: &str = "exactViewport";
-/// Fields an app may declare, filled by name.
+/// Fields an app may declare, filled by name. `gpuTier` is the page facts'
+/// (`crate::Page::gpu_tier`), which the runner answers beside these.
 pub const FIELDS: &[&str] = &[
     "width",
     "height",
@@ -23,6 +24,8 @@ pub const FIELDS: &[&str] = &[
     "verticalViewportSegments",
     "pointer",
     "hover",
+    "gpuTier",
+    "accessibilityTextSize",
 ];
 
 /// The host's layout viewport, before the first settlement.
@@ -191,6 +194,9 @@ pub struct Preferences {
     pub high_dynamic_range: bool,
     /// The window's presentation, CSS's `display-mode` media feature.
     pub display_mode: DisplayMode,
+    /// Bold Text is on (LLP 1115.000 D12.3): no media feature, the
+    /// kernel's, which weights the system font (`Kernel::set_bold_text`).
+    pub bold_text: bool,
 }
 
 /// CSS's `display-mode`, including the Window Controls Overlay extension.
@@ -348,6 +354,7 @@ impl Preferences {
         gamut: Gamut::Srgb,
         high_dynamic_range: false,
         display_mode: DisplayMode::Standalone,
+        bold_text: false,
     };
 
     /// The hosts' wire form: bit 0 reduced motion, bit 1 reduced
@@ -355,7 +362,7 @@ impl Preferences {
     /// `custom`), bit 4 a dark system scheme, bit 5 pointer `coarse`, bit 6
     /// pointer `none` (over bit 5), bit 7 hover `none`, bits 8–9 the gamut
     /// (0 sRGB, 1 P3, 2 rec2020), bit 10 a high dynamic range, bits 11–13
-    /// the [`DisplayMode`] discriminant; other bits
+    /// the [`DisplayMode`] discriminant, bit 14 Bold Text; other bits
     /// are ignored. Zero is a mouse's `fine` and `hover`.
     pub fn from_bits(bits: u32) -> Self {
         Self {
@@ -385,6 +392,7 @@ impl Preferences {
             },
             high_dynamic_range: bits & 1024 != 0,
             display_mode: DisplayMode::from_bits(bits),
+            bold_text: bits & (1 << 14) != 0,
         }
     }
 
@@ -413,6 +421,7 @@ impl Preferences {
             } << 8)
             | (u32::from(self.high_dynamic_range) << 10)
             | ((self.display_mode as u32) << 11)
+            | (u32::from(self.bold_text) << 14)
     }
 
     /// `"light"` or `"dark"`, CSS's words for the system's scheme.
@@ -607,6 +616,9 @@ mod tests {
         for bits in [0, 256, 512, 1024, 256 | 1024] {
             assert_eq!(Preferences::from_bits(bits).bits(), bits);
         }
+        // LLP 1115.000 D12.3: Bold Text.
+        assert!(Preferences::from_bits(1 << 14).bold_text);
+        assert_eq!(Preferences::from_bits(1 << 14 | 16).bits(), 1 << 14 | 16);
         let v = |bits| Viewport {
             preferences: Preferences::from_bits(bits),
             ..Viewport::default()

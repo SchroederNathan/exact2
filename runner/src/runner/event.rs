@@ -7,7 +7,9 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 
 mod focus;
+pub(super) mod frame_navigation;
 mod keyboard;
+mod view_event;
 pub use keyboard::KeyboardEvent;
 
 const BINDING_ARGS: usize = 8;
@@ -184,12 +186,14 @@ pub enum Event {
         /// Exact insertion-before key; None denotes the actual logical end.
         before: Option<String>,
     },
-    /// A press on the view, no modifier key held.
+    /// A press on the view with no point and no modifier key held: a
+    /// keyboard's or an assistive technology's.
     Press,
-    /// A press with modifier keys held (gallery F20: shift-click, ⌘-click),
-    /// the `MouseEvent` flags a `press` action may take; dispatched as
-    /// `Press`. [`Event::press`] makes whichever the modifiers call for.
-    PressWith(KeyModifiers),
+    /// A press with a pointer's point or modifier keys held (gallery F20:
+    /// shift-click, ⌘-click; LLP 1021 D2: a menu at the press), the
+    /// `MouseEvent` a `press` action may take; dispatched as `Press`.
+    /// [`Event::press`] makes whichever the press calls for.
+    PressWith(super::MouseEvent),
     /// A control's value moved (HTML's `input`): a text field's every
     /// keystroke, a checkbox's toggle (LLP 1069.001 D4).
     Input(ControlValue),
@@ -212,6 +216,8 @@ pub enum Event {
     /// A scroll finished (DOM's `scrollend`): the person's, its momentum
     /// included, or an animated one.
     Scrollend,
+    /// The platform's history swipe, as the host tracks it.
+    Historyswipe(super::host_kinds::HistorySwipe),
     /// A text field's selection changed (HTML's `select`, x2apps codeedit
     /// #2): its text, and the selection its `InputEvent` reports.
     FieldSelect(String, super::FieldSelection),
@@ -229,6 +235,8 @@ pub enum Event {
         link: String,
         /// Space-separated unavailable command names.
         unavailable: String,
+        /// The selected atom's source, or empty (LLP 1045.000 D3).
+        atom: String,
     },
     /// The pointer came over the view (`true`) or left it (`false`) —
     /// `pointerenter`/`pointerleave`, not a bubbling `mouseover`.
@@ -286,6 +294,16 @@ pub enum Event {
     /// Files dropped on the view from outside the app (DOM's `drop`), each
     /// a `doc:` handle the host minted (LLP 1069.010 D1).
     Drop(super::DropEvent),
+    /// A drag of files from outside the app came over the view's box from
+    /// outside it (DOM's `dragenter` as a handler that ignores moves between
+    /// its own descendants hears it); its `files` are empty, as the DOM's are
+    /// until the drop.
+    Dragenter(super::DropEvent),
+    /// That drag left the view's box or was cancelled (DOM's `dragleave`,
+    /// likewise); a drop sends none, as the DOM's does.
+    Dragleave(super::DropEvent),
+    /// A press on an inline atom (LLP 1045.000 D7).
+    Atompress(super::AtomEvent),
     /// A double click, or the platform’s double tap.
     Dblclick,
     /// A touch or primary button went down on the view (DOM's
@@ -328,8 +346,9 @@ pub enum Event {
     /// DOM's `copy`, `cut` or `paste` at the focused view (spreadsheet F4,
     /// F14): the clipboard's plain text as the event carries it — what is
     /// pasted; empty on copy and cut, whose action writes the clipboard
-    /// (`copyText`), as a DOM listener's `setData` does.
-    Clipboard(EventKind, String),
+    /// (`copyText`), as a DOM listener's `setData` does — and a paste's files
+    /// (`clipboardData.files`), each a `doc:` handle the host minted.
+    Clipboard(EventKind, String, Vec<String>),
     /// The part of the reader's text selection inside a `text` changed (the
     /// web's `selectionchange`, the reader diary): the selected text and its
     /// UTF-16 start and end in the node's own text; nothing selected there
@@ -346,6 +365,13 @@ pub enum Event {
     },
     /// An incoming location at the navigation root. @ref LLP 1038 D8/D11
     Navigate(String),
+    /// What an iframe's guest shows (@ref LLP 1020.002 D2): its
+    /// `navigate`, `currententrychange`, `navigatesuccess` or
+    /// `navigateerror`, with the `FrameNavigation` record.
+    FrameNavigation(EventKind, Box<frame_navigation::FrameNavigation>),
+    /// An iframe guest's `newwindow` or `download` (@ref LLP 1020.002 D5),
+    /// with its `FrameNewWindow` or `FrameDownload` record.
+    FrameRecord(EventKind, Box<Value>),
     /// An authored sheet handle released: logical height and signed pixels/second.
     HeightRelease {
         /// Finite logical pixels in [0, f32::MAX].
@@ -457,17 +483,6 @@ impl KeyModifiers {
         Some(held)
     }
 
-    /// The `MouseEvent` record `press` offers, its fields in the compiler's
-    /// order (`contract/types/src/selection.rs`).
-    pub fn mouse(&self) -> Value {
-        Value::record(vec![
-            Value::Bool(self.shift),
-            Value::Bool(self.ctrl),
-            Value::Bool(self.alt),
-            Value::Bool(self.meta),
-        ])
-    }
-
     /// A key as a host writes it, split: the modifiers named before it with
     /// any of `Shift+`, `Control+`, `Alt+` and `Meta+`, and the key's name —
     /// the chord syntax of `aria-keyshortcuts` and Playwright
@@ -514,15 +529,20 @@ impl Event {
         })
     }
 
-    /// A press with the modifiers a host held ([`KeyModifiers::held`]):
-    /// `Press` when none is; `None` for a word DOM does not name.
-    pub fn press(held: &str) -> Option<Self> {
-        let held = KeyModifiers::held(held)?;
-        Some(if held == KeyModifiers::default() {
+    /// A press as a host writes it ([`super::MouseEvent::parse`]): the
+    /// modifiers held, after the pointer's point where there was one;
+    /// `Press` for neither; `None` for a malformed line.
+    pub fn press(payload: &str) -> Option<Self> {
+        Some(Self::pressed(super::MouseEvent::parse(payload)?))
+    }
+
+    /// A press with `mouse`'s point and modifiers: `Press` for neither.
+    pub fn pressed(mouse: super::MouseEvent) -> Self {
+        if mouse == super::MouseEvent::default() {
             Self::Press
         } else {
-            Self::PressWith(held)
-        })
+            Self::PressWith(mouse)
+        }
     }
 
     /// A key from its chord ([`KeyModifiers::split`]), with no code.
@@ -535,8 +555,8 @@ impl Event {
     /// (`contract_types::event_record`, `contract/types/src/selection.rs`):
     /// `key`'s and `keyup`'s `KeyboardEvent`, `press`'s `MouseEvent`, the pointer's and
     /// `contextmenu`'s `PointerEvent`, `scroll`'s `ScrollEvent`, the
-    /// clipboard's `ClipboardEvent`, `wheel`'s `WheelEvent` and `drop`'s
-    /// `DragEvent`.
+    /// clipboard's `ClipboardEvent`, `wheel`'s `WheelEvent` and the
+    /// `DragEvent` of `drop`, `dragenter` and `dragleave`.
     pub fn record(&self) -> Option<Value> {
         match self {
             Event::Toggle { old_open, new_open } => Some(Value::record(vec![
@@ -554,6 +574,7 @@ impl Event {
                 super::PointerEvent {
                     offset_x: 0.0,
                     offset_y: 0.0,
+                    button: 0.0,
                     buttons: 0.0,
                     pressure: 0.0,
                     pointer_type: "mouse".into(),
@@ -565,8 +586,12 @@ impl Event {
                 .value(),
             ),
             Event::Wheel(w) => Some(w.value()),
+            Event::Historyswipe(s) => Some(s.value()),
             Event::MidiMessage(m) => Some(m.value()),
-            Event::Drop(d) => Some(d.value()),
+            Event::Drop(d) | Event::Dragenter(d) | Event::Dragleave(d) => Some(d.value()),
+            Event::FrameNavigation(_, n) => Some(n.value()),
+            Event::FrameRecord(_, v) => Some((**v).clone()),
+            Event::Atompress(a) => Some(a.value()),
             Event::Resize(r) => Some(r.value()),
             Event::Intersect {
                 is_intersecting,
@@ -576,7 +601,10 @@ impl Event {
                 Value::Number(*intersection_ratio),
             ])),
             Event::Scroll(s) => Some(s.value(None)),
-            Event::Clipboard(_, text) => Some(Value::record(vec![Value::str(text)])),
+            Event::Clipboard(_, text, files) => Some(Value::record(vec![
+                Value::str(text),
+                Value::list(files.iter().map(|f| Value::str(f)).collect()),
+            ])),
             Event::SelectionChange {
                 text,
                 start,
@@ -588,8 +616,8 @@ impl Event {
                 Value::Number(*end),
                 Value::list(rects.iter().map(|r| r.value()).collect()),
             ])),
-            Event::Press => Some(KeyModifiers::default().mouse()),
-            Event::PressWith(held) => Some(held.mouse()),
+            Event::Press => Some(super::MouseEvent::default().value()),
+            Event::PressWith(mouse) => Some(mouse.value()),
             Event::Media(kind, payload) => super::media_session::record(*kind, payload),
             Event::Focusin {
                 target,
@@ -1056,61 +1084,71 @@ impl<D: DataSource> Runner<D> {
     /// Deliver a host event to `view`: find its handler, evaluate the curried
     /// arguments in the instance's scope now, run the action, update.
     pub fn dispatch(&mut self, view: ViewId, event: Event) -> Result<CommitReceipt, RunnerError> {
+        // A world's message runs as the origin its mark carries (`world_origin.rs`).
+        if let Event::Message(text) = &event {
+            if let Some((origin, text)) = super::world_origin::unmark(text) {
+                let event = Event::Message(text.to_owned());
+                return self.as_origin(origin, |r| r.arrived(|r| r.dispatch_event(view, event)));
+            }
+        }
         self.arrived(|r| r.dispatch_event(view, event))
     }
 
     fn dispatch_event(&mut self, view: ViewId, event: Event) -> Result<CommitReceipt, RunnerError> {
-        let mut what = super::lines::event(
-            match &event {
-                Event::ReorderDrop { .. } => "reorderdrop",
-                Event::Press | Event::PressWith(_) => "press",
-                Event::Input(_) => "input",
-                Event::Change(_) => "change",
-                Event::Cancel => "cancel",
-                Event::Close => "close",
-                Event::Toggle { .. } => "toggle",
-                Event::Scrollend => "scrollend",
-                Event::Select { .. } | Event::FieldSelect(..) => "select",
-                Event::Hover(true) => "hover in",
-                Event::Hover(false) => "hover out",
-                Event::Focus => "focus",
-                Event::Blur => "blur",
-                Event::Focusin { .. } => "focusin",
-                Event::Focusout { .. } => "focusout",
-                Event::Key(..) => "key",
-                Event::Keycapture(..) => "keycapture",
-                Event::Keyup(..) => "keyup",
-                Event::Submit => "submit",
-                Event::Load => "load",
-                Event::Message(_) => "message",
-                Event::Contextmenu | Event::ContextmenuAt(_) => "contextmenu",
-                Event::Beforeunload => "beforeunload",
-                Event::MidiMessage(_) => "midimessage",
-                Event::Wheel(_) => "wheel",
-                Event::Drop(_) => "drop",
-                Event::Dblclick => "dblclick",
-                Event::Pointerdown(_) => "pointerdown",
-                Event::Pointerup(_) => "pointerup",
-                Event::Pointermove(_) => "pointermove",
-                Event::Swiperight => "swiperight",
-                Event::Refresh => "refresh",
-                Event::Scroll(_) => "scroll",
-                Event::Resize(_) => "resize",
-                Event::Intersect { .. } => "intersect",
-                Event::Pan(_, _) => "pan",
-                Event::PanRelease(_, _) => "panrelease",
-                Event::Media(kind, _) | Event::Clipboard(kind, _) => kind.name(),
-                Event::SelectionChange { .. } | Event::FieldSelectionChange(..) => {
-                    "selectionchange"
-                }
-                Event::BeforeInput(..) => "beforeinput",
-                Event::Navigate(_) => "navigate",
-                Event::HeightRelease { .. } => "heightrelease",
-                Event::TransformGeometry { .. } => "transformgeometry",
-                Event::TransformRelease { .. } => "transformrelease",
-            },
-            view,
-        );
+        let name = match &event {
+            Event::ReorderDrop { .. } => "reorderdrop",
+            Event::Press | Event::PressWith(_) => "press",
+            Event::Input(_) => "input",
+            Event::Change(_) => "change",
+            Event::Cancel => "cancel",
+            Event::Close => "close",
+            Event::Toggle { .. } => "toggle",
+            Event::Scrollend => "scrollend",
+            Event::Historyswipe(_) => "historyswipe",
+            Event::Select { .. } | Event::FieldSelect(..) => "select",
+            Event::Hover(true) => "hover in",
+            Event::Hover(false) => "hover out",
+            Event::Focus => "focus",
+            Event::Blur => "blur",
+            Event::Focusin { .. } => "focusin",
+            Event::Focusout { .. } => "focusout",
+            Event::Key(..) => "key",
+            Event::Keycapture(..) => "keycapture",
+            Event::Keyup(..) => "keyup",
+            Event::Submit => "submit",
+            Event::Load => "load",
+            Event::Message(_) => "message",
+            Event::Contextmenu | Event::ContextmenuAt(_) => "contextmenu",
+            Event::Beforeunload => "beforeunload",
+            Event::MidiMessage(_) => "midimessage",
+            Event::Wheel(_) => "wheel",
+            Event::Drop(_) => "drop",
+            Event::Dragenter(_) => "dragenter",
+            Event::Dragleave(_) => "dragleave",
+            Event::FrameNavigation(kind, _) | Event::FrameRecord(kind, _) => {
+                frame_navigation::name(*kind)
+            }
+            Event::Atompress(_) => "atompress",
+            Event::Dblclick => "dblclick",
+            Event::Pointerdown(_) => "pointerdown",
+            Event::Pointerup(_) => "pointerup",
+            Event::Pointermove(_) => "pointermove",
+            Event::Swiperight => "swiperight",
+            Event::Refresh => "refresh",
+            Event::Scroll(_) => "scroll",
+            Event::Resize(_) => "resize",
+            Event::Intersect { .. } => "intersect",
+            Event::Pan(_, _) => "pan",
+            Event::PanRelease(_, _) => "panrelease",
+            Event::Media(kind, _) | Event::Clipboard(kind, ..) => kind.name(),
+            Event::SelectionChange { .. } | Event::FieldSelectionChange(..) => "selectionchange",
+            Event::BeforeInput(..) => "beforeinput",
+            Event::Navigate(_) => "navigate",
+            Event::HeightRelease { .. } => "heightrelease",
+            Event::TransformGeometry { .. } => "transformgeometry",
+            Event::TransformRelease { .. } => "transformrelease",
+        };
+        let mut what = super::lines::event(name, view);
         let was_poisoned = self.poisoned;
         let outer = self.input_source.replace(view);
         let blur = matches!(event, Event::Blur);
@@ -1134,6 +1172,10 @@ impl<D: DataSource> Runner<D> {
         }
         self.input_source = outer;
         self.log_outcome(&what, &result, was_poisoned);
+        let changed = result.as_ref().is_ok_and(|r| {
+            !(r.created.is_empty() && r.destroyed.is_empty() && r.touched.is_empty())
+        });
+        self.count_dispatch(view, name, changed);
         result
     }
 
@@ -1155,11 +1197,15 @@ impl<D: DataSource> Runner<D> {
             })
             .ok_or(RunnerError::UnknownView(view))?;
         // Events without a listener do nothing: a picker's `cancel` (LLP
-        // 1069.010 D3), a dialog's `close` (LLP 1021), a scroll's end.
-        if matches!(event, Event::Cancel | Event::Close | Event::Scrollend) {
+        // 1069.010 D3), a dialog's `close` (LLP 1021), a scroll's end, a swipe.
+        if matches!(
+            event,
+            Event::Cancel | Event::Close | Event::Scrollend | Event::Historyswipe(_)
+        ) {
             let kind = match event {
                 Event::Close => EventKind::Close,
                 Event::Scrollend => EventKind::Scrollend,
+                Event::Historyswipe(_) => EventKind::Historyswipe,
                 _ => EventKind::Cancel,
             };
             let has_handler = self
@@ -1226,11 +1272,13 @@ impl<D: DataSource> Runner<D> {
             Event::Close => (EventKind::Close, None, "close"),
             Event::Toggle { .. } => (EventKind::Toggle, None, "toggle"),
             Event::Scrollend => (EventKind::Scrollend, None, "scrollend"),
+            Event::Historyswipe(_) => (EventKind::Historyswipe, None, "historyswipe"),
             Event::Select {
                 formats,
                 mixed,
                 link,
                 unavailable,
+                atom,
             } => (
                 EventKind::Select,
                 Some(Value::record(vec![
@@ -1238,6 +1286,7 @@ impl<D: DataSource> Runner<D> {
                     Value::Bool(*mixed),
                     Value::str(link),
                     Value::str(unavailable),
+                    Value::str(atom),
                 ])),
                 "select",
             ),
@@ -1263,6 +1312,12 @@ impl<D: DataSource> Runner<D> {
             Event::MidiMessage(_) => (EventKind::Midimessage, None, "midimessage"),
             Event::Wheel(_) => (EventKind::Wheel, None, "wheel"),
             Event::Drop(_) => (EventKind::Drop, None, "drop"),
+            Event::Dragenter(_) => (EventKind::Dragenter, None, "dragenter"),
+            Event::Dragleave(_) => (EventKind::Dragleave, None, "dragleave"),
+            Event::FrameNavigation(kind, _) | Event::FrameRecord(kind, _) => {
+                (*kind, None, frame_navigation::name(*kind))
+            }
+            Event::Atompress(_) => (EventKind::Atompress, None, "atompress"),
             Event::Dblclick => (EventKind::Dblclick, None, "dblclick"),
             Event::Pointerdown(_) => (EventKind::Pointerdown, None, "pointerdown"),
             Event::Pointerup(_) => (EventKind::Pointerup, None, "pointerup"),
@@ -1280,11 +1335,12 @@ impl<D: DataSource> Runner<D> {
                     }
                     EventKind::Error => Some(Value::str(value)),
                     EventKind::Fullscreenchange => Some(Value::Bool(value == "true")),
+                    EventKind::Pictureinpictureerror => Some(Value::str(value)),
                     _ => None,
                 },
                 kind.name(),
             ),
-            Event::Clipboard(kind, _) => (*kind, None, kind.name()),
+            Event::Clipboard(kind, ..) => (*kind, None, kind.name()),
             Event::SelectionChange { .. } => (EventKind::Selectionchange, None, "selectionchange"),
             Event::Pan(_, _) => (EventKind::Pan, None, "pan"),
             Event::PanRelease(_, _) => (EventKind::Panrelease, None, "panrelease"),
@@ -1299,6 +1355,12 @@ impl<D: DataSource> Runner<D> {
                 (EventKind::Navigate, Some(Value::str(location)), "navigate")
             }
         };
+        // A package view's declared event (`view_event.rs`).
+        if let Event::Message(text) = &event {
+            if let Some(done) = self.view_event(node, text, &frames, what) {
+                return done;
+            }
+        }
         let row = self.plan.node(node);
         let handler = row
             .handlers
@@ -1310,7 +1372,20 @@ impl<D: DataSource> Runner<D> {
         let mut args = Vec::new();
         for a in handler.args.iter() {
             let code = self.plan.arg(a).expr;
-            args.push(self.eval(code, &[], &frames)?);
+            let value = match self.eval(code, &[], &frames) {
+                Ok(value) => value,
+                Err(error) => {
+                    let name = self.plan.action(handler.action).name;
+                    let error = RunnerError::HandlerArguments {
+                        action: self.plan.str(name).to_string(),
+                        error: Box::new(error),
+                    };
+                    let result = Err(error);
+                    self.record_ran("handler", name, self.poisoned, &result);
+                    return result;
+                }
+            };
+            args.push(value);
         }
         if let Some(p) = payload {
             // A navigate action may deliberately ignore its location (D8).
@@ -1391,7 +1466,7 @@ impl<D: DataSource> Runner<D> {
             }
         }
         super::lines::ran(what, self.plan.str(self.plan.action(handler.action).name));
-        self.run_action(handler.action, args, &frames)
+        self.traced_action("handler", handler.action, args, &frames)
     }
 }
 

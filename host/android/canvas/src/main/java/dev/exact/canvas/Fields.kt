@@ -1,6 +1,7 @@
 package dev.exact.canvas
 
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.RenderNode
 import android.graphics.Typeface
@@ -11,10 +12,12 @@ import android.text.TextWatcher
 import android.util.Log
 import android.util.TypedValue
 import android.view.Choreographer
+import android.view.ContextThemeWrapper
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
@@ -34,7 +37,7 @@ import kotlin.math.roundToInt
  * The framework's own [EditText], as a hosted field uses it (LLP 1115.001 D8): nothing of it is replaced, and it
  * says when its selection moves, which no listener of the class tells.
  */
-internal class FieldText(context: Context) : EditText(context) {
+internal class FieldText(context: Context) : EditText(unadjusted(context)) {
     var selected: ((Int, Int) -> Unit)? = null
     /** `x_log_fields=1`: what the keyboard asks of the field's input connection, to the log. Its composition is
      * between it and the field, and shows nowhere else. */
@@ -53,6 +56,12 @@ internal class FieldText(context: Context) : EditText(context) {
         stand?.place(info)
     }
 
+    /** Bold Text's step is in the weight the field is given ([unadjusted]): a change of the device's font weight
+     * adjustment reaches the kernel, never the field's own typeface. */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(if (android.os.Build.VERSION.SDK_INT >= 31) Configuration(newConfig).apply { fontWeightAdjustment = 0 } else newConfig)
+    }
+
     override fun onSelectionChanged(selStart: Int, selEnd: Int) {
         super.onSelectionChanged(selStart, selEnd)
         selected?.invoke(selStart, selEnd)
@@ -68,6 +77,7 @@ internal class FieldText(context: Context) : EditText(context) {
             override fun commitText(text: CharSequence?, at: Int): Boolean { say("commitText \"$text\""); return done(super.commitText(text, at)) }
             override fun finishComposingText(): Boolean { say("finishComposingText"); return done(super.finishComposingText()) }
             override fun deleteSurroundingText(before: Int, after: Int): Boolean { say("deleteSurroundingText $before, $after"); return done(super.deleteSurroundingText(before, after)) }
+            override fun deleteSurroundingTextInCodePoints(before: Int, after: Int): Boolean { say("deleteSurroundingTextInCodePoints $before, $after"); return done(super.deleteSurroundingTextInCodePoints(before, after)) }
         }
     }
 }
@@ -252,7 +262,8 @@ internal class Fields(context: Context) : FrameLayout(context) {
             val (value, look) = string(w, i + HEAD)
             val (placeholder, afterHint) = string(w, look + LOOK)
             val (autocomplete, afterFill) = string(w, afterHint)
-            val (family, end) = string(w, afterFill)
+            val (family, afterFamily) = string(w, afterFill)
+            val (axes, end) = string(w, afterFamily)
             seen.add(id)
             var f = fields[id]
             // A view made for a field exact2 already knows (the activity was made again) starts at exact2's count
@@ -275,7 +286,7 @@ internal class Fields(context: Context) : FrameLayout(context) {
                 f.look = words
                 // Setting an input type sets the text again: no edit of the person's.
                 quiet = true
-                try { style(f, w, look, placeholder, autocomplete, family) } finally { quiet = false }
+                try { style(f, w, look, placeholder, autocomplete, family, axes) } finally { quiet = false }
             }
             if (sized) size(f) else if (shown) f.dirty = true
             position(f)
@@ -322,7 +333,9 @@ internal class Fields(context: Context) : FrameLayout(context) {
             }
         })
         text.selected = { _, _ -> if (!quiet) { f.moved = true; later() } }
-        text.asked = { later() }
+        // Any IME call is real input (a backspace in an empty field included, which changes nothing it reports):
+        // a held state lets go (LLP 1122 D8).
+        text.asked = { Exact.fieldInput(f.id, f.generation); later() }
         text.setOnFocusChangeListener { _, has ->
             if (has) {
                 focused = f
@@ -359,6 +372,8 @@ internal class Fields(context: Context) : FrameLayout(context) {
             true
         }
         text.setOnKeyListener { _, code, event ->
+            // Any key down is real input, which lets a held state go (LLP 1122 D8).
+            if (event.action == KeyEvent.ACTION_DOWN) Exact.fieldInput(f.id, f.generation)
             if (code != KeyEvent.KEYCODE_TAB || event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return@setOnKeyListener false
             // Tab is the page's: exact2 moves the focus through its own order, which knows the painted controls.
             if (event.action == KeyEvent.ACTION_DOWN) {
@@ -461,17 +476,18 @@ internal class Fields(context: Context) : FrameLayout(context) {
         if (focused === f) focused = null
         removeView(f.port)
         f.node.discardDisplayList()
+        Extensions.webauthnField(f.text, false)
     }
 
-    /** The field's look and its keyboard, from the look's words ([Native.fields]) and its three strings. */
-    private fun style(f: Field, w: IntArray, at: Int, placeholder: String, autocomplete: String, family: String) {
+    /** The field's look and its keyboard, from the look's words ([Native.fields]) and its four strings. */
+    private fun style(f: Field, w: IntArray, at: Int, placeholder: String, autocomplete: String, family: String, axes: String) {
         val what = w[at]; val keyboard = w[at + 1]; val enter = w[at + 3]
         val text = f.text
         f.multiline = what and MULTILINE != 0
         val type = inputType(what, keyboard, w[at + 2])
         if (text.inputType != type) text.inputType = type
         // Its type after its input type, which sets a password in a monospace face.
-        face(text, fl(w[at + 11]), w[at + 12], what and ITALIC != 0, fl(w[at + 13]), fl(w[at + 14]), family)
+        face(text, fl(w[at + 11]), w[at + 12], what and ITALIC != 0, fl(w[at + 13]), fl(w[at + 14]), family, axes)
         f.action = when {
             f.multiline -> 0
             enter in DONE..SEND -> enter
@@ -509,6 +525,7 @@ internal class Fields(context: Context) : FrameLayout(context) {
         val hints = hints(autocomplete)
         text.importantForAutofill = if (autocomplete == "off") View.IMPORTANT_FOR_AUTOFILL_NO else View.IMPORTANT_FOR_AUTOFILL_AUTO
         text.setAutofillHints(*hints)
+        Extensions.webauthnField(text, autocomplete.trim().substringAfterLast(' ') == "webauthn")
         f.dirty = true
     }
 
@@ -586,7 +603,7 @@ internal class Fields(context: Context) : FrameLayout(context) {
             quiet = true
             try { f.text.requestFocus() } finally { quiet = false }
         }
-        f.text.windowInsetsController?.show(WindowInsets.Type.ime())
+        if (android.os.Build.VERSION.SDK_INT >= 30) f.text.windowInsetsController?.show(WindowInsets.Type.ime()) else Legacy.showKeyboard(f.text)
     }
 
     /** exact2 says no hosted field holds the focus: the one that did lets go of it and the keyboard goes. Where
@@ -678,6 +695,7 @@ internal class Fields(context: Context) : FrameLayout(context) {
         held.clear()
         if (f != null && f.id == field && fields[field] === f) {
             state = OWNED
+            Exact.fieldInput(f.id, f.generation) // a finger down in it: real input, which lets a held state go
             for (e in events) {
                 send(e)
                 if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) { state = NONE; target = null }
@@ -787,16 +805,18 @@ internal class Fields(context: Context) : FrameLayout(context) {
         }
 
         /** The type a field is set in ([Native.fields]): size in px, weight, slant, tracking in ems, the line's
-         * height in px (0: the font's own) and the face's file with its index in a collection (`path#index`; empty:
-         * the device's default family). */
-        private fun face(v: EditText, size: Float, weight: Int, italic: Boolean, spacing: Float, line: Float, family: String) {
+         * height in px (0: the font's own), the face's file with its index in a collection (`path#index`; empty:
+         * the device's default family) and its axes as CSS writes `font-variation-settings` (empty: the weight's
+         * alone). The default family's typeface takes no axes, so a field that moves one names the file text is drawn
+         * from instead. */
+        private fun face(v: EditText, size: Float, weight: Int, italic: Boolean, spacing: Float, line: Float, family: String, axes: String) {
             v.setTextSize(TypedValue.COMPLEX_UNIT_PX, size)
-            v.typeface = faces.getOrPut("$family|$weight|$italic") {
+            v.typeface = faces.getOrPut("$family|$weight|$italic|$axes") {
                 val w = weight.coerceIn(1, 1000)
                 val hash = family.lastIndexOf('#')
                 val made = if (hash <= 0) null else try {
                     Typeface.Builder(File(family.substring(0, hash))).setTtcIndex(family.substring(hash + 1).toIntOrNull() ?: 0)
-                        .setFontVariationSettings("'wght' $w").setWeight(w).setItalic(italic).build()
+                        .setFontVariationSettings(axes.ifEmpty { "'wght' $w" }).setWeight(w).setItalic(italic).build()
                 } catch (e: RuntimeException) { null }
                 made ?: Typeface.create(Typeface.DEFAULT, w, italic)
             }
@@ -832,9 +852,10 @@ internal class Fields(context: Context) : FrameLayout(context) {
             return t
         }
 
-        /** Autofill's hints for HTML's `autocomplete`: its last token, as the platform names it. */
+        /** Autofill's hints for HTML's `autocomplete`: its last token but `webauthn` (HTML's passkey marker, which
+         * names no field: `username webauthn` is a username), as the platform names it. */
         private fun hints(autocomplete: String): Array<String> {
-            val hint = when (autocomplete.trim().substringAfterLast(' ')) {
+            val hint = when (autocomplete.trim().removeSuffix("webauthn").trim().substringAfterLast(' ')) {
                 "email" -> View.AUTOFILL_HINT_EMAIL_ADDRESS; "username" -> View.AUTOFILL_HINT_USERNAME
                 "current-password" -> View.AUTOFILL_HINT_PASSWORD; "new-password" -> "newPassword"
                 "one-time-code" -> "smsOTPCode"; "name" -> View.AUTOFILL_HINT_NAME
@@ -856,19 +877,22 @@ internal class Fields(context: Context) : FrameLayout(context) {
          * first baseline in px, 21 bits each, or -1 when there is no reader to measure in. [flags]: bit 0 italic, bit
          * 1 a textarea, whose lines wrap at [width] px (negative: as long as they are).
          */
-        @JvmStatic fun measure(size: Float, weight: Int, flags: Int, spacing: Float, line: Float, family: String, text: String, width: Float): Long {
+        @JvmStatic fun measure(size: Float, weight: Int, flags: Int, spacing: Float, line: Float, family: String, axes: String, text: String, width: Float): Long {
             val context = context ?: return -1L
             // A host booting on a thread of exact2's own: a view wants a looper to be made on.
             if (Looper.myLooper() == null) Looper.prepare()
-            val v = measurer.get() ?: bare(EditText(context)).also {
+            val v = measurer.get() ?: bare(EditText(unadjusted(context))).also {
                 it.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+                // Never attached, so no parent gives it these; once it has a layout, setText reads them
+                // (TextView.checkForResize) and would throw without them.
+                it.layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                 measurer.set(it)
             }
             val multiline = flags and 2 != 0
             val type = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
                 (if (multiline) InputType.TYPE_TEXT_FLAG_MULTI_LINE else 0)
             if (v.inputType != type) v.inputType = type
-            face(v, size, weight, flags and 1 != 0, spacing, line, family)
+            face(v, size, weight, flags and 1 != 0, spacing, line, family, axes)
             v.setText(text)
             val free = MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED)
             val wide = if (multiline && width >= 0f) MeasureSpec.makeMeasureSpec(ceil(width).toInt(), MeasureSpec.EXACTLY) else free
@@ -878,4 +902,11 @@ internal class Fields(context: Context) : FrameLayout(context) {
                 (v.baseline.coerceIn(0, most).toLong() shl 42)
         }
     }
+}
+
+/** [context] with no font weight adjustment, for a field's [EditText]: Bold Text's step is in the weight the kernel
+ * gives it (LLP 1115.000 D12.3, UIKit's step, which light weights take too), and a `TextView` would otherwise add the
+ * device's adjustment to every typeface it is set in, the one it measures in included. */
+internal fun unadjusted(context: Context): Context = ContextThemeWrapper(context, context.theme).apply {
+    if (android.os.Build.VERSION.SDK_INT >= 31) applyOverrideConfiguration(Configuration().apply { fontWeightAdjustment = 0 })
 }

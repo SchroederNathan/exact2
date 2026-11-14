@@ -2,6 +2,8 @@
 //! app's store files (a named agent drive's, or the app's own) and physical
 //! memory.
 
+use std::path::PathBuf;
+
 /// The kv scope the runner's kept answers live in, beside secrets
 /// (LLP 1027 D4). The same scope Apple's store writes.
 const KEPT: &str = "exact.kept";
@@ -11,13 +13,15 @@ const KEPT: &str = "exact.kept";
 const STATE: &str = "exact.state";
 
 /// What the app has kept — in a named agent drive's scratch tree, or outside
-/// the agent in its own data root ([`crate::picker::secret_root`], LLP
+/// the agent in its own data root ([`crate::picker::store_root`], LLP
 /// 1027.007 D13) — for the runner's boot snapshot. A carried launch and a
 /// nameless drive contribute nothing. A fresh drive's
 /// tree is emptied first, once a process and before anything is written there
 /// (`picker::empty_fresh_tree`); one that cannot be emptied gives nothing,
 /// said at boot and again by the activation.
 pub(super) fn store_snapshot(app_id: &str, carried: bool) -> Vec<(String, Vec<u8>)> {
+    // What an earlier host in this process committed is on disk before it is read back.
+    super::store_writer::settle();
     if carried {
         return Vec::new();
     }
@@ -27,28 +31,30 @@ pub(super) fn store_snapshot(app_id: &str, carried: bool) -> Vec<(String, Vec<u8
         eprintln!("exact: {e:?}");
         return Vec::new();
     }
-    let Some(root) = crate::picker::secret_root(app_id) else {
+    let Ok(Some(root)) = crate::picker::store_root(app_id) else {
         return Vec::new();
     };
-    let secrets = ibex2::secrets::FileStore::new(root.join("secrets"));
     let kv = ibex2::kv::FileStore::new(root.join("kv"));
-    // A leading dot is the store's temporary file, not a secret.
-    let mut names = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root.join("secrets")) {
-        for entry in entries.flatten() {
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            if !name.starts_with('.') && ibex2::secrets::is_valid_name(&name) {
-                names.push(name);
+    let mut out = Vec::new();
+    if let Ok(Some(secret_root)) = crate::picker::secret_root(app_id) {
+        let secrets = ibex2::secrets::FileStore::new(secret_root.join("secrets"));
+        // A leading dot is the store's temporary file, not a secret.
+        let mut names = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(secret_root.join("secrets")) {
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if !name.starts_with('.') && ibex2::secrets::is_valid_name(&name) {
+                    names.push(name);
+                }
             }
         }
-    }
-    names.sort();
-    let mut out = Vec::new();
-    for name in names {
-        if let Ok(Some(value)) = ibex2::secrets::SecretStore::get(&secrets, &name) {
-            out.push((name, value.into_bytes()));
+        names.sort();
+        for name in names {
+            if let Ok(Some(value)) = ibex2::secrets::SecretStore::get(&secrets, &name) {
+                out.push((name, value.into_bytes()));
+            }
         }
     }
     // The runner's own: kept answers and persisted states (LLP 1116 D5),
@@ -74,49 +80,275 @@ pub(super) fn store_snapshot(app_id: &str, carried: bool) -> Vec<(String, Vec<u8
     out
 }
 
-/// Write one commit's store log where [`crate::picker::secret_root`] says: a
-/// named drive's scratch tree, or the app's own data root. A nameless drive
-/// drops the log. A failed write is a journal line.
-pub(super) fn persist_store_writes(
-    app_id: &str,
+pub(super) fn secret_namespace(roots: &StoreRoots) -> Option<exact_data::secrets::Namespace> {
+    roots
+        .as_ref()
+        .ok()?
+        .as_ref()?
+        .1
+        .as_ref()
+        .map(|root| exact_data::secrets::Namespace::disk(root.join("secret-leases")))
+}
+
+pub(super) fn write_stamps(
+    roots: &StoreRoots,
     writes: &[exact_runner::StoreWrite],
-) -> Vec<String> {
-    // Most commits write nothing: no directory is looked up for them.
-    if writes.is_empty() {
-        return Vec::new();
+) -> Vec<Option<exact_data::secrets::Stamp>> {
+    let namespace = secret_namespace(roots);
+    writes
+        .iter()
+        .map(|write| {
+            if write.durable
+                || write.name.starts_with(exact_runner::Store::KEPT)
+                || write.name.starts_with(exact_runner::Store::STATE)
+            {
+                return None;
+            }
+            namespace
+                .as_ref()
+                .map(|namespace| namespace.stamp(&write.name))
+        })
+        .collect()
+}
+
+struct SecretFiles(ibex2::secrets::FileStore, PathBuf);
+impl exact_data::secrets::Backend for SecretFiles {
+    fn read(&self, name: &str) -> Result<Option<String>, String> {
+        ibex2::secrets::SecretStore::get(&self.0, name).map_err(|error| error.to_string())
     }
-    let Some(root) = crate::picker::secret_root(app_id) else {
-        return Vec::new();
-    };
-    let secrets = ibex2::secrets::FileStore::new(root.join("secrets"));
-    let kv = ibex2::kv::FileStore::new(root.join("kv"));
-    let mut errors = Vec::new();
-    for write in writes {
-        let owned = [
-            (KEPT, exact_runner::Store::KEPT),
-            (STATE, exact_runner::Store::STATE),
-        ]
-        .into_iter()
-        .find_map(|(scope, prefix)| Some((scope, write.name.strip_prefix(prefix)?)));
-        let result = match owned {
-            Some((scope, key)) => match &write.value {
-                Some(value) => ibex2::kv::KvStore::set(&kv, scope, key, value),
-                None => ibex2::kv::KvStore::delete(&kv, scope, key),
-            },
-            None => match &write.value {
-                Some(value) => ibex2::secrets::SecretStore::set(
-                    &secrets,
-                    &write.name,
-                    &String::from_utf8_lossy(value),
-                ),
-                None => ibex2::secrets::SecretStore::forget(&secrets, &write.name),
-            },
-        };
-        if let Err(error) = result {
-            errors.push(format!("store {} failed: {error}", write.name));
+    fn write(&self, name: &str, value: Option<&str>) -> Result<(), String> {
+        match value {
+            Some(value) => ibex2::secrets::SecretStore::set(&self.0, name, value),
+            None => ibex2::secrets::SecretStore::forget(&self.0, name),
+        }
+        .map_err(|error| error.to_string())?;
+        exact_data::secrets::sync_directory_chain(&self.1)
+    }
+}
+
+pub(super) fn shared_secrets(app: &str) -> Option<std::sync::Arc<dyn exact_runner::SharedSecrets>> {
+    let roots = store_roots(app);
+    let namespace = secret_namespace(&roots)?;
+    let root = roots.ok()??.1?;
+    Some(std::sync::Arc::new(exact_data::secrets::Coordinator::new(
+        namespace,
+        std::sync::Arc::new(SecretFiles(
+            ibex2::secrets::FileStore::new(root.join("secrets")),
+            root.join("secrets"),
+        )),
+    )))
+}
+
+struct SecretMemory(ibex2::secrets::MemoryStore);
+impl exact_data::secrets::Backend for SecretMemory {
+    fn read(&self, name: &str) -> Result<Option<String>, String> {
+        ibex2::secrets::SecretStore::get(&self.0, name).map_err(|error| error.to_string())
+    }
+    fn write(&self, name: &str, value: Option<&str>) -> Result<(), String> {
+        match value {
+            Some(value) => ibex2::secrets::SecretStore::set(&self.0, name, value),
+            None => ibex2::secrets::SecretStore::forget(&self.0, name),
+        }
+        .map_err(|error| error.to_string())
+    }
+}
+
+pub(super) struct SecretSession {
+    pub shared: std::sync::Arc<dyn exact_runner::SharedSecrets>,
+    memory: Option<(exact_data::secrets::Namespace, std::sync::Arc<SecretMemory>)>,
+}
+impl SecretSession {
+    pub fn new(app: &str) -> Result<Self, String> {
+        store_roots(app)?;
+        if let Some(shared) = shared_secrets(app) {
+            return Ok(Self {
+                shared,
+                memory: None,
+            });
+        }
+        let namespace = exact_data::secrets::Namespace::memory();
+        let backend = std::sync::Arc::new(SecretMemory(ibex2::secrets::MemoryStore::new()));
+        Ok(Self {
+            shared: std::sync::Arc::new(exact_data::secrets::Coordinator::new(
+                namespace.clone(),
+                backend.clone(),
+            )),
+            memory: Some((namespace, backend)),
+        })
+    }
+    pub fn seed(&self, snapshot: Vec<(String, Vec<u8>)>) {
+        use exact_data::secrets::Backend;
+        if let Some((_, backend)) = &self.memory {
+            for (name, value) in snapshot {
+                if ibex2::secrets::is_valid_name(&name) {
+                    let _ = backend.write(&name, Some(&String::from_utf8_lossy(&value)));
+                }
+            }
         }
     }
-    errors
+    pub fn remember(&self, writes: &[exact_runner::StoreWrite]) -> Vec<String> {
+        use exact_data::secrets::Backend;
+        let Some((namespace, backend)) = &self.memory else {
+            return Vec::new();
+        };
+        writes
+            .iter()
+            .filter(|write| !write.durable && ibex2::secrets::is_valid_name(&write.name))
+            .filter_map(|write| {
+                let stamp = namespace.stamp(&write.name);
+                let value = write.value.as_deref().map(String::from_utf8_lossy);
+                namespace
+                    .write(&write.name, &stamp, || {
+                        backend.write(&write.name, value.as_deref())
+                    })
+                    .err()
+            })
+            .collect()
+    }
+}
+
+#[derive(Default)]
+pub(super) struct StoreWrites(std::collections::BTreeMap<String, PendingWrite>);
+
+struct PendingWrite {
+    stamp: Option<exact_data::secrets::Stamp>,
+    value: Option<Vec<u8>>,
+    warned: bool,
+}
+
+/// Where an app's store writes go, as the environment says when they are
+/// committed: the store's root and, where secrets are kept on disk, theirs;
+/// `None` for a drive that keeps nothing (a nameless one), or why neither
+/// could be found.
+pub(super) type StoreRoots = Result<Option<(PathBuf, Option<PathBuf>)>, String>;
+
+/// [`StoreRoots`] for app `app_id`, now.
+pub(super) fn store_roots(app_id: &str) -> StoreRoots {
+    let found = || -> Result<_, exact_runner::DataError> {
+        let Some(root) = crate::picker::store_root(app_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((root, crate::picker::secret_root(app_id)?)))
+    };
+    found().map_err(|e| format!("{e:?}"))
+}
+
+impl StoreWrites {
+    /// Whether a write failed and waits to be tried again.
+    pub(super) fn pending(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    /// Retry at each commit, with newer writes replacing pending values or removals.
+    #[cfg(test)]
+    pub(super) fn flush(
+        &mut self,
+        app_id: &str,
+        writes: &[exact_runner::StoreWrite],
+    ) -> Vec<String> {
+        let roots = store_roots(app_id);
+        let stamps = write_stamps(&roots, writes);
+        self.flush_to(&roots, writes, &stamps)
+    }
+
+    /// [`StoreWrites::flush`] to `roots`, resolved when the writes were
+    /// committed (the store's own thread writes them later).
+    pub(super) fn flush_to(
+        &mut self,
+        roots: &StoreRoots,
+        writes: &[exact_runner::StoreWrite],
+        stamps: &[Option<exact_data::secrets::Stamp>],
+    ) -> Vec<String> {
+        for (write, stamp) in writes.iter().zip(stamps) {
+            if write.durable {
+                self.0.remove(&write.name);
+                continue;
+            }
+            self.0.insert(
+                write.name.clone(),
+                PendingWrite {
+                    stamp: stamp.clone(),
+                    value: write.value.clone(),
+                    warned: false,
+                },
+            );
+        }
+        if self.0.is_empty() {
+            return Vec::new();
+        }
+        let stores = match roots {
+            Ok(None) => {
+                self.0.clear();
+                return Vec::new();
+            }
+            Ok(Some((root, secrets))) => Ok((
+                secrets
+                    .as_ref()
+                    .map(|root| ibex2::secrets::FileStore::new(root.join("secrets"))),
+                ibex2::kv::FileStore::new(root.join("kv")),
+            )),
+            Err(error) => Err(error.clone()),
+        };
+        let namespace = secret_namespace(roots);
+        let mut errors = Vec::new();
+        self.0.retain(|name, pending| {
+            let result = stores
+                .as_ref()
+                .map_err(|e| e.clone())
+                .and_then(|(secrets, kv)| {
+                    let owned = [
+                        (KEPT, exact_runner::Store::KEPT),
+                        (STATE, exact_runner::Store::STATE),
+                    ]
+                    .into_iter()
+                    .find_map(|(scope, prefix)| Some((scope, name.strip_prefix(prefix)?)));
+                    match owned {
+                        Some((scope, key)) => match &pending.value {
+                            Some(value) => ibex2::kv::KvStore::set(kv, scope, key, value),
+                            None => ibex2::kv::KvStore::delete(kv, scope, key),
+                        },
+                        None => {
+                            let write = || {
+                                match secrets {
+                                    Some(secrets) => match &pending.value {
+                                        Some(value) => ibex2::secrets::SecretStore::set(
+                                            secrets,
+                                            name,
+                                            &String::from_utf8_lossy(value),
+                                        ),
+                                        None => ibex2::secrets::SecretStore::forget(secrets, name),
+                                    },
+                                    None => Ok(()),
+                                }
+                                .map_err(|error| error.to_string())
+                            };
+                            return match (&namespace, &pending.stamp) {
+                                (Some(namespace), Some(stamp)) => {
+                                    namespace.write(name, stamp, write)
+                                }
+                                (Some(namespace), None) => namespace.write(
+                                    name,
+                                    &exact_data::secrets::Stamp::unresolved(),
+                                    write,
+                                ),
+                                _ => write(),
+                            };
+                        }
+                    }
+                    .map_err(|e| e.to_string())
+                });
+            if let Err(error) = result {
+                if !pending.warned {
+                    errors.push(format!("store {name} failed: {error}"));
+                    pending.warned = true;
+                }
+                true
+            } else {
+                false
+            }
+        });
+        errors
+    }
 }
 
 /// Physical memory in bytes, for the canvas budget (LLP 1056 D4): a quarter

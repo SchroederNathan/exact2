@@ -6,8 +6,8 @@ import XCTest
 /// LLP 1070.000 §6.2, LLP 1010 §6.8: a correction marked smooth (a smooth
 /// `scrollIntoView`, or a `scroll-behavior: smooth` list following its end)
 /// is one 0.3 s ease-in-out motion of the port; while it runs the fill
-/// reports no travel (which would cancel a request); a later smooth target
-/// retargets it from what shows; an ordinary correction is set at once.
+/// reports no travel; a later smooth target retargets it from what shows;
+/// an ordinary correction is set at once.
 final class SmoothCollectionIOSTests: XCTestCase {
     private var window: UIWindow!
     override func tearDown() { window?.isHidden = true; window = nil; super.tearDown() }
@@ -28,11 +28,33 @@ final class SmoothCollectionIOSTests: XCTestCase {
             "rows": [["view": 10, "root": 10, "epoch": 1]], "correction": correction]]]
     }
     private func spin(_ seconds: Double) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
-    /// Runs the loop until `done`, failing with `what` after `timeout` s.
-    private func wait(_ what: String, _ timeout: Double = 2, _ done: () -> Bool) {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !done(), Date() < deadline { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005)) }
-        XCTAssertTrue(done(), what)
+    /// Waits for `done` (EventWaits' `waitFor`), giving up only once the
+    /// app's display link has delivered more than `frames` s of frames since
+    /// it began (a motion is 0.3 s), or at the 30 s cap, never on wall time
+    /// alone: in the full parallel suite a 2 s deadline failed a motion the
+    /// link had starved. What the link did goes in a failure's message and a
+    /// LATE-PASS attachment (theme2's ruling); a found livelock (the link
+    /// running, the port still) fails at the budget.
+    private func wait(_ what: String, frames budget: CFTimeInterval = 0.6, _ done: () -> Bool) {
+        let clock = FrameClock.shared
+        var first: CFTimeInterval?, last: CFTimeInterval = clock.link?.timestamp ?? 0, seen = 0, gap = 0.0, at = CACurrentMediaTime()
+        let delivered = { first.map { last - $0 } ?? 0 }
+        // Each new link timestamp a frame delivered (sampled each turn, under a frame apart, and once more for the facts).
+        let sample = {
+            let now = CACurrentMediaTime()
+            if let t = clock.link?.timestamp, t > last {
+                if first == nil { first = t }
+                last = t; seen += 1; gap = max(gap, now - at); at = now
+            }
+        }
+        waitFor(what, giveUp: {
+            sample()
+            return delivered() > budget
+        }, facts: {
+            sample()
+            let link = clock.link
+            return "frames seen \(seen) over \(String(format: "%.3f", delivered())) s of link time, largest gap \(String(format: "%.3f", max(gap, CACurrentMediaTime() - at))) s, link \(link == nil ? "none" : link!.isPaused ? "paused" : "running"), app \(UIApplication.shared.applicationState.rawValue), scene \(window?.windowScene?.activationState.rawValue ?? -9)"
+        }, done)
     }
     private func moving(_ p: Presenter) -> Bool { p.collections.offsetDrivers[1] != nil }
     private func list(_ p: Presenter, correction: Any) {
@@ -68,6 +90,35 @@ final class SmoothCollectionIOSTests: XCTestCase {
         wait("moving") { self.moving(p) }
         wait("landed") { !p.collections.animating.contains(1) }
         XCTAssertEqual(scroll.contentOffset.y, 1200, accuracy: 0.5)
+    }
+
+    /// From a port UIKit reads back a ULP off the pixel grid (5/3 at scale 3
+    /// comes back 1.6666666666666665), a smooth correction still eases to its
+    /// target: the driver took that ULP for the port moving under it and
+    /// restarted its ease every frame, so it never left its first frame (the
+    /// full suite's flake, its link running at full rate; PixelGrid.same).
+    func testASmoothCorrectionFromAPortReadBackOffTheGridLands() throws {
+        let p = presenter()
+        list(p, correction: NSNull())
+        let scroll = try XCTUnwrap(p.views[1]?.scroll)
+        // At 3x (the grid 5/3 sits on), whatever the simulator's own scale (Astra's round 2).
+        scroll.traitOverrides.displayScale = 3
+        scroll.updateTraitsIfNeeded()
+        // A grid offset UIKit hands back not exactly as given (the precondition, shown here).
+        let scale = max(1, scroll.traitCollection.displayScale)
+        var start: CGFloat?
+        for k in 1...600 {
+            let y = PixelGrid.offset(CGPoint(x: 0, y: CGFloat(k) / scale), in: scroll).y
+            scroll.contentOffset.y = y
+            if scroll.contentOffset.y != PixelGrid.offset(scroll.contentOffset, in: scroll).y { start = y; break }
+        }
+        guard let y0 = start else { throw XCTSkip("this display hands every grid offset back exactly at scale \(scale): nothing to drive") }
+        XCTAssertTrue(PixelGrid.same(scroll.contentOffset.y, y0, in: scroll), "a ULP off, within the read-back slop")
+        let seq = String(try XCTUnwrap(p.collections.entries[1]?.cursor.sequence))
+        p.apply(wireBatch([collections(revision: 2, correction: ["scrollSequence": seq, "offset": 1700, "smooth": true])]))
+        wait("moving") { self.moving(p) }
+        wait("landed") { !p.collections.animating.contains(1) }
+        XCTAssertEqual(scroll.contentOffset.y, 1700, accuracy: 0.5, "from \(y0), read back \(scroll.contentOffset.y)")
     }
 
     /// Mid-flight, a new target retargets from where the port is (no jump),
@@ -108,6 +159,37 @@ final class SmoothCollectionIOSTests: XCTestCase {
         XCTAssertFalse(moving(p)); XCTAssertFalse(p.collections.animating.contains(1))
         spin(0.2)
         XCTAssertEqual(scroll.contentOffset.y, stopped, accuracy: 0.5, "left where the drag found it")
+    }
+
+    /// LLP 1070.000 §2.5: a tap on the status bar is the reader's move of the
+    /// list, as a drag is, though no finger touches it: it stops a smooth
+    /// request where the port is, for UIKit's scroll to the top, a correction
+    /// of it planned before the tap no longer lands, and the next report says
+    /// the reader made a gesture, which ends the request.
+    func testAStatusBarTapStopsASmoothRequestAndIsTheReadersGesture() throws {
+        let p = presenter()
+        list(p, correction: NSNull())
+        let scroll = try XCTUnwrap(p.views[1]?.scroll)
+        let seq = String(try XCTUnwrap(p.collections.entries[1]?.cursor.sequence))
+        var flags: [UInt32] = []
+        p.collections.onFeedback = { data in flags.append((0..<4).reduce(UInt32(0)) { $0 | UInt32(data[92 + $1]) << ($1 * 8) }) }
+        var request = collections(revision: 2, correction: ["scrollSequence": seq, "offset": 800, "smooth": true])
+        request["items"] = (request["items"] as? [[String: Any]])?.map { $0.merging(["seeking": true, "request": 1]) { _, new in new } }
+        p.apply(wireBatch([request]))
+        wait("on its way") { scroll.contentOffset.y > 200 }
+        XCTAssertFalse(try XCTUnwrap(p.collections.entries[1]).gesture)
+        XCTAssertTrue(try XCTUnwrap(p.views[1]).scrollViewShouldScrollToTop(scroll))
+        XCTAssertFalse(moving(p)); XCTAssertFalse(p.collections.animating.contains(1))
+        let stopped = scroll.contentOffset.y
+        spin(0.2)
+        XCTAssertEqual(scroll.contentOffset.y, stopped, accuracy: 0.5, "left where the tap found it")
+        XCTAssertEqual(flags.last.map { $0 & 64 }, 64, "the reader's gesture is reported")
+        // A batch that still carries the request's correction, planned before the tap
+        request["items"] = (request["items"] as? [[String: Any]])?.map { $0.merging(["revision": 3]) { _, new in new } }
+        p.apply(wireBatch([request]))
+        spin(0.2)
+        XCTAssertFalse(moving(p))
+        XCTAssertEqual(scroll.contentOffset.y, stopped, accuracy: 0.5, "the correction is stale")
     }
 
     /// A sent message's end-follow arrives in the batch whose composer
@@ -234,6 +316,20 @@ final class SmoothCollectionIOSTests: XCTestCase {
         XCTAssertGreaterThan(scroll.contentOffset.y, 0.2, "set there, to the pixel")
     }
 
+    /// LLP 1070.000 §1: under Reduce Motion a smooth correction lands at once.
+    func testUnderReduceMotionASmoothCorrectionLandsAtOnce() throws {
+        let p = presenter()
+        let before = DisplayPreferences.agent
+        DisplayPreferences.agent = (reducedMotion: true, reducedTransparency: false)
+        defer { DisplayPreferences.agent = before }
+        list(p, correction: NSNull())
+        let scroll = try XCTUnwrap(p.views[1]?.scroll)
+        p.apply(wireBatch([collections(revision: 2, correction: ["scrollSequence": "0", "offset": 1200, "smooth": true])]))
+        XCTAssertFalse(p.collections.animating.contains(1))
+        XCTAssertNil(p.collections.offsetDrivers[1])
+        XCTAssertEqual(scroll.contentOffset.y, 1200, accuracy: 0.5)
+    }
+
     /// A smooth correction under half a point (a port rounded to a device
     /// pixel) is set, not eased: 0.3 s of frames for it moved nothing.
     func testASmoothCorrectionUnderHalfAPointIsSet() throws {
@@ -273,11 +369,12 @@ final class SmoothCollectionIOSTests: XCTestCase {
         let node = try XCTUnwrap(p.views[1])
         host.view.addSubview(node)
         let scroll = try XCTUnwrap(node.scroll)
+        // Keep the bottom adjustment constant while the top moves under the bar.
+        scroll.contentInsetAdjustmentBehavior = .always
         p.apply(wireBatch([collections(revision: 2, correction: ["scrollSequence": "0", "offset": 2000, "smooth": false])]))
         let end = { scroll.contentSize.height + scroll.adjustedContentInset.bottom - scroll.bounds.height }
         XCTAssertEqual(scroll.contentOffset.y, end(), accuracy: 0.5, "opened at its end, below the bar")
         let start = try XCTUnwrap(p.collections.geometry(1)).offset
-        scroll.contentInsetAdjustmentBehavior = .always
         p.apply(wireBatch([["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 300.0, "h": 400.0]]))
         XCTAssertEqual(scroll.adjustedContentInset.top, bar, accuracy: 0.5, "under the bar, which UIKit insets it by")
         XCTAssertEqual(try XCTUnwrap(p.collections.geometry(1)).offset, start, accuracy: 0.5, "the port starts where it did")

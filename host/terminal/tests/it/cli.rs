@@ -171,7 +171,19 @@ fn signal_restores(mode: &str, signal: i32, pending: bool) {
 #[cfg(unix)]
 #[test]
 fn signal_restores_raw_mode_when_output_is_blocked() {
+    blocked_output(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn traced_commit_survives_blocked_stderr_and_signal_restores_raw_mode() {
+    blocked_output(true);
+}
+
+#[cfg(unix)]
+fn blocked_output(trace: bool) {
     use std::fs::File;
+    use std::io::{Read, Write};
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::ExitStatusExt;
@@ -190,20 +202,51 @@ fn signal_restores_raw_mode_when_output_is_blocked() {
         },
         0
     );
-    let _master = unsafe { File::from_raw_fd(master_fd) };
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
-    assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOOFF) }, 0);
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "cli::blocked_output_child", "--nocapture"])
-        .env("EXACT_TERMINAL_BLOCKED_OUTPUT_TEST", "1")
+    let path = entry(if trace {
+        "blocked-trace"
+    } else {
+        "blocked-output"
+    });
+    let acknowledged = path.with_extension("ack");
+    if acknowledged.exists() {
+        std::fs::remove_file(&acknowledged).unwrap();
+    }
+    let mut command = if trace {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "cli::blocked_trace_child", "--nocapture"]);
+        command.env("EXACT_TERMINAL_TRACE_ACK", &acknowledged);
+        command.env("EXACT_TERMINAL_TRACE", "1");
+        command
+    } else {
+        assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOOFF) }, 0);
+        std::fs::write(&path, "component App\n  view\n    text \"Ready\"\n").unwrap();
+        // The test harness's banner would block before entering raw mode.
+        let mut command = Command::new(env!("CARGO_BIN_EXE_exact-terminal"));
+        command
+            .arg(path)
+            .args(["--size", "200x160", "--fullscreen"]);
+        command
+    };
+    let mut child = command
         .stdin(slave.try_clone().unwrap())
         .stdout(slave.try_clone().unwrap())
         .stderr(slave.try_clone().unwrap())
         .spawn()
         .unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+        0
+    );
+    let mut output = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut stable = 0;
     loop {
+        let mut chunk = [0; 4096];
+        if let Ok(n) = master.read(&mut chunk) {
+            output.extend_from_slice(&chunk[..n]);
+        }
         let mut termios = MaybeUninit::<libc::termios>::uninit();
         assert_eq!(
             unsafe { libc::tcgetattr(slave.as_raw_fd(), termios.as_mut_ptr()) },
@@ -211,7 +254,11 @@ fn signal_restores_raw_mode_when_output_is_blocked() {
         );
         let raw = unsafe { termios.assume_init() }.c_lflag & libc::ICANON == 0;
         stable = if raw { stable + 1 } else { 0 };
-        if stable >= 5 {
+        if if trace {
+            raw && output.windows(5).any(|part| part == b"Ready")
+        } else {
+            stable >= 5
+        } {
             break;
         }
         if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
@@ -220,6 +267,31 @@ fn signal_restores_raw_mode_when_output_is_blocked() {
             panic!("child did not enter raw mode with output stopped");
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+    if trace {
+        assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOOFF) }, 0);
+        // stdout and stderr share an open file description. Exhaust even
+        // single-byte room so the next diagnostic must encounter EAGAIN.
+        while unsafe { libc::write(slave.as_raw_fd(), b"X".as_ptr().cast(), 1) } == 1 {}
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        master.write_all(b"12").unwrap();
+        // The second action acknowledges that the first commit's trace
+        // returned. Neither action changes the screen, so stdout stays idle.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !acknowledged.exists() {
+            let status = child.try_wait().unwrap();
+            if status.is_some() || Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("host did not survive the blocked commit trace: {status:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(child.try_wait().unwrap().is_none());
+        std::fs::remove_file(acknowledged).unwrap();
     }
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -241,6 +313,49 @@ fn signal_restores_raw_mode_when_output_is_blocked() {
         0
     );
     assert_ne!(unsafe { termios.assume_init() }.c_lflag & libc::ICANON, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn blocked_trace_child() {
+    use exact_plan::Value;
+    use exact_runner::{DataError, DataSource};
+    use exact_terminal::host::{Host, Mode};
+
+    let Some(acknowledged) = std::env::var_os("EXACT_TERMINAL_TRACE_ACK") else {
+        return;
+    };
+    struct Source(PathBuf);
+    impl DataSource for Source {
+        fn query(&mut self, _: &str, args: &[Value]) -> Result<Value, DataError> {
+            if args == [Value::str("second")] {
+                std::fs::write(&self.0, b"survived").unwrap();
+            }
+            Ok(Value::record(vec![Value::str("Ready")]))
+        }
+    }
+    let plan = contract::compile(
+        r#"shape Word
+  text: string
+component App
+  state step = "initial"
+  resource word = word(step) as shape Word
+  action first
+    step = "first"
+  action second
+    step = "second"
+  view
+    column
+      text word.text
+      button press=first aria-keyshortcuts="1"
+        text "First"
+      button press=second aria-keyshortcuts="2"
+        text "Second"
+"#,
+    )
+    .unwrap();
+    let mut host = Host::boot(plan, Source(acknowledged.into()), Mode::Fullscreen, 20, 6).unwrap();
+    exact_terminal::term::run(&mut host).unwrap();
 }
 
 #[cfg(unix)]
@@ -294,7 +409,10 @@ fn normal_exit_waits_for_room_to_restore_screen() {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let filler = [b'X'; 4096];
+    // A running Linux PTY can make room after EAGAIN without a master read.
+    // Stop transmission, then fill even single-byte room in the output queue.
+    assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOOFF) }, 0);
+    let filler = b"X";
     loop {
         let n = unsafe { libc::write(slave.as_raw_fd(), filler.as_ptr().cast(), filler.len()) };
         if n < 0 {
@@ -316,6 +434,7 @@ fn normal_exit_waits_for_room_to_restore_screen() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOON) }, 0);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let mut chunk = [0; 4096];
@@ -348,17 +467,109 @@ fn normal_exit_waits_for_room_to_restore_screen() {
 }
 
 #[cfg(unix)]
-#[test]
-fn blocked_output_child() {
-    use exact_terminal::host::{Host, Mode};
+fn write_readiness(
+    mut output: impl std::io::Write + std::os::fd::AsFd,
+    mut bytes: &[u8],
+) -> std::io::Result<()> {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use std::io::ErrorKind;
 
-    if std::env::var_os("EXACT_TERMINAL_BLOCKED_OUTPUT_TEST").is_none() {
-        return;
+    while !bytes.is_empty() {
+        match output.write(bytes) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                let mut fds = [PollFd::new(&output, PollFlags::OUT)];
+                match poll(&mut fds, None) {
+                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
-    let source = "component App\n  view\n    text \"Ready\"\n";
-    let plan = contract::compile(source).unwrap();
-    let mut host = Host::boot(plan, (), Mode::Fullscreen, 200, 160).unwrap();
-    exact_terminal::term::run(&mut host).unwrap();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn readiness_write_handles_backpressure_and_partial_writes() {
+    use std::io::{ErrorKind, Read, Write};
+    use std::os::fd::{AsFd, BorrowedFd};
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct Writer {
+        stream: UnixStream,
+        blocked: Option<mpsc::Sender<()>>,
+        partial: bool,
+    }
+    impl AsFd for Writer {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.stream.as_fd()
+        }
+    }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // Force short writes even when the reader drains faster than we write.
+            let result = self.stream.write(&bytes[..bytes.len().min(4096)]);
+            match &result {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if let Some(tx) = self.blocked.take() {
+                        tx.send(()).unwrap();
+                    }
+                }
+                Ok(n) if *n < bytes.len() => self.partial = true,
+                _ => {}
+            }
+            result
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    let (mut stream, mut reader) = UnixStream::pair().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut filled = 0;
+    loop {
+        match stream.write(&[b'X'; 4096]) {
+            Ok(n) => {
+                assert!(n > 0);
+                filled += n;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => panic!("fill output: {e}"),
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let drain = std::thread::spawn(move || {
+        // Keep the buffer full until the readiness writer encounters EAGAIN.
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        received
+    });
+    let mut writer = Writer {
+        stream,
+        blocked: Some(tx),
+        partial: false,
+    };
+    let bytes = b"WORK_PENDING\n".repeat(filled);
+    let result = write_readiness(&mut writer, &bytes);
+    let partial = writer.partial;
+    drop(writer);
+    let received = drain.join().unwrap();
+    result.unwrap();
+    assert!(partial, "payload must exceed the output buffer");
+    assert_eq!(&received[..filled], vec![b'X'; filled]);
+    assert_eq!(&received[filled..], bytes);
 }
 
 #[cfg(unix)]
@@ -380,7 +591,8 @@ fn pending_data_child() {
 
         fn continuation(&mut self, _: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
             Some(Box::new(|| {
-                eprintln!("WORK_PENDING");
+                // The PTY's stdout and stderr share the host's O_NONBLOCK flag.
+                write_readiness(std::io::stderr().lock(), b"WORK_PENDING\n").unwrap();
                 loop {
                     std::thread::park();
                 }
@@ -647,6 +859,16 @@ fn inline_paint_carries_colours_decorations_and_links_without_crossing_siblings(
     }
 }
 
+#[test]
+fn typing_a_disabled_field_never_falls_back_to_previous_focus() {
+    let (ok, out, err) = run(
+        "disabled-type",
+        &["type", "field", "kept", "type", "locked", "leak", "print"],
+    );
+    assert!(!ok, "{out}\n{err}");
+    assert!(err.contains("#locked"), "{err}");
+}
+
 fn run(name: &str, ops: &[&str]) -> (bool, String, String) {
     run_in("--inline", name, ops)
 }
@@ -842,4 +1064,177 @@ fn a_progress_bar_is_a_row_of_blocks() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(text.contains("███████████████░░░░░"), "{text}");
+}
+
+#[test]
+fn headless_time_uses_agent_facts_and_survives_an_invalid_place() {
+    let path = entry("live-time-facts");
+    std::fs::write(&path, "component App\n  view\n    column\n      time datetime=1767234600000 format=\"relative\"\n      time datetime=1767225600000 format=\"time-short\"\n").unwrap();
+    // A refused locale falls back to en-US alone; the zone it came with stays.
+    for (locale, clock) in [("en-US", "7:00 PM"), ("invalid@locale", "7:00 PM")] {
+        let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
+            .arg(&path)
+            .args(["--size", "80x6", "print"])
+            .env("EXACT_AGENT_EPOCH", "1767225600000")
+            .env("EXACT_AGENT_TIME_ZONE", "America/Toronto")
+            .env("EXACT_AGENT_LOCALE", locale)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let screen = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            screen.contains("in 3 hr.") && screen.contains(clock),
+            "{screen}"
+        );
+    }
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// The terminal carrier's own `layout` and `plan` verbs (LLP 1121 stage 11 C,
+/// for scripts/scale-check.mjs): each node's kernel frame, its cells, its
+/// testId and its corners' resolved radii; the running plan's SHA-256.
+#[test]
+fn layout_and_plan_answer_as_json() {
+    let path = entry("layout");
+    std::fs::write(
+        &path,
+        "component App\n  view\n    column\n      column testId=\"box\" padding=\"1ch\" border-radius=8 width=\"20ch\"\n        view testId=\"inner\" height=\"2lh\"\n      view testId=\"half\" width=\"4ch\" height=\"2lh\" border-radius=\"50%\"\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
+        .arg(&path)
+        .args(["--size", "40x10", "plan", "layout"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let mut lines = text.lines();
+    let plan = lines.next().unwrap();
+    let digest = plan
+        .strip_prefix("{\"plan\":\"")
+        .and_then(|p| p.strip_suffix("\"}"))
+        .unwrap_or_else(|| panic!("{plan}"));
+    assert!(
+        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{plan}"
+    );
+    let layout = lines.next().unwrap();
+    assert!(
+        layout.starts_with(
+            "{\"viewport\":{\"w\":320,\"h\":160},\"cell\":{\"w\":8,\"h\":16},\"nodes\":["
+        ),
+        "{layout}"
+    );
+    // A ch of padding is a column across and, half a row, none down (the
+    // terminal's space rule, LLP 1121 stage 11 (c)): the box is its child's
+    // two rows; its corners resolved.
+    assert!(
+        layout.contains("\"x\":0,\"y\":0,\"w\":176,\"h\":32,\"cells\":{\"x\":0,\"y\":0,\"w\":22,\"h\":2},\"radius\":[8,8,8,8],\"testId\":\"box\""),
+        "{layout}"
+    );
+    assert!(
+        layout.contains(
+            "\"x\":8,\"y\":0,\"w\":160,\"h\":32,\"cells\":{\"x\":1,\"y\":0,\"w\":20,\"h\":2}"
+        ),
+        "{layout}"
+    );
+    assert!(
+        layout.contains("\"radius\":[0,0,0,0],\"testId\":\"inner\""),
+        "{layout}"
+    );
+    // A percentage of the box, as a host sizes it: half its 32 px.
+    assert!(
+        layout.contains("\"radius\":[16,16,16,16],\"testId\":\"half\""),
+        "{layout}"
+    );
+}
+
+#[test]
+fn type_distinguishes_offscreen_fields_from_ineligible_fields() {
+    let path = entry("type-offscreen");
+    std::fs::write(&path, APP.replace("button press=pick(v) commandfor=\"d\" command=\"close\" text-align=\"start\" testId=v\n              text v", "input value=v testId=v")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
+        .arg(path)
+        .args(["--size", "40x12", "tap", "open", "type", "epsilon", "hello"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("type: #epsilon is not on the screen"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (ok, _, err) = run("type-ineligible", &["type", "locked", "hello"]);
+    assert!(
+        !ok && err.contains("type: #locked is not available for input"),
+        "{err}"
+    );
+}
+
+#[test]
+fn modal_with_popover_refuses_background_tap_type_and_focus_command() {
+    let path = entry("modal-popover-input");
+    std::fs::write(
+        &path,
+        r#"component App
+  state draft = ""
+  state presses = 0
+  state focuses = 0
+  action edit(value)
+    draft = value
+  action press
+    presses = presses + 1
+  action focused
+    focuses = focuses + 1
+  action escape
+    focus("page-field")
+  view
+    column
+      input id="page-field" testId="page-field" value=draft input=edit focus=focused
+      button "Page" testId="page-button" press=press
+      button "Open" testId="open" commandfor="modal" command="show-modal"
+      dialog id="modal" width="30ch" height="5lh"
+        button "Popover" testId="open-popover" popovertarget="popover"
+      column id="popover" popover="manual" width="30ch" height="5lh"
+        button "Escape" testId="escape" press=escape
+        text `page:${presses} text:${draft} focus:${focuses}`
+"#,
+    )
+    .unwrap();
+    let mut failures = Vec::new();
+    for (name, ops) in [
+        ("tap", vec!["tap", "page-button", "print"]),
+        ("focus", vec!["tap", "escape", "key", "x", "print"]),
+        ("type", vec!["type", "page-field", "leak"]),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
+            .arg(&path)
+            .args(["--size", "60x20", "tap", "open", "tap", "open-popover"])
+            .args(ops)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let refused = match name {
+            "tap" => {
+                !out.status.success() && stderr.contains("tap: #page-button is not on the screen")
+            }
+            "type" => {
+                !out.status.success() && stderr.contains("type: #page-field is not on the screen")
+            }
+            _ => out.status.success() && stdout.contains("page:0 text: focus:0"),
+        };
+        if !refused {
+            failures.push(format!("{name}: {stdout}\n{stderr}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

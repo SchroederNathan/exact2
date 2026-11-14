@@ -33,6 +33,9 @@ pub struct ThemeDecl {
 pub struct DesignSource {
     /// The file, as the driver found it.
     pub path: String,
+    /// The file as a component's identity names it (LLP 1121 D15):
+    /// relative to the app's directory.
+    pub home: String,
     /// Its text.
     pub text: String,
     /// Its source id, as a span names the file it is in.
@@ -41,4 +44,11 @@ pub struct DesignSource {
     /// (an `app.ts`, a Rust data crate, declared native modules or hatches):
     /// the driver's half of `names_tokens_outside_views` (LLP 1121 D7).
     pub bindable: bool,
+    /// The package whose design this is (LLP 1121 D11), by its
+    /// `package.json` name (`@exact/reading`); none for the app's.
+    pub package: Option<String>,
+    /// The package's directory, where its `assets/` are (an icon's SVG is
+    /// read under the assets of the root whose file writes it, stage 13); none for
+    /// the app's, whose `assets/` are the app's.
+    pub root: Option<String>,
 }

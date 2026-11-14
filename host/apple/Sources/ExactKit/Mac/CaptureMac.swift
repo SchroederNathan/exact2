@@ -4,30 +4,58 @@
 import AppKit
 
 extension Capture {
-    static func paintOrderBitmap(of view: NSView, scale: CGFloat? = nil) -> NSBitmapImageRep? {
-        // A canvas overlay can be captured before AppKit has installed its
-        // inherited backing layer (its window need not have displayed yet).
-        view.wantsLayer = true
+    /// AppKit attaches new backing layers at the window display boundary.
+    /// Do this once per upload, before Capture.bitmap changes visibility.
+    package static func prepareBackingLayers(of view: NSView) {
         view.layoutSubtreeIfNeeded()
+        if view.layer == nil, (view as? NSTextView)?.isFieldEditor != true { view.wantsLayer = true }
+        func unattached(_ v: NSView) -> Bool {
+            // The installed editor inherits backing from its field. Opting it
+            // into backing explicitly can interrupt AppKit's editing session.
+            if (v as? NSTextView)?.isFieldEditor == true { return false }
+            guard let layer = v.layer else { return true }
+            if v.superview != nil, layer.superlayer == nil { return true }
+            return v.subviews.contains(where: unattached)
+        }
+        if unattached(view) { view.window?.displayIfNeeded() }
+    }
+
+    static func paintOrderBitmap(of view: NSView, scale: CGFloat? = nil, prepared: Bool = false) -> NSBitmapImageRep? {
+        if !prepared { prepareBackingLayers(of: view) }
         view.displayIfNeeded()
-        let scale = scale ?? view.window?.backingScaleFactor ?? 2
-        let width = Int((view.bounds.width * scale).rounded()), height = Int((view.bounds.height * scale).rounded())
-        guard let root = view.layer, width > 0, height > 0,
-              let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
-                                  bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let scale = scale ?? view.pixelScale ?? 2
+        guard let root = view.layer else { return nil }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         let tree = paintOrderLayer(of: view, root: root)
-        // CA renders the root in bottom-up Quartz space; the agent's
-        // bitmap (like AppKit's cacheDisplay) has its first row at the top.
-        ctx.translateBy(x: 0, y: CGFloat(height))
-        ctx.scaleBy(x: scale, y: -scale)
-        tree.render(in: ctx)
-        guard let image = ctx.makeImage() else { return nil }
+        defer { releasePaintCopy(tree) }
+        guard let image = picture(of: tree, size: view.bounds.size, scale: scale) else { return nil }
         let rep = NSBitmapImageRep(cgImage: image)
         rep.size = view.bounds.size
         return rep
+    }
+
+    /// Detached copies still participate in the current transaction. Drop
+    /// their borrowed backing stores before commit so AppKit retains its ink.
+    static func releasePaintCopy(_ tree: CALayer) {
+        tree.contents = nil
+        if let mask = tree.mask { releasePaintCopy(mask) }
+        for child in tree.sublayers ?? [] { releasePaintCopy(child) }
+    }
+
+    /// A layer tree drawn into a bitmap of `size` points, its first row at
+    /// the top, as AppKit's `cacheDisplay` has it.
+    static func picture(of tree: CALayer, size: CGSize, scale: CGFloat) -> CGImage? {
+        let width = Int((size.width * scale).rounded()), height = Int((size.height * scale).rounded())
+        guard width > 0, height > 0,
+              let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                  bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        // CA renders the root in bottom-up Quartz space.
+        ctx.translateBy(x: 0, y: CGFloat(height))
+        ctx.scaleBy(x: scale, y: -scale)
+        tree.render(in: ctx)
+        return ctx.makeImage()
     }
 }
 #endif

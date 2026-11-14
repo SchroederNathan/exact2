@@ -12,9 +12,34 @@
 // instance registers with that router rather than taking `exact.gpu`.
 import { pacer } from "./pace.js";
 import { assetDelivery } from "./gpu-assets.js";
+import { inertAncestor } from "./navigation.js";
+import { padPoller } from "./gpu-pads.js";
+import { chooseTier, TIERS } from "./gpu-tier.js";
+import { showRefusal } from "./gpu-refusal.js";
 const artifact = new URL(import.meta.url).searchParams.get("artifact");
 const stem = artifact ?? "gpu";
 let gpu;
+const quarantines = new WeakMap();
+const trapped = (module = gpu) => quarantines.get(module)?.reply;
+const refusal = (message, subsystem = "gpu") => ({error:String(message), refused:{host:"web", subsystem, message:String(message)}});
+function retainTrap(error, module = gpu) {
+  if (!(error instanceof WebAssembly.RuntimeError)) throw error;
+  if (!trapped(module)) { console.error(error); quarantines.set(module, {reply:refusal(error), error}); }
+  return trapped(module);
+}
+// Asset callbacks and exported entries share only their own instance's quarantine.
+function guardedModule(module) {
+  const guarded = new Proxy({}, {get(_target, key) {
+    const value = module[key];
+    if (typeof value !== "function") return value;
+    return (...args) => {
+      if (trapped(guarded)) throw quarantines.get(guarded).error;
+      try { const result = value(...args); return result?.catch ? result.catch(error => { retainTrap(error, guarded); throw error; }) : result; }
+      catch (error) { retainTrap(error, guarded); throw error; }
+    };
+  }});
+  return guarded;
+}
 const WORLD_LIMIT = 256 * 1024 * 1024;
 const HOST_WORK_LIMIT = 16 * 1024 * 1024;
 const worldSize = bytes => { if (bytes.length > WORLD_LIMIT) throw new Error("world carrier exceeds 256 MiB limit"); return bytes; };
@@ -26,6 +51,12 @@ const publishers = new Map(); // name -> first live entry
 const pendingRecords = [];
 let drainingRecords = false;
 let planCarries = new Map();
+let editsAdmitted = false;
+function retainEdits(entry, module = gpu) {
+  if (!entry?.id) return;
+  const reply = module.gpu_agent(entry.id, JSON.stringify({op:"state"}));
+  if (reply) editsAdmitted ||= JSON.parse(reply).world?.developmentEdits === true;
+}
 const surfaces = new Map(); // view id -> surface, input listeners and journal cursor
 // postMessage(text, name): held per surface name (at most exact.postBound, glue.js's
 // POST_BOUND = Linux POST_BOUND = Apple Canvases.postBound) until a canvas of
@@ -48,6 +79,7 @@ let pendingCutover;
 const RECOVERY_LIMIT = 5;
 let recoveryTimer, recoveryFailures = 0, recoveryErrorLogged = false, recoveryTerminalLogged = false, lossDuringRecovery = false;
 let terminalDevice = false;
+let tierCode = 0; // the GPU tier this page told its modules (gpu-tier.js `TIERS`)
 let raf = null;
 let finishReady;
 const ready = new Promise((resolve) => { finishReady = resolve; });
@@ -88,8 +120,10 @@ const pendingRecovery = () => {
   const entries = [...surfaces.values()].filter(entry => !entry.terminal);
   return entries.length ? entries.map(entry => ({name:`GPU recovery ${entry.name}`,canvas:entry.view})) : [{name:"GPU recovery"}];
 };
-async function settled() {
+async function settleModule() {
   await ready;
+  await Promise.all([...surfaces.values()].map(e => e.refusalPage?.ready));
+  if (trapped()) return [];
   const deadline = performance.now() + 2500;
   while ((recoveringDevice || recoveryTimer) && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 0));
   if (recoveringDevice || recoveryTimer) return pendingRecovery();
@@ -114,6 +148,7 @@ async function settled() {
           await new Promise(resolve => setTimeout(resolve, 0));
           continue;
         }
+        if (trapped()) return [];
         let drew = false;
         for (const entry of surfaces.values()) if (entry.id && !entry.terminal && (gpu.gpu_dirty(entry.id) || entry.renderedAt !== exact.now())) {
           render(entry, exact.now()); drew = true;
@@ -131,6 +166,11 @@ async function settled() {
   return pending;
 }
 
+async function settled() {
+  try { return await settleModule(); }
+  catch (error) { retainTrap(error); return []; }
+}
+
 function size(el) {
   const r = el.getBoundingClientRect();
   return { w: Math.max(r.width, 1), h: Math.max(r.height, 1), s: devicePixelRatio || 1 };
@@ -143,6 +183,7 @@ const clockFor = (frameNow) => exact.now?.() ?? frameNow;
 
 let hidden = document.hidden;
 function lifecycle(code) {
+  if (trapped()) return;
   if (code === 0 || code === 1) hidden = code === 0;
   const deliver = () => { for (const entry of surfaces.values()) if (entry.id) gpu?.gpu_lifecycle(entry.id, code); };
   if (recoveringDevice) recoveringDevice.then(deliver); else deliver();
@@ -227,6 +268,8 @@ function resetRecovery() {
 function fallback(entry) {
   if (entry.fallbackApplied) return;
   entry.fallbackApplied = true;
+  // No adapter: the canvas's box says why, and world requests are refused by type (LLP 1139.003 D1).
+  if (api.recovery?.code === "no-adapter") { entry.unsupported = refusal(api.recovery.error); showRefusal(entry); }
   entry.terminal = true;
   entry.wants = false;
   for (const row of entry.children ?? []) restoreChild(row);
@@ -240,8 +283,8 @@ function fallback(entry) {
 function terminalRecovery(outcome) {
   terminalDevice = true;
   recoveryFailures = RECOVERY_LIMIT;
-  for (const entry of surfaces.values()) fallback(entry);
   api.recovery = outcome;
+  for (const entry of surfaces.values()) fallback(entry);
 }
 function reportRecovery(error, terminal) {
   if (!recoveryErrorLogged || (terminal && !recoveryTerminalLogged)) {
@@ -278,7 +321,7 @@ function recoverDevice() {
     if (outcome.status !== "recovered") throw Object.assign(new Error(outcome.error ?? JSON.stringify(outcome)), {code:outcome.code});
     pendingCutover = {module, staged, outcome};
     for (const [old, entry] of staged) {
-      if (live(old.view) !== old) { module.gpu_destroy(entry.id); continue; }
+      if (live(old.view) !== old) { retainEdits(entry, module); module.gpu_destroy(entry.id); continue; }
       entry.values = old.values;
       detached.add(old);
       installCanvas(old, entry);
@@ -327,7 +370,13 @@ function recoverDevice() {
 // canvas recorded since the last one once (LLP 1009 D7). It runs before the
 // task that rendered ends, which is when the browser presents the canvases.
 function flush(module = gpu) {
-  if (module && (module !== gpu || !terminalDevice) && !module.gpu_flush()) console.error("exact gpu:", module.gpu_error());
+  if (trapped()) return;
+  if (!module || (module === gpu && terminalDevice)) return;
+  if (!module.gpu_flush()) console.error("exact gpu:", module.gpu_error());
+  // A submitted callback can publish after render drained the surface's output.
+  if (module === gpu) for (const entry of [...surfaces.values()]) {
+    if (entry.id && !entry.terminal && live(entry.view) === entry) messages(entry, false);
+  }
 }
 
 // An HDR surface's headroom (LLP 1100 D12b). The web has no headroom query:
@@ -339,10 +388,13 @@ function headroom(el) {
   return limit === "constrained" ? 2 : 4;
 }
 
-function render(entry, now) {
+function renderModule(entry, now) {
   if (entry.terminal || (hidden && !exact.now) || recoveringDevice || recoveryTimer) return;
   const { w, h, s } = size(entry.el);
-  const pw = Math.max(1, Math.round(w * s)), ph = Math.max(1, Math.round(h * s));
+  // The backing store is the raster the module draws: a world's render scale (its quality rung) shrinks it, and CSS stretches it to the box.
+  // In f32, as the module's Frame::pixels rounds it, so the two agree to the pixel.
+  const f = Math.fround, rs = gpu.gpu_render_scale?.(entry.id) ?? 1, scaled = f(f(s) * f(rs));
+  const pw = Math.max(1, Math.round(f(f(w) * scaled))), ph = Math.max(1, Math.round(f(f(h) * scaled)));
   if (entry.el.width !== pw || entry.el.height !== ph) { entry.el.width = pw; entry.el.height = ph; }
   supplyChildren(entry);
   if (entry.hdr) gpu.gpu_headroom(entry.id, headroom(entry.host ?? entry.el));
@@ -369,6 +421,11 @@ function render(entry, now) {
   messages(entry);
 }
 
+function render(entry, now) {
+  if (trapped()) return;
+  try { renderModule(entry, now); } catch (error) { retainTrap(error); }
+}
+
 // The live frame clock is the callback's timestamp paced onto the display's
 // lattice (pace.js): a world drawn at the raw timestamp judders by the
 // timestamp's own jitter. The agent's clock (exact.now) bypasses this in clockFor.
@@ -378,6 +435,7 @@ let frameAt = null; // the last paced frame time: a render outside the frame loo
 let sentPeriod = 0, frameGeneration = 0, frameRaw = 0;
 function frame(now) {
   raf = null;
+  if (trapped()) return;
   if (hidden && !exact.now) return;
   const at = frameAt = pace(now);
   frameRaw = now; frameGeneration++;
@@ -398,7 +456,11 @@ function frame(now) {
   if (more && (!exact.now || liveWindow)) schedule();
 }
 
-function schedule() { if ((!hidden || exact.now) && raf === null) raf = requestAnimationFrame(frame); }
+function schedule() { if (!trapped() && (!hidden || exact.now) && raf === null) raf = requestAnimationFrame(frame); }
+// An editable element takes the keyboard from a world (its `focusin` blurs it), and the pads with it.
+const editable = target => target instanceof Element && target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])');
+// Pads go to the world whose canvas has focus, as keys do.
+padPoller(() => [...surfaces.values()].find(e => e.pads && live(e.view) === e && e.host.contains(document.activeElement) && !editable(document.activeElement)) ?? null);
 
 // Creation/binding is a hard result. Staging never publishes or attaches listeners.
 function create(entry, module, carry) {
@@ -451,15 +513,16 @@ function ensure(entry) {
   try {
     create(entry, gpu, entry.carry);
     if (!entry.restoreError && !entry.pendingRestore) delete entry.carry;
-    restorePending(entry);
+    restorePending(entry); delete entry.refused;
   } catch (error) {
-    if (entry.id) gpu.gpu_destroy(entry.id);
-    entry.id = 0;
+    if (entry.id && !trapped()) { retainEdits(entry); gpu.gpu_destroy(entry.id); }
+    entry.id = 0; entry.refused = refusal(error, "canvas");
     throw error;
   }
   attach(entry);
 }
 function restoreReply(reply) {
+  if (trapped()) return reply;
   if (exact.worldCarry !== undefined && !terminalRestoreReported) {
     const candidates = [...surfaces.values()];
     if (candidates.length && candidates.every(e => e.id && (e.attemptedCarry === exact.worldCarry || JSON.parse(gpu.gpu_agent(e.id, '{"op":"state"}') || "null")?.world === undefined))
@@ -523,9 +586,12 @@ function listen(entry) {
     if (recoveringDevice) recoveringDevice.then(deliver); else deliver();
   };
   const controls = entry.controls ??= new Map(), controlKeys = entry.controlKeys ??= new Map();
+  // The pads this world was last sent (gpu-pads.js); a blur forgets them, so a pad still held reports again.
+  entry.pads = new Map();
+  entry.sendPad = value => send({ timeStamp: performance.now() }, value);
   const control = target => {
     const node = target instanceof Element ? target.closest('button[data-action]') : null;
-    return node && node.closest('[data-gpu-input]') === el && node.getAttribute('data-action') && !node.disabled && !node.hidden && !node.closest('[hidden], [inert]') && !node.closest('[inert]') ? node : null;
+    return node && node.closest('[data-gpu-input]') === el && node.getAttribute('data-action') && !node.disabled && !node.hidden && !node.closest('[hidden]') && !inertAncestor(node) ? node : null;
   };
   const binding = node => { const r = node.getBoundingClientRect(); return {node, name:node.getAttribute("data-action"), left:r.left, top:r.top}; };
   const sendControl = (event, owner, phase, id, x = 0, y = 0) => send(event, {t:"control", name:owner.name, phase, id, x, y});
@@ -608,16 +674,16 @@ function listen(entry) {
     delete entry.restoredCarry;
   };
   entry.resampleHeld();
-  const editable = target => target instanceof Element && target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])');
   const blur = event => {
     entry.resampleHeld();
     for (const [id, owner] of controls) sendControl(event, owner, "cancel", id);
     for (const [code, owner] of controlKeys) sendControl(event, owner, "cancel", code === "Space" ? 4294967294 : 4294967293);
-    held.clear(); controls.clear(); controlKeys.clear(); send(event, { t: "blur" });
+    held.clear(); controls.clear(); controlKeys.clear(); entry.pads.clear(); send(event, { t: "blur" });
   };
   // A pointer-owned control may coexist with a focused editor outside this canvas.
   const pressedKey = (event, down) => {
-    if (event.defaultPrevented || event.isComposing || event.metaKey || event.ctrlKey || !["Space", "Enter", "NumpadEnter"].includes(event.code)) return;
+    if (event.exactFlowCapture) return;
+    if (event.defaultPrevented || event.isComposing || event.keyCode === 229 || event.key === "Process" || event.metaKey || event.ctrlKey || !["Space", "Enter", "NumpadEnter"].includes(event.code)) return; // an input method's key, as input-glue.js's
     cancelRemoved(); entry.resampleHeld();
     const owner = controlKeys.get(event.code) ?? (down ? controls.values().next().value : null);
     if (!owner) return;
@@ -633,7 +699,7 @@ function listen(entry) {
   window.addEventListener("keyup", pressedUp, true);
   on("keydown", event => {
     const target = event.target instanceof Element ? event.target : null;
-    if (event.defaultPrevented || event.isComposing || event.code === "Tab" || editable(target)) return;
+    if (event.defaultPrevented || event.isComposing || event.keyCode === 229 || event.key === "Process" || event.code === "Tab" || editable(target)) return;
     // The focused game's own canvas owns Ctrl/Meta chords (RTS control groups).
     // An editor or ordinary HUD control keeps its browser shortcuts.
     if (event.metaKey || event.ctrlKey) {
@@ -663,8 +729,9 @@ function listen(entry) {
   });
   const inactive = event => blur(event);
   window.addEventListener("blur", inactive);
-  // Assistive technology activates a button without a pointer/key sequence.
-  on("click", event => { const button = control(event.target); if (button && event.detail === 0 && !controlKeys.size) { sendControl(event, binding(button), "down", 4294967292); sendControl(event, binding(button), "up", 4294967292); } });
+  // Assistive technology, and a declared shortcut (input-glue.js), activate a button without a pointer/key sequence;
+  // heard in the capture phase, as a button's own `press` stops the click's propagation (navigation.js): both run.
+  on("click", event => { const button = control(event.target); if (button && event.detail === 0 && !controlKeys.size) { sendControl(event, binding(button), "down", 4294967292); sendControl(event, binding(button), "up", 4294967292); } }, true);
   on("focusin", event => { if (editable(event.target)) blur(event); });
   on("focusout", event => {
     if (controls.size || el.contains(event.relatedTarget)) return;
@@ -689,13 +756,18 @@ function agent(view, request) {
   const entry = live(view);
   if (!entry) return null;
   const { w, h, s } = size(entry.host);
-  const reply = gpu.gpu_agent(entry.id, JSON.stringify({ ...request, ...(exact.now ? { now: exact.now() } : {}), width: w, height: h, scale: s }));
+  if (trapped()) return trapped();
+  let reply;
+  try { reply = gpu.gpu_agent(entry.id, JSON.stringify({ ...request, ...(exact.now ? { now: exact.now() } : {}), width: w, height: h, scale: s })); }
+  catch (error) { return retainTrap(error); }
   messages(entry);
   schedule();
   if (!reply) return null;
   try {
     const value = JSON.parse(reply);
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("world reply must be an object");
+    if (request.op === "state" && Array.isArray(value.entities)) { editsAdmitted ||= value.developmentEdits === true; value.sessionDevelopmentEdits = editsAdmitted; }
+    if (value.world) { editsAdmitted ||= value.world.developmentEdits === true; value.world.sessionDevelopmentEdits = editsAdmitted; }
     if (request.op === "state" && value.world && entry.restoreError) value.world.restoreError = entry.restoreError;
     return value;
   } catch (error) { console.error(`exact gpu: view ${view}:`, error); return null; }
@@ -751,18 +823,34 @@ const api = {
     messages(entry);schedule();
   },
   // postMessage(id, text) from Contract: one input event, stamped at the call,
-  // delivered in order; held until the canvas's surface exists.
+  // delivered in order; held until the canvas's surface exists. The refusal, or null.
   post(name, text, at) {
     const queued = posts.get(name) ?? posts.set(name, []).get(name);
-    if (queued.length >= (exact.postBound ?? 64)) { console.warn(`exact: postMessage: dropped: ${exact.postBound ?? 64} posts already wait for surface "${name}"`); return; }
+    if (queued.length >= (exact.postBound ?? 64)) { const refused = `postMessage: dropped: ${exact.postBound ?? 64} posts already wait for surface "${name}"`; console.warn(`exact: ${refused}`); return refused; }
     queued.push(JSON.stringify({ t: "message", text, at }));
     deliverPosts(name);
+    return null;
   },
+  // The agent's substitute's sensor samples (LLP 1133.013 D6), a frame's at a
+  // time, on the path posts take: `[{surface, event}]`, each event input JSON.
+  sensors(events) {
+    for (const { surface, event } of events) { const queued = posts.get(surface) ?? posts.set(surface, []).get(surface); if (queued.length < 1024) queued.push(event); } // a world's queue holds 1,024
+    for (const name of new Set(events.map(e => e.surface))) deliverPosts(name);
+  },
+  // The driver's `post` (LLP 1139.004 D1): a canvas's surface name, the page's
+  // one world's, and whether posts to a name still wait for its canvas.
+  surfaceOf: (view) => surfaces.get(view)?.name,
+  liveSurface() {
+    const names = [...new Set([...surfaces.values()].filter(e => !e.terminal && exact.views.get(e.view) === e.host).map(e => e.name))]; // a canvas on the page, its world live or loading
+    return names.length === 1 ? names[0] : names.length ? {error:`post: ${names.length} worlds are live (${names.join(", ")}); name one: post <surface> <text>`} : undefined;
+  },
+  waiting: (name) => posts.has(name),
   wantsInput: (view) => live(view)?.wantsInput === true,
   answers: (request) => request.entity !== undefined || request.world === true || request.contact !== undefined,
   handle(request, ask, tagged) {
+    if (trapped()) return trapped();
     const entry = live(request.id);
-    if (!entry) return { error: `view ${request.id} has no world` };
+    if (!entry) return surfaces.get(request.id)?.refused ?? surfaces.get(request.id)?.unsupported ?? refusal(`view ${request.id} has no world`, "canvas");
     if (request.op === "tap" && request.contact !== undefined) {
       entry.resampleHeld?.();
       const owner = entry.controls?.get(request.contact);
@@ -772,16 +860,22 @@ const api = {
       messages(entry); schedule();
       return ok ? tagged({phase:request.phase, delivery:"recognized"}) : {error:gpu.gpu_error()};
     }
+    // The agent's pad (LLP 1127.003 D3): the world queues it as a host's pad event.
+    if ((request.op === "type" && /^Gamepad/.test(request.key ?? "")) || (request.op === "tap" && request.stick !== undefined)) {
+      if (!entry.wantsInput) return { error: `view ${request.id}'s surface does not take input` };
+      const reply = agent(request.id, request) ?? { error: `view ${request.id} has no world` };
+      return reply.error ? reply : tagged(reply);
+    }
     if (request.op === "focus") {
       if (!entry.wantsInput) return { error: `view ${request.id}'s surface does not take input` };
       entry.host.focus({ preventScroll: true }); return tagged({ ok: document.activeElement === entry.host });
     }
     if (request.op === "screenshot" && request.form === "save") {
       let bytes;
-      try { bytes = gpu.gpu_carry(entry.id); } catch (error) { return {error: `save refused: ${error}`}; }
+      try { bytes = gpu.gpu_carry(entry.id); } catch (error) { return refusal(`save refused: ${error}`, "assets"); }
       if (bytes === undefined) {
         const state = agent(request.id, {op:"state"})?.world;
-        return {error: state?.assets?.length ? `save refused: ${JSON.stringify(state.assets)}` : `canvas ${entry.name} carries no state`, assets:state?.assets};
+        return {...refusal(state?.assets?.length ? `save refused: ${JSON.stringify(state.assets)}` : `canvas ${entry.name} carries no state`, "assets"), assets:state?.assets};
       }
       worldSize(bytes);
       const state = agent(request.id, { op: "state" });
@@ -789,6 +883,15 @@ const api = {
       for (let i = 0; i < bytes.length; i += 8192) encoded += String.fromCharCode(...bytes.subarray(i, i + 8192));
       return tagged({ data: btoa(encoded), bytes: bytes.length, hash: state?.world?.hash, tick: state?.tick });
     }
+    // A look frame (LLP 1127.000) reads back on the page's next turn: the module
+    // answers `pending` until its maps land, and this waits, up to 5 s.
+    if ((request.op === "screenshot" && request.form === "look") || (request.op === "state" && (request.look || request.draws || request.visible))) return recoveringDevice || recoveryTimer ? { unavailable: "no picture while the device recovers" } : (async () => {
+      for (const end = performance.now() + 5000; performance.now() < end; await new Promise((r) => setTimeout(r, 4))) {
+        const reply = agent(request.id, request);
+        if (reply?.pending !== "readback") return reply ? tagged(reply) : { error: `view ${request.id} has no world` };
+      }
+      return { error: "look frame: the readback did not land in 5 s" };
+    })();
     if (!["layout", "state", "tree"].includes(request.op)) return { error: `world does not answer ${request.op}` };
     if (request.op === "layout" && request.entity === undefined) {
       const r = entry.host.getBoundingClientRect();
@@ -800,27 +903,35 @@ const api = {
     return restoreReply(tagged(reply));
   },
   decorate(request, reply) {
+    if (trapped() && request.op !== "logs") return trapped();
     if (reply?.then) return reply.then((r) => api.decorate(request, r));
     if (!reply || reply.error) return reply;
+    if (request.op !== "logs") { const failed = [...surfaces.values()].find(e => e.refused); if (failed) return failed.refused; }
     if (api.answers(request)) return restoreReply(reply);
     if (request.op === "tree") for (const node of reply.nodes ?? []) {
+      const page = surfaces.get(node.id)?.refusalPage;
+      if (page) node.status = page.text; // the refusal page's role=status (LLP 1139.003 D1)
       const summary = agent(node.id, { op: "tree", summary: true });
       if (summary?.world) node.world = summary.world;
     }
     if (request.op === "state") {
-      const world = worlds({ op: "state" });
+      const world = worlds({ op: "state", trace_export: request.trace_export === true });
+      reply.sessionDevelopmentEdits ||= editsAdmitted;
       if (world.length) reply.world = [...(reply.world ?? []), ...world]; // another artifact's worlds too
     }
     if (request.op === "logs") {
       const world = [];
+      if (trapped()) world.push({lines:[trapped().refused.message], refused:trapped().refused});
       for (const [canvas, entry] of surfaces) {
-        const journal = agent(canvas, { op: "logs", since: entry.logCursor });
+        const since = request.all ? 0 : entry.logCursor;
+        const journal = agent(canvas, { op: "logs", since });
         if (!journal || journal.error || !Array.isArray(journal.lines)) continue;
         const { from, next, lines } = journal;
-        world.push({ canvas, from, next, lines, dropped: Math.max(0, from - entry.logCursor) });
+        world.push({ canvas, from, next, lines, dropped: Math.max(0, from - since) });
         entry.logCursor = next;
       }
       for (const {canvas, error} of restoreJournal.splice(0)) world.push({canvas, lines:[error]});
+      reply.sessionDevelopmentEdits ||= editsAdmitted;
       if (world.length) reply.world = [...(reply.world ?? []), ...world]; // another artifact's worlds too
     }
     return restoreReply(reply);
@@ -872,8 +983,8 @@ const api = {
   },
   destroy(view) {
     const entry = surfaces.get(view);
-    if (entry) { cancelAssets(entry); for (const row of entry.children ?? []) restoreChild(row); }
-    if (entry?.id) gpu.gpu_destroy(entry.id);
+    if (entry) { cancelAssets(entry); for (const row of entry.children ?? []) restoreChild(row); entry.refusalPage?.remove(); }
+    if (entry?.id) { retainEdits(entry); gpu.gpu_destroy(entry.id); }
     // The observer would fire once more as the element leaves the page, for
     // a surface the module no longer has (found by the agent smoke, which
     // is the first thing to navigate away from a canvas and back).
@@ -895,6 +1006,23 @@ const api = {
     for (const view of [...surfaces.keys()]) this.destroy(view);
   },
   finishRestart() { planCarries.clear(); },
+  // A validated asset generation can reach existing surfaces without replacing their worlds.
+  async reloadAssets(cards, names, current = () => true) {
+    await ready;
+    return exact.mutate(() => {
+      if (!current()) return false;
+      for (const name of names) if (!name.startsWith('assets/') || (!cards.get(name)?.bytes || cards.get(name).bytes.length > 64 * 1024 * 1024)) throw new Error(`missing surface asset ${name}`);
+      for (const entry of surfaces.values()) if (entry.id && !entry.terminal) {
+        for (const name of names) {
+          cancelAssets(entry, new Set([name.slice(7)]));
+          if (!gpu.gpu_asset(entry.id, name.slice(7), cards.get(name).bytes)) throw new Error(gpu.gpu_error());
+        }
+        messages(entry);
+      }
+      for (const name of names) exact.devAssets?.set(name, cards.get(name));
+      schedule(); return true;
+    });
+  },
   // Dev only; callers serialize versions. Agent pages never receive automatic swaps.
   swap(version) { return exact.mutate(() => swap(version)); },
   /// A shader's text (LLP 1030 D8) — the dev loop's edit, or the first
@@ -946,11 +1074,26 @@ const api = {
     schedule();
     return worlds;
   },
+  /// The agent's `prefer gpu-tier` (LLP 1139.003 D2): each canvas's renderer
+  /// is made again at the new tier's rung, on the same device, under the same
+  /// world and surface; a rung is otherwise read once, when a renderer is made.
+  retier(tier) {
+    tierCode = Math.max(0, TIERS.indexOf(tier));
+    if (!loaded || terminalDevice || trapped()) return;
+    gpu.gpu_tier?.(tierCode);
+    gpu.gpu_retier?.();
+    for (const entry of surfaces.values()) if (entry.id && !entry.terminal) entry.wants = true;
+    schedule();
+  },
   /// Time moved (the agent's `clock`): render what wants a frame, once.
   schedule() { for (const entry of surfaces.values()) if (entry.id && !entry.terminal && entry.wants) { entry.wants = false; gpu.gpu_bind_at(entry.id, JSON.stringify(entry.values), exact.now?.()); } schedule(); },
 };
 // Standalone, the one module is `exact.gpu`. Routed, the router hands this
 // instance the surfaces queued for its artifact before its script arrived.
+for (const key of ["handle", "decorate", "advance", "clock"]) {
+  const call = api[key]; if (!call) continue;
+  api[key] = (...args) => { try { return call(...args); } catch (error) { return retainTrap(error); } };
+}
 if (artifact === null) exact.gpu = api; else exact.gpu.register(stem, api);
 
 function shaderRows(assets, module = gpu) {
@@ -992,9 +1135,10 @@ async function swap(version) {
   await ready;
   await recoveringDevice;
   if (loaded && version === api.version) return { ms: 0, errors: [] };
-  const start = performance.now(), next = await loadModule(version), staged = [];
+  const start = performance.now(), next = guardedModule(await loadModule(version)), staged = [];
   const carrier = { worldCarry: exact.worldCarry };
   try {
+    next.gpu_tier?.(tierCode);
     await next.gpu_load();
     if (exact.now) next.gpu_seekable(true);
     if (sentPeriod) next.gpu_period(sentPeriod);
@@ -1018,8 +1162,11 @@ async function swap(version) {
     }
     if (!next.gpu_flush()) throw new Error(`surfaces: flush: ${next.gpu_error()}`);
   } catch (error) {
-    for (const [,entry] of staged) if (entry.id) next.gpu_destroy(entry.id);
-    next.gpu_unload(); exact.devError?.(String(error)); throw error;
+    if (!trapped(next)) {
+      try { for (const [,entry] of staged) if (entry.id) { retainEdits(entry, next); next.gpu_destroy(entry.id); } if (!trapped(next)) next.gpu_unload(); }
+      catch (cleanup) { console.error(cleanup); }
+    }
+    exact.devError?.(String(error)); throw error;
   }
   if (raf !== null) { cancelAnimationFrame(raf); raf = null; }
   const oldModule = gpu;
@@ -1027,7 +1174,7 @@ async function swap(version) {
     installCanvas(old, entry);
     if (publishers.get(old.name) === old) publishers.set(old.name, entry);
     surfaces.set(entry.view, entry);
-    if (old.id) oldModule.gpu_destroy(old.id);
+    if (old.id) { retainEdits(old, oldModule); oldModule.gpu_destroy(old.id); }
   }
   oldModule?.gpu_unload(); gpu = next; loaded = true; resetRecovery();
   for (const [old, entry] of staged) {
@@ -1046,14 +1193,17 @@ async function swap(version) {
 const t0 = performance.now();
 try {
   const version = (stem === "gpu" ? exact.gpuVersion : exact.gpuVersions?.[stem]) ?? 0;
-  gpu = await loadModule(version);
+  // The tier is chosen before the device is made, from the adapter's facts (LLP 1139.003 D2).
+  tierCode = Math.max(0, TIERS.indexOf(await chooseTier(exact.pageFacts)));
+  gpu = guardedModule(await loadModule(version));
+  gpu.gpu_tier?.(tierCode);
   await gpu.gpu_load();
   if (exact.now) gpu.gpu_seekable(true);
   replaceShaders(await loadShaders(gpu));
   api.version = version;
   loaded = true;
 } catch (error) {
-  gpu?.gpu_unload(); gpu = undefined;
+  if (!trapped()) gpu?.gpu_unload(); gpu = undefined;
   const failure = failureOutcome(error);
   terminalRecovery({...failure, status:"no device"});
   reportRecovery(Object.assign(new Error(failure.error), {code:failure.code}), true);

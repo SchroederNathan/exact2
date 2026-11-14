@@ -1,7 +1,8 @@
+import { viewChildren, inertAncestor } from './navigation.js';
 import { carryRouter, clock, launchLocation, res, sig } from './rt.js';
 import { offerAll } from './focus.js';
 
-// A render's checkpoint answers (LLP 1048.000 D4), as
+// A render's checkpoint answers (LLP 1048.000 D6), as
 // `exact_web::document::checkpoint` writes them: JSON text, one
 // `[name, source, [args…], value]` per answer the document used, each value
 // typed as `push_value` (host/web/src/page.rs) spells it — a list an array,
@@ -74,9 +75,9 @@ export function prepareDev() {
     if (!cp.focus) return;
     // A virtualized row wrapper is a logical View in the wasm tree even
     // though it is host-created and has no plan-node carry attribute.
-    const children = e => [...(e?.children ?? [])].filter(x => x.hasAttribute('data-carry-type') || x.hasAttribute('data-listitemkey'));
+    const children = e => viewChildren(e).filter(x => x.hasAttribute('data-carry-type') || x.hasAttribute('data-listitemkey'));
     let el = document.getElementById('exact-root');
     for (const at of cp.focus.path) el = children(el)[at];
-    if (el?.getAttribute('data-carry-type') === cp.focus.type && el.getClientRects().length && !el.matches(':disabled') && !el.closest('[inert]')) focus.call(el, { preventScroll: true });
+    if (el?.getAttribute('data-carry-type') === cp.focus.type && el.getClientRects().length && !el.matches(':disabled') && !inertAncestor(el)) focus.call(el, { preventScroll: true });
   };
 }

@@ -18,12 +18,19 @@
 #![deny(missing_docs)]
 
 mod actions;
+mod activities;
+pub use activities::option_type as activity_option_type;
 mod bounds;
 mod calls;
 mod checks;
 mod component;
+mod decorations;
+mod each;
 mod enums;
 mod failure;
+mod frame;
+mod frame_commands;
+mod frames;
 mod geometry;
 mod injects;
 mod lists;
@@ -37,9 +44,10 @@ mod posts;
 pub mod records;
 pub mod routes;
 mod selection;
+mod shadows;
 mod tasks;
 pub use bounds::MAX_TYPE_DEPTH;
-pub use payload::handler_arity_message;
+pub use payload::{handler_arity_message, handler_parameters, handler_signature};
 pub use selection::event_record;
 /// The strings call and the tables it is checked against (LLP 1060).
 pub mod strings;
@@ -48,6 +56,7 @@ mod uses;
 use checks::check_shape_cycles;
 use contract_syntax::{BinOp, Component, Expr, File, Span, TemplatePart, TypeExpr, UnOp};
 use exact_plan::Stdlib;
+use frame::Frame;
 use injects::check_injects;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -166,6 +175,9 @@ impl Ty {
                 self,
                 Ty::Number | Ty::String | Ty::Enum(_) | Ty::Bool | Ty::List(_)
             ),
+            "list<number>" => {
+                matches!(self, Ty::List(t) if matches!(**t, Ty::Number | Ty::Unknown))
+            }
             _ => *self == Self::from_roster(spec) && *self != Ty::Unknown,
         }
     }
@@ -175,39 +187,14 @@ impl Ty {
             "number" => Ty::Number,
             "string" => Ty::String,
             "bool" => Ty::Bool,
-            "Router" | "Entry" | "Geometry" => Ty::Record(spec.into()),
+            "Router" | "Entry" | "Geometry" | "SharedFiles" => Ty::Record(spec.into()),
             "list<Entry>" => Ty::List(Box::new(Ty::Record("Entry".into()))),
             "list<string>" => Ty::List(Box::new(Ty::String)),
+            "list<number>" => Ty::List(Box::new(Ty::Number)),
             "option<string>" => Ty::Option(Box::new(Ty::String)),
             "option<number>" => Ty::Option(Box::new(Ty::Number)),
             _ => Ty::Unknown,
         }
-    }
-}
-
-/// Whether a roster parameter admits `t`. The roster table spells three
-/// parameters `any`; each is held to the values its runner entry reads, so a
-/// call that would fail at runtime (`length(5)`) is refused here instead.
-fn roster_accepts(f: Stdlib, spec: &str, t: &Ty) -> bool {
-    match (f, spec) {
-        (Stdlib::Length | Stdlib::IsEmpty, "any") => {
-            matches!(t, Ty::String | Ty::Enum(_) | Ty::List(_))
-        }
-        (Stdlib::ToString, "any") => matches!(t, Ty::Number | Ty::String | Ty::Enum(_) | Ty::Bool),
-        (Stdlib::First | Stdlib::At, "any") => matches!(t, Ty::List(_)),
-        _ => t.matches_roster(spec),
-    }
-}
-
-/// A roster parameter as a refusal spells it.
-fn roster_spelling(f: Stdlib, spec: &str) -> &str {
-    match (f, spec) {
-        (Stdlib::Length | Stdlib::IsEmpty, "any") => "string | list",
-        (Stdlib::ToString, "any") => "number | string | bool",
-        (Stdlib::First | Stdlib::At, "any") => "list",
-        // The ISO 4217 codes `"currency"` takes (LLP 1116 D8), too many to spell here.
-        (Stdlib::FormatNumber, code) if code.starts_with("\"USD\"") => "\"USD\" | \"EUR\" | …",
-        _ => spec,
     }
 }
 
@@ -306,6 +293,9 @@ pub struct Shapes {
     /// Action name → the first component that declares it: a statement
     /// naming one out of its scope is told where it is (LLP 1089 D10).
     pub actions: BTreeMap<String, String>,
+    /// An action or `fn` named like a standard function → what it is and
+    /// where it is declared (`shadows`).
+    pub shadows: BTreeMap<(String, String), (&'static str, Span)>,
     /// Shape name → how deep its values can nest (LLP 1090 D2), once every
     /// shape's fields are known.
     pub depths: BTreeMap<String, u32>,
@@ -315,6 +305,11 @@ pub struct Shapes {
     /// The sounds the app declares, by path (LLP 1096 D1): a literal
     /// `playSound` source names one.
     pub sounds: std::collections::BTreeSet<String>,
+    /// The native modules' sends that answer nothing, by program-unique
+    /// name: a statement naming one sends it (LLP 1133.004 D5).
+    pub effects: std::collections::BTreeSet<String>,
+    /// Where `x.length` reads a record's field (`lists::LengthReads`).
+    pub(crate) lengths: Arc<std::sync::Mutex<lists::LengthReads>>,
 }
 
 impl Shapes {
@@ -390,13 +385,6 @@ pub enum Ref {
     Local(u32),
 }
 
-#[derive(Debug, Clone)]
-struct Frame {
-    names: Vec<(String, Ref, Ty)>,
-    /// Whether this frame is a region scope (counts toward `Item`/`Bound` depth).
-    region: bool,
-}
-
 /// A stack of scopes: component declarations at the bottom, then action
 /// parameters or region frames.
 #[derive(Debug, Clone, Default)]
@@ -405,9 +393,17 @@ pub struct Scope {
     frames: Vec<Arc<Frame>>,
     // Inside an action's body, where geometry reads are allowed (LLP 1051.000 D2).
     action: bool,
+    // The component whose declarations are the bottom frame; empty for a
+    // scope of values alone.
+    component: Arc<str>,
 }
 
 impl Scope {
+    /// The component this scope belongs to, for a refusal that names it.
+    pub fn component(&self) -> &str {
+        &self.component
+    }
+
     /// Mark this scope as an action's body: geometry reads are allowed here
     /// and nowhere else (LLP 1051.000 D2).
     pub fn enter_action(&mut self) {
@@ -426,28 +422,20 @@ impl Scope {
 
     /// Push a non-region frame (component declarations, action parameters).
     pub fn push(&mut self, names: Vec<(String, Ref, Ty)>) {
-        self.frames.push(Arc::new(Frame {
-            names,
-            region: false,
-        }));
+        self.frames.push(Arc::new(Frame::new(names, false)));
     }
 
     /// Push a region frame binding at most one name (`for` item or `match` binding).
     pub fn push_region(&mut self, name: Option<(String, Ref, Ty)>) {
-        self.frames.push(Arc::new(Frame {
-            names: name.into_iter().collect(),
-            region: true,
-        }));
+        self.frames
+            .push(Arc::new(Frame::new(name.into_iter().collect(), true)));
     }
 
     /// Push a `for` row's frame: its item, and its position when named.
     pub fn push_each(&mut self, item: &str, index: Option<&str>, ty: Ty) {
         let mut names = vec![(item.to_string(), Ref::Item(0), ty)];
         names.extend(index.map(|i| (i.to_string(), Ref::Index(0), Ty::Number)));
-        self.frames.push(Arc::new(Frame {
-            names,
-            region: true,
-        }));
+        self.frames.push(Arc::new(Frame::new(names, true)));
     }
 
     /// The one value name in scope `name` most plausibly misspells. Actions
@@ -462,6 +450,12 @@ impl Scope {
                 (!matches!(t, Ty::Action(_)) && !n.contains(['#', '@'])).then_some(n.as_str())
             });
         contract_syntax::suggestion(name, names)
+    }
+
+    /// Add a name at the end of frame `at`, copying the frame only when
+    /// another scope shares it.
+    pub(crate) fn push_name_at(&mut self, at: usize, entry: (String, Ref, Ty)) {
+        Arc::make_mut(&mut self.frames[at]).push_name(entry);
     }
 
     /// Pop the innermost frame.
@@ -479,16 +473,15 @@ impl Scope {
     pub fn lookup(&self, name: &str) -> Option<(Ref, &Ty)> {
         let mut depth = 0u32;
         for frame in self.frames.iter().rev() {
-            for (n, r, t) in &frame.names {
-                if n == name {
-                    let r = match r {
-                        Ref::Item(_) => Ref::Item(depth),
-                        Ref::Index(_) => Ref::Index(depth),
-                        Ref::Bound(_) => Ref::Bound(depth),
-                        other => *other,
-                    };
-                    return Some((r, t));
-                }
+            if let Some(i) = frame.find(name) {
+                let (_, r, t) = &frame.names[i];
+                let r = match r {
+                    Ref::Item(_) => Ref::Item(depth),
+                    Ref::Index(_) => Ref::Index(depth),
+                    Ref::Bound(_) => Ref::Bound(depth),
+                    other => *other,
+                };
+                return Some((r, t));
             }
             if frame.region {
                 depth += 1;
@@ -641,7 +634,10 @@ impl Types {
                 Ty::Action(ct.actions[i].clone()),
             ));
         }
-        let mut scope = Scope::default();
+        let mut scope = Scope {
+            component: Arc::from(c.name.as_str()),
+            ..Scope::default()
+        };
         scope.push(names);
         scope
     }
@@ -849,7 +845,8 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
                 if args.len() != params.len() {
                     return err(
                         "type-arity",
-                        checks::call_arity(name, args.len(), params),
+                        checks::call_arity(name, args.len(), params)
+                            + &shadows::note(name, None, shapes),
                         *span,
                     );
                 }
@@ -859,8 +856,9 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
                         return err(
                             "type-argument",
                             format!(
-                                "{} expects `{want}`, given `{t}`",
-                                contract_syntax::idioms::argument(name, i)
+                                "{} expects `{want}`, given `{t}`{}",
+                                contract_syntax::idioms::argument(name, i),
+                                shadows::note(name, None, shapes)
                             ),
                             arg.span(),
                         );
@@ -874,29 +872,7 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
                 .lookup(name)
                 .filter(|_| !routes::value_call(name, args, scope, shapes))
             {
-                // A curried action reference: `action(args)` binds the leading parameters.
-                if args.len() > params.len() && !params.is_empty() {
-                    return err(
-                        "type-arity",
-                        format!(
-                            "`{name}` takes at most {} argument(s), given {}",
-                            params.len(),
-                            args.len()
-                        ),
-                        *span,
-                    );
-                }
-                for (arg, pt) in args.iter().zip(params.iter()) {
-                    let t = infer(arg, scope, shapes)?;
-                    if !checks::accepts_expr(pt, arg, &t, scope, shapes) {
-                        return err(
-                            "type-argument",
-                            format!("`{name}` expects `{pt}`, given `{t}`"),
-                            arg.span(),
-                        );
-                    }
-                }
-                Ty::Action(params.iter().skip(args.len()).cloned().collect())
+                component::action_call(name, params, args, *span, scope, shapes)?
             } else if let Some(f) = Stdlib::from_name(name).filter(|f| lists::is_list_op(*f)) {
                 return lists::infer_call(f, args, *span, scope, shapes);
             } else if let Some(f) = Stdlib::from_name(name) {
@@ -914,7 +890,7 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
                             args.len(),
                             f.params().iter().enumerate().map(|(i, spec)| {
                                 let optional = if i >= f.min_arity() { "?" } else { "" };
-                                format!("{}{optional}", roster_spelling(f, spec))
+                                format!("{}{optional}", checks::roster_spelling(f, spec))
                             }),
                         ),
                         *span,
@@ -934,7 +910,7 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
                     }
                     let t = infer(arg, scope, shapes)?;
                     given.push(t.clone());
-                    if !roster_accepts(f, spec, &t) {
+                    if !checks::roster_accepts(f, spec, &t) {
                         // @ref LLP 1116.016 D5 — the web's `String.prototype.at`.
                         let text = if f == Stdlib::At && i == 0 && t.is_string() {
                             ": for text, `s.slice(i, i + 1)`, `\"\"` past the end"
@@ -946,13 +922,13 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
                             format!(
                                 "{} expects `{}`, given `{t}`{text}",
                                 contract_syntax::idioms::argument(name, i),
-                                roster_spelling(f, spec)
+                                checks::roster_spelling(f, spec)
                             ),
                             arg.span(),
                         );
                     }
                 }
-                routes::location(f, args, shapes)?;
+                routes::location(f, args, scope, shapes)?;
                 if f == Stdlib::FormatNumber {
                     literals::currency_code(args, *span)?;
                 }
@@ -968,6 +944,9 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
             }
         }
         Expr::Unary(op, inner, span) => {
+            if let Some(e) = calls::unquoted_token(*op, inner, scope, *span) {
+                return Err(e);
+            }
             let t = infer(inner, scope, shapes)?;
             if t == Ty::Unknown {
                 return Ok(Ty::Unknown);
@@ -1085,7 +1064,7 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
         Expr::Arrow { span, .. } => {
             return err(
                 "type-arrow-position",
-                "an arrow function is only the argument of `map` or `filter`: `xs.map((item, index) => …)`",
+                "an arrow function is only the callback of `map`, `filter` or `sortBy`: `xs.map((item, index) => …)`, `sortBy(xs, item => key)`",
                 *span,
             )
         }
@@ -1166,10 +1145,16 @@ pub fn check_declarations(file: &File) -> Result<Shapes, TypeError> {
                 .or_insert_with(|| c.name.clone());
         }
     }
+    shadows::declare(file, &mut shapes);
     shapes.sounds = file.sounds.iter().map(|s| s.source.clone()).collect();
+    shapes.effects = (file.modules.iter())
+        .filter(|m| m.kind == contract_syntax::ModuleKind::Send && m.answers.is_none())
+        .map(|m| m.name.clone())
+        .collect();
     routes::declare(file, &mut shapes)?;
     selection::declare(&mut shapes);
     geometry::declare(&mut shapes);
+    decorations::declare(&mut shapes);
     failure::declare(&mut shapes);
     for s in &file.shapes {
         if shapes.map.contains_key(&s.name) {
@@ -1372,13 +1357,11 @@ fn check_with_sites(
             expanded,
         })
     } else {
-        Err(prefer_call_sites(
-            sink.errors,
-            children,
-            file,
-            &types,
-            &expanded,
-        ))
+        let mut errors = prefer_call_sites(sink.errors, children, file, &types, &expanded);
+        for e in &mut errors {
+            records::nominal(e, &types.shapes, file);
+        }
+        Err(errors)
     }
 }
 
@@ -1387,12 +1370,18 @@ fn check_with_sites(
 fn check_children(file: &File, types: &mut Types, sink: &mut Sink) {
     // A child may own `state`, `derive`, and `action` (LLP 1017 P4c: its
     // instances' own), never a `resource`, `mutation`, or `task` — a row
-    // must not open N requests, and only the root has a clock.
+    // must not open N requests, and only the root has a clock — but it may
+    // read the device's facts, which open none (`DEVICE_FACTS`).
     for c in file.components.iter().skip(1) {
-        if !c.resources.is_empty() || !c.mutations.is_empty() || !c.tasks.is_empty() {
+        let data = c
+            .resources
+            .iter()
+            .any(|r| !contract_syntax::inline::reads_device(r));
+        if data || !c.mutations.is_empty() || !c.tasks.is_empty() {
             let span = c
                 .resources
-                .first()
+                .iter()
+                .find(|r| !contract_syntax::inline::reads_device(r))
                 .map(|r| r.span)
                 .or(c.mutations.first().map(|m| m.span))
                 .or(c.tasks.first().map(|t| t.span))
@@ -1493,3 +1482,6 @@ fn in_child(file: &File, span: Span) -> bool {
         .max_by_key(|(_, c)| c.span.line)
         .is_some_and(|(i, _)| i > 0)
 }
+
+#[cfg(test)]
+mod scope_tests;

@@ -2,11 +2,111 @@
 // on this Mac, a test class to an `xctest` process; on a simulator, the
 // `.xctestrun` xcodebuild wrote, without the Thread Performance Checker.
 import { spawn, spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { resolve } from 'node:path';
+import { plistFile } from './assets.mjs';
+import { encodePng } from '../../scripts/png.mjs';
 
 const read = (cmd, args, opts = {}) => spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...opts });
+
+/** Rebuild fixture plans with `env.EXACT_CONTRACT`; write their paths to `<prefix>_<KEY>_PLAN`.
+ * Plans embed the current schema digest. App entries need the test app's `appId` to boot. */
+export function compileFixtures(root, run, env, dir, prefix, appId) {
+  const contract = args => run(env.EXACT_CONTRACT, ['build', ...args]);
+  // A test that writes its own manifest names the app the tests link (`SheetFixture`'s `data`).
+  env[`${prefix}_TEST_APP_ID`] = appId;
+  for (const [name, key] of [['frame-health', 'FRAME_HEALTH'], ['store-refresh', 'STORE_REFRESH'], ['headless', 'HEADLESS'], ['headless-markdown', 'HEADLESS_MARKDOWN'], ['headless-hidden-markdown', 'HEADLESS_HIDDEN_MARKDOWN'], ['headless-live', 'HEADLESS_LIVE'], ['headless-back', 'HEADLESS_BACK'], ['native-navigation-scroll', 'NATIVE_SCROLL'], ['intersect', 'INTERSECT'], ['native-buttons', 'BUTTONS'], ['keyboard-form', 'KEYBOARD'], ['tab-edge', 'TAB_EDGE'], ['repaint', 'REPAINT'], ['still-title', 'STILL_TITLE'], ['navigation-bars', 'NAVIGATION_BARS'], ['large-title', 'LARGE_TITLE'], ['transparent-bar', 'TRANSPARENT_BAR'], ['bar-band', 'BAR_BAND'], ['pad-bar', 'PAD_BAR'], ['pushed-title', 'PUSHED_TITLE'], ['inline-frame', 'INLINE_FRAME'], ['fieldless', 'FIELDLESS'], ['web-documents', 'WEB_DOCUMENTS'], ['iframe-post-messages', 'IFRAME_POST_MESSAGES'], ['iframe-partition', 'IFRAME_PARTITION'], ['iframe-windows', 'IFRAME_WINDOWS'], ['iframe-pdf', 'IFRAME_PDF'], ['iframe-resident-popover', 'IFRAME_RESIDENT_POPOVER'], ['tab-owner', 'TAB_OWNER'], ['grouped-list-reveal', 'GROUPED_REVEAL'], ['due-now', 'DUE_NOW'], ['caret-reveal', 'CARET_REVEAL'], ['cover-scroll', 'COVER_SCROLL'], ['page-edges', 'PAGE_EDGES'], ['barless-route', 'BARLESS_ROUTE'], ['page-edges-grouped', 'PAGE_EDGES_GROUPED'], ['control-bars', 'CONTROL_BARS'], ['search-scope', 'SEARCH_SCOPE'], ['held-tab', 'HELD_TAB'], ['pull-refresh', 'PULL_REFRESH'], ['edge-effect', 'EDGE_EFFECT'], ['sticky-bar', 'STICKY_BAR'], ['glass-press', 'GLASS_PRESS'], ['surface-pairs', 'SURFACE_PAIRS'], ['prevent-focus', 'PREVENT_FOCUS'], ['accent-bars', 'ACCENT_BARS'], ['accent-tabs', 'ACCENT_TABS']]) {
+    contract([resolve(root, `scripts/fixtures/${name}.contract`), '-o', env[`${prefix}_${key}_PLAN`] = resolve(dir, `${name}.plan`)]);
+  }
+  contract([resolve(root, 'host/apple/tests/fixtures/sticky-transition.contract'), '-o', env[`${prefix}_STICKY_TRANSITION_PLAN`] = resolve(dir, 'sticky-transition.plan')]);
+  // HeldStateTests' own (a card that presses over a flat leaf), beside them.
+  contract([resolve(root, 'host/apple/tests/fixtures/held-state.contract'), '-o', env[`${prefix}_HELD_STATE_PLAN`] = resolve(dir, 'held-state.plan')]);
+  // AgentStickyReveal{Mac,IOS}Tests': rows under a sticky header and dock.
+  contract([resolve(root, 'host/apple/tests/fixtures/sticky-tap.contract'), '-o', env[`${prefix}_STICKY_TAP_PLAN`] = resolve(dir, 'sticky-tap.plan')]);
+  // RestartListIOSTests': a restart over a route whose bar covers a virtualized list.
+  contract([resolve(root, 'host/apple/tests/fixtures/restart-list.contract'), '-o', env[`${prefix}_RESTART_LIST_PLAN`] = resolve(dir, 'restart-list.plan')]);
+  // NavigationTabsIOSTests': the selected tab tapped again over a list its press asks a row of.
+  contract([resolve(root, 'host/apple/tests/fixtures/tab-top-request.contract'), '-o', env[`${prefix}_TAB_TOP_REQUEST_PLAN`] = resolve(dir, 'tab-top-request.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/feedback-race.contract'), '-o', env[`${prefix}_FEEDBACK_RACE_PLAN`] = resolve(dir, 'feedback-race.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/async-advance.contract'), '-o', env[`${prefix}_ASYNC_ADVANCE_PLAN`] = resolve(dir, 'async-advance.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/timer-admission.contract'), '-o', env[`${prefix}_TIMER_ADMISSION_PLAN`] = resolve(dir, 'timer-admission.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/reset-gate.contract'), '-o', env[`${prefix}_RESET_GATE_PLAN`] = resolve(dir, 'reset-gate.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/reset-gate-admission.contract'), '-o', env[`${prefix}_RESET_GATE_ADMISSION_PLAN`] = resolve(dir, 'reset-gate-admission.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/native-retry.contract'), '-o', env[`${prefix}_NATIVE_RETRY_PLAN`] = resolve(dir, 'native-retry.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/dimmed-pixels.contract'), '-o', env[`${prefix}_DIMMED_PIXELS_PLAN`] = resolve(dir, 'dimmed-pixels.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/glass-title.contract'), '-o', env[`${prefix}_GLASS_TITLE_PLAN`] = resolve(dir, 'glass-title.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/reset-hold.contract'), '-o', env[`${prefix}_RESET_HOLD_PLAN`] = resolve(dir, 'reset-hold.plan')]);
+  // NavigationBarIOSTests': a header whose controls share and add a control.
+  contract([resolve(root, 'host/apple/tests/fixtures/bar-share.contract'), '-o', env[`${prefix}_BAR_SHARE_PLAN`] = resolve(dir, 'bar-share.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/dialog-sheet-reads.contract'), '-o', env[`${prefix}_DIALOG_SHEET_READS_PLAN`] = resolve(dir, 'dialog-sheet-reads.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/progress-contexts.contract'), '-o', env[`${prefix}_PROGRESS_CONTEXTS_PLAN`] = resolve(dir, 'progress-contexts.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/agent-unmounted.contract'), '-o', env[`${prefix}_AGENT_UNMOUNTED_PLAN`] = resolve(dir, 'agent-unmounted.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/fractional-borders.contract'), '-o', env[`${prefix}_FRACTIONAL_BORDERS_PLAN`] = resolve(dir, 'fractional-borders.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/top-layer-pins.contract'), '-o', env[`${prefix}_TOP_LAYER_PINS_PLAN`] = resolve(dir, 'top-layer-pins.plan')]);
+  // PositionAreaRegionIOSTests' pages: Chrome's position-area table, and mirrored.
+  contract([resolve(root, 'host/apple/tests/fixtures/position-area-region.contract'), '-o', env[`${prefix}_POSITION_AREA_PLAN`] = resolve(dir, 'position-area-region.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/position-area-region-rtl.contract'), '-o', env[`${prefix}_POSITION_AREA_RTL_PLAN`] = resolve(dir, 'position-area-region-rtl.plan')]);
+  const question = 'host/apple/tests/ExactKitTests/SnapshotFixtures/open-question';
+  const refusing = resolve(dir, 'entries/refusing');
+  mkdirSync(refusing, { recursive: true });
+  writeFileSync(resolve(refusing, 'app.contract'), 'shape Props\n  title: string\ncomponent App\n  view\n    text "App"\ncomponent Card\n  props\n    title: string\n  view\n    text title\n');
+  writeFileSync(resolve(refusing, 'app.json'), JSON.stringify({ name: 'Refusing refresh', app: { id: appId, name: 'Refusing refresh' }, widgets: [{ kind: 'refusing', families: ['systemSmall'], component: 'Card', props: 'Props', refresh: 'nextTrains', preview: { title: 'Preview' } }] }));
+  // Caltrain's nextTrains answers a different Props shape: the refresh must refuse.
+  contract([resolve(refusing, 'app.contract'), '--entry', 'refusing', '-o', env[`${prefix}_SNAPSHOT_REFUSING_PLAN`] = resolve(dir, 'refusing.plan')]);
+  // An activity whose Lock Screen placement has a background and a link (ActivityDriverTests: the tint, the URL).
+  const tinted = resolve(dir, 'entries/tinted');
+  mkdirSync(tinted, { recursive: true });
+  writeFileSync(resolve(tinted, 'app.contract'), 'shape TintedState\n  title: string\ncomponent App\n  view\n    text "App"\ncomponent Tinted\n  props\n    title: string\n  view\n    view slot="lockScreen" background-color="#1e3a5f" padding=8\n      link href="/alerts" display="block"\n        text title color="#ffffff"\n    view slot="compactLeading"\n      text "T"\n    view slot="compactTrailing"\n      text title text-align="center"\n    view slot="minimal"\n      text "T"\n    view slot="expanded"\n      view slot="leading"\n        text title\n      view slot="trailing"\n        text title width=120\n      view slot="center"\n        link href="/alerts" display="block"\n          text title\n      view slot="bottom"\n        text title\n');
+  writeFileSync(resolve(tinted, 'app.json'), JSON.stringify({ name: 'Tinted activity', app: { id: appId, name: 'Tinted activity', origin: 'https://tinted.exact.invalid' }, live_activities: [{ kind: 'tinted', component: 'Tinted', state: 'TintedState', preview: { title: 'Preview title' } }] }));
+  contract([resolve(tinted, 'app.contract'), '--entry', 'tinted', '-o', env[`${prefix}_SNAPSHOT_TINTED_PLAN`] = resolve(dir, 'tinted.plan')]);
+  // An activity whose Lock Screen root has a gradient and a colour (the colour is the tint, the gradient paints).
+  const graded = resolve(dir, 'entries/graded');
+  mkdirSync(graded, { recursive: true });
+  writeFileSync(resolve(graded, 'app.contract'), 'shape GradedState\n  title: string\ncomponent App\n  view\n    text "App"\ncomponent Graded\n  props\n    title: string\n  view\n    view slot="lockScreen" background-color="#1e3a5f" background-image="linear-gradient(to right, #ff0000, #0000ff)"\n      text title color="#ffffff"\n    view slot="compactLeading"\n      text "G"\n    view slot="compactTrailing"\n      text title\n    view slot="minimal"\n      text "G"\n    view slot="expanded"\n      view slot="leading"\n        text title\n      view slot="trailing"\n        text title\n      view slot="center"\n        text title\n      view slot="bottom"\n        text title\n');
+  writeFileSync(resolve(graded, 'app.json'), JSON.stringify({ name: 'Graded activity', app: { id: appId, name: 'Graded activity' }, live_activities: [{ kind: 'graded', component: 'Graded', state: 'GradedState', preview: { title: 'Preview title' } }] }));
+  contract([resolve(graded, 'app.contract'), '--entry', 'graded', '-o', env[`${prefix}_SNAPSHOT_GRADED_PLAN`] = resolve(dir, 'graded.plan')]);
+  // An activity exercising the sizes a region takes (ActivityDriverTests): root margins, `flex-basis: 0` beside an
+  // authored width, a `min-width` past the proposal, a percentage of the proposal, `margin: auto`, justified content,
+  // a wrapping paragraph, viewport-dependent content; and no `data-privacy` word, so the Lock Screen redacts it.
+  const sized = resolve(dir, 'entries/sized');
+  mkdirSync(sized, { recursive: true });
+  writeFileSync(resolve(sized, 'app.contract'), 'shape SizedState\n  title: string\n  long: string\nshape SizedViewport\n  width: number\n  height: number\ncomponent App\n  view\n    text "App"\ncomponent Sized\n  props\n    title: string\n    long: string\n  inject\n    snapshot_viewport: SizedViewport\n  view\n    view slot="lockScreen" margin=12\n      text title\n      text long\n    view slot="compactLeading" width=120 min-width=0 flex-basis=0\n      text title\n    view slot="compactTrailing" min-width=200\n      text title\n    view slot="minimal" width="50%"\n      text title\n    view slot="expanded"\n      view slot="leading" display="flex" flex-direction="row" justify-content="flex-end"\n        text title\n      view slot="trailing"\n        text long\n      view slot="center" margin="auto"\n        text title\n      view slot="bottom"\n        text title\n        if snapshot_viewport.width > 160\n          text long\n');
+  writeFileSync(resolve(sized, 'app.json'), JSON.stringify({ name: 'Sized activity', app: { id: appId, name: 'Sized activity' }, live_activities: [{ kind: 'sized', component: 'Sized', state: 'SizedState', preview: { title: 'Hi', long: 'A long paragraph that wraps to several lines in any Island region or Lock Screen card.' } }] }));
+  contract([resolve(sized, 'app.contract'), '--entry', 'sized', '-o', env[`${prefix}_SNAPSHOT_SIZED_PLAN`] = resolve(dir, 'sized.plan')]);
+  const edges = resolve(dir, 'entries/activity-edges');
+  mkdirSync(edges, { recursive: true });
+  cpSync(resolve(root, 'host/apple/tests/fixtures/activity-edges.contract'), resolve(edges, 'app.contract'));
+  writeFileSync(resolve(edges, 'app.json'), JSON.stringify({ app: { id: appId, name: 'Activity edges' }, live_activities: [{ kind: 'edges', component: 'Edges', state: 'EdgeState', preview: { title: 'Private account label' } }] }));
+  contract([resolve(edges, 'app.contract'), '--entry', 'edges', '-o', env[`${prefix}_SNAPSHOT_EDGES_PLAN`] = resolve(dir, 'edges.plan')]);
+  if (prefix === 'EXACT') {
+    const app = resolve(dir, 'SnapshotAssets.app'), resources = resolve(app, 'Contents/Resources');
+    const extension = resolve(app, 'Contents/PlugIns/Card.appex');
+    const catalog = resolve(dir, 'SnapshotAssets.xcassets');
+    for (const path of [resources, resolve(resources, 'assets'), resolve(extension, 'Contents/Resources'), resolve(catalog, 'WidgetInk.colorset')]) mkdirSync(path, { recursive: true });
+    for (const [bundle, id] of [[app, 'dev.exact.snapshot-assets'], [extension, 'dev.exact.snapshot-assets.widget']])
+      writeFileSync(resolve(bundle, 'Contents/Info.plist'), plistFile({ CFBundleIdentifier: id, CFBundlePackageType: bundle === app ? 'APPL' : 'XPC!', CFBundleExecutable: 'Fixture' }));
+    writeFileSync(resolve(catalog, 'Contents.json'), JSON.stringify({ info: { version: 1, author: 'xcode' } }));
+    writeFileSync(resolve(catalog, 'WidgetInk.colorset/Contents.json'), JSON.stringify({ info: { version: 1, author: 'xcode' }, colors: [{ idiom: 'universal', color: { 'color-space': 'srgb', components: { red: '1.0', green: '0.0', blue: '0.0', alpha: '1.0' } } }] }));
+    run('xcrun', ['actool', '--compile', resources, '--platform', 'macosx', '--minimum-deployment-target', '14.0', '--target-device', 'mac', catalog]);
+    writeFileSync(resolve(resources, 'assets/widget.png'), encodePng({ width: 1, height: 1, data: Buffer.from([255, 0, 0, 255]) }));
+    env.EXACT_SNAPSHOT_ASSETS_EXTENSION = extension;
+  }
+  const copies = new Map();
+  for (const [app, kind, key] of [['apps/caltrain', 'next-trains', 'SNAPSHOT_TRAINS'], ['apps/caltrain', 'departure', 'SNAPSHOT_DEPARTURE'], ['apps/caltrain', 'service-alert', 'SNAPSHOT_SERVICE_ALERT'], [question, 'question-small', 'SNAPSHOT_QUESTION_SMALL'],
+    [question, 'question-medium', 'SNAPSHOT_QUESTION_MEDIUM'], [question, 'question-rectangular', 'SNAPSHOT_QUESTION_RECTANGULAR'], [question, 'question-adaptive', 'SNAPSHOT_QUESTION_ADAPTIVE'], [question, 'gradient-card', 'SNAPSHOT_GRADIENT']]) {
+    let copy = copies.get(app);
+    if (!copy) {
+      copy = resolve(dir, 'entries', app.split('/').pop());
+      mkdirSync(copy, { recursive: true });
+      for (const file of readdirSync(resolve(root, app)).filter(f => f.endsWith('.contract'))) cpSync(resolve(root, app, file), resolve(copy, file));
+      const manifest = JSON.parse(readFileSync(resolve(root, app, 'app.json'), 'utf8'));
+      writeFileSync(resolve(copy, 'app.json'), JSON.stringify({ ...manifest, $schema: undefined, id: appId, app: { ...manifest.app, id: appId } }));
+      copies.set(app, copy);
+    }
+    contract([resolve(copy, 'app.contract'), '--entry', kind, '-o', env[`${prefix}_${key}_PLAN`] = resolve(dir, `${kind}.plan`)]);
+  }
+}
 
 /** The Swift host tests on this Mac, built under `scratch`: each test class
  *  in an `xctest` process of its own, as many at once as there are cores, so
@@ -14,22 +114,33 @@ const read = (cmd, args, opts = {}) => spawnSync(cmd, args, { encoding: 'utf8', 
  *  every process on the Mac shares (the general pasteboard, the active app,
  *  the mouse, a capture of the screen) share one process beside them, one
  *  class after another. A window's key status and first responder belong
- *  to its own process. The Canvas 2D GPU module (`canvasGpu`) is loaded only
- *  in its own tests' process: loaded, every canvas draws on the GPU. */
-export async function macTests(pkg, scratch, env, canvasGpu) {
+ *  to its own process. A class whose file opens a menu that tracks, which
+ *  it observes as `NSMenu.didBeginTrackingNotification` with
+ *  `addObserver(forName:)`, runs after all of them, alone, in a process of its
+ *  own: beside another test process its menu can close before the test reads
+ *  it, and in the shared process it reads the menu items other classes
+ *  left. The Canvas 2D GPU module (`canvasGpu`) is loaded only in its own
+ *  tests' process: loaded, every canvas draws on the GPU. `only`, when
+ *  given, names the classes to run. */
+export async function macTests(pkg, scratch, env, canvasGpu, only = null) {
   const listed = read('swift', ['test', '--skip-build', '--list-tests', '--scratch-path', scratch], { cwd: pkg, env });
   if (listed.status !== 0) throw new Error(`swift test --list-tests failed: ${listed.stderr}`);
-  const classes = [...new Set(listed.stdout.match(/^ExactKitTests\.\w+(?=\/)/gm) ?? [])];
+  const classes = chosen([...new Set(listed.stdout.match(/^ExactKitTests\.\w+(?=\/)/gm) ?? [])], only, 'macOS');
   const macWide = /NSPasteboard\.general|\bactivate\(|NSEvent\.mouseLocation|CGWindowListCreateImage/;
-  const shared = new Set();
+  const tracksMenu = /addObserver\(forName: NSMenu\.didBeginTrackingNotification/;
+  const shared = new Set(), solo = new Set();
   for (const file of readdirSync(resolve(pkg, 'tests/ExactKitTests')).filter(f => f.endsWith('.swift'))) {
     const source = readFileSync(resolve(pkg, 'tests/ExactKitTests', file), 'utf8');
-    if (macWide.test(source)) for (const [, name] of source.matchAll(/class (\w+)\s*:\s*XCTestCase/g)) shared.add(`ExactKitTests.${name}`);
+    const named = [...source.matchAll(/class (\w+)\s*:\s*XCTestCase/g)].map(([, name]) => `ExactKitTests.${name}`);
+    for (const name of named) if (tracksMenu.test(source)) solo.add(name); else if (macWide.test(source)) shared.add(name);
   }
   const gpuClass = 'ExactKitTests.Canvas2DGpuStressTests';
   shared.delete(gpuClass);
-  const groups = [classes.filter(c => shared.has(c)), ...classes.filter(c => !shared.has(c)).map(c => [c])].filter(g => g.length);
-  const bundle = resolve(read('swift', ['build', '--show-bin-path', '--scratch-path', scratch], { cwd: pkg, env }).stdout.trim(), 'ExactKitTests.xctest');
+  const groups = [classes.filter(c => shared.has(c)), ...classes.filter(c => !shared.has(c) && !solo.has(c)).map(c => [c])].filter(g => g.length);
+  const alone = classes.filter(c => solo.has(c)).map(c => [c]);
+  // SwiftPM names the test bundle after the test target up to Swift 6.2 and after the package from 6.3 on.
+  const bin = read('swift', ['build', '--show-bin-path', '--scratch-path', scratch], { cwd: pkg, env }).stdout.trim();
+  const bundle = ['ExactKitTests.xctest', 'ExactPackageTests.xctest'].map(name => resolve(bin, name)).find(existsSync) ?? resolve(bin, 'ExactKitTests.xctest');
   const failed = [];
   const one = (group) => new Promise((done) => {
     const gpu = group.includes(gpuClass) ? { EXACT_CANVAS_GPU_DYLIB: canvasGpu } : {};
@@ -48,7 +159,8 @@ export async function macTests(pkg, scratch, env, canvasGpu) {
   let next = 0;
   const taker = async () => { while (next < groups.length) await one(groups[next++]); };
   await Promise.all(Array.from({ length: Math.min(groups.length, availableParallelism()) }, taker));
-  console.log(`host/apple: ${classes.length} test classes in ${groups.length} processes, ${failed.length} failed`);
+  for (const group of alone) await one(group);
+  console.log(`host/apple: ${classes.length} test classes in ${groups.length + alone.length} processes (${alone.length} alone after the rest), ${failed.length} failed`);
   if (failed.length) throw new Error(`swift tests failed:\n  ${failed.join('\n  ')}`);
 }
 
@@ -59,8 +171,9 @@ export async function macTests(pkg, scratch, env, canvasGpu) {
  *  accessibility runtime on for that run alone. The Canvas 2D GPU module's own run apart with it
  *  loaded (`canvasGpu`): loaded, every canvas draws on the GPU, and the others read the Core
  *  Graphics path a runner without it draws. `runApple` and `run` are build.mjs's: they throw on
- *  failure, and `runApple` refuses a mixed deployment target. */
-export function iosTestRuns({ pkg, products, destination, udid, env, canvasGpu, hostSource, triple, runApple, run }) {
+ *  failure, and `runApple` refuses a mixed deployment target. `only`, when
+ *  given, names the classes to run, and a run with none of them is left out. */
+export function iosTestRuns({ pkg, products, destination, udid, env, canvasGpu, hostSource, triple, runApple, run, only = null }) {
   const bare = withoutPerformanceChecker(products), host = resolve(products, 'ExactTestHost.app');
   rmSync(host, { recursive: true, force: true });
   mkdirSync(host, { recursive: true });
@@ -72,7 +185,8 @@ export function iosTestRuns({ pkg, products, destination, udid, env, canvasGpu, 
   runApple('xcrun', ['--sdk', 'iphonesimulator', 'swiftc', '-parse-as-library', '-target', triple, hostSource, '-o', resolve(host, 'ExactTestHost')]);
   const hosted = hostedIn(products, bare, 'ExactTestHost.app');
   run('codesign', ['-s', '-', '--force', '--deep', host], { stdio: 'ignore' });
-  const hostedOnly = hostedTests(resolve(pkg, 'tests/ExactKitTests')), gpuTests = 'ExactKitTests/Canvas2DGpuStressTests';
+  const gpuTests = 'ExactKitTests/Canvas2DGpuStressTests', classes = only?.map(c => `ExactKitTests/${c}`);
+  const hostedOnly = hostedTests(resolve(pkg, 'tests/ExactKitTests')).filter(t => !classes || classes.some(c => t.startsWith(`${c}/`)));
   const testRun = (xctestrun, selection, runEnv) => {
     try {
       runApple('xcodebuild', ['test-without-building', '-xctestrun', xctestrun, '-destination', destination, '-collect-test-diagnostics', 'never',
@@ -80,19 +194,24 @@ export function iosTestRuns({ pkg, products, destination, udid, env, canvasGpu, 
       return null;
     } catch (e) { return e; }
   };
-  const bareRun = testRun(bare, [gpuTests, ...hostedOnly].map(t => `-skip-testing:${t}`), env);
+  const bareClasses = classes?.filter(c => c !== gpuTests);
+  const bareRun = bareClasses?.length === 0 ? null : testRun(bare, [...(bareClasses ?? []).map(c => `-only-testing:${c}`),
+    ...[gpuTests, ...hostedOnly].map(t => `-skip-testing:${t}`)], env);
   // UIKit loads its accessibility code only for an assistive technology or automation
   // (AgentAccessibility.axRuntimeLoaded): on for the hosted run, then as it was.
-  read('xcrun', ['simctl', 'bootstatus', udid, '-b']);
-  const ax = ['com.apple.Accessibility', 'ApplicationAccessibilityEnabled'], before = read('xcrun', ['simctl', 'spawn', udid, 'defaults', 'read', ...ax]);
   let hostedRun = null;
-  try {
-    run('xcrun', ['simctl', 'spawn', udid, 'defaults', 'write', ...ax, '-bool', 'true']);
-    hostedRun = hostedOnly.length ? testRun(hosted, hostedOnly.map(t => `-only-testing:${t}`), env) : null;
-  } finally {
-    read('xcrun', ['simctl', 'spawn', udid, 'defaults', ...(before.status === 0 ? ['write', ...ax, '-bool', before.stdout.trim() === '1' ? 'true' : 'false'] : ['delete', ...ax])]);
+  if (hostedOnly.length) {
+    read('xcrun', ['simctl', 'bootstatus', udid, '-b']);
+    const ax = ['com.apple.Accessibility', 'ApplicationAccessibilityEnabled'], before = read('xcrun', ['simctl', 'spawn', udid, 'defaults', 'read', ...ax]);
+    try {
+      run('xcrun', ['simctl', 'spawn', udid, 'defaults', 'write', ...ax, '-bool', 'true']);
+      hostedRun = testRun(hosted, hostedOnly.map(t => `-only-testing:${t}`), env);
+    } finally {
+      read('xcrun', ['simctl', 'spawn', udid, 'defaults', ...(before.status === 0 ? ['write', ...ax, '-bool', before.stdout.trim() === '1' ? 'true' : 'false'] : ['delete', ...ax])]);
+    }
   }
-  const gpuRun = testRun(bare, [`-only-testing:${gpuTests}`], { ...env, TEST_RUNNER_EXACT_CANVAS_GPU_DYLIB: canvasGpu });
+  const gpuRun = classes && !classes.includes(gpuTests) ? null
+    : testRun(bare, [`-only-testing:${gpuTests}`], { ...env, TEST_RUNNER_EXACT_CANVAS_GPU_DYLIB: canvasGpu });
   const failed = bareRun ?? hostedRun ?? gpuRun;
   if (failed) throw failed;
 }
@@ -151,6 +270,142 @@ export function hostedIn(products, xctestrun, app) {
   return hosted;
 }
 
+/** The test classes `--only` names in `args`, `FrameHealthMetricsTests,FrameHealthIOSTests`, checked
+ *  against those the files in `dir` declare for `platform`, so a misspelled class, or one the
+ *  platform compiles out, fails before the build. */
+export function onlyClasses(args, dir, platform) {
+  const value = args[args.indexOf('--only') + 1] ?? '';
+  const only = value.startsWith('-') ? [] : value.split(',').map(c => c.trim().replace(/^ExactKitTests\./, '')).filter(Boolean);
+  if (!only.length) throw new Error('--only names no test class. Name one or more, separated by commas: --only FrameHealthMetricsTests,FrameHealthIOSTests');
+  chosen(testClasses(dir, platform).map(c => `ExactKitTests.${c}`), only, platform);
+  return only;
+}
+
+/** `classes`, `ExactKitTests.<Class>`, kept to those `only` names when it is given; a name that is no
+ *  test class there fails, naming the platform. */
+function chosen(classes, only, platform) {
+  if (!only) return classes;
+  const unknown = only.filter(name => !classes.includes(`ExactKitTests.${name}`));
+  if (unknown.length) throw new Error(`--only names ${unknown.join(', ')}, which ${unknown.length === 1 ? 'is no' : 'are not'} ${platform} test class${unknown.length === 1 ? '' : 'es'} in tests/ExactKitTests. Name a test class that ${platform} compiles, as FrameHealthMetricsTests, which both platforms run; a class within #if os() runs only where that condition holds.`);
+  return only.map(name => `ExactKitTests.${name}`);
+}
+
+/** The test classes the files in `dir` declare for `platform`, 'iOS' or 'macOS', by name: a subclass
+ *  of `XCTestCase`, of a fixture or of another test class, outside any `#if` branch that rules the
+ *  platform out by `os()` or `canImport(UIKit|AppKit)`. A condition that names anything else is taken
+ *  to hold either way. */
+export function testClasses(dir, platform) {
+  return declarations(dir, platform).tests;
+}
+
+/** The test classes of `platform` that a change to `files` (names in `dir`) can reach, to run
+ *  alone (`--only`): those the files declare or extend, the classes of each file that names one
+ *  reached (a subclass, an extension, a use of a member), and those derived from one. Null when any
+ *  class can be reached: a file is gone, or it, or a file that names a class reached, declares at
+ *  its top level, not `private`, something else other files can use (a function, a type that is no
+ *  test class, an extension of one), as the shared helpers do; or when the files reach no class yet
+ *  compile something on the platform (a `private extension` of a test class, a fixture renamed),
+ *  whose error only a build would show. */
+export function classesReached(dir, platform, files) {
+  const { parents, tests, perFile } = declarations(dir, platform);
+  const reached = new Set();
+  for (const file of files) {
+    const own = perFile.get(file);
+    if (!own || own.shared) return null;
+    for (const name of own.classes) reached.add(name);
+  }
+  // Reach the classes of each file that names a class reached; every class when that file is shared
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const own of perFile.values()) {
+      if (![...own.names].some(name => reached.has(name))) continue;
+      if (own.shared) return null;
+      const before = reached.size;
+      for (const name of own.classes) reached.add(name);
+      grew ||= reached.size > before;
+    }
+  }
+  // Reach a class declared indented (nested, or within `#if`) through the class it derives from
+  const reaches = (name, seen = new Set()) => reached.has(name) || (parents.has(name) && !seen.has(name) && reaches(parents.get(name), seen.add(name)));
+  const out = tests.filter(name => reaches(name));
+  return out.length || !files.some(file => perFile.get(file).compiles) ? out : null;
+}
+
+/** A line that declares and compiles nothing: an import, a diagnostic directive (`#warning`), attributes. */
+const DECLARES_NOTHING = /^\s*(?:(?:@\w+(?:\([^)]*\))?\s+)*import\b|#(?:warning|error|sourceLocation)\b|(?:@\w+(?:\([^)]*\))?\s*)+$)/;
+
+/** What the Swift files in `dir` declare for `platform`: each class's parent (`parents`), the
+ *  test classes (`tests`, sorted), and per file the classes it declares or extends at its top level,
+ *  not `private` (`classes`), the capitalized names it uses (`names`), whether it compiles anything
+ *  on the platform but what `DECLARES_NOTHING` matches or a block comment holds (`compiles`), and
+ *  whether it declares at its top level, not `private`, anything else other files can use
+ *  (`shared`). */
+function declarations(dir, platform) {
+  const ios = platform === 'iOS';
+  // 'yes', 'no' or 'maybe' for a condition, worked out with each condition it names that does not
+  // depend on the platform taken first as true and then as false
+  const holds = (condition) => {
+    const as = (other) => {
+      const js = condition.replace(/\/\/.*$/, '').replace(/os\((\w+)\)/g, (_, os) => String(os === (ios ? 'iOS' : 'macOS')))
+        .replace(/canImport\((\w+)\)/g, (_, m) => m === 'UIKit' ? String(ios) : m === 'AppKit' ? String(!ios) : String(other))
+        // The iOS tests run on a simulator, and neither platform's in Mac Catalyst
+        .replace(/targetEnvironment\((\w+)\)/g, (_, e) => String(e === 'simulator' && ios))
+        .replace(/\b(?!true\b|false\b)[A-Za-z_]\w*\b/g, String(other));
+      // Only whole tokens of a condition reach the evaluation; one that does not parse is taken either way
+      if (!/^(\s*(true|false|&&|\|\||[()!]))*\s*$/.test(js)) return other;
+      try { return Boolean(Function(`return (${js})`)()); } catch { return other; }
+    };
+    const [one, two] = [as(true), as(false)];
+    return one === two ? (one ? 'yes' : 'no') : 'maybe';
+  };
+  const parents = new Map(), perFile = new Map();
+  for (const file of readdirSync(dir).filter(f => f.endsWith('.swift'))) {
+    const branches = [], own = { classes: [], names: new Set(), compiles: false, shared: false };
+    perFile.set(file, own);
+    let comment = false;
+    for (const line of readFileSync(resolve(dir, file), 'utf8').split('\n')) {
+      // Skip a block comment, from the line that opens it to the one that closes it
+      if (comment || /^\s*\/\*/.test(line)) { comment = !line.includes('*/'); continue; }
+      const directive = /^\s*#(if|elseif|else|endif)\b\s*(.*)/.exec(line);
+      if (directive) {
+        const [, word, condition] = directive, top = branches.at(-1);
+        if (word === 'if') { const now = holds(condition); branches.push({ now, taken: now === 'yes', open: now !== 'no' }); }
+        else if (word === 'endif') branches.pop();
+        else if (top) {
+          const now = top.taken ? 'no' : word === 'else' ? (top.open ? 'maybe' : 'yes') : holds(condition);
+          Object.assign(top, { now, taken: top.taken || now === 'yes', open: top.open || now !== 'no' });
+        }
+        continue;
+      }
+      if (/^\s*\/\//.test(line) || branches.some(b => b.now === 'no')) continue;
+      for (const name of line.match(/\b[A-Z]\w*/g) ?? []) own.names.add(name);
+      if (/\S/.test(line) && !DECLARES_NOTHING.test(line)) own.compiles = true;
+      const declaration = /\bclass (\w+)\s*:\s*(\w+)/.exec(line);
+      if (declaration) parents.set(declaration[1], declaration[2]);
+      // Read a declaration at the file's top level (unindented), after its attributes and modifiers
+      const top = /^(?:@\w+(?:\([^)]*\))?\s+)*((?:\w+\s+)*?)(extension|func|struct|enum|protocol|class|actor|let|var|typealias)\s+(\w+)/.exec(line);
+      // Mark the file shared at a top-level line the pattern does not read (an operator,
+      // `private(set) var`): it may declare what other files use
+      if (!top) { if (/^[^\s}\])]/.test(line) && !DECLARES_NOTHING.test(line)) own.shared = true; continue; }
+      if (/\b(private|fileprivate)\b/.test(top[1])) continue;
+      // Count an extension of a class as that class's own, as its body is
+      if (top[2] === 'class' || top[2] === 'extension') own.classes.push(top[3]);
+      else own.shared = true;
+    }
+  }
+  const isTest = (name, seen = new Set()) => {
+    const parent = parents.get(name);
+    if (!parent || seen.has(name)) return false;
+    return parent === 'XCTestCase' || /Fixture$/.test(parent) || isTest(parent, seen.add(name));
+  };
+  // Mark a file shared when it declares or extends a class that is no test class or fixture: other
+  // files can use that type
+  for (const own of perFile.values()) if (own.classes.some(name => !isTest(name))) own.shared = true;
+  // A fixture is a base the test classes share, with no tests of its own
+  const tests = [...parents.keys()].filter(name => isTest(name) && !name.endsWith('Fixture')).sort();
+  return { parents, tests, perFile };
+}
+
 /** The tests in `dir` that need what only an app gives them, `ExactKitTests/<Class>/<test>`:
  *  those that throw `missing("scene", …)` (a presentation completes only in a scene's
  *  window) or `missing("accessibility", …)` (UIKit's accessibility runtime), which run
@@ -161,7 +416,7 @@ export function hostedTests(dir) {
     const lines = readFileSync(resolve(dir, file), 'utf8').split('\n');
     let className = null, func = null;
     lines.forEach((line, i) => {
-      className = /class (\w+)\s*:\s*XCTestCase/.exec(line)?.[1] ?? className;
+      className = /class (\w+)\s*:\s*(XCTestCase|\w+Fixture)\b/.exec(line)?.[1] ?? className;
       func = /\bfunc (\w+)\s*\(/.exec(line)?.[1] ?? func;
       if (!/missing\("(scene|accessibility)"/.test(line)) return;
       if (!className || !func?.startsWith('test')) throw new Error(`${file}:${i + 1}: missing(scene or accessibility) outside a test method (${func ?? 'none'}); say it in the test so the test runs hosted`);

@@ -1,7 +1,7 @@
 # LLP 1125: A transport, MIDI, and the small pieces apps hand-roll
 
 **Type:** RFC
-**Status:** Accepted r2, 2026-10-16, by the orchestrator under Charlie's instruction of that day ("once happy with it, go ahead and implement"). r1 (`404863b35`) was reviewed blind by three families, each asked for direction and fundamentals only: GPT-6 Astra (max), Grok 4.7 (xhigh) and Muse Wonder Full 1.0 (xhigh), all RIGHT DIRECTION WITH CHANGES (`llp/reviews/1125-a-transport-midi-and-the-small-pieces.{astra,grok,muse}.md`). r2 takes their findings as §R records.
+**Status:** Built, stages 1–5, 2026-10-16 (each stage's "As built" below; every stage's diff reviewed by Astra and Grok before it landed; open edge cases in `QUEUE.md`). Accepted r2, 2026-10-16, by the orchestrator under Charlie's instruction of that day ("once happy with it, go ahead and implement"). r1 (`404863b35`) was reviewed blind by three families, each asked for direction and fundamentals only: GPT-6 Astra (max), Grok 4.7 (xhigh) and Muse Wonder Full 1.0 (xhigh), all RIGHT DIRECTION WITH CHANGES (`llp/reviews/1125-a-transport-midi-and-the-small-pieces.{astra,grok,muse}.md`). r2 takes their findings as §R records.
 **Systems:** Contract compiler (a `sequence` declaration; `sendMIDI`, `requestMIDIAccess`; `midimessage`, `midiinputs`; `wakelock`; `playbackRate=` and `pan=` on hits; `share`'s `files=`), Plan (`sequences`; use bits), Runner (new `runner/src/transport.rs` beside `sound.rs`; the voice bound; `exactTransport()` and `exactMIDI()`; a MIDI queue and record; clock ticks as an input), JS target (`host/web-js/sounds.js` and a transport twin), the sound arm (`host/apple/soundarm/`, `host/web/sound-glue.js`: rate, pan, capacity), a new MIDI arm (Apple `ExactMIDI`, web `midi-glue.js`), the wake lock on each host, Share (`runner/src/share.rs`, `Share.swift`), the agent (`state.transport`, `state.midi`, `state.wakelock`; test steps), `runner/src/device.rs` (one grant row)
 **Author:** Claude (Opus 5.5) for Charlie Cheever
 **Date:** 2026-10-16
@@ -252,10 +252,13 @@ resource transport = exactTransport() as shape Transport
 --   clock: "internal" | "midi" }
 ```
 
-A playhead is drawn from it in a frame task gated on visibility (LLP 1073),
-with `beat = anchorBeat + (performanceNow() − anchorAt) × bpm / 60000`. A
-frame commits only while the playhead is shown, and sound never waits on
-those commits.
+The beat is `anchorBeat + (performanceNow() − anchorAt) × bpm / 60000`. A
+playhead follows it as CSS animations on a clock timeline (LLP 1055.002),
+whose position the app reads once per anchor, so nothing commits while it
+plays (`docs/contract-for-agents.md`, "Following the transport"; euxy's port went
+from 9–10% of a core to 0.1% this way, 2026-10-18). Text that changes with
+the beat is a frame task gated on visibility (LLP 1073). Sound never waits
+on either.
 
 **Haptic steps** play on the main thread at their time. UIKit's feedback
 generators cannot be scheduled ahead, so a blocked main thread makes them
@@ -303,7 +306,28 @@ resource midi = exactMIDI() as shape MIDI
 -- { state: "prompt" | "granted" | "denied" | "unavailable",
 --   inputs: MIDIPort[], outputs: MIDIPort[] }
 -- MIDIPort: { id, name, manufacturer, state: "connected" | "disconnected" }
+-- sent (declared or not): { output, data: number[], timeStamp }[]
 ```
+
+- **`sent`** is the last 128 messages that went out by the runner's clock
+  (due, not taken back), in the order they went: by time, then by id. It is
+  kept apart from the queue's record, which lets a handed message go when
+  1,024 more are queued. Timing Clock (`F8`) is never listed, clock out's
+  or an app's own. A reader that declares it is answered again at each
+  message's time, a commit with no app action; one that does not is not
+  (2026-10-20: euxy's activity log, which ports 11–14 rebuilt from the
+  pattern). A message to a named output that is not connected is dropped
+  before the queue and never listed: listing it would call a message sent
+  that no output took (2026-10-20, euxy port 15).
+- **`""` is no output** (2026-10-20, euxy ports 15–17, which each rebuilt
+  the original's log of what it plays with no device from the pattern). A
+  track whose `output` is `""` and `sendMIDI("", …)` queue their messages as
+  any are queued, taken back by an edit or a stop the same way, and `sent`
+  lists them with `output: ""` when they are due; no host is handed one and
+  no MIDI access is needed. An app logs what it plays, device or not, and
+  filters on `output` for what reached one. The count-in, which has no
+  output, sends no note; a track meant to play only samples writes
+  `note=-1`.
 
 - **Names are Web MIDI's** (`MIDIAccess.inputs`, `MIDIPort.id` and so on).
 - **`id` is stable across replug**: on Apple, `kMIDIPropertyUniqueID`, not the
@@ -417,6 +441,10 @@ column wakelock=(playing or waitingForClock ? "screen" : "none")
 While any element that is mounted and displayed says `wakelock="screen"`, the
 display does not dim or lock for idleness. Displayed means no ancestor is
 `display: none`, so a screen kept mounted in a hidden tab panel holds nothing.
+What a sheet covers stays displayed: the page and every sheet between it
+and the top, as the web shows them, and a `dialog` or popover counts only
+while its host has it open. LLP 1133.029's `orientationlock` shares this
+rule (`exact_runner::wakelock::displayed`).
 The value is the Screen Wake Lock API's one type. An attribute fits better
 than commands, for two reasons:
 
@@ -442,8 +470,11 @@ shares a PNG of it as it is drawn now.
 
 ```
 action shareCard
-  share(title=pattern.name, url=link, files=["#card"])
+  share(title=`euxy-${slug}`, files=["#card"])
 ```
+
+The picture is the share's one item, named by `title` (`euxy-untitled.png`); a `url`
+beside it would be a second ("1 Link and 1 Image"), so the link is its own button's share.
 
 - **On Apple and Android it is the host's own drawing**: the node's view
   rendered at the display's scale. Apple's presenter has one view per node (§1).
@@ -639,7 +670,8 @@ otherwise.
   fixtures name the new ids.
 - **Deviation: `length` is two names.** Contract refuses a field named
   `length` (`syntax-length-field`: `.length` is a list's), so a track's
-  `length` is `beats` and a step's `length` is `duration`. Everything else
+  `length` is `beats` and a step's `length` is `duration` (since 2026-10-17 a
+  field may be named `length`, LLP 1116.016 §5; the names stay). Everything else
   is D2's, in D2's order (the rulings' nine fields, then optionally
   `playbackRate` and `pan`).
 - **Runner** (`runner/src/transport.rs`, `runner/src/runner/transport.rs`).
@@ -942,6 +974,134 @@ are binding and two of them amend the text:
   test. The Lean semantics were not run (not installed); the corpus's
   `send-midi` agrees between the runner and the JS target. euxy's port has
   not yet deleted its scheduler or `MidiManager.swift`.
+
+## As built (stage 4, 2026-10-16)
+
+D9 as written, with the orchestrator's fourteen rulings for the stage
+(binding), except where this says otherwise.
+
+- **Compiler.** `clock=` lowers as plan code; `lower-sequence-clock` is
+  gone. `bpm=` is required unless `clock=` is given, and an omitted one is
+  120: the prior a follower plays at until it has heard 13 ticks (rulings
+  #2). `expect sound … by clock` parses, and the test step `tap midi "<in>"
+  clock <bpm> <ms>` reaches the driver.
+- **Runner** (`runner/src/transport/clock.rs`). A sequence with `clock=` is
+  `waiting` until Start: no segment, no fill. The follower keeps the last 48
+  tick stamps and estimates `60000·(n−1)/(span·24)` on a packet-leading
+  tick once 13 are in the window (euxy's estimator, no throttle); a stamp
+  earlier than the last, or 500 ms after it, empties the window. Position
+  counts ticks (rulings #11): Start puts `from` at the tick it predicts
+  next, else at its own stamp (rulings #1); Continue resumes at Song
+  Position since the last Stop, else at the held beat, else 0, with no
+  count-in (rulings #12). Each run of ticks ends in an anchor. Hits are
+  issued under one segment to 100 ms past the delivery (more by a track's
+  negative offset), and between deliveries nothing fills (a full queue's
+  wake aside). Stop silences as D4 does and leaves the sequence `waiting`,
+  reason `clock`, still following (rulings #3). `clockOut=` is ignored and
+  journaled (rulings #4); a changed `clock=` restarts as a key does
+  (rulings #13); nothing times out a lost clock (rulings #14). Deliveries
+  are the existing `{"messages":…}` input call (rulings #8): the followed
+  input's Clock, Start, Continue, Stop and Song Position go to the
+  transport first, in arrival order, then the delivery is coalesced and
+  dispatched as before, Start, Continue, Stop and Song Position still heard
+  as `midimessage` with `e.beat` read after (rulings #9). The `open` op
+  carries `"clock":[ids]`, and the followed input is opened with or without
+  a listener. `exactTransport` says `clock: "midi"`, its tempo rounded to
+  0.1 and published again only on rulings #7's terms; while waiting it
+  shows the device's tempo. `state.transport.follow` shows the input, the
+  ticks, the window, the estimate, the ticks since Start and the held beat.
+- **Deviation, rulings #5.** A new anchor that moves any revocable hit (from
+  50 ms past the delivery, more by a negative offset, to where hits are
+  issued) by more than 2 ms becomes the segment and takes back the whole
+  band (`by: clock`), not only from the first beat that drifts; one within
+  2 ms everywhere is kept out, the hits issued under the segment they were.
+  With deliveries 50 ms apart nothing is revocable (the lookahead is the
+  batch plus the hold), so re-anchoring then only moves later hits; it
+  takes hits back when a delivery comes sooner (Start and Stop at once,
+  single ticks).
+- **After review** (Astra, Grok; round 1): the band starts strictly after
+  the hold's edge, so a note due exactly 50 ms out, handed already, is
+  neither taken back nor queued again. Following, the transport keeps the
+  hits it issued by `(beat, track, step)`, and a refill
+  issues none of those again: a hit kept within the hold at one re-anchor
+  belongs to an older segment, whose beats the next anchor's band need not
+  order, and was otherwise issued twice. A refill starts at the first beat
+  taken back when an older segment put it before the band. Apple's hub
+  numbers its drains, so a tick's delayed drain armed before a drain at
+  once does nothing and the ticks after it wait their own 50 ms. A
+  sequence that followed a clock and stopped (its gate, the background,
+  its end) answers `clock: "internal"` again.
+  Round 2: only a re-anchor's cut excludes its edge; Start and Continue
+  while playing take back the hits from their delivery's time, its own
+  included. The hits kept are let go by position, not age: once the ticks
+  counted pass a hit's beat by one, and no hit more than a beat behind them
+  is issued, so a clock that stalls and comes back plays no beat twice.
+- **Rules beyond the text and the rulings** (each the simplest
+  deterministic one, in the module's comment):
+  - Start's predicted tick is never before Start's own stamp; Start again
+    while playing takes back (`clock`) what was issued for later and starts
+    over at `from`.
+  - Stop silences at the delivery's runner time, not at its stamp: what the
+    output already played cannot be taken back.
+  - A gap empties the window but keeps the last estimate.
+  - Following, `e.beat` reads the one segment hits are issued under (the
+    clock's segments do not join), and is −1 while waiting.
+  - An edit while following starts no segment (`bpm=` is the prior); while
+    waiting it only keeps the new value. An edit, or Start again, in the
+    hold after a re-anchor can play a hit at that boundary twice or not at
+    all within the drift: a declared limit.
+  - A message from an input no element hears is dropped unrecorded, so a
+    clock-only input's transport messages reach the transport and not
+    `state.midi.received`.
+  - A key or clock restart starts a new follower, its window empty.
+  - `tap midi`'s clock form is `{"input","clock":[[stamp, byte],…]}` (Song
+    Position `[stamp, 242, lsb, msb]`), stamps rising from the follower's
+    last tick to now, refused by name without a follower (`tap midi: no
+    sequence follows "<in>" (clock=)`); its byte form needs no listener for
+    the followed input. The CLI's `tap midi` takes a quoted input.
+  - Journal lines: `sequence S waits for clock from IN`, `sequence S: clock
+    start|continue at T, beat B`, `sequence S re-anchored: beat B at T, bpm
+    N`, `sequence S: song position ignored while playing`, `sequence S:
+    clock out ignored: it follows IN`, and `sounds|midi|haptics retracted:
+    N (clock)`.
+- **JS target** (`host/web-js/clockin.js`, `transport.js`, `midi.js`,
+  `sounds.js`): the runner's rules line for line; rt.js and
+  `runner/src/agent.rs` unchanged.
+- **Hosts.** Apple's arm passes Timing Clock on (Active Sensing still
+  dropped at the receive block); the hub keeps a tick only from an input
+  some session follows and delivers it only to that session, ticks alone
+  at most 50 ms after the oldest, anything else at once with the ticks
+  ahead (`main.async`). midi-glue.js does the same, the rest at the next
+  frame. Linux, Windows and the wasm host: no change.
+- **The driver** (rulings #10). `tap midi "<input>" clock <bpm> <ms>`
+  expands in `scripts/agent-keys.mjs` (`clockSlices`) into 50 ms slices,
+  each `clock` to its end and one delivery of its ticks; a tempo whose tick
+  is a whole number of milliseconds keeps every stamp exact.
+- **Consumer.** The metronome gains "Follow clock", a `select` of
+  `exactMIDI().inputs`: following, it shows "Waiting for clock" until
+  Start and the device's tempo in the stepper's place.
+- **Measured.** Runner tests (`runner/src/transport/tests/clock.rs`, 9):
+  the window, Start from rest and with a running clock, Stop, Continue and
+  Song Position, a count-in landing on tick 96, a tempo change taking hits
+  back with none within the hold moving, ±1 ms jitter moving nothing,
+  `ended=` at the predicted end, a key and an input restart, clock out
+  ignored, what is dispatched, and the same deliveries into fresh runners
+  giving the same voices, MIDI, journal, answer and `state` (one advance
+  or seventy across a lost clock). Conformance `midi-clock`: 31 of 31 steps
+  equal on wasm, JS and Linux; `transport` 44/44, `midi` 36/36,
+  `midi-order` 8/8, `sounds` 33/33, `gates` 19/19, `frames` 9/9, `clock`
+  10/10 still equal. The metronome's nine tests pass on the web, macOS, the
+  iOS 27 simulator and Linux. The macOS loopback XCTest passes: ticks stamped from their packets
+  within 0.5 ms, ticks alone more than 40 ms apart and never more than
+  75 ms late, Start within 10 ms with its ticks ahead, no Active Sensing,
+  and no tick from an input not followed. midi-glue.test.mjs covers the
+  web's batching.
+- **Not done here.** The bar, euxy following a real OP–XY's clock through
+  a count-in and a take, was not run: no device. The first downbeat from a
+  device whose clock was not already running is late by the delivery's
+  latency (declared). The Lean semantics were not run (not installed);
+  `contract-difftest`'s tests pass. Clock thru (sending clock while
+  following one) is deferred (`rules/DEFERRED.md`).
 
 ## As built (stage 5, 2026-10-16)
 

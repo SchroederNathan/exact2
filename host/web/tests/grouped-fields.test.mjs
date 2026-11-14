@@ -3,18 +3,18 @@
 // and dark, at a phone's width and a desktop's. `appearance="none"` stays the author's bare box: no line, no corners,
 // its text's height. The app is compiled from Contract and built for the JS target, as `exact` builds one.
 import { test, expect } from 'bun:test';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { Cdp } from '../../../scripts/agent.mjs';
-import { chromium } from '../../../scripts/agent-launch.mjs';
+import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';
 import { serveBuildTree } from '../serve.mjs';
 import { need } from '../../../scripts/coverage.mjs';
 
 const ROOT = resolve(new URL('../../..', import.meta.url).pathname);
-const { executable: chrome, unavailable } = chromium();
+const compiler = resolve(process.env.CARGO_TARGET_DIR ?? resolve(ROOT, 'target'), 'debug', process.platform === 'win32' ? 'contract.exe' : 'contract');
+const { unavailable } = chromium();
 const check = need('chrome', unavailable);
 
 const FORM = `component Form
@@ -46,18 +46,15 @@ const FORM = `component Form
 async function inChrome(test) {
   const dir = mkdtempSync(join(tmpdir(), 'exact-grouped-fields-')), contract = join(dir, 'app.contract'), plan = join(dir, 'app.plan'), dist = join(dir, 'dist');
   writeFileSync(contract, FORM);
-  const compile = spawnSync('cargo', ['run', '-q', '-p', 'contract', '--', 'build', contract, '-o', plan], { cwd: ROOT, encoding: 'utf8' });
+  const compile = spawnSync(compiler, ['build', contract, '-o', plan], { cwd: ROOT, encoding: 'utf8' });
   if (compile.status !== 0) throw new Error(compile.stderr);
   const build = spawnSync(process.execPath, ['host/web-js/build.mjs', 'caltrain', '--plan', plan, '--out', dist, '--render', 'none'], { cwd: ROOT, encoding: 'utf8' });
   if (build.status !== 0) throw new Error(build.stderr);
   const server = createServer((request, response) => serveBuildTree(dist, request, response));
   await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
-  const child = spawn(chrome, ['--headless=new', '--remote-debugging-pipe', '--window-size=1400,900', `--user-data-dir=${join(dir, 'profile')}`,
-    '--no-sandbox', '--no-first-run', '--disable-background-networking', 'about:blank'], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+  const suite = await cdpBrowser({ args: ['--window-size=1400,900'] }), { cdp } = suite;
   try {
-    const cdp = new Cdp(child.stdio[3], child.stdio[4]);
-    const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    const { sessionId } = await suite.page();
     const call = (method, params) => cdp.send(method, params, sessionId);
     const evaluate = async (expression) => {
       const reply = await call('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
@@ -73,7 +70,7 @@ async function inChrome(test) {
     await frames();
     await test(evaluate, size, scheme);
   } finally {
-    child.kill();
+    await suite.close();
     server.close();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -82,7 +79,7 @@ async function inChrome(test) {
 // Each field's line, corners, box and background, its row's box, and the card's background behind it.
 const FACTS = `(() => Object.fromEntries(['unsaid', 'beside', 'bare', 'area'].map(id => {
   const e = document.querySelector('[data-testid=' + id + ']'), s = getComputedStyle(e), r = e.getBoundingClientRect();
-  let row = e.parentElement; while (row && getComputedStyle(row).borderBottomStyle !== 'solid') row = row.parentElement;
+  const row = e.closest('[data-groupedrowseparator]');
   const rr = row.getBoundingClientRect();
   return [id, { line: s.borderTopWidth + ' ' + s.borderTopStyle, color: s.borderTopColor, radius: s.borderTopLeftRadius,
     height: r.height, width: r.width, inRow: r.left >= rr.left && r.right <= rr.right && r.top >= rr.top && r.bottom <= rr.bottom,
@@ -95,15 +92,18 @@ check('a field in a grouped row is a visible field on the web; appearance="none"
     for (const mode of ['light', 'dark']) {
       await scheme(mode);
       const facts = await evaluate(FACTS);
+      // Apple's continuous curve over the radius scaled to its reach, where the engine draws `corner-shape`.
+      const radius = await evaluate(`CSS.supports('corner-shape', 'superellipse(2)') ? '12.16px' : '8px'`);
       for (const id of ['unsaid', 'beside', 'area']) {
         const f = facts[id], at = `${id} at ${width} in ${mode}`;
         expect(f.line, at).toBe('1px solid');
-        expect(f.radius, at).toBe('8px');
+        expect(f.radius, at).toBe(radius);
         expect(f.height, at).toBeGreaterThanOrEqual(36);
         expect(f.inRow, `${at} fits its row`).toBe(true);
         expect(f.color, `${at}: its line shows on the card`).not.toBe(f.card);
       }
-      expect(facts.unsaid.width, 'a field in a column fills the row').toBeGreaterThan(width === 390 ? 250 : 900);
+      // (A section is at most 720 px wide on the web, LLP 1115.000 D4.16.)
+      expect(facts.unsaid.width, 'a field in a column fills the row').toBeGreaterThan(width === 390 ? 250 : 620);
       expect(facts.bare.line, `bare at ${width} in ${mode}`).toBe('0px none');
       expect(facts.bare.radius).toBe('0px');
       expect(facts.bare.height).toBeLessThan(30);

@@ -72,10 +72,13 @@ pub fn event_record(attr: &str) -> Option<&'static str> {
         // secondary click was (studio diary R22).
         "pointerdown" | "pointerup" | "pointermove" | "contextmenu" => Some("PointerEvent"),
         "wheel" => Some("WheelEvent"),
-        "drop" => Some("DragEvent"),
+        "drop" | "dragenter" | "dragleave" => Some("DragEvent"),
+        "atompress" => Some("AtomEvent"),
         "key" | "keycapture" | "keyup" => Some("KeyboardEvent"),
         "scroll" => Some("ScrollEvent"),
         "toggle" => Some("ToggleEvent"),
+        // @ref LLP 1115.000 D5.5 — the history swipe the host tracks.
+        "historyswipe" => Some("HistorySwipeEvent"),
         "press" => Some("MouseEvent"),
         "copy" | "cut" | "paste" => Some("ClipboardEvent"),
         "selectionchange" => Some("Selection"),
@@ -94,11 +97,98 @@ pub fn event_record(attr: &str) -> Option<&'static str> {
         "seekbackward" | "seekforward" | "seekto" | "previoustrack" | "nexttrack" | "stop" => {
             Some("MediaSessionActionDetails")
         }
+        // @ref LLP 1020.002 D2 — what an iframe's guest shows, seen from
+        // outside; `framenavigate` is an iframe's `navigate`
+        // (`contract_syntax::typed_event`).
+        "framenavigate" | "currententrychange" | "navigatesuccess" | "navigateerror" => {
+            Some("FrameNavigation")
+        }
+        // @ref LLP 1020.002 D5 — a guest's request for a window, by Chrome's
+        // `<webview>` event and Electron's disposition names; and a download
+        // it started, by Electron's `DownloadItem` states.
+        "newwindow" => Some("FrameNewWindow"),
+        "download" => Some("FrameDownload"),
+        // @ref LLP 1020.002 D7 — the answer to `captureScreenshot`: the file
+        // and its size, or why there is none.
+        "capture" => Some("FrameCapture"),
+        // @ref LLP 1020.002 D9 — an agent-controlled frame's dialog, by WebDriver
+        // BiDi's `browsingContext.userPromptOpened`.
+        "userpromptopened" => Some("FrameUserPrompt"),
         _ => None,
     }
 }
 
 pub(super) fn declare(shapes: &mut Shapes) {
+    // @ref LLP 1020.002 D2 — the Navigation API's names for what an iframe's
+    // guest shows; the runner's `FrameNavigation::value` is in this order.
+    shapes.map.insert(
+        "FrameNavigation".into(),
+        vec![
+            ("url".into(), Ty::String),
+            ("destination".into(), Ty::String),
+            ("navigationId".into(), Ty::Number),
+            ("navigationType".into(), Ty::String),
+            ("title".into(), Ty::String),
+            ("icons".into(), Ty::List(Box::new(Ty::String))),
+            ("canGoBack".into(), Ty::Bool),
+            ("canGoForward".into(), Ty::Bool),
+            ("loading".into(), Ty::Bool),
+            ("partitioned".into(), Ty::Bool),
+            ("controller".into(), Ty::String),
+            ("error".into(), Ty::String),
+            ("message".into(), Ty::String),
+            ("recovering".into(), Ty::Bool),
+        ],
+    );
+    // @ref LLP 1020.002 D7 — the runner's `frame_navigation::other` builds it
+    // in this order: the `app:/` path the command named, the PNG's size in
+    // pixels, and on failure a DOMException name and the platform's words.
+    shapes.map.insert(
+        "FrameCapture".into(),
+        vec![
+            ("path".into(), Ty::String),
+            ("width".into(), Ty::Number),
+            ("height".into(), Ty::Number),
+            ("error".into(), Ty::String),
+            ("message".into(), Ty::String),
+        ],
+    );
+    // @ref LLP 1020.002 D9 — the runner's `frame_navigation::other` builds it
+    // in this order: BiDi's `userPromptOpened` fields.
+    shapes.map.insert(
+        "FrameUserPrompt".into(),
+        vec![
+            ("type".into(), Ty::String),
+            ("message".into(), Ty::String),
+            ("defaultValue".into(), Ty::String),
+        ],
+    );
+    // @ref LLP 1020.002 D7 — Geometry's `DOMRect`, by its constructor's fields:
+    // what `getBoundingClientRect()` gives, and a capture's `clip=`.
+    shapes.map.insert(
+        "DOMRect".into(),
+        ["x", "y", "width", "height"]
+            .map(|f| (f.into(), Ty::Number))
+            .to_vec(),
+    );
+    // @ref LLP 1020.002 D5 — the runner's `frame_navigation::new_window` and
+    // `download` build these in this order.
+    shapes.map.insert(
+        "FrameNewWindow".into(),
+        vec![
+            ("url".into(), Ty::String),
+            ("disposition".into(), Ty::String),
+        ],
+    );
+    shapes.map.insert(
+        "FrameDownload".into(),
+        vec![
+            ("url".into(), Ty::String),
+            ("suggestedFilename".into(), Ty::String),
+            ("state".into(), Ty::String),
+            ("path".into(), Ty::String),
+        ],
+    );
     // `exact_runner::midi`'s order (LLP 1125 D8): the input's `id`, the
     // message's bytes, when it arrived in runner time, and the transport's
     // beat then (−1 while stopped).
@@ -132,6 +222,20 @@ pub(super) fn declare(shapes: &mut Shapes) {
             ("newState".into(), Ty::String),
         ],
     );
+    // @ref LLP 1115.000 D5.5 — the runner's `HistorySwipe::value` builds it
+    // in this order: AppKit's phase of the swipe it tracks, the way it would
+    // step, its `gestureAmount` along that way, and where the pointer was
+    // as it began, in the viewport.
+    shapes.map.insert(
+        "HistorySwipeEvent".into(),
+        vec![
+            ("phase".into(), Ty::String),
+            ("direction".into(), Ty::String),
+            ("amount".into(), Ty::Number),
+            ("clientX".into(), Ty::Number),
+            ("clientY".into(), Ty::Number),
+        ],
+    );
     shapes.map.insert(
         "MarkdownSelection".into(),
         vec![
@@ -139,6 +243,9 @@ pub(super) fn declare(shapes: &mut Shapes) {
             ("mixed".into(), Ty::Bool),
             ("link".into(), Ty::String),
             ("unavailable".into(), Ty::String),
+            // The selected atom's source when the selection is exactly one
+            // atom, else "" (LLP 1045.000 D3).
+            ("atom".into(), Ty::String),
         ],
     );
     // What a `key` or `keyup` handler's action hears after the key when it
@@ -147,7 +254,8 @@ pub(super) fn declare(shapes: &mut Shapes) {
     // kanban F27), then the physical key (`code`: `KeyB`, `Digit1`,
     // `MetaLeft`, whatever the layout types there; "" where the host cannot
     // tell) and whether a keydown is the platform's auto-repeat (`repeat`;
-    // #140).
+    // #140), then whether it came while an input method composed text
+    // (`isComposing`, false where the host hands handlers no composing key).
     shapes.map.insert(
         "KeyboardEvent".into(),
         vec![
@@ -158,6 +266,7 @@ pub(super) fn declare(shapes: &mut Shapes) {
             ("metaKey".into(), Ty::Bool),
             ("code".into(), Ty::String),
             ("repeat".into(), Ty::Bool),
+            ("isComposing".into(), Ty::Bool),
         ],
     );
     // What `input` and `change` hand an action that takes one more
@@ -183,12 +292,18 @@ pub(super) fn declare(shapes: &mut Shapes) {
             ("isComposing".into(), Ty::Bool),
         ],
     );
-    // DOM's `ClipboardEvent`, its data as plain text (`getData("text/plain")`):
+    // DOM's `ClipboardEvent`, its data as plain text (`getData("text/plain")`)
+    // and its `clipboardData.files` as the `doc:` handles the host minted for
+    // them (LLP 1069.010 D1), image data with no file among them as a PNG:
     // what a paste carries; empty on copy and cut, as the DOM's is until a
     // listener sets it — the action writes the clipboard with `copyText`.
-    shapes
-        .map
-        .insert("ClipboardEvent".into(), vec![("text".into(), Ty::String)]);
+    shapes.map.insert(
+        "ClipboardEvent".into(),
+        vec![
+            ("text".into(), Ty::String),
+            ("files".into(), Ty::List(Box::new(Ty::String))),
+        ],
+    );
     // The part of the reader's selection inside one `text` (the reader
     // diary), what `selectionchange` hands its action, in the order
     // `exact_runner::Event::SelectionChange` writes it: the selected text
@@ -209,14 +324,16 @@ pub(super) fn declare(shapes: &mut Shapes) {
     );
     // DOM's `PointerEvent`, the subset every host measures, in the order
     // `exact_runner::PointerEvent` writes it: the point from the node's
-    // content box, the buttons' bits, the pressure, the device, its id, the
-    // point from the viewport (`frame()`'s space, LLP 1094 D11), and the
-    // modifiers held (a `MouseEvent`'s).
+    // content box, the button that changed and the buttons' bits (3 and 8
+    // back, 4 and 16 forward), the pressure, the device, its id, the point
+    // from the viewport (`frame()`'s space, LLP 1094 D11), and the modifiers
+    // held (a `MouseEvent`'s).
     shapes.map.insert(
         "PointerEvent".into(),
         vec![
             ("offsetX".into(), Ty::Number),
             ("offsetY".into(), Ty::Number),
+            ("button".into(), Ty::Number),
             ("buttons".into(), Ty::Number),
             ("pressure".into(), Ty::Number),
             ("pointerType".into(), Ty::String),
@@ -237,9 +354,10 @@ pub(super) fn declare(shapes: &mut Shapes) {
         "ReorderEvent".into(),
         vec![("from".into(), Ty::String), ("to".into(), Ty::String)],
     );
-    // DOM's `MouseEvent`, the modifiers held, what a `press` action may take
-    // (gallery F20: shift-click range select, ⌘-click), in the order
-    // `exact_runner::KeyModifiers::mouse` writes it.
+    // DOM's `MouseEvent`, what a `press` action may take: the modifiers held
+    // (gallery F20: shift-click range select, ⌘-click) and the point from the
+    // viewport, 0, 0 from a keyboard or assistive press (LLP 1021 D2: a menu
+    // at the press), in the order `exact_runner::MouseEvent` writes it.
     shapes.map.insert(
         "MouseEvent".into(),
         vec![
@@ -247,6 +365,8 @@ pub(super) fn declare(shapes: &mut Shapes) {
             ("ctrlKey".into(), Ty::Bool),
             ("altKey".into(), Ty::Bool),
             ("metaKey".into(), Ty::Bool),
+            ("clientX".into(), Ty::Number),
+            ("clientY".into(), Ty::Number),
         ],
     );
     // DOM's `WheelEvent` (studio diary R3), in the order
@@ -266,6 +386,8 @@ pub(super) fn declare(shapes: &mut Shapes) {
     // DOM's `DragEvent` at a `drop` of files (studio diary R19), its
     // `dataTransfer.files` as the `doc:` handles the host minted for them
     // (LLP 1069.010 D1, as a picker's), in `exact_runner::DropEvent`'s order.
+    // A `dragenter` or `dragleave` has none: the DOM protects a drag's files
+    // until it drops.
     shapes.map.insert(
         "DragEvent".into(),
         [

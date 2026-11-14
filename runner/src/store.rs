@@ -13,6 +13,8 @@
 
 use crate::runner::DataError;
 
+mod presence;
+
 /// Durable client state as the runner holds it (LLP 1018 D1): the host's
 /// snapshot of the app's kept secrets, read before boot, and the writes
 /// since, which the host persists after each commit. The runner never
@@ -29,9 +31,20 @@ pub struct Store {
     /// A child executor may see only the intersection with its own grants.
     restricted: bool,
     values: exact_kernel::SortedMap<String, Vec<u8>>,
+    /// The granted names whose line carries a presence policy (LLP 1133.010
+    /// D4), in declaration order: each one's occupancy is a runner-owned
+    /// entry of `values` (`exact.presence.<name>`), and its bytes are never
+    /// there while it is locked or pending (D5).
+    presence: Vec<(String, exact_grants::Presence)>,
     /// The snapshot it opened with held a granted secret (LLP 1027 D4,
     /// 2026-10-10): a launch's fact, unchanged by later writes.
     opened_with_secrets: bool,
+    /// It opened with a presence name locked or pending: the launch shows no
+    /// kept answer (LLP 1133.010 D5).
+    opened_locked: bool,
+    /// A read of a locked name's value this answer made, which a Rust
+    /// source's answer fails for (`InvalidAccessError`, D5).
+    locked_read: std::cell::RefCell<Option<String>>,
     writes: Vec<StoreWrite>,
     /// Monotonic within a transaction; restored with a refused transaction.
     revision: u64,
@@ -43,14 +56,22 @@ pub struct Store {
     /// Device topics the answer being made watches (`native.watch`, LLP
     /// 1016.002): taken by the runner after each answer.
     topics: std::cell::RefCell<Vec<String>>,
-    /// Socket operations the mutation being answered staged, by the index
-    /// of the resource that owns each socket (LLP 1016.000 D7): taken by
-    /// the runner after each mutation's answer, which publishes them only
-    /// if the answer stands.
+    /// Socket operations the mutation being answered, or the mapper of the
+    /// frame being parsed, staged, by the index of the resource that owns
+    /// each socket (LLP 1016.000 D7): taken by the runner after each such
+    /// turn, which publishes them only if its commit stands.
     sockets: Vec<(usize, crate::SocketOp)>,
+    /// Socket operations a turn of an answer sent, by the same index (the
+    /// amendment of 2026-10-18): taken by the runner after the turn, and
+    /// sent once its commit stands, whatever becomes of the answer.
+    answer_sockets: Vec<(usize, crate::SocketOp)>,
     /// Each open socket's buffered bytes at the start of the turn, by its
     /// resource's index: what its handle's `bufferedAmount` starts from.
     socket_buffered: Vec<(usize, u64)>,
+    /// The runner's clock as the call being made started, ms: when a timer
+    /// a TypeScript answer arms now is due (LLP 1027.000 D1). The runner
+    /// sets it before each call into its data source.
+    clock_ms: f64,
     /// Each entry's value before its first write since the open checkpoint:
     /// what a refused transaction puts back. A checkpoint costs what the
     /// transaction writes, not the store's size. Checkpoints do not nest.
@@ -94,6 +115,14 @@ impl PartialEq for ScopeReader {
     }
 }
 fn module_secret_names(grants: &str) -> Vec<String> {
+    module_secret_lines(grants)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// [`module_secret_names`] with each name's presence policy.
+fn module_secret_lines(grants: &str) -> Vec<(String, Option<exact_grants::Presence>)> {
     grants
         .lines()
         .filter_map(|line| {
@@ -102,7 +131,12 @@ fn module_secret_names(grants: &str) -> Vec<String> {
                 return None;
             }
             let name = words.next()?;
-            (exact_grants::valid_name(name) && words.next().is_none()).then(|| name.to_string())
+            let policy: Vec<&str> = words.collect();
+            if !exact_grants::valid_name(name) || name.starts_with(exact_grants::PRESENCE_PREFIX) {
+                return None;
+            }
+            let presence = exact_grants::presence_words(&policy).ok()?;
+            Some((name.to_string(), presence))
         })
         .collect()
 }
@@ -114,6 +148,9 @@ pub struct StoreWrite {
     pub name: String,
     /// The value to keep, or `None` to forget: a secret's or a state's text, a kept answer's canonical bytes.
     pub value: Option<Vec<u8>>,
+    /// Already persisted through an exclusive lease. Hosts update their
+    /// snapshots and discard older retries without writing it again.
+    pub durable: bool,
 }
 
 /// Why the store refused.
@@ -124,6 +161,12 @@ pub enum StoreError {
     /// The app's grants did not parse, so they name nothing: the name, then
     /// why ([`crate::grants::refusal`]).
     Unparsed(String, String),
+    /// The name is locked behind the person's presence: its value is read
+    /// with `store.unlock` (LLP 1133.010 D5).
+    Locked(String),
+    /// The name would be kept locked, and this device keeps no locked
+    /// secret now (D5, D15).
+    NotSupported(String),
 }
 
 impl From<StoreError> for DataError {
@@ -131,6 +174,8 @@ impl From<StoreError> for DataError {
         DataError::Unavailable(match e {
             StoreError::Refused(name) => format!("secret {name} is not granted"),
             StoreError::Unparsed(name, why) => format!("secret {name} is not granted: {why}"),
+            StoreError::Locked(name) => presence::locked_message(&name),
+            StoreError::NotSupported(name) => presence::unsupported_message(&name),
         })
     }
 }
@@ -141,6 +186,15 @@ pub(crate) struct StoreCheckpoint {
     pub(crate) writes: usize,
 }
 
+/// What a host's store snapshot changed (LLP 1126.001 WP12): anything at all,
+/// and whether a name a resource reads did. Only the second re-asks readers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreChange {
+    /// Some kept name differed.
+    pub any: bool,
+    /// A name a resource reads differed: not a kept answer or a persisted slot.
+    pub read: bool,
+}
 impl Store {
     /// The store for `grants` (its `secret.keep <name>` lines, when the whole
     /// set parses), filled from `snapshot`; an entry the grant does not name
@@ -169,11 +223,26 @@ impl Store {
         snapshot: Vec<(String, Vec<u8>)>,
         link: crate::grants::GrantsLink,
     ) -> Store {
-        let (granted, unparsed): (Vec<String>, _) = match crate::grants::parse_with(grants, link) {
-            Ok(set) => (set.secrets().map(str::to_string).collect(), None),
-            Err(errors) => (Vec::new(), Some(crate::grants::refusal(&errors))),
-        };
-        Self::from_names(granted, unparsed, ScopeReader::Strict(link), snapshot)
+        let (granted, presence, unparsed): (Vec<String>, Vec<_>, _) =
+            match crate::grants::parse_with(grants, link) {
+                Ok(set) => (
+                    set.secrets().map(str::to_string).collect(),
+                    set.presence().map(|(n, p)| (n.to_string(), p)).collect(),
+                    None,
+                ),
+                Err(errors) => (
+                    Vec::new(),
+                    Vec::new(),
+                    Some(crate::grants::refusal(&errors)),
+                ),
+            };
+        Self::from_names(
+            granted,
+            presence,
+            unparsed,
+            ScopeReader::Strict(link),
+            snapshot,
+        )
     }
 
     /// Local mirror inside an importless logic module (LLP 1029): the host
@@ -181,8 +250,13 @@ impl Store {
     /// atomically validates every returned write. This grants no host access.
     /// Host runners must use `new`, which validates the declaration itself.
     pub fn module_mirror(grants: &str, snapshot: Vec<(String, Vec<u8>)>) -> Store {
+        let lines = module_secret_lines(grants);
+        let presence = (lines.iter())
+            .filter_map(|(n, p)| Some((n.clone(), p.clone()?)))
+            .collect();
         Self::from_names(
-            module_secret_names(grants),
+            lines.into_iter().map(|(n, _)| n).collect(),
+            presence,
             None,
             ScopeReader::default(),
             snapshot,
@@ -191,29 +265,39 @@ impl Store {
 
     fn from_names(
         granted: Vec<String>,
+        presence: Vec<(String, exact_grants::Presence)>,
         unparsed: Option<String>,
         scope_reader: ScopeReader,
         snapshot: Vec<(String, Vec<u8>)>,
     ) -> Store {
-        let values = snapshot
+        let mut values = snapshot
             .into_iter()
-            .filter(|(n, _)| granted.iter().any(|g| g == n) || Store::is_kept(n))
+            .filter(|(n, _)| {
+                granted.iter().any(|g| g == n)
+                    || (Store::is_kept(n) && presence::admits_entry(n, &presence))
+            })
             .collect::<exact_kernel::SortedMap<_, _>>();
-        let opened_with_secrets = values.keys().any(|n| !Store::is_kept(n));
+        let opened_locked = presence::settle_entries(&mut values, &presence);
+        let opened_with_secrets = opened_locked || values.keys().any(|n| !Store::is_kept(n));
         Store {
             granted,
             scope_reader,
             unparsed,
             restricted: false,
             values,
+            presence,
             opened_with_secrets,
+            opened_locked,
+            locked_read: Default::default(),
             writes: Vec::new(),
             revision: 0,
             reads: std::cell::Cell::new(0),
             entropy: std::cell::Cell::new(0),
             topics: Default::default(),
             sockets: Vec::new(),
+            answer_sockets: Vec::new(),
             socket_buffered: Vec::new(),
+            clock_ms: 0.0,
             undo: Vec::new(),
             copied: 0,
         }
@@ -244,11 +328,13 @@ impl Store {
         struct Scope<'a> {
             store: &'a mut Store,
             granted: Vec<String>,
+            presence: Vec<(String, exact_grants::Presence)>,
             restricted: bool,
         }
         impl Drop for Scope<'_> {
             fn drop(&mut self) {
                 self.store.granted = std::mem::take(&mut self.granted);
+                self.store.presence = std::mem::take(&mut self.presence);
                 self.store.restricted = self.restricted;
             }
         }
@@ -260,10 +346,16 @@ impl Store {
             .cloned()
             .collect();
         let granted = std::mem::replace(&mut self.granted, narrowed);
+        let narrowed_presence = (self.presence.iter())
+            .filter(|(name, _)| admitted.contains(name))
+            .cloned()
+            .collect();
+        let presence = std::mem::replace(&mut self.presence, narrowed_presence);
         let restricted = std::mem::replace(&mut self.restricted, true);
         let scope = Scope {
             store: self,
             granted,
+            presence,
             restricted,
         };
         call(scope.store)
@@ -296,7 +388,9 @@ impl Store {
     /// Whether `name` is the runner's own — a kept answer or a persisted
     /// state — which no grant reaches.
     pub fn runner_owned(name: &str) -> bool {
-        name.starts_with(Store::KEPT) || name.starts_with(Store::STATE)
+        name.starts_with(Store::KEPT)
+            || name.starts_with(Store::STATE)
+            || name.starts_with(Store::PRESENCE)
     }
 
     /// A kept answer, by the runner (uncounted, ungated).
@@ -308,7 +402,7 @@ impl Store {
     pub(crate) fn kept_lengths(&self) -> Vec<(String, usize)> {
         self.values
             .iter()
-            .filter(|(name, _)| Store::is_kept(name))
+            .filter(|(name, _)| name.starts_with(Store::KEPT))
             .map(|(name, value)| (name.clone(), value.len()))
             .collect()
     }
@@ -324,6 +418,7 @@ impl Store {
         self.remember(name);
         self.values.insert(name.to_string(), value.clone());
         self.writes.push(StoreWrite {
+            durable: false,
             name: name.to_string(),
             value: Some(value),
         });
@@ -335,6 +430,7 @@ impl Store {
         self.remember(name);
         if self.values.remove(name).is_some() {
             self.writes.push(StoreWrite {
+                durable: false,
                 name: name.to_string(),
                 value: None,
             });
@@ -351,17 +447,36 @@ impl Store {
     /// The kept value under `name` — `None` when nothing is kept, or when
     /// `name` is not granted (the same fact, as `process.env` has it), or
     /// when what is kept is not text.
+    ///
+    /// A presence name that is locked or pending reads `None` here, and the
+    /// answer that read it fails with `InvalidAccessError`, as data code's
+    /// `store.get` throws ([`Store::read`]): its value is `store.unlock`'s.
     pub fn get(&self, name: &str) -> Option<&str> {
+        match self.read(name) {
+            Ok(value) => value,
+            Err(_) => {
+                *self.locked_read.borrow_mut() = Some(name.to_owned());
+                None
+            }
+        }
+    }
+
+    /// [`Store::get`], refusing a locked or pending presence name by name.
+    pub fn read(&self, name: &str) -> Result<Option<&str>, StoreError> {
         if Store::is_kept(name) {
-            return None;
+            return Ok(None);
         }
         self.reads.set(self.reads.get() + 1);
         if !self.is_granted(name) {
-            return None;
+            return Ok(None);
         }
-        self.values
+        if self.occupancy(name).is_some_and(|o| o.locked()) {
+            return Err(StoreError::Locked(name.to_owned()));
+        }
+        Ok(self
+            .values
             .get(name)
-            .and_then(|v| std::str::from_utf8(v).ok())
+            .and_then(|v| std::str::from_utf8(v).ok()))
     }
 
     /// Keep `value` under `name`, replacing what was there; refused outside
@@ -369,17 +484,26 @@ impl Store {
     /// Storage's `setItem` does nothing then: no revision and no write, so a
     /// source that writes as it answers does not make the store's readers
     /// stale with a value they already have.
+    ///
+    /// A presence name in its locked state (locked, pending, or absent under
+    /// a mandatory line) keeps nothing here: the write carries the value to
+    /// the host's backend, which keeps it locked (LLP 1133.010 D5).
     pub fn set(&mut self, name: &str, value: &str) -> Result<(), StoreError> {
         if !self.is_granted(name) {
             return Err(self.refused(name));
+        }
+        if self.writes_locked(name) {
+            return self.set_locked(name, value);
         }
         if self.values.get(name).map(Vec::as_slice) == Some(value.as_bytes()) {
             return Ok(());
         }
         self.remember(name);
         self.values.insert(name.to_string(), value.into());
+        self.written_plain(name);
         self.revision += 1;
         self.writes.push(StoreWrite {
+            durable: false,
             name: name.to_string(),
             value: Some(value.into()),
         });
@@ -394,11 +518,67 @@ impl Store {
         }
         self.remember(name);
         self.values.remove(name);
+        self.absent(name);
         self.revision += 1;
         self.writes.push(StoreWrite {
+            durable: false,
             name: name.to_string(),
             value: None,
         });
+        Ok(())
+    }
+
+    /// Validate a lease for a plain secret. Presence-protected names use the
+    /// presence backend, whose unlock and occupancy cannot be bypassed.
+    pub fn check_exclusive(&self, name: &str) -> Result<(), StoreError> {
+        if !self.is_granted(name) || Store::is_kept(name) {
+            return Err(self.refused(name));
+        }
+        if self.writes_locked(name) {
+            return Err(StoreError::Locked(name.to_owned()));
+        }
+        self.read(name).map(|_| ())
+    }
+
+    /// Update a snapshot with a value already persisted under an exclusive lease.
+    pub fn set_durable(&mut self, name: &str, value: &str) -> Result<(), StoreError> {
+        let first = self.writes.len();
+        self.set(name, value)?;
+        if self.writes.len() == first {
+            self.writes.push(StoreWrite {
+                name: name.into(),
+                value: Some(value.into()),
+                durable: true,
+            });
+        }
+        for write in &mut self.writes[first..] {
+            write.durable = true;
+        }
+        Ok(())
+    }
+
+    /// Update a snapshot after an exclusive lease removed its persisted value.
+    pub fn forget_durable(&mut self, name: &str) -> Result<(), StoreError> {
+        if !self.is_granted(name) {
+            return Err(self.refused(name));
+        }
+        if !self.values.contains_key(name)
+            && self
+                .occupancy(name)
+                .is_none_or(|state| state == crate::presence::Occupancy::Absent)
+        {
+            self.writes.push(StoreWrite {
+                name: name.into(),
+                value: None,
+                durable: true,
+            });
+            return Ok(());
+        }
+        let first = self.writes.len();
+        self.forget(name)?;
+        for write in &mut self.writes[first..] {
+            write.durable = true;
+        }
         Ok(())
     }
 
@@ -406,16 +586,71 @@ impl Store {
     pub fn names(&self) -> Vec<&str> {
         self.values
             .keys()
-            .filter(|name| !self.restricted || self.is_granted(name))
+            .filter(|name| self.visible(name))
             .map(String::as_str)
             .collect()
+    }
+
+    /// Whether this scope sees entry `name`: everything, or in a child's
+    /// narrowed scope its granted names and their occupancy.
+    fn visible(&self, name: &str) -> bool {
+        !self.restricted || self.is_granted(name) || presence::presence_entry(name, &self.presence)
+    }
+
+    /// Adopt a host snapshot without publishing its values as new writes.
+    /// The open checkpoint can restore it if settlement refuses the change.
+    ///
+    /// Presence occupancy is the backend's, never a snapshot's: the entries
+    /// stay, and a locked or pending name's bytes in the snapshot are dropped
+    /// (LLP 1133.010 D4).
+    pub(crate) fn refresh_snapshot(&mut self, snapshot: Vec<(String, Vec<u8>)>) -> StoreChange {
+        let mut next: exact_kernel::SortedMap<_, _> = snapshot
+            .into_iter()
+            .filter(|(name, _)| {
+                self.is_granted(name)
+                    || (Self::runner_owned(name) && !name.starts_with(Store::PRESENCE))
+            })
+            .collect();
+        for (name, value) in self.values.iter() {
+            if name.starts_with(Store::PRESENCE) {
+                next.insert(name.clone(), value.clone());
+            }
+        }
+        presence::settle_entries(&mut next, &self.presence);
+        let mut names: Vec<String> = self.values.keys().chain(next.keys()).cloned().collect();
+        names.sort();
+        names.dedup();
+        let mut change = StoreChange::default();
+        for name in names {
+            if self.values.get(&name) == next.get(&name) {
+                continue;
+            }
+            change.any = true;
+            change.read |= !Self::runner_owned(&name);
+            self.remember(&name);
+            match next.get(&name) {
+                Some(value) => {
+                    self.values.insert(name, value.clone());
+                }
+                None => {
+                    self.values.remove(&name);
+                }
+            }
+        }
+        // A kept answer or a persisted slot is the runner's own record, never
+        // a reader's input: two sessions keeping different answers to one
+        // reader would otherwise re-ask each other without end.
+        if change.read {
+            self.revision += 1;
+        }
+        change
     }
 
     /// Everything kept: what a reload carries (`Carried::store`).
     pub fn snapshot(&self) -> Vec<(String, Vec<u8>)> {
         self.values
             .iter()
-            .filter(|(name, _)| !self.restricted || self.is_granted(name))
+            .filter(|(name, _)| self.visible(name))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
@@ -466,9 +701,20 @@ impl Store {
     }
 
     /// Stage `op` on the socket of resource `resource` for the mutation
-    /// being answered (LLP 1016.000 D7).
+    /// being answered or the frame being parsed (LLP 1016.000 D7).
     pub fn stage_socket(&mut self, resource: usize, op: crate::SocketOp) {
         self.sockets.push((resource, op));
+    }
+
+    /// Stage `op` on the socket of resource `resource` for the turn of an
+    /// answer being run (LLP 1016.000 D7, the amendment of 2026-10-18).
+    pub fn stage_answer_socket(&mut self, resource: usize, op: crate::SocketOp) {
+        self.answer_sockets.push((resource, op));
+    }
+
+    /// The operations turns of answers sent since the last take.
+    pub fn take_answer_sockets(&mut self) -> Vec<(usize, crate::SocketOp)> {
+        std::mem::take(&mut self.answer_sockets)
     }
 
     /// Set the turn's socket snapshot (see `socket_buffered`).
@@ -480,6 +726,22 @@ impl Store {
     /// index of the resource that owns it.
     pub fn socket_buffered(&self) -> &[(usize, u64)] {
         &self.socket_buffered
+    }
+
+    /// Set the runner's clock for the call about to be made ([`Store::clock_ms`]).
+    pub fn set_clock_ms(&mut self, ms: f64) {
+        self.clock_ms = ms;
+    }
+
+    /// The runner's clock as the call being made started, ms; zero where no
+    /// runner set it (a bake's store).
+    pub fn clock_ms(&self) -> f64 {
+        self.clock_ms
+    }
+
+    /// The socket operations staged since the last take, left staged.
+    pub fn staged_sockets(&self) -> &[(usize, crate::SocketOp)] {
+        &self.sockets
     }
 
     /// The socket operations staged since the last take.
@@ -546,6 +808,36 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_absence_keeps_reader_revision_but_changes_real_presence_occupancy() {
+        let mut plain = Store::new("secret.keep token", []);
+        let revision = plain.revision();
+        plain.forget_durable("token").unwrap();
+        plain.forget_durable("token").unwrap();
+        assert_eq!(plain.revision(), revision);
+        assert_eq!(plain.copied_bytes(), 0);
+        assert_eq!(plain.writes().len(), 2);
+        assert!(plain
+            .writes()
+            .iter()
+            .all(|w| w.durable && w.value.is_none()));
+        plain.forget("token").unwrap();
+        assert_eq!(
+            plain.revision(),
+            revision + 1,
+            "explicit forget retains its semantics"
+        );
+        let mut locked = Store::new(
+            "secret.keep token user-presence optional",
+            [(format!("{}token", Store::PRESENCE), b"locked".to_vec())],
+        );
+        assert!(locked.locked("token"));
+        let revision = locked.revision();
+        locked.forget_durable("token").unwrap();
+        assert!(!locked.locked("token"));
+        assert_eq!(locked.revision(), revision + 1);
+    }
 
     #[test]
     fn module_mirror_has_only_its_host_endowed_secret_scope() {
@@ -635,5 +927,26 @@ mod tests {
         store.set("token", "new").unwrap();
         assert_eq!(store.revision(), before + 1);
         assert_eq!(store.take_writes().len(), 1);
+        let revision = store.revision();
+        assert_eq!(
+            store.refresh_snapshot(store.snapshot()),
+            StoreChange::default()
+        );
+        assert_eq!(store.revision(), revision);
+        let kept = format!("{}token", Store::KEPT);
+        let mut peer = store.snapshot();
+        peer.push((kept.clone(), b"answer".to_vec()));
+        let change = store.refresh_snapshot(peer);
+        assert!(
+            change.any && !change.read,
+            "a kept answer is no reader's input"
+        );
+        assert_eq!(store.revision(), revision);
+        assert!(
+            store
+                .refresh_snapshot(vec![("token".into(), b"peer".to_vec())])
+                .read
+        );
+        assert_eq!(store.revision(), revision + 1);
     }
 }

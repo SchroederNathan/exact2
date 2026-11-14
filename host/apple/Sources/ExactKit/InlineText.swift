@@ -1,48 +1,12 @@
-// @ref LLP 1044.000 §6 S1 — textual descendants are paragraph values.
+import ExactCore
 import Foundation
 import CoreText
 
-struct InlineText {
-    let id: UInt32
-    let parent: UInt32
-    let props: [String: String]
-    private let lightRun: Run
-    private let darkColor: [Double]?
-    private let darkBackground: [Double]?
-    private let colorRef: BatchValue?
-    private let backgroundRef: BatchValue?
-    /// Its `color` is one its author fixed (`BatchValue.fixesInk`).
-    private let fixedInk: Bool
-    private let paint: RunPaintRows
-    let hasSchemeColor: Bool
+extension InlineText {
+    /// What it reads as: its text, or an image's `aria-label` (LLP 1011.002 D4).
+    var spoken: String { lightRun.box == nil ? text : boxShown ? props["accessibilityLabel"] ?? "" : "" }
     /// Whether a colour here is the view's tint (LLP 1095 D8).
     var namesTint: Bool { colorRef?.namesTint == true || backgroundRef?.namesTint == true || paint.namesTint }
-    let handlers: Set<String>
-    let paints: Bool
-    /// Its computed `visibility: hidden`: its text is no target
-    /// (`inlineTarget`), though it hears a visible run's click inside it.
-    var hidden: Bool { lightRun.hidden }
-    var range: NSRange = NSRange(location: 0, length: 0)
-
-    init(id: UInt32, parent: UInt32, props: [String: String], style: InlineStyle,
-         handlers: Set<String>, paints: Bool) {
-        self.id = id; self.parent = parent; self.props = props
-        var value = style.run
-        value.text = props["text"] ?? ""
-        value.href = props["href"] ?? ""
-        lightRun = value
-        darkColor = style.darkColor
-        darkBackground = style.darkBackground
-        colorRef = style.colorRef; backgroundRef = style.backgroundRef
-        fixedInk = style.fixedInk
-        paint = style.paint
-        hasSchemeColor = style.paired || style.paint.paired
-        self.handlers = handlers; self.paints = paints
-    }
-
-    var text: String { lightRun.text }
-    /// A run with an `href`: the web's `<a>` in its paragraph.
-    var isLink: Bool { !(props["href"] ?? "").isEmpty }
     /// The run in its paragraph owner's traits: `contrast` and `elevated`
     /// as `BatchValue.channels` takes them (LLP 1095 D5).
     func run(dark: Bool, contrast: Bool? = nil, elevated: Bool = false, tint: PlatformColor? = nil) -> Run {
@@ -55,7 +19,6 @@ struct InlineText {
                                                      color: value.color ?? SystemColor.canvasTextChannels(dark: dark, contrast: contrast))
         return value
     }
-
     static func run(_ text: String, style: NodeStyle, href: String = "", dark: Bool, contrast: Bool? = nil, elevated: Bool = false,
                     tint: PlatformColor? = nil) -> Run {
         func number(_ key: String, _ fallback: Double = 0) -> Double { style[key]?.number ?? fallback }
@@ -68,6 +31,9 @@ struct InlineText {
                       family: Int(number("font_family")), italic: style["font_style"]?.string == "italic",
                       lineHeight: height, letterSpacing: CGFloat(Float(number("letter_spacing"))),
                       numeric: Int(number("font_variant_numeric")),
+                      ligatures: Int(number("font_variant_ligatures")),
+                      stretch: CGFloat(Float(number("font_stretch", 100))),
+                      variations: FontAxis.of(style),
                       color: style["text_color"]?.textChannels(dark: dark, contrast: contrast, elevated: elevated, tint: tint),
                       decoration: style["text_decoration_line"]?.string ?? "", href: href)
         (run.shadow, run.stroke) = RunPaintRows(style).resolve(dark: dark, contrast: contrast, elevated: elevated, tint: tint,
@@ -91,21 +57,6 @@ extension Run {
     #else
     static let linksUnderlined = false
     #endif
-}
-
-// Resolved while reading a paragraph; no dictionary of unused layout rows.
-struct InlineStyle {
-    var run = Run(text: "", size: 16, weight: 400, family: 0, italic: false, lineHeight: nil, letterSpacing: 0)
-    var darkColor: [Double]?
-    var darkBackground: [Double]?
-    /// A platform colour by name, resolved when the run is read (LLP 1095 D5).
-    var colorRef: BatchValue?
-    var backgroundRef: BatchValue?
-    /// Whether `color` is one its author fixed, not a platform colour by name.
-    var fixedInk = false
-    /// `text-shadow` and `-webkit-text-stroke`, computed for the run (LLP 1077).
-    var paint = RunPaintRows()
-    var paired = false
 }
 
 extension Presenter {
@@ -142,6 +93,7 @@ extension Presenter {
         for run in node.inlineText where inlineOwners[run.id]?.owner == node.id { inlineOwners.removeValue(forKey: run.id) }
         node.inlineText.removeAll()
         #if os(iOS)
+        node.updateContextGestures()
         textSelection.remove(node) // its text interaction and selection go with it
         #endif
     }
@@ -169,6 +121,9 @@ extension Presenter {
         node.invalidateText()
         node.updateInlineInteraction()
         node.updateTextAccessibility()
+        #if os(iOS)
+        node.updateContextGestures()
+        #endif
         #if os(macOS)
         // Its `href` runs' pointing hand (`resetCursorRects`).
         if hadLinks || rows.contains(where: \.isLink) { node.window?.invalidateCursorRects(for: node) }
@@ -235,8 +190,10 @@ extension NodeView {
         }
         return nil
     }
-    func inlineActivationTarget(at point: CGPoint) -> InlineText? {
-        var run = inlineTarget(at: point)
+    func inlineActivationTarget(at point: CGPoint) -> InlineText? { activationTarget(from: inlineTarget(at: point)) }
+    /// The run a press on `run` acts on: it, or the nearest run it stands in, with a press or an `href`
+    func activationTarget(from run: InlineText?) -> InlineText? {
+        var run = run
         while let current = run {
             if current.handlers.contains("press") || !(current.props["href"] ?? "").isEmpty { return current }
             run = presenter?.inlineText(current.parent)
@@ -247,8 +204,9 @@ extension NodeView {
         guard kind == "button", !handlers.contains("press"), let url = props["href"], !url.isEmpty else { return nil }
         return url
     }
-    func activateLink(_ url: String) -> Bool {
-        guard let session = presenter?.session, !disabled, !inert else { return false }
+    func activateLink(_ url: String, bubbled: Bool = false) -> Bool {
+        if pressReaderAtom(url) { return true }
+        guard let session = presenter?.session, !disabled, !(bubbled ? authoredInert : inert) else { return false }
         if url.hasPrefix("/") && !url.hasPrefix("//") { return session.navigate(url) }
         session.delegate?.exactSession(session, command: "openURL", args: [url]); return true
     }
@@ -261,7 +219,18 @@ extension NodeView {
     }
     func activateInline(_ id: UInt32) -> Bool {
         guard canActivateInline(id), let presenter, let run = presenter.inlineText(id) else { return false }
-        if run.handlers.contains("press") { presenter.press(id); return true }
+        if run.handlers.contains("press") {
+            #if os(iOS)
+            if presenter.activationButton(from: self, inline: id) != nil {
+                presenter.menus.activating(from: self, pressing: nil) { presenter.press(id) }
+            } else { presenter.press(id) }
+            #elseif os(macOS)
+            presenter.menus.activating(from: self, pressing: nil, inline: id) { presenter.press(id) }
+            #else
+            presenter.press(id)
+            #endif
+            return true
+        }
         // A route in the note navigates; anything else is the app's to open
         // (session.follow). A button's own `href` uses `activateLink`.
         guard let url = run.props["href"], let session = presenter.session else { return false }

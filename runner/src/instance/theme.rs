@@ -52,12 +52,46 @@ pub struct ThemedRow {
     pub tokens: u64,
 }
 
+/// A Markdown node's `atomFaces` whose colours read a token (LLP 1045.000
+/// D2): the faces as the bridge named them, read again in their tuple when
+/// a token changes, as a row's text is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThemedFaces {
+    /// The faces' named JSON, the colours as written.
+    pub text: exact_kernel::PropValue,
+    /// The app tuple they were read in.
+    pub tuple: u32,
+    /// The tokens they read, as `theme::name_bit`s.
+    pub tokens: u64,
+    /// The colours the faces as last set refused, as written. A read again
+    /// that refuses one of these sets the faces anyway; one that refuses
+    /// any other colour, which the faces as set took, keeps them.
+    pub refused: Vec<String>,
+}
+
+/// The end of a refused colour's journal line. A first read sets the faces
+/// with the colour empty, so its kind's paint stands; a read again that
+/// refuses a colour the faces as set took keeps those faces.
+pub(crate) const KIND: &str = "its kind's paint stands";
+pub(crate) const KEPT: &str = "its faces stay as they were";
+
+/// The colours a read again refused (`now`) that the faces as set took:
+/// those faces refused only `set`. Any such colour keeps them.
+pub(crate) fn newly_refused(now: &[String], set: &[String]) -> Vec<String> {
+    now.iter().filter(|t| !set.contains(t)).cloned().collect()
+}
+
 /// Every row that read a token, by view and row (D7's index): what a
 /// token's new value sets again, with no tree visited and no binding
 /// evaluated. One map, so a themed list's rows allocate only its growth.
 #[derive(Debug, Default)]
 pub struct ThemeIndex {
     rows: std::collections::HashMap<(ViewId, u16), ThemedRow>,
+    /// Each node's state looks that read a token (LLP 1121 D8): what a
+    /// token's new value resolves again, as `rows` are.
+    pub(super) looks: std::collections::HashMap<ViewId, super::looks::Looks>,
+    /// Each Markdown node's faces that read a token, likewise.
+    faces: std::collections::HashMap<ViewId, ThemedFaces>,
     /// The window's app tuple (`setMode`), which a visit starts in.
     pub window: u32,
     /// The window's tuple moved since a visit last started: the next one
@@ -76,6 +110,47 @@ impl ThemeIndex {
         self.rows.get(&(view, style as u16))
     }
 
+    /// `view`'s `style`, set again, read `tokens` too: a token's new value
+    /// may read one its old value didn't (a shadow over a base the design
+    /// sets, LLP 1121 stage 12 B3), which an edit of that one then sets
+    /// again. The bits are added, never replaced: a row whose text no
+    /// longer reads a token keeps its bit, which costs at most one re-set
+    /// that changes nothing (bits are already shared by names, `name_bit`),
+    /// where replacing them could drop a read the parse didn't repeat.
+    pub(crate) fn also_read(&mut self, view: ViewId, style: StyleId, tokens: u64) {
+        if let Some(row) = self.rows.get_mut(&(view, style as u16)) {
+            row.tokens |= tokens;
+        }
+    }
+
+    /// `view`'s state looks, resolved again, read `tokens` too, added as
+    /// [`ThemeIndex::also_read`] adds a row's.
+    pub(crate) fn looks_read(&mut self, view: ViewId, tokens: u64) {
+        if let Some(l) = self.looks.get_mut(&view) {
+            l.tokens |= tokens;
+        }
+    }
+
+    /// `view`'s faces, read again, read `tokens` too, added as
+    /// [`ThemeIndex::also_read`] adds a row's.
+    pub(crate) fn faces_read(&mut self, view: ViewId, tokens: u64) {
+        if let Some(f) = self.faces.get_mut(&view) {
+            f.tokens |= tokens;
+        }
+    }
+
+    /// `view`'s faces, set again, refuse `refused`.
+    pub(crate) fn faces_set(&mut self, view: ViewId, refused: Vec<String>) {
+        if let Some(f) = self.faces.get_mut(&view) {
+            f.refused = refused;
+        }
+    }
+
+    /// Each Markdown node's faces that read a token, by view.
+    pub fn faces(&self) -> impl Iterator<Item = (ViewId, &ThemedFaces)> + '_ {
+        self.faces.iter().map(|(view, f)| (*view, f))
+    }
+
     /// `view`'s `style` reads no token now.
     pub(super) fn drop_row(&mut self, view: ViewId, style: StyleId) {
         if !self.rows.is_empty() {
@@ -86,6 +161,13 @@ impl ThemeIndex {
     /// Forget the views `live` says are gone.
     pub(super) fn retain(&mut self, live: &impl Fn(ViewId) -> bool) {
         self.rows.retain(|(view, _), _| live(*view));
+        self.looks.retain(|view, _| live(*view));
+        self.faces.retain(|view, _| live(*view));
+    }
+
+    /// Each node's state looks that read a token, by view.
+    pub fn looks(&self) -> impl Iterator<Item = (ViewId, &super::looks::Looks)> + '_ {
+        self.looks.iter().map(|(view, l)| (*view, l))
     }
 
     /// Every themed row, in no order.
@@ -205,11 +287,17 @@ impl super::NodeInst {
         let row = plan.node(self.node);
         // A row it sets passes its text on when that read a token, else
         // nothing; a row it does not set, its implied row's or the one around.
-        let inherited = std::array::from_fn(|k| match binding_of(plan, row, INHERITED[k]) {
-            Some(b) if self.themed.sets(b) => {
-                self.themed.get(b).then(|| self.last[b].clone()).flatten()
-            }
-            _ => match self.implied.as_ref().and_then(|implied| implied[k].clone()) {
+        let inherited = std::array::from_fn(|k| match binding_of(plan, &row, INHERITED[k]) {
+            Some(b) if self.themed.sets(b) => self
+                .themed
+                .get(b)
+                .then(|| self.emitted(plan, u.sites, b))
+                .flatten(),
+            _ => match self
+                .rare
+                .as_ref()
+                .and_then(|r| r.implied.as_ref()?[k].clone())
+            {
                 Some(text) => Some(text),
                 None => u.theme.inherited[k].clone(),
             },
@@ -222,6 +310,79 @@ impl super::NodeInst {
         u.theme.tuple = self.tuple;
         u.theme.inherited = inherited;
         saved
+    }
+
+    /// Binding `i`'s `atomFaces` (LLP 1045.000 D2), each face's colours read
+    /// as a bound colour row's are, in this node's tuple
+    /// (`bridge::atom_face_paint`): the value to set, or `None` to leave the
+    /// faces as they are. A first read journals each colour that is none,
+    /// which then leaves its kind's paint. A read again of the same faces,
+    /// when the tuple moves, leaves them as they were if it refuses a colour
+    /// the faces as set took, and journals that colour; one they already
+    /// refused is refused again without a line. Faces that read a token are
+    /// kept in the index, read again when the token changes, and their
+    /// binding is set again when the tuple moves, as a themed row's is.
+    pub(super) fn faces(
+        &mut self,
+        u: &mut super::Update<'_>,
+        i: usize,
+        text: exact_kernel::PropValue,
+    ) -> Option<exact_kernel::PropValue> {
+        let again = (u.ids.theme.faces.get(&self.view))
+            .filter(|f| f.text == text)
+            .map(|f| (f.refused.clone(), f.tokens));
+        exact_kernel::style::theme::take_named();
+        let mut refused = Vec::new();
+        let painted = crate::bridge::atom_face_paint(
+            u.env.plan,
+            exact_kernel::PropId::AtomFaces,
+            text.clone(),
+            &mut refused,
+        );
+        let mut tokens = exact_kernel::style::theme::take_named();
+        let view = self.view;
+        let (value, refused) = match again {
+            Some((set, read)) => {
+                tokens |= read;
+                let newly = newly_refused(&refused, &set);
+                for text in &newly {
+                    u.notes.push(super::invalid_face(view, text.clone(), KEPT));
+                }
+                match newly.is_empty() {
+                    true => (Some(painted), refused),
+                    false => (None, set),
+                }
+            }
+            None => {
+                for text in &refused {
+                    u.notes.push(super::invalid_face(view, text.clone(), KIND));
+                }
+                (Some(painted), refused)
+            }
+        };
+        self.themed.set(i, tokens != 0, false);
+        match tokens {
+            0 => {
+                u.ids.theme.faces.remove(&view);
+            }
+            _ => {
+                let tuple = self.tuple;
+                let faces = ThemedFaces {
+                    text,
+                    tuple,
+                    tokens,
+                    refused,
+                };
+                u.ids.theme.faces.insert(view, faces);
+            }
+        }
+        value
+    }
+
+    /// Binding `i`'s faces are cleared: they read no token now.
+    pub(super) fn unthemed_faces(&mut self, u: &mut super::Update<'_>, i: usize) {
+        self.themed.set(i, false, false);
+        u.ids.theme.faces.remove(&self.view);
     }
 
     /// Binding `i` set `style`'s row from `text`: kept beside its token when
@@ -241,6 +402,9 @@ impl super::NodeInst {
         };
         self.colour_moved |= INHERITED.contains(&style);
         self.themed.set(i, named, ok);
+        if !ok {
+            self.unimply(style);
+        }
         match named {
             true => u.ids.theme.put(
                 self.view,
@@ -262,6 +426,17 @@ impl super::NodeInst {
         self.colour_moved |= INHERITED.contains(&style);
         self.themed.set(i, false, false);
         u.ids.theme.drop_row(self.view, style);
+        self.unimply(style);
+    }
+
+    /// The binding's clear (or a value the row refused) cleared `style`'s
+    /// row, an implied one with it: a boundary sets it again (`boundary_rows`),
+    /// unwritten, though what it implies has not changed since.
+    fn unimply(&mut self, style: StyleId) {
+        let k = INHERITED.iter().position(|s| *s == style);
+        if let (Some(k), Some(implied)) = (k, self.rare.as_mut().and_then(|r| r.implied.as_mut())) {
+            implied[k] = None;
+        }
     }
 
     /// A mode boundary's implied rows (D7): each inherited colour row it does
@@ -275,16 +450,17 @@ impl super::NodeInst {
     ) {
         let plan = u.env.plan;
         let row = plan.node(self.node);
+        let (view, tuple) = (self.view, self.tuple);
         for (k, style) in INHERITED.into_iter().enumerate() {
             // Its own row stands: an implied one is set again when it goes.
-            if binding_of(plan, row, style).is_some_and(|b| self.themed.sets(b)) {
-                if let Some(implied) = self.implied.as_mut() {
+            if binding_of(plan, &row, style).is_some_and(|b| self.themed.sets(b)) {
+                if let Some(implied) = self.rare.as_mut().and_then(|r| r.implied.as_mut()) {
                     implied[k] = None;
                 }
                 continue;
             }
             let want = u.theme.inherited[k].clone();
-            let implied = self.implied.get_or_insert_with(Default::default);
+            let implied = self.rare().implied.get_or_insert_with(Default::default);
             if want == implied[k] && !force {
                 continue;
             }
@@ -296,11 +472,11 @@ impl super::NodeInst {
                     let tokens = exact_kernel::style::theme::take_named();
                     if set.is_ok() {
                         u.ids.theme.put(
-                            self.view,
+                            view,
                             ThemedRow {
                                 style,
                                 text: text.clone(),
-                                tuple: self.tuple,
+                                tuple,
                                 written: false,
                                 implied: true,
                                 tokens,
@@ -312,11 +488,11 @@ impl super::NodeInst {
                     let mut mask = exact_kernel::StyleMask::default();
                     mask.set(style);
                     u.ops.push(exact_kernel::Op::ClearStyle {
-                        id: self.view,
+                        id: view,
                         mask,
                         written: false,
                     });
-                    u.ids.theme.drop_row(self.view, style);
+                    u.ids.theme.drop_row(view, style);
                 }
                 None => {}
             }

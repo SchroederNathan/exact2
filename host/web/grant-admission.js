@@ -2,11 +2,13 @@
 // the pre-pixel wasm host, whose two-module boot contract owns the definitions.
 export {
   admitsNetwork,
+  admittingGrant,
   admitsSecret,
   coversPath,
   createGrantSet,
   grantError,
   hasGrant,
+  isLocalNetwork,
   rawGrantText,
   sameGrantDeclaration,
   scopedGrantSet,

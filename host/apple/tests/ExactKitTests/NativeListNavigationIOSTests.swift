@@ -243,7 +243,7 @@ final class NativeListNavigationIOSTests: XCTestCase {
         XCTAssertTrue(route.collapseScroll === node)
         XCTAssertTrue(route.collapseScrollView === collection)
         XCTAssertEqual(plain.contentInsetAdjustmentBehavior, .never)
-        XCTAssertEqual(collection.contentInsetAdjustmentBehavior, .always)
+        XCTAssertEqual(collection.contentInsetAdjustmentBehavior, .automatic)
         collection.contentInset.bottom = 40
         XCTAssertTrue(NavigationHost.ownedChanges(collection, of: node, insetByUIKit: true).isEmpty, "the collection retains its Exact-owned delegate and native footer insets")
         let changedDelegate = NativeDelegate()
@@ -258,10 +258,71 @@ final class NativeListNavigationIOSTests: XCTestCase {
         XCTAssertTrue(route.contentScrollView(for: .top) === replacement, "a new backend on the same node is rebound")
         XCTAssertEqual(collection.contentInsetAdjustmentBehavior, .never)
         XCTAssertTrue(route.contentScrollView(for: .bottom) === replacement, "the bottom edge follows the replacement too")
-        XCTAssertEqual(replacement.contentInsetAdjustmentBehavior, .always)
+        XCTAssertEqual(replacement.contentInsetAdjustmentBehavior, .automatic)
         XCTAssertEqual(node.scrollOrigin, 0, "the previous backend's title inset is not carried over")
         XCTAssertEqual(node.scrollCollapsed, 0)
         XCTAssertTrue(navigation.shownScroll(navigation.contentScroller(of: route)) === replacement)
+        route.setContentScrollView(replacement, for: .top)
+        navigation.prepareRoutes([route], in: nav)
+        XCTAssertTrue(navigation.contentScroller(of: route) === node, "native selection retains the collection's Exact owner")
+        XCTAssertTrue(route.collapseScroll === node)
+        XCTAssertTrue(route.collapseScrollView === replacement)
+        XCTAssertEqual(route.projected?.scroll, ObjectIdentifier(replacement), "the route hatch receives the selected collection")
+    }
+
+    func testRawNativeScrollSelectionsKeepTheirPoliciesAndOneScrollToTopTarget() throws {
+        let session = try fixture("native-scroll-selection")
+        let (nav, route, node) = try second(session)
+        let p = session.presenter, automatic = try XCTUnwrap(node.scrollView)
+        let firstNative = UIScrollView(frame: route.view.bounds), secondNative = UIScrollView(frame: route.view.bounds)
+        firstNative.scrollsToTop = false; secondNative.scrollsToTop = false
+        firstNative.contentInsetAdjustmentBehavior = .always
+        secondNative.contentInsetAdjustmentBehavior = .automatic
+        route.view.addSubview(firstNative); route.view.addSubview(secondNative)
+        defer { firstNative.removeFromSuperview(); secondNative.removeFromSuperview() }
+
+        route.setContentScrollView(firstNative, for: .all)
+        XCTAssertTrue(firstNative.scrollsToTop, "a selected native view is enabled even when its flag was false")
+        XCTAssertFalse(automatic.scrollsToTop)
+        p.navigation.prepareRoutes([route], in: nav)
+        XCTAssertEqual(route.projected?.scroll, ObjectIdentifier(firstNative), "the route hatch receives an app-owned native view")
+        XCTAssertEqual(firstNative.contentInsetAdjustmentBehavior, .always, "projection preserves the native bottom selection's inset policy")
+
+        route.setContentScrollView(secondNative, for: .top)
+        XCTAssertFalse(firstNative.scrollsToTop, "the previous native target stops competing for status-bar taps")
+        XCTAssertTrue(secondNative.scrollsToTop)
+        p.navigation.prepareRoutes([route], in: nav)
+        XCTAssertEqual(route.projected?.scroll, ObjectIdentifier(secondNative))
+        XCTAssertTrue(route.contentScrollView(for: .bottom) === firstNative)
+        XCTAssertEqual(firstNative.contentInsetAdjustmentBehavior, .always)
+        XCTAssertEqual(secondNative.contentInsetAdjustmentBehavior, .automatic)
+
+        #if EXACT_INSPECT
+        let inspected = Inspect.on
+        defer { Inspect.on = inspected; p.syncScrollsToTop() }
+        Inspect.on = true
+        p.syncScrollsToTop()
+        XCTAssertFalse(secondNative.scrollsToTop, "Inspect disables the native target too")
+        Inspect.on = false
+        p.syncScrollsToTop()
+        XCTAssertTrue(secondNative.scrollsToTop)
+        #endif
+
+        route.setContentScrollView(nil, for: .all)
+        XCTAssertFalse(firstNative.scrollsToTop)
+        XCTAssertFalse(secondNative.scrollsToTop)
+        XCTAssertTrue(automatic.scrollsToTop)
+        p.navigation.prepareRoutes([route], in: nav)
+        XCTAssertEqual(route.projected?.scroll, ObjectIdentifier(automatic))
+        XCTAssertNil(route.contentScrollView(for: .top), "UIKit retains automatic discovery")
+        XCTAssertNil(route.contentScrollView(for: .bottom))
+        XCTAssertEqual(firstNative.contentInsetAdjustmentBehavior, .always)
+        XCTAssertEqual(secondNative.contentInsetAdjustmentBehavior, .automatic)
+
+        route.setContentScrollView(firstNative, for: .top)
+        XCTAssertTrue(firstNative.scrollsToTop)
+        p.navigation.reset()
+        XCTAssertFalse(firstNative.scrollsToTop, "retiring navigation releases its native status-bar target")
     }
 
     private func nativeList(initialTop: Double? = 0, paddingTop: Double = 0, laterAuthoredTop: Double? = nil, customHero: Bool = false, heroHeight: Double = 80, followEnd: Bool = false) throws -> (ExactSession, UINavigationController, RouteController, NodeView) {
@@ -330,7 +391,7 @@ final class NativeListNavigationIOSTests: XCTestCase {
         XCTAssertTrue(node.scrollView === collection)
         XCTAssertTrue(route.contentScrollView(for: .top) === collection)
         XCTAssertTrue(p.navigation.shownScroll(p.navigation.contentScroller(of: route)) === collection)
-        XCTAssertEqual(collection.contentInsetAdjustmentBehavior, .always)
+        XCTAssertEqual(collection.contentInsetAdjustmentBehavior, .automatic)
         XCTAssertFalse(collection.isHidden)
         XCTAssertGreaterThan(collection.contentSize.height, collection.bounds.height, "the native layout owns the row extent")
         XCTAssertGreaterThan(node.scrollOrigin, 0)
@@ -514,20 +575,49 @@ final class NativeListNavigationIOSTests: XCTestCase {
         XCTAssertEqual(measured?["sy"] as? Double ?? -1, Double(collection.contentOffset.y + node.scrollTopInset(collection)), accuracy: 0.5, "the new layout basis is reported as the current logical offset")
     }
 
-    func testRevealingAnOffscreenNativeRowFromTheExpandedTitleSurvivesLayout() throws {
+    /// Reveals row `offset` of the list from the expanded title, then lets a
+    /// batch's restore run over it. Returns the row's distance below the port
+    /// and the offset's distance short of the range's end, after each.
+    private func reveal(_ offset: UInt32) throws -> (aligned: CGFloat, short: CGFloat, alignedAfter: CGFloat, shortAfter: CGFloat) {
         let (session, _, _, node) = try nativeList()
         let p = session.presenter
         let collection = try XCTUnwrap(node.scrollView)
-        let targetID = node.id + 30
+        let targetID = node.id + offset
         p.apply(wireBatch([["op": "props", "id": targetID, "set": ["id": "native-nav-reveal-target"]]]))
-        p.scrollElementIntoView(["native-nav-reveal-target", "start", "nearest"])
+        p.scrollElementIntoView(["native-nav-reveal-target", "start", "nearest", "instant"])
         collection.layoutIfNeeded()
-        spin(0.2)
         let target = try XCTUnwrap(p.views[targetID])
-        let rect = try XCTUnwrap(p.groupedLists?.projectedRect(for: target, in: collection))
-        XCTAssertEqual(rect.minY - collection.contentOffset.y - collection.adjustedContentInset.top, 0, accuracy: 0.5, "the requested native row remains aligned after the bar collapses")
+        func measure() throws -> (CGFloat, CGFloat) {
+            let rect = try XCTUnwrap(p.groupedLists?.projectedRect(for: target, in: collection))
+            let i = collection.adjustedContentInset
+            return (rect.minY - collection.contentOffset.y - i.top, collection.contentSize.height + i.bottom - collection.bounds.height - collection.contentOffset.y)
+        }
+        let (aligned, short) = try measure()
+        // Any batch restores every scroller's reading position (the fixture's
+        // own timer sent one a moment later, which made this race).
+        p.apply(wireBatch([["op": "props", "id": node.id + 2, "set": ["id": "native-nav-unrelated"]]]))
+        collection.layoutIfNeeded()
+        let (alignedAfter, shortAfter) = try measure()
         let list = try XCTUnwrap((p.groupedLists as? GroupedListHost)?.lists[node.id])
         XCTAssertNotNil(list.cell(targetID), "the row is actually realized in the visible native collection")
+        return (aligned, short, alignedAfter, shortAfter)
+    }
+
+    func testRevealingAnOffscreenNativeRowFromTheExpandedTitleSurvivesLayout() throws {
+        let r = try reveal(20)
+        XCTAssertEqual(r.aligned, 0, accuracy: 0.5, "the requested native row is aligned under the collapsed bar")
+        XCTAssertEqual(r.alignedAfter, 0, accuracy: 0.5, "the requested native row remains aligned after the next batch")
+    }
+
+    /// Near the end the row cannot reach the port's top: the reveal stops at
+    /// the range's end, as CSS clamps it, and not past it where collapsing
+    /// the title put it until the next batch clamped it.
+    func testRevealingANativeRowNearTheEndFromTheExpandedTitleStopsAtTheEnd() throws {
+        let r = try reveal(30)
+        XCTAssertGreaterThan(r.aligned, 0.5, "the row is too near the end to reach the port's top")
+        XCTAssertEqual(r.short, 0, accuracy: 0.5, "the reveal ends at the range's end, not past it")
+        XCTAssertEqual(r.alignedAfter, r.aligned, accuracy: 0.5, "the next batch leaves the row where the reveal put it")
+        XCTAssertEqual(r.shortAfter, 0, accuracy: 0.5)
     }
 
     func testANativePaddedListsDefaultOffsetIsZeroWithoutAnAuthoredScrollTop() throws {
@@ -556,7 +646,7 @@ final class NativeListNavigationIOSTests: XCTestCase {
         XCTAssertNil(route.collapseScroll)
         XCTAssertNil(route.collapseScrollView)
         XCTAssertTrue(node.scrollView === collection, "releasing the bar does not replace the native backend")
-        XCTAssertEqual(collection.contentInsetAdjustmentBehavior, .always)
+        XCTAssertEqual(collection.contentInsetAdjustmentBehavior, .automatic)
         XCTAssertEqual(collection.contentInset.top, 24, accuracy: 0.5, "native content padding remains owned by the list")
         XCTAssertEqual(collection.contentOffset.y + node.scrollTopInset(collection), initialTop, accuracy: 0.5, "releasing navigation ownership preserves CSS offset including native padding")
     }

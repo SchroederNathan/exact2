@@ -37,9 +37,14 @@ use std::collections::VecDeque;
 /// Reserved resource source, answered by the runner.
 pub const SOURCE: &str = "exactMIDI";
 /// Fields an app may declare, filled by name.
-pub const FIELDS: &[&str] = &["state", "inputs", "outputs"];
+pub const FIELDS: &[&str] = &["state", "inputs", "outputs", "sent"];
 /// A `MIDIPort`'s fields, filled by name.
 pub const PORT_FIELDS: &[&str] = &["id", "name", "manufacturer", "state"];
+/// A sent message's fields, filled by name: `MIDIOutput.send`'s output,
+/// data and timestamp (runner ms).
+pub const SENT_FIELDS: &[&str] = &["output", "data", "timeStamp"];
+/// The messages `exactMIDI().sent` lists: the last that went out.
+pub const SENT: usize = 128;
 /// How long before its time a host hands a message to its output, ms (D7).
 pub const HOLD: f64 = 50.0;
 /// Messages that may wait to be handed.
@@ -358,6 +363,42 @@ impl Sent {
         self.by.is_none() && self.at - HOLD <= t
     }
 
+    /// What `exactMIDI().sent` may list: not Timing Clock, whether clock
+    /// out's tick or an app's own `[248]` (24 a beat would be most of it).
+    fn listed(&self) -> bool {
+        self.tick.is_none() && self.data != [0xF8]
+    }
+
+    /// Gone out by `t`, as `exactMIDI().sent` lists it: due and never
+    /// taken back.
+    fn gone(&self, t: f64) -> bool {
+        self.listed() && self.by.is_none() && self.at <= t
+    }
+
+    /// `exactMIDI().sent`'s order: by time, then by id.
+    fn order(&self, other: &Sent) -> std::cmp::Ordering {
+        self.at.total_cmp(&other.at).then(self.id.cmp(&other.id))
+    }
+
+    /// The record of `fields`, by name; `None` for a field it lacks.
+    fn value(&self, fields: &[&str]) -> Option<Value> {
+        let mut out = Vec::with_capacity(fields.len());
+        for f in fields {
+            out.push(match *f {
+                "output" => Value::str(&self.output),
+                "data" => Value::list(
+                    self.data
+                        .iter()
+                        .map(|b| Value::Number(f64::from(*b)))
+                        .collect(),
+                ),
+                "timeStamp" => Value::Number(self.at),
+                _ => return None,
+            });
+        }
+        Some(Value::record(out))
+    }
+
     /// Exempt from [`QUEUED`]: a note-off, Stop, a tick.
     fn exempt(&self) -> bool {
         self.tick.is_some() || note_off(&self.data) || self.data == [0xFC]
@@ -404,10 +445,13 @@ pub enum MidiOp {
         /// The message.
         id: u64,
     },
-    /// Listen to exactly these inputs, by id.
+    /// Listen to exactly these inputs, by id; forward Timing Clock only
+    /// from those in `clock`, which a sequence follows (LLP 1125 D9).
     Open {
         /// The inputs.
         inputs: Vec<String>,
+        /// The inputs whose clock ticks are delivered.
+        clock: Vec<String>,
     },
     /// `requestMIDIAccess()`: ask the platform, then report the ports.
     Request,
@@ -417,7 +461,8 @@ pub enum MidiOp {
 /// plan uses MIDI (the host loads its arm, and forgets what an earlier
 /// runner left held), then the ops — `{"op":"send","id","output","data":
 /// [bytes],"at"}` in runner ms, `{"op":"retract","id"}`, `{"op":"open",
-/// "inputs":[…]}`, `{"op":"request"}`. `None` when there is nothing to say.
+/// "inputs":[…],"clock":[…]}`, `{"op":"request"}`. `None` when there is
+/// nothing to say.
 pub fn batch_op(ops: &[MidiOp], boot: bool) -> Option<String> {
     if ops.is_empty() && !boot {
         return None;
@@ -450,13 +495,16 @@ pub fn batch_op(ops: &[MidiOp], boot: bool) -> Option<String> {
                 s.push_str(&format!("],\"at\":{}}}", num(*at)));
             }
             MidiOp::Retract { id } => s.push_str(&format!("{{\"op\":\"retract\",\"id\":{id}}}")),
-            MidiOp::Open { inputs } => {
+            MidiOp::Open { inputs, clock } => {
                 s.push_str("{\"op\":\"open\",\"inputs\":[");
-                for (k, input) in inputs.iter().enumerate() {
-                    if k > 0 {
-                        s.push(',');
+                for (key, list) in [("", inputs), ("],\"clock\":[", clock)] {
+                    s.push_str(key);
+                    for (k, input) in list.iter().enumerate() {
+                        if k > 0 {
+                            s.push(',');
+                        }
+                        crate::agent::quote(input, &mut s);
                     }
-                    crate::agent::quote(input, &mut s);
                 }
                 s.push_str("]}");
             }
@@ -503,12 +551,16 @@ pub struct Midi {
     /// The app grants `device.midi`.
     granted: bool,
     queue: VecDeque<Sent>,
+    /// Listed messages the queue let go once handed, which can no longer be
+    /// taken back, in `sent`'s order: its history beyond the queue.
+    out: Vec<Sent>,
     next: u64,
     received: VecDeque<Received>,
     heard: u64,
     ops: Vec<MidiOp>,
-    /// The inputs a host was last told to open.
-    open: Vec<String>,
+    /// The inputs a host was last told to open, and those of them whose
+    /// clock it forwards.
+    open: (Vec<String>, Vec<String>),
     clock: Option<Clock>,
     ticks: u64,
     /// The last tick handed and let go from the queue: its index and time.
@@ -519,6 +571,8 @@ pub struct Midi {
     pub(crate) answer_due: f64,
     /// The resources reading `exactMIDI`.
     pub(crate) readers: Vec<usize>,
+    /// One of them declares `sent`: each message's time answers them again.
+    pub(crate) reads_sent: bool,
     /// The agent's environment (`prefer midi.*`): what a request answers.
     preferred: Ports,
 }
@@ -535,17 +589,19 @@ impl Midi {
             }),
             granted,
             queue: VecDeque::new(),
+            out: Vec::new(),
             next: 0,
             received: VecDeque::new(),
             heard: 0,
             ops: Vec::new(),
-            open: Vec::new(),
+            open: (Vec::new(), Vec::new()),
             clock: None,
             ticks: 0,
             played: None,
             clock_floor: f64::NEG_INFINITY,
             answer_due: f64::INFINITY,
             readers,
+            reads_sent: false,
             preferred: Ports::none(Access::Granted),
         }
     }
@@ -572,7 +628,7 @@ impl Midi {
 
     /// The inputs a host was last told to open.
     pub fn open(&self) -> &[String] {
-        &self.open
+        &self.open.0
     }
 
     /// Clock out's output while it plays, and the ticks ever queued.
@@ -603,29 +659,55 @@ impl Midi {
         std::mem::take(&mut self.ops)
     }
 
-    /// The inputs a host should listen to now; an `Open` when they changed.
-    pub(crate) fn set_open(&mut self, inputs: Vec<String>) {
-        if inputs != self.open {
+    /// The inputs a host should listen to now, and those whose clock it
+    /// forwards; an `Open` when they changed.
+    pub(crate) fn set_open(&mut self, inputs: Vec<String>, clock: Vec<String>) {
+        if (&inputs, &clock) != (&self.open.0, &self.open.1) {
             self.ops.push(MidiOp::Open {
                 inputs: inputs.clone(),
+                clock: clock.clone(),
             });
-            self.open = inputs;
+            self.open = (inputs, clock);
         }
     }
 
-    /// One `exactMIDI` field, for a reader's shape: a port list's records
-    /// carry `port_fields`.
-    pub fn field(&self, name: &str, port_fields: &[&str]) -> Option<Value> {
+    /// One `exactMIDI` field at `t`, for a reader's shape: a list's records
+    /// carry `item_fields`.
+    pub fn field(&self, name: &str, item_fields: &[&str], t: f64) -> Option<Value> {
         let list = |ports: &[Port]| -> Option<Value> {
-            let items: Option<Vec<Value>> = ports.iter().map(|p| p.value(port_fields)).collect();
+            let items: Option<Vec<Value>> = ports.iter().map(|p| p.value(item_fields)).collect();
             items.map(Value::list)
         };
         match name {
             "state" => Some(Value::str(self.ports.access.word())),
             "inputs" => list(&self.ports.inputs),
             "outputs" => list(&self.ports.outputs),
+            "sent" => {
+                let mut gone: Vec<&Sent> = (self.out.iter().filter(|s| s.at <= t))
+                    .chain(self.queue.iter().filter(|s| s.gone(t)))
+                    .collect();
+                gone.sort_by(|a, b| a.order(b));
+                let items: Option<Vec<Value>> = gone[gone.len().saturating_sub(SENT)..]
+                    .iter()
+                    .map(|s| s.value(item_fields))
+                    .collect();
+                items.map(Value::list)
+            }
             _ => None,
         }
+    }
+
+    /// When the next message `sent` lists goes after `t`, while a reader
+    /// declares it.
+    pub(crate) fn next_sent(&self, t: f64) -> f64 {
+        if !self.reads_sent {
+            return f64::INFINITY;
+        }
+        (self.queue.iter().filter(|s| s.listed() && s.by.is_none()))
+            .chain(&self.out)
+            .map(|s| s.at)
+            .filter(|at| *at > t)
+            .fold(f64::INFINITY, f64::min)
     }
 
     /// What a host reported, merged over what was seen; `false` when
@@ -736,7 +818,7 @@ impl Midi {
                 "midi dropped: at is not a number (sendMIDI to {output})"
             ));
         }
-        if !self.ports.connected_output(&output) {
+        if !self.can_send(&output) {
             let why = if self.ports.access != Access::Granted {
                 format!("access is {}", self.ports.access.word())
             } else {
@@ -782,20 +864,27 @@ impl Midi {
         if m.tick.is_none() {
             log.push(format!(
                 "midi {id} to {} {} at {}{note}",
-                m.output,
+                if m.output.is_empty() {
+                    "no output"
+                } else {
+                    m.output
+                },
                 hex(&m.data),
                 num(m.at)
             ));
         } else {
             self.ticks += 1;
         }
-        self.ops.push(MidiOp::Send {
-            id,
-            output: m.output.to_string(),
-            data: m.data.clone(),
-            at: m.at,
-        });
-        self.queue.push_back(Sent {
+        if !m.output.is_empty() {
+            self.ops.push(MidiOp::Send {
+                id,
+                output: m.output.to_string(),
+                data: m.data.clone(),
+                at: m.at,
+            });
+        }
+        // A reader of `sent` is answered again when the message goes.
+        let sent = Sent {
             id,
             output: m.output.to_string(),
             data: m.data,
@@ -805,7 +894,11 @@ impl Midi {
             step_at: m.step_at,
             tick: m.tick,
             on_at: m.on_at,
-        });
+        };
+        if self.reads_sent && sent.listed() {
+            self.answer_due = self.answer_due.min(sent.at);
+        }
+        self.queue.push_back(sent);
         self.trim(t);
         id
     }
@@ -815,7 +908,9 @@ impl Midi {
     fn retract(&mut self, i: usize, by: &'static str) {
         let s = &mut self.queue[i];
         s.by = Some(by);
-        self.ops.push(MidiOp::Retract { id: s.id });
+        if !s.output.is_empty() {
+            self.ops.push(MidiOp::Retract { id: s.id });
+        }
         if let Some(c) = self.clock.as_mut() {
             if s.seq && s.data == [0xFA] && s.output == c.output {
                 c.started = false;
@@ -843,10 +938,21 @@ impl Midi {
         }
         while self.queue.len() > RECORD {
             let Some(i) = self.queue.iter().position(|s| !s.waits(t)) else {
-                return;
+                break;
             };
-            self.queue.remove(i);
+            // Handed, it goes whatever comes after: `sent` keeps it.
+            if let Some(s) = self
+                .queue
+                .remove(i)
+                .filter(|s| s.by.is_none() && s.listed())
+            {
+                let at = self.out.partition_point(|o| o.order(&s).is_lt());
+                self.out.insert(at, s);
+            }
         }
+        // What 128 later messages due already follow is never listed again.
+        let due = self.out.partition_point(|s| s.at <= t);
+        self.out.drain(..due.saturating_sub(SENT));
     }
 
     /// Whether a note-on at `on_at` would find no waiting place at `t`: it
@@ -855,9 +961,11 @@ impl Midi {
         on_at - HOLD > t && self.waiting(t) >= QUEUED
     }
 
-    /// Whether a sequence's notes and clock can go to `output` now.
+    /// Whether messages can go to `output` now: a connected output, or
+    /// `""`, no output, which no host is handed but `sent` lists as any
+    /// other (LLP 1125 D6), so an app logs what it plays without a device.
     pub(crate) fn can_send(&self, output: &str) -> bool {
-        self.ports.connected_output(output)
+        output.is_empty() || self.ports.connected_output(output)
     }
 
     /// One sequence note on `output` (LLP 1125 D7): `on` at `on_at`, its
@@ -943,22 +1051,29 @@ impl Midi {
     /// An edit at `t` (LLP 1125 D3, D7): every waiting message the sequence
     /// queued for a step at or after `t` is taken back, but a note-off whose
     /// note-on was handed stays (rulings #6); the clock goes on from its
-    /// first tick taken back.
-    pub(crate) fn retract_seq(&mut self, t: f64, log: &mut Vec<String>) {
+    /// first tick taken back. A clock's Start or new anchor (D9) takes back
+    /// those for a step `from` takes the same way, `by` `clock`.
+    pub(crate) fn retract_seq(
+        &mut self,
+        t: f64,
+        from: crate::sound::Cut,
+        by: &'static str,
+        log: &mut Vec<String>,
+    ) {
         let mut n = 0;
         for i in 0..self.queue.len() {
             let s = &self.queue[i];
-            if s.seq && s.waits(t) && s.step_at >= t && !s.off_of_handed(t) {
+            if s.seq && s.waits(t) && from.takes(s.step_at) && !s.off_of_handed(t) {
                 if let (Some(k), Some(c)) = (s.tick, self.clock.as_mut()) {
                     c.next = c.next.min(k);
                 } else {
                     n += 1;
                 }
-                self.retract(i, "edit");
+                self.retract(i, by);
             }
         }
         if n > 0 {
-            log.push(format!("midi retracted: {n} (edit)"));
+            log.push(format!("midi retracted: {n} ({by})"));
         }
     }
 
@@ -1207,8 +1322,9 @@ pub struct Incoming {
 /// the latest of its input, channel and controller or note, never across a
 /// note or transport message of the same input and channel (a transport
 /// message has none, so it bounds every channel of its input). Clock and
-/// Active Sensing are left out (they are clock in's, stage 4); what is not
-/// one whole message is dropped and journaled. Returns the messages to
+/// Active Sensing are left out (clock in took its input's ticks first,
+/// `crate::transport::clock`); what is not one whole message is dropped
+/// and journaled. Returns the messages to
 /// dispatch, in order, and how many each input coalesced.
 pub fn coalesce(batch: Vec<Incoming>, log: &mut Vec<String>) -> Vec<Incoming> {
     let mut out: Vec<Option<Incoming>> = Vec::with_capacity(batch.len());

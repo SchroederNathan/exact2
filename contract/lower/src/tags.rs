@@ -104,6 +104,12 @@ pub fn tag(name: &str) -> Option<Tag> {
             fixed_props: &[],
             positional: None,
         },
+        "time" => Tag {
+            node_type: NodeType::Text,
+            fixed_styles: &[],
+            fixed_props: &[(PropId::SemanticTag, "time")],
+            positional: None,
+        },
         "text" => Tag {
             node_type: NodeType::Text,
             fixed_styles: &[],
@@ -338,6 +344,9 @@ pub fn tag(name: &str) -> Option<Tag> {
             fixed_props: &[],
             positional: None,
         },
+        // @ref LLP 1153 D7 — HTML's table and description list (`tables.rs`).
+        "table" | "caption" | "thead" | "tbody" | "tfoot" | "tr" | "th" | "td" | "dl" | "dt"
+        | "dd" => crate::tables::tag(name),
         _ => return None,
     })
 }
@@ -364,6 +373,8 @@ pub fn prop_ty(prop: PropId) -> PropTy {
 }
 /// Whether an attribute sets style rows.
 pub fn style(name: &str) -> bool {
+    // A state part's row (`:disabled opacity`, LLP 1121 D8) is the row it is.
+    let name = contract_syntax::state::state_of(name).map_or(name, |(_, row)| row);
     matches!(
         attr(name),
         Some(AttrTarget::Styles(_) | AttrTarget::Flex | AttrTarget::Shorthand)
@@ -378,14 +389,40 @@ pub fn attr_valued(name: &str, value: &contract_syntax::Expr) -> Option<AttrTarg
     if name == "resize" && matches!(value, Expr::Ident(..) | Expr::Call(..)) {
         return Some(AttrTarget::Handler("resize"));
     }
+    // No `::marker` (CSS Lists 3 §3): every list is already `list-style: none`, so the
+    // reset a stylesheet writes on a `ul` is taken and writes nothing (`lint::unknown_attr`
+    // names the bullet for any other value).
+    if matches!(name, "list-style" | "list-style-type")
+        && matches!(value, Expr::Str(v, _) if v.trim().eq_ignore_ascii_case("none"))
+    {
+        return Some(AttrTarget::Styles(&[]));
+    }
     attr(name)
 }
+/// The style rows an attribute writes: its own, a shorthand's longhands,
+/// none for a prop or a handler.
+pub fn rows(a: &contract_syntax::Attr) -> Vec<StyleId> {
+    match attr_valued(&a.name, &a.value) {
+        Some(AttrTarget::Styles(ids)) => ids.to_vec(),
+        Some(AttrTarget::Shorthand) => crate::shorthands::rows(&a.name).to_vec(),
+        Some(AttrTarget::Flex) => vec![StyleId::FlexGrow, StyleId::FlexShrink, StyleId::FlexBasis],
+        _ => Vec::new(),
+    }
+}
+
 /// Look up an attribute.
 pub fn attr(name: &str) -> Option<AttrTarget> {
+    if let Some(("active", row)) = contract_syntax::state::state_of(name) {
+        return crate::states::active_target(row);
+    }
     if let Some(target) = crate::style_names::lookup(name) {
         return Some(target);
     }
     Some(match name {
+        "datetime" => AttrTarget::Prop(PropId::Datetime),
+        "format" => AttrTarget::Prop(PropId::TimeFormat),
+        "start" => AttrTarget::Prop(PropId::Start),
+        "end" => AttrTarget::Prop(PropId::End),
         // handlers (the web's events, LLP 1005 §3)
         "loadedmetadata" => AttrTarget::Handler("loadedmetadata"),
         "durationchange" => AttrTarget::Handler("durationchange"),
@@ -403,11 +440,26 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         // A `video` entered or left full screen (`requestFullscreen`, the
         // platform's own controls); the payload says which.
         "fullscreenchange" => AttrTarget::Handler("fullscreenchange"),
+        // An `image` floated or stopped floating in picture in picture
+        // (`requestPictureInPicture`, LLP 1042 §9).
+        "enterpictureinpicture" => AttrTarget::Handler("enterpictureinpicture"),
+        "leavepictureinpicture" => AttrTarget::Handler("leavepictureinpicture"),
+        // The request failed: HTML's rejected promise, as an event with its reason.
+        "pictureinpictureerror" => AttrTarget::Handler("pictureinpictureerror"),
         "canplay" => AttrTarget::Handler("canplay"),
         // @ref LLP 1098 D1, D2 — the media session: `metadata=` claims it,
         // the six actions by `setActionHandler`'s names, and the seconds a
         // seek moves when the platform gives none.
         "metadata" => AttrTarget::MediaMetadata,
+        "decorations" => AttrTarget::Prop(PropId::Decorations),
+        // LLP 1045.000 D3: a Markdown node's atom kinds and faces (the
+        // lowerer's `bind_atoms` and `bind_atom_faces` read them first).
+        "atoms" => AttrTarget::Prop(PropId::Atoms),
+        "atomFaces" => AttrTarget::Prop(PropId::AtomFaces),
+        // LLP 1045 D11: a Markdown editor's base direction per line.
+        "paragraphDirs" => AttrTarget::Prop(PropId::ParagraphDirs),
+        "alertPart" => AttrTarget::Prop(PropId::AlertPart),
+        "defaultSurface" => AttrTarget::Prop(PropId::DefaultSurface),
         "seekbackward" => AttrTarget::Handler("seekbackward"),
         "seekforward" => AttrTarget::Handler("seekforward"),
         "seekto" => AttrTarget::Handler("seekto"),
@@ -462,9 +514,14 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         // declares it hears each message from an input its `midiinputs` lists.
         "midimessage" => AttrTarget::Handler("midimessage"),
         "midiinputs" => AttrTarget::Prop(p("midiInputs")),
-        // DOM's `wheel` (studio diary R3) and `drop` of files (R19).
+        // DOM's `wheel` (studio diary R3), `drop` of files (R19), and the
+        // `dragenter` and `dragleave` of a file drag over the node.
         "wheel" => AttrTarget::Handler("wheel"),
         "drop" => AttrTarget::Handler("drop"),
+        "dragenter" => AttrTarget::Handler("dragenter"),
+        "dragleave" => AttrTarget::Handler("dragleave"),
+        // A press on an inline atom (LLP 1045.000 D7).
+        "atompress" => AttrTarget::Handler("atompress"),
         "copy" => AttrTarget::Handler("copy"),
         "cut" => AttrTarget::Handler("cut"),
         "paste" => AttrTarget::Handler("paste"),
@@ -481,6 +538,20 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         "pan" => AttrTarget::Handler("pan"),
         "panrelease" => AttrTarget::Handler("panrelease"),
         "navigate" => AttrTarget::Handler("navigate"),
+        // @ref LLP 1115.000 D5.5 — the history swipe the host tracks.
+        "historyswipe" => AttrTarget::Handler("historyswipe"),
+        // @ref LLP 1020.002 D2 — an iframe's guest, by the Navigation API's
+        // event names (an iframe's `navigate=` is its guest's too).
+        "currententrychange" => AttrTarget::Handler("currententrychange"),
+        "navigatesuccess" => AttrTarget::Handler("navigatesuccess"),
+        "navigateerror" => AttrTarget::Handler("navigateerror"),
+        // @ref LLP 1020.002 D5 — a guest's window request and its downloads.
+        "newwindow" => AttrTarget::Handler("newwindow"),
+        "download" => AttrTarget::Handler("download"),
+        // @ref LLP 1020.002 D7 — the answer to a frame's `captureScreenshot`.
+        "capture" => AttrTarget::Handler("capture"),
+        // @ref LLP 1020.002 D9 — an agent-controlled frame's dialog.
+        "userpromptopened" => AttrTarget::Handler("userpromptopened"),
         "heightrelease" => AttrTarget::Handler("heightrelease"),
         "transformgeometry" => AttrTarget::Handler("transformgeometry"),
         "transformrelease" => AttrTarget::Handler("transformrelease"),
@@ -541,11 +612,15 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         "testId" => AttrTarget::Prop(p("testId")),
         "navigationKey" => AttrTarget::Prop(p("navigationKey")),
         "navigationBack" => AttrTarget::Prop(p("navigationBack")),
+        "navigationHistory" => AttrTarget::Prop(p("navigationHistory")),
         "navigationPresentation" => AttrTarget::Prop(p("navigationPresentation")),
         "navigationDetent" => AttrTarget::Prop(p("navigationDetent")),
+        "navigationInitialDetent" => AttrTarget::Prop(p("navigationInitialDetent")),
         "navigationGrabber" => AttrTarget::Prop(p("navigationGrabber")),
         // @ref LLP 1125 D11 — the Screen Wake Lock API's one type, on any element.
         "wakelock" => AttrTarget::Prop(p("wakelock")),
+        // @ref LLP 1133.029 D1 — the Screen Orientation API's lock types, on any element.
+        "orientationlock" => AttrTarget::Prop(p("orientationlock")),
         // @ref LLP 1115.000 D5.2 — a route's say over the platform's bar:
         // `none` for a full-bleed screen.
         "navigationBar" => AttrTarget::Prop(p("navigationBar")),
@@ -578,6 +653,8 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         "aria-label" => AttrTarget::Prop(p("accessibilityLabel")),
         "-exact-menu" => AttrTarget::Prop(p("menuPlacement")),
         "-exact-menu-remove" => AttrTarget::Prop(p("menuRemove")),
+        "-exact-menu-keys" => AttrTarget::Prop(p("menuKeys")),
+        "-exact-return-presses" => AttrTarget::Prop(p("returnPresses")),
         "aria-keyshortcuts" => AttrTarget::Prop(p("accessibilityKeyShortcuts")),
         "aria-description" => AttrTarget::Prop(p("accessibilityHint")),
         "aria-level" => AttrTarget::Prop(p("accessibilityHeadingLevel")),
@@ -623,6 +700,10 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         // Where a virtualized list opens: at its start, or at its end (a
         // transcript), CSS Scroll Snap 2's container-level `scroll-start`.
         "scroll-start" => AttrTarget::Prop(p("scrollStart")),
+        // @ref LLP 1145 D4 — how far ahead a virtualized list's edges fire.
+        "reach-margin" => AttrTarget::Prop(p("reachMargin")),
+        // @ref LLP 1010 §6.11 — the rows a virtualized list keeps mounted.
+        "keep-mounted" => AttrTarget::Prop(p("keepMounted")),
         // @ref LLP 1056 D6 (r3): a canvas's explicit bitmap size, HTML's
         // `width`/`height` content attributes (Contract's are the CSS box).
         "bitmap-width" => AttrTarget::Prop(p("bitmapWidth")),
@@ -648,6 +729,14 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         "lang" => AttrTarget::Prop(p("lang")),
         "src" => AttrTarget::Prop(p("src")),
         "sandbox" => AttrTarget::Prop(p("sandbox")),
+        // @ref LLP 1020.002 D1, §9 — a top-level guest's own storage, and
+        // `WKWebView`'s words under the platform's key (`frames.rs`).
+        "partition" => AttrTarget::Prop(p("partition")),
+        "apple.allowsBackForwardNavigationGestures" => {
+            AttrTarget::Prop(p("appleAllowsBackForwardNavigationGestures"))
+        }
+        "apple.allowsMagnification" => AttrTarget::Prop(p("appleAllowsMagnification")),
+        "apple.inactiveSchedulingPolicy" => AttrTarget::Prop(p("appleInactiveSchedulingPolicy")),
         // The Popover API, by its own names (LLP 1021 D1): a container with `popover` is
         // hidden until its invoker — a `button` whose `popovertarget` names the container's
         // `id` — toggles it; open state is the host's, never the plan's (D2). `aria-checked`
@@ -680,6 +769,11 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         "aria-required" => AttrTarget::Prop(p("accessibilityRequired")),
         "aria-haspopup" => AttrTarget::Prop(p("accessibilityHasPopup")),
         "aria-current" => AttrTarget::Prop(p("accessibilityCurrent")), // Depot: a nav link's page
+        "aria-sort" => AttrTarget::Prop(p("accessibilitySort")),
+        // @ref LLP 1153 D7 — a table cell's, held to its tag by `tables::check`.
+        "colspan" => AttrTarget::Prop(PropId::ColSpan),
+        "rowspan" => AttrTarget::Prop(PropId::RowSpan),
+        "scope" => AttrTarget::Prop(PropId::Scope),
         // @ref LLP 1116 D8 — a range role's value (`progressbar`, `slider`,
         // `meter`, …), numbers written as HTML writes them (`aria_values`).
         "aria-valuenow" => AttrTarget::Prop(p("accessibilityValueNow")),
@@ -781,6 +875,9 @@ pub fn renamed(old: &str) -> Option<&'static str> {
         "size" | "fontSize" => "font-size",
         "weight" | "fontWeight" => "font-weight",
         "fontStyle" => "font-style",
+        "fontStretch" => "font-stretch",
+        "fontVariationSettings" => "font-variation-settings",
+        "fontOpticalSizing" => "font-optical-sizing",
         "fontFamily" => "font-family",
         "background" | "backgroundColor" => "background-color",
         "letterSpacing" => "letter-spacing",
@@ -826,7 +923,12 @@ pub fn renamed(old: &str) -> Option<&'static str> {
         "align" | "alignItems" => "align-items",
         "alignSelf" => "align-self",
         "boxSizing" => "box-sizing",
-        "fit" | "objectFit" => "object-fit",
+        "fit" | "objectFit" | "resizeMode" => "object-fit",
+        // React Native's names for CSS's text rows.
+        "numberOfLines" => "line-clamp",
+        "ellipsizeMode" => "text-overflow",
+        "textTransform" => "text-transform",
+        "fontVariant" => "font-variant-numeric",
         // UIKit's, SwiftUI's and React Native's shrink-to-fit (LLP 1116.001 D1.4).
         "adjustsFontSizeToFitWidth"
         | "adjustsFontSizeToFit"
@@ -850,6 +952,13 @@ pub fn renamed(old: &str) -> Option<&'static str> {
         "keepScreenOn" | "keep-screen-on" | "idleTimerDisabled" | "keepAwake" | "wakeLock" => {
             "wakelock"
         }
+        // The web's call, Android's activity attribute, UIKit's (LLP 1133.029 D1).
+        "screenOrientation"
+        | "screen-orientation"
+        | "lockOrientation"
+        | "orientation"
+        | "requestedOrientation"
+        | "supportedInterfaceOrientations" => "orientationlock",
         "interactiveWidget" | "keyboardAvoidingView" | "keyboardAvoiding" => "interactive-widget",
         "secureTextEntry" => "type",
         "onClick" | "onPress" => "press",
@@ -866,6 +975,13 @@ pub fn renamed(old: &str) -> Option<&'static str> {
         "symbol-value" => "-exact-symbol-value",
         "symbol-effect" => "-exact-symbol-effect",
         "press-haptic" => "-exact-press-haptic",
+        // LLP 1061 D7: the pressed paint, and React Native's
+        // `TouchableOpacity`/`TouchableHighlight` props that set it.
+        "press-opacity" | "activeOpacity" => "-exact-press-opacity",
+        "-exact-press-background-color" | "press-background-color" | "underlayColor" => {
+            ":active background-color"
+        }
+        "-exact-press-color" | "press-color" => ":active color",
         "content-transition" => "-exact-content-transition",
         "scroll-edge-effect" => "-exact-scroll-edge-effect",
         "hover-effect" => "-exact-hover-effect",
@@ -893,7 +1009,7 @@ pub(crate) fn validate_list(
     for name in ["initial-item-count", "scroll-start"] {
         if let Some(a) = expanded.iter().find(|a| a.name == name && !virtualized) {
             let why =
-                format!("`{name}` is a virtualized list's; it goes on `list virtualized=true`");
+                format!("`{name}` is a virtualized list's; it goes on `list virtualized=true` (a chat's transcript: `contract vocab chat-thread`)");
             return super::err("lower-list-virtualized", why, a.span);
         }
     }
@@ -962,19 +1078,7 @@ pub const HEAD_FIELDS: &[&str] = &[
     // LLP 1069.010 D6: the document has unsaved changes (a declared deviation).
     "edited",
 ];
-/// Suggest one unambiguous single-edit spelling from the existing attribute
-/// lookup. No second vocabulary is maintained, and this never admits an alias.
-pub(crate) fn similar_attr(name: &str, style_only: bool) -> Option<String> {
-    similar(name, |candidate| match attr(candidate) {
-        Some(AttrTarget::Styles(_) | AttrTarget::Flex | AttrTarget::Shorthand) => true,
-        Some(_) => !style_only,
-        None => false,
-    })
-}
-/// The same for a tag, from the tag lookup.
-pub(crate) fn similar_tag(name: &str) -> Option<String> {
-    similar(name, |candidate| tag(candidate).is_some())
-}
+pub(crate) use crate::spelling::{similar_attr, similar_tag};
 
 /// What Contract calls an HTML element it spells differently.
 pub(crate) fn html_tag(name: &str) -> Option<&'static str> {
@@ -993,9 +1097,7 @@ pub(crate) fn html_tag(name: &str) -> Option<&'static str> {
         "form" => {
             "there is no `form`: a field's Enter is its `submit` (`input … submit=save`), and a `button`'s `press` acts"
         }
-        "table" | "thead" | "tbody" | "tr" | "td" | "th" | "grid" => {
-            "a table or grid is `view display=\"grid\"` with `grid-template-columns`, or a `column` of `row`s"
-        }
+        "grid" => "a grid is `view display=\"grid\"` with `grid-template-columns`, or a `column` of `row`s",
         "details" | "summary" => {
             "there is no `details`: keep `open` in state, show the body `if open`, and toggle it from a `button`"
         }
@@ -1011,62 +1113,6 @@ pub(crate) fn html_tag(name: &str) -> Option<&'static str> {
         "ul" | "ol" | "li" => "a list is `list` (or a `column` of rows)",
         _ => return None,
     })
-}
-
-/// One unambiguous single-edit spelling of `name` that `admitted` accepts,
-/// found by trying every edit against the lookup itself.
-fn similar(name: &str, admitted: impl Fn(&str) -> bool) -> Option<String> {
-    if !name.is_ascii() || !(3..=64).contains(&name.len()) {
-        return None;
-    }
-    let mut found: Option<String> = None;
-    let mut consider = |bytes: &[u8]| {
-        let candidate = std::str::from_utf8(bytes).expect("ASCII spelling edits");
-        if candidate == name {
-            return true;
-        }
-        if admitted(candidate) {
-            if found.as_deref().is_some_and(|old| old != candidate) {
-                return false;
-            }
-            found = Some(candidate.to_owned());
-        }
-        true
-    };
-    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
-    let mut candidate = name.as_bytes().to_vec();
-    for index in 0..name.len() {
-        let original = candidate.remove(index);
-        if !consider(&candidate) {
-            return None;
-        }
-        candidate.insert(index, original);
-        for &letter in LETTERS {
-            candidate[index] = letter;
-            if !consider(&candidate) {
-                return None;
-            }
-        }
-        candidate[index] = original;
-        if index + 1 < name.len() {
-            candidate.swap(index, index + 1);
-            if !consider(&candidate) {
-                return None;
-            }
-            candidate.swap(index, index + 1);
-        }
-    }
-    for index in 0..=name.len() {
-        candidate.insert(index, b'a');
-        for &letter in LETTERS {
-            candidate[index] = letter;
-            if !consider(&candidate) {
-                return None;
-            }
-        }
-        candidate.remove(index);
-    }
-    found
 }
 
 /// Exclusions wrap their parent's text and must be positioned by that parent.
@@ -1160,8 +1206,7 @@ pub(crate) fn host_transform_recipients(
                     let maybe_absolute =
                         absolute || position.is_some_and(|a| !matches!(&a.value, Expr::Str(_, _)));
                     let scrolls = tag(name).is_some_and(|t| t.node_type.scrolls_by_default())
-                        || rows.iter().any(|a| matches!(a.name.as_str(), "overflow" | "overflow-y")
-                            && !matches!(&a.value, Expr::Str(v, _) if v != "auto" && v != "scroll"));
+                        || crate::overflow::Overflow::of(&rows, "visible").may_scroll_y();
                     let index = boxes.len();
                     boxes.push(BoxSite {
                         key: (*span, *instance),
@@ -1247,44 +1292,6 @@ pub(crate) fn host_transform_recipients(
     recipients
 }
 
-/// @ref LLP 1116.019 D6 — a `color` the author wrote on a symbol `image`
-/// (or its class) is the symbol's colour, as an inline SVG icon drawn in
-/// `currentcolor` follows `color` on the web: the row this returns,
-/// `-exact-tint-color: currentcolor`, said as the `color` was. `None` where
-/// the image names its `-exact-tint-color`, writes no `color`, or is no
-/// symbol (a raster given a tint paints as a silhouette). `rows` are the
-/// author's, its classes' included, without the sheet's.
-pub(crate) fn symbol_ink(
-    tag: &str,
-    positional: &[contract_syntax::Expr],
-    rows: &[contract_syntax::Attr],
-) -> Option<contract_syntax::Attr> {
-    use contract_syntax::{Expr, TemplatePart};
-    fn symbol(source: &Expr) -> bool {
-        match source {
-            Expr::Str(s, _) => s.starts_with("symbol:"),
-            Expr::Template(parts, _) => {
-                matches!(parts.first(), Some(TemplatePart::Text(t)) if t.starts_with("symbol:"))
-            }
-            Expr::Ternary(_, a, b, _) => symbol(a) && symbol(b),
-            _ => false,
-        }
-    }
-    if tag != "image" || !positional.first().is_some_and(symbol) {
-        return None;
-    }
-    if rows.iter().any(|a| a.name == "-exact-tint-color") {
-        return None;
-    }
-    let color = rows.iter().rev().find(|a| a.name == "color")?;
-    Some(contract_syntax::Attr {
-        name: "-exact-tint-color".into(),
-        value: Expr::Str("currentcolor".into(), color.span),
-        span: color.span,
-        written: color.written,
-    })
-}
-
 /// How an element is a flex or grid container, if it is: its tag, or a
 /// literal `display` (LLP 1093 §1).
 pub(crate) fn flex_container<'a>(tag: &'a str, attrs: &[contract_syntax::Attr]) -> Option<&'a str> {
@@ -1357,6 +1364,31 @@ impl crate::Lowerer<'_> {
         locals: u16,
         bindings: &mut Vec<BindingsRow>,
     ) {
+        use contract_syntax::Expr;
+        let Some(chosen) = self.link_colour(tag, parent_tag, attrs, children) else {
+            return;
+        };
+        let link = match &chosen {
+            Expr::Str(word, _) if word == "LinkText" => self.fixed(true, "LinkText"),
+            // A value the attribute's own lowering refuses is said there.
+            _ => match self.expr_code(&chosen, scope, locals) {
+                Ok(code) => code,
+                Err(_) => return,
+            },
+        };
+        bindings.push(crate::style_row(StyleId::TextColor, link, crate::IMPLIED));
+    }
+
+    /// The colour a link's text takes when its author writes none: `LinkText`,
+    /// or `inherit` where its computed target is empty; `None` for a node that
+    /// is no link's text (a state part's base, LLP 1121 D8, reads it too).
+    pub(crate) fn link_colour(
+        &self,
+        tag: &str,
+        parent_tag: Option<&str>,
+        attrs: &[contract_syntax::Attr],
+        children: &[contract_syntax::Node],
+    ) -> Option<contract_syntax::Expr> {
         use contract_syntax::{BinOp, Expr, Node, TemplatePart};
         // Texts and images alone, an `if` or a `for` of them included.
         fn words(node: &Node) -> bool {
@@ -1379,114 +1411,31 @@ impl crate::Lowerer<'_> {
             && !children.is_empty()
             && children.iter().all(words);
         if !(run || block) {
-            return;
+            return None;
         }
-        let link = match href.map(|a| &a.value) {
-            Some(Expr::Str(to, _)) if to.is_empty() => return,
+        let span = href.map_or(contract_syntax::Span::default(), |a| a.value.span());
+        let word = |w: &str| Expr::Str(w.into(), span);
+        Some(match href.map(|a| &a.value) {
+            Some(Expr::Str(to, _)) if to.is_empty() => return None,
             // A written target, a template with words of its own, or a
             // block `link` that is its `press`: a link whatever happens.
-            None | Some(Expr::Str(..)) => self.fixed(true, "LinkText"),
+            None | Some(Expr::Str(..)) => word("LinkText"),
             Some(Expr::Template(parts, _))
                 if parts
                     .iter()
                     .any(|p| matches!(p, TemplatePart::Text(t) if !t.is_empty())) =>
             {
-                self.fixed(true, "LinkText")
+                word("LinkText")
             }
             Some(to) => {
-                let span = to.span();
-                let word = |w: &str| Box::new(Expr::Str(w.into(), span));
-                let empty = Expr::Binary(BinOp::Eq, Box::new(to.clone()), word(""), span);
-                let chosen =
-                    Expr::Ternary(Box::new(empty), word("inherit"), word("LinkText"), span);
-                // A value the attribute's own lowering refuses is said there.
-                let Ok(code) = self.expr_code(&chosen, scope, locals) else {
-                    return;
-                };
-                code
+                let empty = Expr::Binary(BinOp::Eq, Box::new(to.clone()), Box::new(word("")), span);
+                Expr::Ternary(
+                    Box::new(empty),
+                    Box::new(word("inherit")),
+                    Box::new(word("LinkText")),
+                    span,
+                )
             }
-        };
-        bindings.push(crate::style_row(StyleId::TextColor, link, crate::IMPLIED));
-    }
-
-    /// @ref LLP 1115 D3 — a heading is the platform's text style for its
-    /// level, as a hand-built screen's would be: 1 `title1`, 2 `title2`, 3
-    /// `title3`, 4 and on `headline` (ARIA's default level is 2), at the
-    /// style's size for the root font size and its emphasized weight (LLP
-    /// 1116 D7): bold for a title, whose own weight is regular, as Apple's
-    /// emphasized title styles and the web's headings are; `headline`'s own
-    /// semibold. A level chosen
-    /// between literals (`aria-level=(top ? 1 : 2)`) chooses between their
-    /// styles; any other computed level is 2's. Pushed before the author's
-    /// rows, so a written `font-size` or `font-weight` wins; an inherited one
-    /// is unsaid and does not.
-    pub(crate) fn heading_style(
-        &mut self,
-        tag: &str,
-        attrs: &[contract_syntax::Attr],
-        scope: &crate::Scope,
-        locals: u16,
-        bindings: &mut Vec<BindingsRow>,
-    ) -> Result<(), crate::LowerError> {
-        use contract_syntax::Expr;
-        let heading = attrs
-            .iter()
-            .any(|a| a.name == "role" && matches!(&a.value, Expr::Str(v, _) if v == "heading"));
-        if tag != "text" || !heading {
-            return Ok(());
-        }
-        let style = |level: f64| {
-            let name = match level {
-                1.0 => "title1",
-                3.0 => "title3",
-                n if n >= 4.0 => "headline",
-                _ => "title2",
-            };
-            let id = exact_kernel::style::relative::text_style(&format!("-exact-{name}"));
-            let weight =
-                exact_kernel::TEXT_STYLES[usize::from(id.expect("a schema text style"))].weight;
-            (name, if weight == 400 { 700 } else { weight })
-        };
-        // The level's literal leaves, each mapped; `None` when one is computed.
-        fn leaves(e: &Expr, f: &dyn Fn(f64) -> Expr) -> Option<Expr> {
-            Some(match e {
-                Expr::Number(n, _) => f(*n),
-                Expr::Str(v, _) => f(v.trim().parse().ok()?),
-                Expr::Ternary(c, yes, no, span) => Expr::Ternary(
-                    c.clone(),
-                    Box::new(leaves(yes, f)?),
-                    Box::new(leaves(no, f)?),
-                    *span,
-                ),
-                _ => return None,
-            })
-        }
-        let level = attrs
-            .iter()
-            .find(|a| a.name == "aria-level")
-            .map(|a| &a.value);
-        if level.is_none() {
-            // ARIA's default level, said: a host that reads the level (iOS's
-            // header-shaped route takes only a heading with one) sees 2.
-            let expr = self.expr_code(&Expr::Number(2.0, Default::default()), scope, locals)?;
-            let level = p("accessibilityHeadingLevel");
-            bindings.push(crate::prop_row(level, expr, crate::IMPLIED));
-        }
-        let span = level.map_or_else(Default::default, |l| l.span());
-        let two = Expr::Number(2.0, span);
-        let level = level
-            .filter(|l| leaves(l, &|_| two.clone()).is_some())
-            .unwrap_or(&two);
-        let size = leaves(level, &|n| {
-            Expr::Str(format!("-exact-{}", style(n).0), span)
         })
-        .expect("literal leaves");
-        let weight =
-            leaves(level, &|n| Expr::Number(f64::from(style(n).1), span)).expect("literal leaves");
-        for (row, value) in [(StyleId::FontSize, size), (StyleId::FontWeight, weight)] {
-            let expr = self.expr_code(&value, scope, locals)?;
-            bindings.push(crate::style_row(row, expr, crate::IMPLIED));
-        }
-        Ok(())
     }
 }

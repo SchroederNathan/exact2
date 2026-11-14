@@ -18,7 +18,10 @@ extension ExactSession {
 public final class ExactView: NSView {
     public let session: ExactSession
     public override func selectAll(_ sender: Any?) { session.presenter.selection.selectAll() }
-    @objc public func copy(_ sender: Any?) { session.presenter.selection.copy() }
+    /// The first root's `copy` with nothing focused (`RootEdits`), else the text selection's.
+    @objc public func copy(_ sender: Any?) { if !rootEdits.perform(#selector(NodeView.copy(_:))) { session.presenter.selection.copy() } }
+    /// Edit ▸ Cut, Copy and Paste with nothing focused, after the window in its responder chain.
+    private lazy var rootEdits: RootEdits = { let edits = RootEdits(); edits.presenter = session.presenter; return edits }()
     /// Edit ▸ Speech over the selected text, as a browser speaks a page's
     /// selection (#141); a field's `NSTextView` answers first while it has
     /// the focus. Spoken Content's voice and rate, as AppKit's own.
@@ -36,6 +39,44 @@ public final class ExactView: NSView {
     private var fitPending = false
     private var lastDisplayScale: CGFloat = 0
     private var shortcutMonitor: Any?
+    private var windowToolbarObservation: NSKeyValueObservation?
+    private var toolbarVisibilityObservation: NSKeyValueObservation?
+    private var geometryObservers: [NSObjectProtocol] = []
+    private var insetsPending = false
+
+    private func scheduleInsets() {
+        guard !insetsPending else { return }
+        insetsPending = true
+        // AppKit finishes updating safe areas after its frame/toolbar notification.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.insetsPending = false
+            guard self.session.state != .destroyed else { return }
+            self.syncInsets()
+        }
+    }
+
+    private func observeEnvironment() {
+        geometryObservers.forEach(NotificationCenter.default.removeObserver)
+        geometryObservers = []
+        var ancestor: NSView? = self
+        while let view = ancestor {
+            view.postsFrameChangedNotifications = true
+            view.postsBoundsChangedNotifications = true
+            for name in [NSView.frameDidChangeNotification, NSView.boundsDidChangeNotification] {
+                geometryObservers.append(NotificationCenter.default.addObserver(forName: name, object: view, queue: .main) { [weak self] _ in
+                    self?.scheduleInsets()
+                })
+            }
+            ancestor = view.superview
+        }
+        scheduleInsets()
+    }
+
+    public override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        observeEnvironment()
+    }
     /// Screen changes and HDR suppression: HDR pictures re-plan (LLP 1100 D9).
     private var rangeObservers: [NSObjectProtocol] = []
     /// The adapter's hook for the first root's `viewport-fit` (window chrome
@@ -81,6 +122,12 @@ public final class ExactView: NSView {
         get { session.presenter.sidebar.onWanted }
         set { session.presenter.sidebar.onWanted = newValue; session.presenter.navigation.split.onWanted = newValue }
     }
+    /// The window's owner put `window-controls-overlay`'s toolbar in the
+    /// title bar (LLP 1039 D8): the title-bar area is beside the traffic
+    /// lights in its band, and the display mode is that overlay.
+    public var controlsOverlay = false {
+        didSet { if controlsOverlay != oldValue { session.tellPreferences() } }
+    }
     public var hasWindowToolbar: Bool {
         guard let toolbar = session.presenter.toolbar.toolbar else { return false }
         return window?.toolbar === toolbar
@@ -98,6 +145,7 @@ public final class ExactView: NSView {
         viewport.autoresizingMask = [.width, .height]
         addSubview(viewport)
         session.view = self
+        viewport.visibleSizeChanged = { [weak self] in self?.fit() }
         session.presenter.onViewportFit = { [weak self] in
             self?.syncInsets()
             self?.onViewportFit?()
@@ -114,6 +162,8 @@ public final class ExactView: NSView {
                     guard let self, note.object == nil || note.object as AnyObject? === self.window || note.object is NSApplication else { return }
                     self.session.tellPreferences()
                     self.session.rasters.displayChanged()
+                    // The title bar leaves the window in full screen and comes back after it.
+                    if note.name == NSWindow.didEnterFullScreenNotification || note.name == NSWindow.didExitFullScreenNotification { self.syncInsets() }
                 }
             }
         }
@@ -145,11 +195,12 @@ public final class ExactView: NSView {
         return session(in: content) === self
     }
 
-    /// The trackpad's swipe back from a pushed route (LLP 1115.000 D5.1,
-    /// `BackSwipe`): the page's scroll view passes a sideways gesture up
-    /// here when it is pinned for it and this says a swipe may be tracked.
+    /// The trackpad's swipe back from a pushed route, or forward to where
+    /// Back left (LLP 1115.000 D5.1, D5.5, `BackSwipe`): the page's scroll
+    /// view passes a sideways gesture up here when it is pinned for it and
+    /// this says a swipe may be tracked.
     public override func wantsScrollEventsForSwipeTracking(on axis: NSEvent.GestureAxis) -> Bool {
-        axis == .horizontal && session.presenter.navigation.canGoBack
+        axis == .horizontal && (session.presenter.navigation.canGoBack || session.presenter.navigation.canGoForward)
     }
     public override func scrollWheel(with event: NSEvent) {
         if !session.presenter.backSwipe.scroll(event) { super.scrollWheel(with: event) }
@@ -167,6 +218,7 @@ public final class ExactView: NSView {
     deinit {
         if let shortcutMonitor { NSEvent.removeMonitor(shortcutMonitor) }
         rangeObservers.forEach(NotificationCenter.default.removeObserver)
+        geometryObservers.forEach(NotificationCenter.default.removeObserver)
         session.presenter.menus.reset()
         session.presenter.dialogs.reset()
         session.presenter.toolbar.detach()
@@ -189,8 +241,10 @@ public final class ExactView: NSView {
     }
 
     /// Boot at the first real size (an embedder's view), else resize; the
-    /// insets follow.
+    /// insets follow. Owed while a restart holds the runtime, the last-told
+    /// size untouched: ResetGate replays it after the batch.
     private func fit() {
+        if session.runtime.holds("resize(width:height:)") { return }
         if Owner.shared.isServingMain {
             if !fitPending {
                 fitPending = true
@@ -208,13 +262,15 @@ public final class ExactView: NSView {
         session.presenter.menus.layout()
         let size = session.presenter.viewportSize
         guard size.width > 0, size.height > 0 else { return }
-        let scale = window?.backingScaleFactor ?? 1
+        let scale = session.devicePixelScale
         session.rasters.fit(size: size, scale: scale)
         if scale != lastDisplayScale {
             lastDisplayScale = scale
             session.apply(session.runtime.canvasDisplay(scale: scale, memory: ProcessInfo.processInfo.physicalMemory))
             session.rasters.displayChanged()
-            session.tellDisplayScale() // a hairline is one device pixel of this display (LLP 1115.000 D10.3)
+            session.controlTextChanged() // text line boxes round to the page's device pixels (LLP 1008 §3)
+            session.tellDisplayScale() // a hairline is one device pixel of the page (LLP 1115.000 D10.3)
+            session.presenter.regridAll() // every box on the new device pixels (`PixelGridMac.swift`)
         }
         if !session.booted {
             // A refused boot is terminal (LLP 1031 D8): the session says why
@@ -241,13 +297,29 @@ public final class ExactView: NSView {
         fit()
     }
 
+    /// The page zoom moved (ZoomMac.swift): the viewport is another size in
+    /// CSS px, its device pixels another scale, and its insets other lengths.
+    func zoomChanged() {
+        fit()
+        syncInsets()
+    }
+
     public override func viewWillMove(toWindow newWindow: NSWindow?) {
-        if newWindow !== window { session.natives.windowLeaving(window) }   // its window hatch ends while the window is there
+        if newWindow !== window { session.natives.windowLeaving(window); rootEdits.leave(window) }   // its window hatch ends while the window is there
+        if newWindow !== window { session.presenter.releaseEarlyPress(nil) } // its monitor goes, which would release it (LLP 1005)
         super.viewWillMove(toWindow: newWindow)
     }
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        ExactApp.shared.refreshDevPills() // in the window it joined, or another's (DevPill.swift)
+        observeEnvironment()
+        toolbarVisibilityObservation = nil
+        windowToolbarObservation = window?.observe(\.toolbar, options: [.initial, .new]) { [weak self] window, _ in
+            guard let self else { return }
+            self.toolbarVisibilityObservation = window.toolbar?.observe(\.isVisible, options: [.new]) { [weak self] _, _ in self?.scheduleInsets() }
+            self.scheduleInsets()
+        }
         session.natives.scopesChanged()
         if window == nil { session.presenter.menus.reset(); session.presenter.dialogs.reset() }
         session.tellPreferences()
@@ -257,11 +329,31 @@ public final class ExactView: NSView {
         if session.presenter.toolbar.window !== window { session.presenter.toolbar.detach() }
         else { session.presenter.toolbar.sync() }
         if let shortcutMonitor { NSEvent.removeMonitor(shortcutMonitor); self.shortcutMonitor = nil }
+        if let window { rootEdits.join(window) }
         if window != nil {
             // Text editors can consume control chords before the responder chain.
             // Route declared commands first, scoped to this session's focused view.
-            shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp]) { [weak self] event in
-                guard let self, self.session.presenter.hosts(event.window) else { return event }
+            shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp, .otherMouseUp]) { [weak self] event in
+                guard let self else { return event }
+                #if EXACT_INSPECT
+                // Inspect mode's monitor has every event (InspectMac.swift): none is the app's.
+                if Inspect.on || InspectHost.draining { return event }
+                #endif
+                // An early press in an editor no tracking took is released at its up, wherever it goes;
+                // its up while its down still bubbles waits for the down (LLP 1005).
+                if event.type == .leftMouseUp, self.session.presenter.releaseEarlyPress(event) { return nil }
+                // AppKit can route an up to no view after the pressed subtree leaves its window
+                // (an early press still bubbling is released when it has bubbled).
+                if [.leftMouseUp, .rightMouseUp, .otherMouseUp].contains(event.type), self.session.presenter.mouseChain.early == nil,
+                   let source = self.session.presenter.pointerSource, source.window == nil {
+                    source.pointerReleased(event)
+                }
+                guard self.session.presenter.hosts(event.window) else { return event }
+                // The reader's press in a list, before any handler here can make a request in answer.
+                self.session.presenter.collections.heard(event)
+                // A window may hold several sessions: the one under the pointer steps its history.
+                if event.type == .otherMouseUp, event.window === self.window,
+                   self.bounds.contains(self.convert(event.locationInWindow, from: nil)) { self.session.presenter.historyButton(event) }
                 // A modifier pressed is a keydown on the web (`"Shift"`), and
                 // released a keyup (#140); to AppKit a flags change, which
                 // goes on to it either way.
@@ -271,10 +363,21 @@ public final class ExactView: NSView {
                 }
                 if event.type != .keyDown && event.type != .keyUp {
                     // A click is a new place for Tab to start from (`tabStart`): the window's, as before.
-                    if event.type == .leftMouseDown || event.type == .rightMouseDown { self.session.presenter.tabStart = nil }
+                    if event.type == .leftMouseDown || event.type == .rightMouseDown {
+                        // A press outside a field composing text commits it before the press runs, as Chrome's mousedown does.
+                        self.session.presenter.commitCompositionBefore(event)
+                        self.session.presenter.tabStart = nil
+                        // A press on a held node, or in it, lets its hold go (HeldState.swift), whatever view takes it.
+                        self.session.presenter.heldPointerDown(event)
+                    }
+                    self.session.presenter.tables.pointer(event)
                     self.session.presenter.menus.pointer(event)
                     // A click on the window behind a `closedby="any"` sheet is the sheet's.
-                    return self.session.presenter.dialogs.pointer(event) ? nil : event
+                    if self.session.presenter.dialogs.pointer(event) { return nil }
+                    // A press in an editor: its `pointerdown` before NSWindow focuses it (LLP 1005).
+                    // Prevented there, the window does not get the down: the focus stays where it is.
+                    if self.session.presenter.pressEditorFirst(event) { return nil }
+                    return event
                 }
                 if event.type == .keyDown { self.session.presenter.flushKeyViewLoop() }
                 let focused = self.ownsShortcutFocus(in: event.window)
@@ -288,7 +391,7 @@ public final class ExactView: NSView {
         }
         // Mounted and visible participate in frame demand (D3): an unmounted
         // view wants no frames; a mounted one asks again.
-        session.frames.run(window != nil && (session.frames.motion || session.canvases.wantsFrames))
+        session.frames.run(window != nil && session.frames.hasWork)
         if window != nil { fit(); session.presenter.syncAccessibility() }
         // In a window's sidebar pane, or out of it: the sidebar stands for
         // the tablist only while it is in a window (SidebarMac.swift).
@@ -297,24 +400,37 @@ public final class ExactView: NSView {
 
     /// The insets the kernel gets: under `viewport-fit=cover` the view's own
     /// safe area (the titlebar, when the window's content includes it);
-    /// zero otherwise. Then AppKit's layout regions (LLP 1123 D10).
+    /// zero otherwise. Then AppKit's layout regions (LLP 1123 D10) and the
+    /// title-bar area beside the window's controls.
     public func syncInsets() {
+        if session.runtime.holds("insets(top:right:bottom:left:)") { return } // (owed, as `fit`: ResetGate)
         if session.presenter.deferGeometry({ [weak self] in self?.fit() }) { return }
-        let next = viewportFit == "cover" ? safeAreaInsets : NSEdgeInsetsZero
+        // In CSS px: the view's points over the page zoom, as a browser's `env()` lengths are.
+        let zoom = session.presenter.viewport.magnification
+        func css(_ points: CGFloat) -> CGFloat { points / zoom }
+        let safe = viewportFit == "cover" ? safeAreaInsets : NSEdgeInsetsZero
+        let next = NSEdgeInsets(top: css(safe.top), left: css(safe.left), bottom: css(safe.bottom), right: css(safe.right))
         let prev = session.presenter.insets
         if next.top != prev.top || next.left != prev.left || next.bottom != prev.bottom || next.right != prev.right {
             session.presenter.insets = next
             session.insets(top: next.top, right: next.right, bottom: next.bottom, left: next.left)
         }
         guard session.booted else { return }
-        let regions = LayoutRegionsMac.insets(of: self)
-        guard !regionsTold || regions != session.presenter.regions else { return }
-        regionsTold = true
-        session.presenter.regions = regions
-        session.regions(regions)
+        let regions = LayoutRegionsMac.insets(of: self).map(css)
+        if !regionsTold || regions != session.presenter.regions {
+            regionsTold = true
+            session.presenter.regions = regions
+            session.regions(regions)
+        }
+        let area = TitleBarAreaMac.rect(of: self, cover: viewportFit == "cover" || controlsOverlay, overlay: controlsOverlay)?.map(css)
+        if !titlebarTold || area != session.presenter.titlebarArea {
+            titlebarTold = true
+            session.presenter.titlebarArea = area
+            session.titlebarArea(area)
+        }
     }
-    /// Whether the runner has the layout regions (LLP 1123 D10).
-    private var regionsTold = false
+    /// Whether the runner has the layout regions (LLP 1123 D10) and the title-bar area.
+    private var regionsTold = false, titlebarTold = false
 
     /// After a restart from a new plan: the new runner knows nothing of the
     /// insets — hand them over again, and fit the root. AppKit has no fold
@@ -323,7 +439,7 @@ public final class ExactView: NSView {
     func rebooted() {
         let i = session.presenter.insets
         if i.top != 0 || i.left != 0 || i.bottom != 0 || i.right != 0 { session.insets(top: i.top, right: i.right, bottom: i.bottom, left: i.left) }
-        regionsTold = false  // the next fit tells the new runner
+        regionsTold = false; titlebarTold = false  // the next fit tells the new runner
         session.segments(session.presenter.fold)
         viewDidChangeEffectiveAppearance()
         needsLayout = true
@@ -334,6 +450,9 @@ public final class ExactView: NSView {
         super.viewDidChangeEffectiveAppearance()
         session.controlTextChanged()
         session.scheme(dark: effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+        // The window's bar resolved its inks, tints and painted faces by the old appearance, and a
+        // `light-dark()` pair puts no op on the wire when the scheme turns.
+        session.presenter.toolbar.sync()
         // The app's `setScheme` arrives here, as the system's does; iOS's, through `tellPreferences` (LLP 1122 D4).
         session.app.scheduleStatus()
     }
@@ -343,6 +462,7 @@ extension ExactView: NSMenuItemValidation {
     /// Start Speaking with text selected, Stop Speaking while it speaks.
     public func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
+        case #selector(toggleFrameHealth(_:)): validateFrameHealthItem(item)
         case #selector(startSpeaking(_:)): !session.presenter.selection.selectedText().isEmpty
         case #selector(stopSpeaking(_:)): Self.speech.isSpeaking
         default: true

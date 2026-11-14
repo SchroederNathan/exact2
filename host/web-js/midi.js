@@ -13,10 +13,10 @@
 // - `midimessage` (rt.js `onMIDI`): every connected element whose
 //   `data-exact-midiinputs` lists the input hears each message, in document
 //   order, a commit each.
-import { journal, clock, Sounds, Mutations, Resources, R, data, commit } from './rt.js';
+import { journal, clock, Sounds, Mutations, Resources, R, data, commit, time } from './rt.js';
 import { plain } from './format.js';
 
-const HOLD = 50, QUEUED = 1024, RECORD = 1024, SHOWN = 64;
+const HOLD = 50, QUEUED = 1024, RECORD = 1024, SHOWN = 64, SENT = 128;
 const say = line => journal.push(`t=${clock.now} ${line}`);
 const num = n => !Number.isFinite(n) ? 'null' : n < 0 ? `-${plain(-n)}` : plain(n); // the runner's `num`
 const hex = d => d.map(b => b.toString(16).padStart(2, '0')).join(' ');
@@ -57,13 +57,19 @@ const noteKey = d => d.length === 3 && ((d[0] & 0xF0) === 0x80 || (d[0] & 0xF0) 
 const waits = (s, t) => s.by == null && s.at - HOLD > t, handed = (s, t) => s.by == null && s.at - HOLD <= t;
 const exempt = s => s.tick != null || noteOff(s.data) || s.data.length === 1 && s.data[0] === 0xFC;
 const offOfHanded = (s, t) => s.onAt != null && s.onAt - HOLD <= t;
+// What `exactMIDI().sent` may list, what has gone out by `t`, and its order (midi.rs `Sent::listed`, `gone`, `order`).
+const listed = s => s.tick == null && !(s.data.length === 1 && s.data[0] === 0xF8);
+const gone = (s, t) => listed(s) && s.by == null && s.at <= t;
+const order = (a, b) => a.at - b.at || a.id - b.id;
+// When the next message `sent` lists goes after `t`, while a reader declares it (midi.rs `next_sent`).
+const nextSent = t => ReadsSent ? [...Queue.filter(s => listed(s) && s.by == null), ...Out].reduce((m, s) => s.at > t ? Math.min(m, s.at) : m, Infinity) : Infinity;
 const stateOf = (s, t) => s.by != null ? 'retracted' : s.at - HOLD > t ? 'waiting' : 'handed';
 
 let Ports = { access: 'prompt', inputs: [], outputs: [] }, Granted = false, Uses = false;
-let Queue = [], Next = 0, Received = [], Heard = 0, Ops = [], Open = [], Clock = null, Ticks = 0, Played = null, ClockFloor = -Infinity;
-let Preferred = { access: 'granted', inputs: [], outputs: [] }, Readers = {}, Glue = null, Output = null, Boot = true;
+let Queue = [], Out = [], Next = 0, Received = [], Heard = 0, Ops = [], Open = [], OpenClock = [], Clock = null, Ticks = 0, Played = null, ClockFloor = -Infinity;
+let Preferred = { access: 'granted', inputs: [], outputs: [] }, Readers = {}, ReadsSent = false, Glue = null, Output = null, Boot = true;
 const Listening = () => Sounds.midi ?? []; // [element, handler] pairs from rt.js `onMIDI`, registered as the view is built
-const Answer = { name: 'midi', requests: 0, e: () => null, due: Infinity, next: Infinity, then: () => { Answer.due = Infinity; for (const r of Resources) if (r.source === 'exactMIDI') R(r); } };
+const Answer = { name: 'midi', requests: 0, e: () => null, due: Infinity, next: Infinity, then: () => { Answer.due = nextSent(clock.now); for (const r of Resources) if (r.source === 'exactMIDI') R(r); } };
 
 const portsEqual = (a, b) => a.access === b.access && ['inputs', 'outputs'].every(k => a[k].length === b[k].length
   && a[k].every((p, i) => ['id', 'name', 'manufacturer', 'connected'].every(f => p[f] === b[k][i][f])));
@@ -74,6 +80,8 @@ function merged(reported) {
 }
 const connectedOutput = id => Ports.access === 'granted' && Ports.outputs.some(p => p.id === id && p.connected);
 const connectedInput = id => Ports.access === 'granted' && Ports.inputs.some(p => p.id === id && p.connected);
+// `""`, no output, goes to no host but `sent` lists it as any other (LLP 1125 D6; midi.rs `can_send`).
+const canSend = id => id === '' || connectedOutput(id);
 function setPorts(reported) {
   if (!Granted) return false;
   const ports = merged(reported);
@@ -90,14 +98,17 @@ const waiting = t => Queue.filter(s => waits(s, t) && !exempt(s)).length;
 
 function push(m, t, note = '') {
   const id = ++Next;
-  if (m.tick == null) say(`midi ${id} to ${m.output} ${hex(m.data)} at ${num(m.at)}${note}`); else Ticks++;
-  Ops.push({ op: 'send', id, output: m.output, data: m.data, at: m.at });
-  Queue.push({ id, output: m.output, data: m.data, at: m.at, seq: m.seq, by: null, stepAt: m.stepAt, tick: m.tick ?? null, onAt: m.onAt ?? null });
+  if (m.tick == null) say(`midi ${id} to ${m.output || 'no output'} ${hex(m.data)} at ${num(m.at)}${note}`); else Ticks++;
+  if (m.output) Ops.push({ op: 'send', id, output: m.output, data: m.data, at: m.at });
+  // A reader of `sent` is answered again when the message goes.
+  const s = { id, output: m.output, data: m.data, at: m.at, seq: m.seq, by: null, stepAt: m.stepAt, tick: m.tick ?? null, onAt: m.onAt ?? null };
+  if (ReadsSent && listed(s) && s.at < Answer.due) { Answer.due = s.at; placeAnswer(); }
+  Queue.push(s);
   trim(t);
   return id;
 }
 // Clock out's own Start taken back is sent again before its next tick.
-function retract(s, by) { s.by = by; Ops.push({ op: 'retract', id: s.id }); if (Clock && s.seq && s.data.length === 1 && s.data[0] === 0xFA && s.output === Clock.output) Clock.started = false; }
+function retract(s, by) { s.by = by; if (s.output) Ops.push({ op: 'retract', id: s.id }); if (Clock && s.seq && s.data.length === 1 && s.data[0] === 0xFA && s.output === Clock.output) Clock.started = false; }
 function trim(t) {
   for (let i = 0; i < Queue.length;) {
     const s = Queue[i];
@@ -105,7 +116,15 @@ function trim(t) {
     else if (s.tick != null && s.by != null) Queue.splice(i, 1);
     else i++;
   }
-  while (Queue.length > RECORD) { const i = Queue.findIndex(s => !waits(s, t)); if (i < 0) return; Queue.splice(i, 1); }
+  while (Queue.length > RECORD) {
+    const i = Queue.findIndex(s => !waits(s, t)); if (i < 0) break;
+    // Handed, it goes whatever comes after: `sent` keeps it.
+    const [s] = Queue.splice(i, 1);
+    if (s.by == null && listed(s)) { const k = Out.findIndex(o => order(o, s) >= 0); Out.splice(k < 0 ? Out.length : k, 0, s); }
+  }
+  // What 128 later messages due already follow is never listed again.
+  const due = Out.findIndex(s => s.at > t);
+  Out.splice(0, Math.max(0, (due < 0 ? Out.length : due) - SENT));
 }
 function send(args, t) {
   const [output, bytes, at0] = args;
@@ -114,7 +133,7 @@ function send(args, t) {
   if (data.why) return say(`midi dropped: ${data.why} (sendMIDI to ${output})`);
   const asked = at0 == null ? t : typeof at0 === 'number' ? at0 : NaN;
   if (!Number.isFinite(asked)) return say(`midi dropped: at is not a number (sendMIDI to ${output})`);
-  if (!connectedOutput(output)) return say(`midi dropped: ${Ports.access !== 'granted' ? `access is ${Ports.access}` : `${output} is not a connected output`} (sendMIDI)`);
+  if (!canSend(output)) return say(`midi dropped: ${Ports.access !== 'granted' ? `access is ${Ports.access}` : `${output} is not a connected output`} (sendMIDI)`);
   const at = Math.max(asked, t), note = asked < t ? ` (asked ${num(asked)})` : '';
   for (const d of data) {
     if (!(noteOff(d) || d.length === 1 && d[0] === 0xFC) && waiting(t) >= QUEUED) { say(`midi dropped: ${QUEUED} messages wait (sendMIDI to ${output} ${hex(d)})`); continue; }
@@ -158,7 +177,7 @@ function reload(t) {
 
 /** The sequence's side of the queue (transport.js), as midi.rs's `Midi` methods. */
 export const Midi = {
-  canSend: connectedOutput, access: () => Ports.access,
+  canSend, access: () => Ports.access,
   blocks: (onAt, t) => onAt - HOLD > t && waiting(t) >= QUEUED,
   nextHanded: t => Queue.filter(s => waits(s, t) && !exempt(s)).reduce((m, s) => Math.min(m, s.at - HOLD), Infinity),
   note(output, on, onAt, offAt, stepAt, t) {
@@ -172,10 +191,11 @@ export const Midi = {
     push({ output, data: [0x80 | (on[0] & 0x0F), on[1], 0], at: offAt, stepAt, seq: true, onAt }, t);
     return 'done';
   },
-  retractSeq(t) {
+  // An edit at `t`, or a clock's Start or new anchor (`by` 'clock', LLP 1125 D9; `strict` at the hold's edge): what waits, for a step from `from`.
+  retractSeq(t, from = t, by = 'edit', strict = false) {
     let n = 0;
-    for (const s of [...Queue]) if (s.seq && waits(s, t) && s.stepAt >= t && !offOfHanded(s, t)) { if (s.tick != null && Clock) Clock.next = Math.min(Clock.next, s.tick); else n++; retract(s, 'edit'); }
-    if (n) say(`midi retracted: ${n} (edit)`);
+    for (const s of [...Queue]) if (s.seq && waits(s, t) && (strict ? s.stepAt > from : s.stepAt >= from) && !offOfHanded(s, t)) { if (s.tick != null && Clock) Clock.next = Math.min(Clock.next, s.tick); else n++; retract(s, by); }
+    if (n) say(`midi retracted: ${n} (${by})`);
   },
   stopSeq(t) {
     let n = 0; const moved = [];
@@ -222,11 +242,15 @@ function listeners(input) {
   }
   return out.sort(([[a]], [[b]]) => a === b ? 0 : a.compareDocumentPosition(b) & 4 ? -1 : 1);
 }
+// The inputs the listeners name, then the one a sequence follows (LLP 1125 D9), opened with or without a listener.
 function inputsHeard() {
-  const open = [];
+  const open = [], clockIn = Sounds.clockInput?.();
   for (const [, inputs] of listeners(null)) for (const i of inputs) if (!open.includes(i)) open.push(i);
+  if (clockIn != null && !open.includes(clockIn)) open.push(clockIn);
   return open;
 }
+// One whole message clock in reads: Timing Clock, Start, Continue, Stop, or Song Position (the runner's `clock_message`).
+const clockMessage = d => d.length === 1 && [0xF8, 0xFA, 0xFB, 0xFC].includes(d[0]) || d.length === 3 && d[0] === 0xF2 && d[1] < 0x80 && d[2] < 0x80;
 // One host delivery, coalesced (midi.rs `coalesce`).
 function coalesce(batch) {
   const out = [], latest = [], coalesced = [];
@@ -249,17 +273,25 @@ function coalesce(batch) {
   for (const [input, n] of coalesced) say(`midi coalesced: ${n} (${input})`);
   return out.filter(Boolean);
 }
-// One host delivery of input messages, each to every listener, a commit each (the runner's `midi_input`); a refusal does
+// One host delivery of input messages (the runner's `midi_input`): the followed input's clock messages to the transport
+// first (D9), then each message to every listener, a commit each, one no element hears dropped unrecorded; a refusal does
 // not stop the rest, and the first is returned.
 function hear(batch) {
+  const clockIn = Sounds.clockInput?.();
+  if (clockIn != null && connectedInput(clockIn)) {
+    const msgs = batch.filter(m => m.input === clockIn && clockMessage(m.data)).map(m => [m.timeStamp, m.data]);
+    if (msgs.length) { time(); Sounds.clockIn(msgs); }
+  }
   let first = null;
   for (const m of coalesce(batch)) {
     if (!connectedInput(m.input)) { say(`midi in dropped: ${m.input} is not a connected input`); continue; }
+    const heard = listeners(m.input);
+    if (!heard.length) continue;
     const beat = Sounds.beatAt ? Sounds.beatAt(m.timeStamp) : -1;
     say(`midi in ${m.input} ${hex(m.data)} at ${num(m.timeStamp)} beat ${num(beat)}`);
     Heard++; Received.push({ input: m.input, data: m.data, timeStamp: m.timeStamp, beat, at: clock.now }); if (Received.length > RECORD) Received.shift();
     const record = [m.input, m.data, m.timeStamp, beat];
-    for (const [pair] of listeners(m.input)) if (pair[0].isConnected && pair[1](record) !== true) first ??= (journal.findLast(l => / refused /.test(l)) ?? 'refused').replace(/^t=\S+ /, '');
+    for (const [pair] of heard) if (pair[0].isConnected && pair[1](record) !== true) first ??= (journal.findLast(l => / refused /.test(l)) ?? 'refused').replace(/^t=\S+ /, '');
   }
   return first;
 }
@@ -283,13 +315,34 @@ function prefer(m) {
   return reply();
 }
 // `tap midi "<input>" 90 3c 64`: one delivery of the messages the bytes make (the runner's `midi_tap`).
+const unconnected = input => connectedInput(input) ? null : { error: `tap midi: ${Ports.access === 'granted' ? `${JSON.stringify(input)} is not a connected input (prefer midi.inputs)` : `MIDI access is ${Ports.access} (requestMIDIAccess, prefer midi.state)`}` };
+// Its clock form (D9): one delivery from the input a sequence follows, stamps rising from its last tick to now.
+function tapClock(input, list) {
+  const f = Sounds.follower?.();
+  if (!f || f.input !== input) return { error: `tap midi: no sequence follows ${JSON.stringify(input)} (clock=)` };
+  let last = f.lastTick ?? -Infinity;
+  const no = unconnected(input); if (no) return no;
+  const batch = [];
+  for (const e of Array.isArray(list) ? list : []) {
+    const a = Array.isArray(e) ? e : [], d7 = k => Number.isInteger(a[k]) && a[k] >= 0 && a[k] < 128;
+    const data = a.length === 2 && [0xF8, 0xFA, 0xFB, 0xFC].includes(a[1]) ? [a[1]] : a.length === 4 && a[1] === 0xF2 && d7(2) && d7(3) ? [0xF2, a[2], a[3]] : null;
+    if (!data) return { error: 'tap midi: a clock message is [stamp, f8|fa|fb|fc] or [stamp, f2, lsb, msb]' };
+    const stamp = typeof a[0] === 'number' ? a[0] : NaN;
+    if (!(stamp >= last && stamp <= clock.now)) return { error: `tap midi: clock stamps rise from the last tick to now (${num(clock.now)}), not ${num(stamp)}` };
+    last = stamp; batch.push({ input, timeStamp: stamp, data });
+  }
+  const refused = hear(batch);
+  return refused ? { error: `tap midi: ${refused}` } : reply();
+}
 function tap(req) {
-  const input = typeof req.input === 'string' ? req.input : '', data = Array.isArray(req.data) && req.data.length && req.data.every(b => Number.isInteger(b) && b >= 0 && b < 256) ? req.data : null;
+  const input = typeof req.input === 'string' ? req.input : '';
+  if (req.clock !== undefined) return tapClock(input, req.clock);
+  const data = Array.isArray(req.data) && req.data.length && req.data.every(b => Number.isInteger(b) && b >= 0 && b < 256) ? req.data : null;
   if (!data) return { error: 'tap midi: the bytes are whole numbers 0–255' };
   const parts = split(data);
   if (parts.why) return { error: `tap midi: ${parts.why}` };
-  if (!connectedInput(input)) return { error: `tap midi: ${Ports.access === 'granted' ? `${JSON.stringify(input)} is not a connected input (prefer midi.inputs)` : `MIDI access is ${Ports.access} (requestMIDIAccess, prefer midi.state)`}` };
-  if (!listeners(input).length) return { error: `tap midi: no mounted element with a midimessage handler lists ${JSON.stringify(input)} in midiinputs` };
+  const no = unconnected(input); if (no) return no;
+  if (!listeners(input).length && Sounds.clockInput?.() !== input) return { error: `tap midi: no mounted element with a midimessage handler lists ${JSON.stringify(input)} in midiinputs` };
   const refused = hear(parts.map(d => ({ input, timeStamp: clock.now, data: d })));
   return refused ? { error: `tap midi: ${refused}` } : reply();
 }
@@ -303,8 +356,8 @@ function load() {
     .catch(err => say(`midi: unavailable: ${err.message}`));
 }
 function flush() {
-  const open = inputsHeard();
-  if (open.join('\n') !== Open.join('\n') || open.length !== Open.length) { Ops.push({ op: 'open', inputs: open }); Open = open; }
+  const open = inputsHeard(), clockIn = Sounds.clockInput?.(), forward = clockIn != null ? [clockIn] : [];
+  if (open.join('\n') !== Open.join('\n') || open.length !== Open.length || forward.join('\n') !== OpenClock.join('\n')) { Ops.push({ op: 'open', inputs: open, clock: forward }); Open = open; OpenClock = forward; }
   if (clock.agent) Ops = [];
   else if (Output) { if (Ops.length || Boot) { Output.ops(Ops.splice(0), Boot); Boot = false; } }
   else load();
@@ -320,7 +373,7 @@ function apply(commands) {
 }
 /** `readers`: resource name → [its fields, {a port list's field: its port fields}]; `uses`: the plan uses MIDI (`uses::uses_midi`). */
 export function midi(readers, uses) {
-  Readers = readers; Uses = uses;
+  Readers = readers; Uses = uses; ReadsSent = Object.values(readers).some(([fields]) => fields.includes('sent'));
   // The grants are the data module's, which may load after the first frame: then the readers are asked again.
   const granted = () => /^\s*device\.midi\s/m.test(data.grants ?? '');
   Granted = granted();
@@ -330,7 +383,10 @@ export function midi(readers, uses) {
   (data.reserved ??= {}).exactMIDI = (_, a, name) => {
     const [fields, ports] = Readers[name];
     const port = (p, keys) => keys.map(k => k === 'state' ? (p.connected ? 'connected' : 'disconnected') : p[k]);
-    return fields.map(f => f === 'state' ? Ports.access : Ports[f].map(p => port(p, ports[f])));
+    const message = (s, keys) => keys.map(k => k === 'output' ? s.output : k === 'data' ? [...s.data] : s.at);
+    return fields.map(f => f === 'state' ? Ports.access
+      : f === 'sent' ? [...Out.filter(s => s.at <= clock.now), ...Queue.filter(s => gone(s, clock.now))].sort(order).slice(-SENT).map(s => message(s, ports[f]))
+      : Ports[f].map(p => port(p, ports[f])));
   };
   // `state.midi`, as the runner's (runner/src/agent/midi.rs).
   (globalThis.exact ??= {}).midi = {

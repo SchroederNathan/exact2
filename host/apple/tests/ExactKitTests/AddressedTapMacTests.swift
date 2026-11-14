@@ -111,5 +111,56 @@ final class AddressedTapMacTests: XCTestCase {
         XCTAssertNil(second["error"], "\(second)")
         XCTAssertEqual(presses(), [32], "the second run, at a point in it: \(second)")
     }
+
+    func testAFieldOrACheckboxTakesTheClickAndPressesNoAncestor() throws {
+        let (agent, presses) = rows(), p = try XCTUnwrap(session?.presenter), win = try XCTUnwrap(window)
+        p.apply(wireBatch([
+            ["op": "create", "id": 20, "kind": "input", "props": ["value": "draft"]],
+            ["op": "create", "id": 21, "kind": "control", "props": ["type": "checkbox"]],
+            ["op": "create", "id": 22, "kind": "control", "props": ["type": "button"]],
+            ["op": "create", "id": 23, "kind": "text", "props": ["text": "Beside the controls"]],
+            ["op": "children", "id": 1, "ids": [2]], ["op": "children", "id": 2, "ids": [20, 21, 22, 23]],
+            ["op": "frame", "id": 2, "x": 0, "y": 0, "w": 400, "h": 400],
+        ] + (20...23).map { ["op": "frame", "id": $0, "x": 20, "y": ($0 - 20) * 60 + 20, "w": 240, "h": 40] }))
+        p.viewport.layoutSubtreeIfNeeded()
+        for id: UInt32 in [20, 21] {
+            let node = try XCTUnwrap(p.views[id])
+            let point = node.convert(NSPoint(x: node.bounds.midX, y: node.bounds.midY), to: nil)
+            if case .control(let owner)? = agent.pressReach(node, at: point, in: win) {
+                XCTAssertTrue(owner === node)
+            } else { XCTFail("the addressed walk must stop at native control \(id)") }
+            let tap = agent.tap(["id": Int(id)])
+            XCTAssertNil(tap["error"], "\(tap)")
+            XCTAssertEqual(presses(), [], "the native click must not press the ancestor")
+            if let field = node.field { XCTAssertTrue(field.currentEditor() === win.firstResponder) }
+        }
+        // A native button's click presses the nearest handler, as a person's does.
+        XCTAssertNil(agent.tap(["id": 22])["error"])
+        XCTAssertNil(agent.tap(["id": 23])["error"])
+        XCTAssertEqual(presses(), [2, 2])
+    }
+
+    /// A run that presses nothing is clicked on a fragment it paints, as the
+    /// web's driver clicks the span, not at its paragraph's middle (the
+    /// paragraph's other text there): a `user-select: all` run is selected.
+    func testATapOnARunThatPressesNothingLandsOnItsText() throws {
+        let (agent, presses) = rows()
+        let p = try XCTUnwrap(session?.presenter)
+        p.apply(wireBatch([
+            ["op": "create", "id": 20, "kind": "text", "style": ["font_size": 16.0]],
+            ["op": "children", "id": 1, "ids": [2, 4, 6, 8, 20]],
+            ["op": "frame", "id": 20, "x": 0.0, "y": 600.0, "w": 400.0, "h": 20.0],
+            ["op": "paragraph", "id": 20, "runs": [
+                ["id": 21, "parent": 20, "paint": true, "props": ["text": "Folder: "]],
+                ["id": 22, "parent": 20, "paint": true, "props": ["text": "/tmp/work"], "style": ["user_select": "all"]],
+                ["id": 23, "parent": 20, "paint": true, "props": ["text": ". Check the path and the folder."]],
+            ]],
+        ]))
+        p.viewport.layoutSubtreeIfNeeded()
+        let reply = agent.tap(["id": NSNumber(value: 22)])
+        XCTAssertNil(reply["error"], "\(reply)")
+        XCTAssertEqual(p.selection.selectedText(), "/tmp/work", "the click landed in the run: \(reply)")
+        XCTAssertEqual(presses(), [])
+    }
 }
 #endif

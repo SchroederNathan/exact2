@@ -72,7 +72,12 @@ pub(super) struct Contact {
     /// Every sample since down, for a pan's release velocity (LLP 1057 §10.6).
     pan_velocity: VelocityTracker,
     retained: Option<super::retained_action::RetainedContact>,
-    press: Option<(NodeKey, PaintedBox)>,
+    feedback: Option<(NodeKey, PaintedBox)>,
+    /// Keep the activation route chosen at down when feedback gains or loses paint.
+    press_activates: bool,
+    /// Mouse focus was decided on down; its prior focus, possibly none.
+    focus_before_down: Option<Option<ViewId>>,
+    focus_blocked: bool,
     /// The canvas that owns this contact and sees its down, moves and up.
     canvas: Option<ViewId>,
 }
@@ -142,15 +147,18 @@ impl<D: DataSource> Presenter<D> {
             }
             None => {
                 self.input_live(contact.hit)
-                    && contact.press.is_none_or(|(key, _)| {
-                        self.input_live(key)
-                            && self.host.kernel().node_by_key(key).is_some_and(|n| {
-                                self.host
-                                    .runner()
-                                    .handlers_of(n.id)
-                                    .contains(&EventKind::Press)
-                            })
-                    })
+                    && contact
+                        .feedback
+                        .filter(|_| contact.press_activates)
+                        .is_none_or(|(key, _)| {
+                            self.input_live(key)
+                                && self.host.kernel().node_by_key(key).is_some_and(|n| {
+                                    self.host
+                                        .runner()
+                                        .handlers_of(n.id)
+                                        .contains(&EventKind::Press)
+                                })
+                        })
                     && match contact.candidate {
                         Some(Candidate::Pan(key)) => {
                             self.input_live(key)
@@ -231,8 +239,21 @@ impl<D: DataSource> Presenter<D> {
     pub(super) fn contact_hit(&self) -> Option<NodeKey> {
         self.contact.as_ref().map(|contact| contact.hit)
     }
+    /// The node a live contact presses now: its press, while it is inside
+    /// the box it had when pressed.
+    pub(super) fn contact_press(&self) -> Option<NodeKey> {
+        let c = self.contact.as_ref()?;
+        let (key, box_) = c.feedback.as_ref()?;
+        box_.contains(c.position.0, c.position.1).then_some(*key)
+    }
     pub(crate) fn contact_position(&self) -> Option<(f32, f32)> {
         self.contact.as_ref().map(|c| c.position)
+    }
+    /// The agent's contact phase is done: its press lands at once (LLP
+    /// 1061 D2, D7), the clock unmoved.
+    pub(crate) fn land_presses(&mut self) {
+        self.host.land_presses();
+        self.dirty = true;
     }
     pub(crate) fn contact_event_ms(&self) -> Option<f64> {
         self.contact.as_ref().map(|c| c.event_ms)
@@ -319,6 +340,17 @@ impl<D: DataSource> Presenter<D> {
         None
     }
 
+    /// A finger or a pen on Android puts the focus back in touch mode
+    /// (`touch_mode`): the focus it finds shows no ring until a key.
+    pub(crate) fn touched(&mut self) {
+        if self.brush.touch_mode && self.contact_is_direct() {
+            self.brush.keyless = true;
+            let ringless = self.focus.and_then(|id| self.unringed(id));
+            self.dirty |= self.brush.ringless != ringless;
+            self.brush.ringless = ringless;
+        }
+    }
+
     /// Whether the web host prevents pointerdown's default focus for this hit.
     /// Swipe and reorder prevent moves, not the down.
     pub(crate) fn pointerdown_prevents_focus(&self, hit: ViewId) -> bool {
@@ -378,7 +410,7 @@ impl<D: DataSource> Presenter<D> {
                     let Some(n) = kernel.node(id).filter(|n| n.parent.is_some()) else {
                         break;
                     };
-                    if n.style.position_type == exact_kernel::PositionType::Absolute {
+                    if n.layout_position() == exact_kernel::PositionType::Absolute {
                         if self.is_inside(button, id) {
                             return true;
                         }
@@ -406,6 +438,10 @@ impl<D: DataSource> Presenter<D> {
     /// synthesis; then the node's `pointerdown` (LLP 1005 §3), which the
     /// contact never waits for.
     pub fn pointer_down(&mut self, x: f32, y: f32, now_ms: f64) -> Result<bool, String> {
+        self.touched();
+        if self.overlay_pointer(0, x, y, now_ms) || self.scrollbar_pointer(0, x, y) {
+            return Ok(true);
+        }
         // A hatch observes after this dispatch, and claims nothing
         // (LLP 1075.003.000.001 §2.2.2); so for a move, an up and a cancel.
         // Under an open surface of the top layer the page takes no touch.
@@ -414,12 +450,104 @@ impl<D: DataSource> Presenter<D> {
         }
         let mark = self.hatch_pointer_mark(crate::hatches::Phase::Down, x, y);
         let result = match self.contact_down(x, y, now_ms) {
-            Ok(taken) => self.pointer_pressed(x, y, now_ms).map_or(Ok(taken), Err),
+            Ok(taken) => {
+                // Keep the down target's identity before its handler can remove it.
+                let focus = self.contact.as_ref().and_then(|c| {
+                    let node = self.host.kernel().node_by_key(c.hit)?;
+                    let field = node.node_type == NodeType::TextInput;
+                    (c.canvas.is_none()
+                        && c.retained.is_none()
+                        && !crate::fields::hosts(&node)
+                        && (field || (c.candidate.is_none() && !c.group)))
+                        .then_some((c.hit, c.origin, field))
+                });
+                match self.pointer_pressed(x, y, now_ms) {
+                    Some(error) => Err(error),
+                    None => {
+                        let queued = self.commands.len();
+                        self.commands.retain(|c| c.name != "preventDefault");
+                        if let Some(contact) = &mut self.contact {
+                            contact.focus_blocked = self.commands.len() != queued;
+                        }
+                        if let Some((key, point, field)) = focus {
+                            self.focus_on_down(key, point, now_ms, field);
+                        }
+                        Ok(taken)
+                    }
+                }
+            }
             Err(e) => Err(e),
         };
         self.refresh_feedback();
         self.hatch_pointer(mark, crate::hatches::Phase::Down, x, y);
         result
+    }
+    /// A desktop mouse down with the shell's platform click count.
+    pub fn pointer_down_with_clicks(
+        &mut self,
+        x: f32,
+        y: f32,
+        now_ms: f64,
+        clicks: u32,
+    ) -> Result<bool, String> {
+        let before = self.hit(x, y).and_then(|id| {
+            let node = self.host.kernel().node(id)?;
+            (node.node_type == NodeType::TextInput)
+                .then(|| (node.key, self.field_text(id), self.field_selection(id)))
+        });
+        let result = self.pointer_down(x, y, now_ms);
+        if result.is_ok() && !self.contact_is_direct() {
+            let target = self
+                .contact
+                .as_ref()
+                .filter(|c| {
+                    c.focus_before_down.is_some()
+                        && !c.focus_blocked
+                        && c.canvas.is_none()
+                        && c.retained.is_none()
+                })
+                .map(|c| c.hit);
+            if let Some(key) = target {
+                self.begin_field_drag(key, (x, y), clicks, before);
+            }
+        }
+        result
+    }
+    fn focus_on_down(&mut self, key: NodeKey, point: (f32, f32), now_ms: f64, field: bool) {
+        if self.contact_is_direct() || self.menu.is_some() {
+            return;
+        }
+        let hit = self.host.kernel().node_by_key(key).map(|n| n.id);
+        if let Some(contact) = self.contact.as_mut().filter(|c| c.hit == key) {
+            contact.focus_before_down = Some(self.focus);
+            if contact.focus_blocked {
+                return;
+            }
+        }
+        let editing = self
+            .focus
+            .and_then(|id| self.host.kernel().node(id))
+            .is_some_and(|node| node.node_type == NodeType::TextInput);
+        if hit.is_some_and(|id| {
+            self.pointerdown_prevents_focus(id) || (editing && self.control_target(id).is_some())
+        }) {
+            return;
+        }
+        if hit.is_none_or(|id| {
+            field
+                && (!self.input_live(key)
+                    || !self.focusable(id)
+                    || self.focus_refusal(id).is_some())
+        }) {
+            // A field hidden, disabled or removed by pointerdown still blurs
+            // the old editor. Keep any surviving contact for up or cancellation.
+            if let Some(error) = self.set_focus(None, now_ms) {
+                eprintln!("exact: {error}");
+            }
+            self.queue_collections();
+            return;
+        }
+        self.focus_for_press(hit.unwrap(), point, now_ms, false);
     }
     fn contact_down(&mut self, x: f32, y: f32, now_ms: f64) -> Result<bool, String> {
         self.pointer_sample(x, y, now_ms)?;
@@ -452,7 +580,10 @@ impl<D: DataSource> Presenter<D> {
                     hold: None,
                     group: false,
                     retained: Some(retained),
-                    press: None,
+                    feedback: None,
+                    press_activates: false,
+                    focus_before_down: None,
+                    focus_blocked: false,
                     canvas: None,
                     panning: false,
                     pan_velocity: VelocityTracker::new(),
@@ -505,26 +636,32 @@ impl<D: DataSource> Presenter<D> {
                 panning: false,
                 pan_velocity: VelocityTracker::new(),
                 retained: None,
-                press: None,
+                feedback: None,
+                press_activates: false,
+                focus_before_down: None,
+                focus_blocked: false,
                 canvas: Some(canvas),
             });
             return Ok(true);
         }
         let pressed = self.handler_target(view, EventKind::Press);
         // `-exact-press-haptic` plays at the press, the host's own as the
-        // scale below is (LLP 1077 D14).
+        // scale and paint below are (LLP 1077 D14; LLP 1061 D7).
         if let Some(id) = pressed {
             self.press_haptic(id);
         }
-        let press = pressed.and_then(|id| {
+        let feedback = pressed.and_then(|id| {
             let node = self.host.kernel().node(id)?;
-            if node.style.press_scale == 1. {
-                return None;
-            }
             let (key, origin) = (node.key, node.style.transform_origin);
             self.box_of(id).map(|b| (key, b.unpressed(origin)))
         });
-        if let Some((key, _)) = press {
+        let press_activates = feedback.is_some_and(|(key, _)| {
+            self.host
+                .kernel()
+                .node_by_key(key)
+                .is_some_and(|node| crate::host::press::shows(&node))
+        });
+        if let Some((key, _)) = feedback {
             self.host.press_feedback(key, true, now_ms);
             self.dirty = true;
         }
@@ -544,7 +681,10 @@ impl<D: DataSource> Presenter<D> {
             panning: false,
             pan_velocity,
             retained: None,
-            press,
+            feedback,
+            press_activates,
+            focus_before_down: None,
+            focus_blocked: false,
             canvas: None,
         });
         self.set_collection_interaction(Some(view));
@@ -573,6 +713,9 @@ impl<D: DataSource> Presenter<D> {
         now_ms: f64,
         event_ms: f64,
     ) -> Result<bool, String> {
+        if self.overlay_pointer(2, x, y, now_ms) || self.scrollbar_pointer(2, x, y) {
+            return Ok(true);
+        }
         let mark = self.hatch_pointer_mark(crate::hatches::Phase::Move, x, y);
         let moved = self.pointer_moved(x, y, now_ms, event_ms);
         // The device's motion belongs to this move alone, sent or not.
@@ -612,6 +755,11 @@ impl<D: DataSource> Presenter<D> {
         let mut contact = self.contact.take().unwrap();
         contact.last_ms = now_ms;
         contact.event_ms = event_ms;
+        if self.drag_field(x, y) {
+            contact.position = (x, y);
+            self.contact = Some(contact);
+            return Ok(true);
+        }
         if let Some(canvas) = contact.canvas {
             // At the screen's edge the position stops; the device's motion does not.
             let moved = (x, y) != contact.position || self.has_raw_motion();
@@ -622,7 +770,7 @@ impl<D: DataSource> Presenter<D> {
         contact
             .pan_velocity
             .push(event_ms / 1000., Value::new(x as f64, y as f64));
-        if let Some((key, box_)) = contact.press {
+        if let Some((key, box_)) = contact.feedback {
             self.host.press_feedback(key, box_.contains(x, y), now_ms);
             self.dirty = true;
         }
@@ -659,7 +807,7 @@ impl<D: DataSource> Presenter<D> {
             contact.position = (x, y);
             if contact.panning || dx.abs().max(dy.abs()) > slop {
                 contact.panning = true;
-                if let Some((key, _)) = contact.press.take() {
+                if let Some((key, _)) = contact.feedback.take() {
                     self.host.press_feedback(key, false, now_ms);
                 }
                 let view = self.host.kernel().node_by_key(key).unwrap().id;
@@ -699,7 +847,7 @@ impl<D: DataSource> Presenter<D> {
                 return Ok(false);
             }
             if contact.candidate.is_some() {
-                if let Some((key, _)) = contact.press.take() {
+                if let Some((key, _)) = contact.feedback.take() {
                     self.host.press_feedback(key, false, now_ms);
                 }
             }
@@ -752,9 +900,17 @@ impl<D: DataSource> Presenter<D> {
                     self.begin_swipe(key, now_ms)
                 }
                 _ => {
-                    if contact.press.is_some() {
+                    if (contact.press_activates && contact.feedback.is_some())
+                        || (contact.candidate.is_none()
+                            && contact.retained.is_none()
+                            && !self.contact_is_direct())
+                    {
                         self.contact = Some(contact);
                     } else {
+                        if let Some((key, _)) = contact.feedback {
+                            self.host.press_feedback(key, false, now_ms);
+                            self.dirty = true;
+                        }
                         self.set_collection_interaction(None);
                     }
                     return Ok(false);
@@ -828,13 +984,22 @@ impl<D: DataSource> Presenter<D> {
         now_ms: f64,
         event_ms: f64,
     ) -> Result<bool, String> {
+        if self.overlay_pointer(1, x, y, now_ms) || self.scrollbar_pointer(1, x, y) {
+            return Ok(true);
+        }
         let mark = self.hatch_pointer_mark(crate::hatches::Phase::Up, x, y);
         let result = self.pointer_lift(x, y, now_ms, event_ms);
+        self.field_drag = None;
         self.refresh_feedback();
         self.hatch_pointer(mark, crate::hatches::Phase::Up, x, y);
         result
     }
     fn pointer_lift(&mut self, x: f32, y: f32, now_ms: f64, event_ms: f64) -> Result<bool, String> {
+        // The physical release target precedes authored pointerup mutations.
+        // The retained pointerup path is not the mouse's hit at release.
+        let click = (!self.contact_is_direct())
+            .then(|| self.mouse_click_target(x, y))
+            .flatten();
         // DOM's order: the node's `pointerup`, then any click.
         if let Some(error) = self.pointer_lifted(Some((x, y)), now_ms) {
             return Err(error);
@@ -856,7 +1021,7 @@ impl<D: DataSource> Presenter<D> {
         if let Some(canvas) = contact.canvas {
             return Ok(self.canvas_pointer(canvas, "up", 0, x, y, now_ms));
         }
-        if let Some((key, _)) = contact.press {
+        if let Some((key, _)) = contact.feedback {
             self.host.press_feedback(key, false, now_ms);
             self.dirty = true;
         }
@@ -927,17 +1092,59 @@ impl<D: DataSource> Presenter<D> {
                     .map_or(Ok(true), Err),
                 _ => Ok(true),
             }
-        } else if let Some((key, box_)) = contact.press {
+        } else if !self.contact_is_direct() && contact.retained.is_none() {
+            if let Some(hit) = click
+                .filter(|_| self.menu_press(x, y).is_none())
+                .and_then(|key| self.host.kernel().node_by_key(key))
+            {
+                let (id, key) = (hit.id, hit.key);
+                // Click targeting does not change the focus decided on down.
+                let focus = contact
+                    .focus_before_down
+                    .or_else(|| (key != contact.hit).then_some(self.focus));
+                self.press_hit_after_down(id, (x, y), now_ms, focus, true);
+            }
+            Ok(false)
+        } else if let Some((key, box_)) = contact.feedback.filter(|_| contact.press_activates) {
+            let hit = self.host.kernel().node_by_key(contact.hit).map(|n| n.id);
+            let visible = |id| {
+                self.host.kernel().node(id).is_some_and(|n| {
+                    n.computed_row(exact_kernel::StyleId::Visibility, |s| s.visibility)
+                        == exact_kernel::Visibility::Visible
+                })
+            };
             if box_.contains(x, y) && self.input_live(key) {
-                if let Some(id) = self.host.kernel().node_by_key(key).map(|n| n.id) {
+                if let Some(id) = self
+                    .host
+                    .kernel()
+                    .node_by_key(key)
+                    .filter(|n| {
+                        // A hidden ancestor still hears a visible descendant's click.
+                        self.focus_refusal(n.id).is_none()
+                            && (visible(n.id)
+                                || hit.is_some_and(|hit| {
+                                    visible(hit)
+                                        && self.focus_refusal(hit).is_none()
+                                        && self.is_inside(hit, n.id)
+                                }))
+                    })
+                    .map(|n| n.id)
+                {
                     // Focus is decided from what the finger touched, as
                     // `press_at` decides it: a `retainFocus` child counts.
-                    let hit = self.host.kernel().node_by_key(contact.hit).map(|n| n.id);
                     let hit = hit.unwrap_or(id);
-                    self.note_press(hit, false);
-                    if !self.pointerdown_prevents_focus(hit) {
-                        self.focus_for_press(hit, now_ms, self.contact_is_direct());
+                    self.note_press_from(
+                        hit,
+                        false,
+                        contact.focus_before_down.unwrap_or(self.focus),
+                    );
+                    if contact.focus_before_down.is_none()
+                        && !contact.focus_blocked
+                        && !self.pointerdown_prevents_focus(hit)
+                    {
+                        self.focus_for_press(hit, (x, y), now_ms, self.contact_is_direct());
                     }
+                    self.press_point = Some((x, y));
                     self.activate(id, now_ms);
                 }
             }
@@ -952,7 +1159,8 @@ impl<D: DataSource> Presenter<D> {
                         self.retained_press_target(target, now_ms);
                     }
                 } else {
-                    self.press_at(x, y, now_ms);
+                    let finger = self.direct();
+                    self.press_at_after_down(x, y, now_ms, contact.focus_before_down, finger);
                 }
             }
             Ok(false)
@@ -961,6 +1169,40 @@ impl<D: DataSource> Presenter<D> {
             self.set_collection_interaction(None);
         }
         result
+    }
+    fn mouse_click_target(&mut self, x: f32, y: f32) -> Option<NodeKey> {
+        if self
+            .field_drag
+            .as_ref()
+            .is_some_and(|drag| drag.moved((x, y)))
+        {
+            return None;
+        }
+        let contact = self.contact.as_ref()?;
+        if contact.canvas.is_some()
+            || contact.retained.is_some()
+            || contact.group
+            || contact.panning
+            || contact.hold.is_some()
+        {
+            return None;
+        }
+        let down = contact.hit;
+        let up = self.hit_after_pointerdown(x, y)?;
+        if self.brush.region_blocks_action(up) {
+            return None;
+        }
+        let kernel = self.host.kernel();
+        // A removed down node cancels the click; there is no surviving-parent
+        // fallback. Walk from the original node, including it, toward the root.
+        let mut at = Some(kernel.node_by_key(down)?.id);
+        while let Some(id) = at {
+            if id == up || self.is_inside(up, id) {
+                return kernel.node(id).map(|n| n.key);
+            }
+            at = kernel.node(id)?.parent;
+        }
+        None
     }
     fn end_contact(&mut self, held: &Hold, end: HoldEnd, now_ms: f64) -> Result<(), String> {
         match held.kind {
@@ -979,6 +1221,10 @@ impl<D: DataSource> Presenter<D> {
     /// Escape, wheel takeover, disconnection, or invalidated binding: no
     /// release event, except a pan that began, which releases at rest.
     pub fn pointer_cancel(&mut self, now_ms: f64) -> Result<(), String> {
+        self.overlay_pointer_cancel();
+        self.field_drag = None;
+        self.brush.scrollbars.drag = None;
+        self.brush.scrollbars.pressed = false;
         let at = self.contact_position().or(self.pointer).unwrap_or((0., 0.));
         let mark = self.hatch_pointer_mark(crate::hatches::Phase::Cancel, at.0, at.1);
         let result = self.pointer_abandon(now_ms);
@@ -1003,7 +1249,7 @@ impl<D: DataSource> Presenter<D> {
             let (x, y) = contact.position;
             self.cancel_canvas(canvas, x, y, now_ms);
         }
-        if let Some((key, _)) = contact.press {
+        if let Some((key, _)) = contact.feedback {
             self.host.press_feedback(key, false, now_ms);
             self.dirty = true;
         }
@@ -1034,3 +1280,7 @@ impl<D: DataSource> Presenter<D> {
 #[cfg(test)]
 #[path = "precedence_tests.rs"]
 mod precedence_tests;
+
+#[cfg(test)]
+#[path = "press_paint_tests.rs"]
+mod press_paint_tests;

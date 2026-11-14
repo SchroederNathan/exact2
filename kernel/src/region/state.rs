@@ -152,6 +152,17 @@ impl RegionState {
             self.invalidate()
         }
     }
+    /// Lay the region out again when its owner is `slot` or within it: a
+    /// change to `slot`'s rows' insets changes the owner's content box but
+    /// may leave its border box, the offer, as it was.
+    pub fn within(&mut self, arena: &NodeArena, slot: u32) {
+        if arena
+            .resolve(self.binding.owner)
+            .is_some_and(|o| o == slot || arena.is_ancestor(slot, o))
+        {
+            self.invalidate()
+        }
+    }
     pub fn resolve(
         &mut self,
         request: &RegionTextRequest,
@@ -465,6 +476,7 @@ impl RegionState {
                         .ok_or(LayoutError::ContentRegion("paragraph lacks stamp"))?;
                     let paragraph = arena.paragraph(slot);
                     let request = TextMeasureRequest {
+                        atoms: Default::default(),
                         exclusions: &[],
                         runs: &runs,
                         paragraph,
@@ -577,6 +589,10 @@ impl Candidate<'_> {
     }
 }
 impl TextMeasurer for Candidate<'_> {
+    fn measure_reservation(&mut self, request: &TextMeasureRequest<'_>) -> Option<TextMetrics> {
+        // Width samples are not canonical paragraph sources or paint artifacts.
+        self.measurer.measure_reservation(request)
+    }
     fn field_chrome(&mut self, request: &crate::FieldChromeRequest) -> crate::FieldChrome {
         self.measurer.field_chrome(request)
     }
@@ -586,6 +602,10 @@ impl TextMeasurer for Candidate<'_> {
         request: &TextMeasureRequest<'_>,
     ) -> Option<TextMetrics> {
         self.measurer.field_text(kind, request)
+    }
+
+    fn measure_revision(&self) -> u64 {
+        self.measurer.measure_revision()
     }
     fn height_free(&self) -> bool {
         self.height_free
@@ -737,7 +757,7 @@ fn holds_absolute(arena: &NodeArena, owner: u32) -> bool {
         while let Some(s) = stack.pop() {
             seen += 1;
             let children = arena.children(s);
-            if arena.style(s).position_type == crate::PositionType::Absolute
+            if crate::style::top_layer::layout_position(arena, s) == crate::PositionType::Absolute
                 || seen + stack.len() + children.len() > REGION_NODES
             {
                 return true;
@@ -772,6 +792,13 @@ fn validate(arena: &NodeArena, b: ContentRegion) -> Result<(), LayoutError> {
     while let Some(s) = p {
         if arena.style(s).display == Display::None {
             return Err(bad());
+        }
+        // In the top layer the owner is laid out in its own block, after
+        // the region's shell: no trial can place it (stage 14 B). Whether
+        // it is in the top layer now, not whether the last layout's block
+        // still stands (a host's block is refused beside a region anyway).
+        if arena.top_layer_slots.contains(s) {
+            return Err(LayoutError::ContentRegion("region owner in the top layer"));
         }
         // Fixed dimensions do not fix an exported child baseline: cutting the
         // child tree can replace its first baseline with the owner's height.
@@ -817,7 +844,9 @@ fn validate(arena: &NodeArena, b: ContentRegion) -> Result<(), LayoutError> {
     // absolute is under it. The compiler positions a clipping box only when
     // something absolute can be under it (487f14493), so a static owner holds
     // none; one that does is refused, at registration and at each commit.
-    if s.position_type == crate::PositionType::Static && holds_absolute(arena, b.owner.index) {
+    if crate::style::top_layer::layout_position(arena, b.owner.index) == crate::PositionType::Static
+        && holds_absolute(arena, b.owner.index)
+    {
         return Err(bad());
     }
     // Deliberately narrow certificate: percentages only under a direct root.
@@ -835,7 +864,8 @@ fn validate(arena: &NodeArena, b: ContentRegion) -> Result<(), LayoutError> {
             let definite = sized(dim)
                 || (width
                     && dim == Dimension::Auto
-                    && root.position_type != crate::PositionType::Absolute);
+                    && crate::style::top_layer::layout_position(arena, parent)
+                        != crate::PositionType::Absolute);
             if !definite {
                 return Err(bad());
             }
@@ -876,7 +906,7 @@ fn flex_height_independent(arena: &NodeArena, owner: u32) -> bool {
         && definite(root.height)
         && s.height == Dimension::Auto
         && definite(s.width)
-        && s.position_type != crate::PositionType::Absolute
+        && crate::style::top_layer::layout_position(arena, owner) != crate::PositionType::Absolute
         && s.flex_grow == 1.
         && s.flex_shrink == 1.
         && zero(s.flex_basis)
@@ -886,7 +916,7 @@ fn flex_height_independent(arena: &NodeArena, owner: u32) -> bool {
         // automatic main-axis content minimum. Aspect transfer is not admitted.
         && limit(s.min_width)
         && limit(s.max_width)
-        && s.aspect_ratio.preferred().is_none()
+        && s.rare.aspect_ratio.preferred().is_none()
         && [s.margin_top, s.margin_right, s.margin_bottom, s.margin_left]
             .into_iter().all(zero)
         && [s.top, s.right, s.bottom, s.left]

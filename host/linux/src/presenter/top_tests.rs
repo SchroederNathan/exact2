@@ -105,6 +105,11 @@ component App
           text "Archive"
         button commandfor="light" command="close" testId="light-cancel"
           text "Cancel"
+      dialog id="notice" role="alertdialog"
+        text "Couldn't save."
+        text "The disk is full."
+        button commandfor="notice" command="close"
+          text "OK"
       dialog id="chooser" role="alertdialog"
         button press=keep commandfor="chooser" command="close"
           text "One"
@@ -157,6 +162,67 @@ fn boot() -> Presenter<()> {
     .unwrap();
     assert!(error.is_none(), "{error:?}");
     p
+}
+
+#[test]
+fn desktop_overlay_accepts_pointer_keys_and_dismisses_without_clicking_through() {
+    let mut p = boot();
+    p.serve_overlays();
+    p.frame();
+    tap(&mut p, "more").unwrap();
+    p.frame();
+    assert!(
+        p.brush.top_surface.is_some(),
+        "the menu reaches the page painter"
+    );
+    let open = p.top.open.as_ref().unwrap();
+    let (x, y, w, h) = open.layout.targets[0].rect;
+    let x = open.frame[0] as f32 / open.scale + x + w / 2.;
+    let y = open.frame[1] as f32 / open.scale + y + h / 2.;
+    p.pointer_down(x, y, 0.).unwrap();
+    p.pointer_up(x, y, 1.).unwrap();
+    assert!(p.surface().is_none());
+    assert_eq!(text(&p, "said"), "renamed");
+    p.frame();
+    assert!(p.brush.top_surface.is_none());
+
+    tap(&mut p, "more").unwrap();
+    p.pointer_down(2., 2., 2.).unwrap();
+    p.pointer_up(2., 2., 3.).unwrap();
+    assert!(p.surface().is_none());
+    assert_eq!(text(&p, "said"), "renamed");
+    tap(&mut p, "more").unwrap();
+    assert!(p.surface_key("ArrowDown", 4.));
+    assert!(p.surface_key("ArrowDown", 5.));
+    assert!(p.surface_key("Enter", 6.));
+    assert_eq!(text(&p, "said"), "sent");
+    assert!(p.surface().is_none());
+}
+
+#[test]
+fn desktop_alerts_focus_cancel_or_ok_on_open_and_replacement() {
+    let mut p = boot();
+    p.serve_overlays();
+    let frame = p.display_frame().unwrap();
+    assert!(p.display_complete(&frame));
+    tap(&mut p, "ask").unwrap();
+    let open = p.top.open.as_ref().unwrap();
+    assert_eq!(
+        open.focused.map(|i| open.layout.targets[i].node),
+        Some(id(&p, "confirm-cancel"))
+    );
+    assert!(p.surface_key("Enter", 1.));
+    assert!(p.surface().is_none());
+    assert_eq!(text(&p, "said"), "nothing");
+    tap(&mut p, "ask").unwrap();
+    let notice = named(&p, "notice");
+    let key = p.host.kernel().node(notice).unwrap().key;
+    assert!(p.present(Some(key), "notice", None, None, true, 3.));
+    assert_eq!(p.top.open.as_ref().unwrap().focused, Some(0));
+    assert!(p.surface_key("Enter", 4.));
+    assert!(p.surface().is_none());
+    assert_eq!(text(&p, "said"), "nothing");
+    assert_eq!(p.focus(), Some(id(&p, "ask")));
 }
 
 /// A presenter whose shell makes windows, and the pictures it recorded.
@@ -315,6 +381,24 @@ fn the_shape_rule_is_the_one_the_apple_hosts_follow() {
     );
     let titles: Vec<_> = rows.iter().map(|r| r.title.as_str()).collect();
     assert_eq!(titles, ["Cancel", "Save", "Not now"]);
+    // Text and its one closing button: the one-button alert, which tells.
+    let Some(Plan::Alert {
+        title,
+        message,
+        rows,
+        cancellable,
+        outside,
+    }) = plan("notice")
+    else {
+        panic!("notice is an alert");
+    };
+    assert_eq!(
+        (title.as_deref(), message.as_deref()),
+        (Some("Couldn't save."), Some("The disk is full."))
+    );
+    let titles: Vec<_> = rows.iter().map(|r| (r.title.as_str(), r.cancel)).collect();
+    assert_eq!(titles, [("OK", true)]);
+    assert!(cancellable && !outside);
     assert_eq!(
         plan("chooser"),
         None,
@@ -738,7 +822,9 @@ fn a_long_press_opens_the_context_menu_a_node_names_where_the_finger_is() {
     let held = p.rect_of(id(&p, "held")).unwrap();
     let at = (held.0 + 120.0, held.1 + 10.0);
     assert_eq!(p.pointer_down(at.0, at.1, 0.0), Ok(true));
+    let before = p.long_presses();
     assert!(p.long_press(at.0, at.1, 500.0));
+    assert_eq!(p.long_presses(), before.wrapping_add(1));
     // Its `contextmenu` ran first, then the menu opened at the finger.
     assert_eq!(text(&p, "aimed"), "row");
     assert_eq!(p.surface().map(|s| s.kind), Some(SurfaceKind::Menu));
@@ -757,6 +843,11 @@ fn a_long_press_opens_the_context_menu_a_node_names_where_the_finger_is() {
     assert!(
         !p.long_press(poke.0 + 5.0, poke.1 + 5.0, 800.0),
         "a node that names none"
+    );
+    assert_eq!(
+        p.long_presses(),
+        before.wrapping_add(1),
+        "counted only when taken"
     );
 }
 
@@ -825,6 +916,7 @@ fn a_surface_follows_the_scheme_the_font_scale_and_a_reader_made_again() {
         bold_text: false,
         high_contrast: false,
         touch: true,
+        tv: false,
         touch_slop: 8.0,
         dates: String::new(),
     };
@@ -862,6 +954,7 @@ fn a_surface_follows_the_scheme_the_font_scale_and_a_reader_made_again() {
 fn the_dialog_and_the_menu_keep_materials_metrics() {
     let engine = crate::text::TextEngine::shared();
     let inputs = |width: f32| Inputs {
+        contrast: None,
         dark: false,
         font_scale: 1.0,
         window: (width, 800.0),
@@ -1112,6 +1205,13 @@ fn focus_after_show_selects_the_shell_menu_row_and_escape_restores_the_trigger()
     let second = id(&p, "menu-share");
     p.set_focus(Some(trigger), 0.0);
     p.popover_command("showPopover", &[Value::str("menu"), Value::str("trigger")]);
+    assert_eq!(p.focus_command(&[Value::str("trigger")]), None);
+    assert_eq!(p.focus(), None);
+    let journal = crate::agent::handle(&mut p, r#"{"op":"logs"}"#);
+    assert!(
+        journal.contains(r#"focus \"trigger\" refused: page under surface is inert"#),
+        "{journal}"
+    );
     assert_eq!(p.focus_command(&[Value::str("second")]), Some(second));
     assert_eq!(p.top.open.as_ref().unwrap().focused, Some(1));
     assert_eq!(p.focus(), None, "the menu owns focus, not the page");
@@ -1343,4 +1443,56 @@ fn shell_surface_geometry_tracks_insets_cutouts_and_scale() {
         );
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn mouse_invocation_keeps_the_nearest_press_handler() {
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for handler in ["child", "invoker", "parent"] {
+        for feedback in ["", "-exact-press-opacity=0.5"] {
+            let at = |name| if handler == name { "press=record" } else { "" };
+            let source = format!(
+                r#"component App
+  state seen = ""
+  action record
+    seen = `${{seen}}press `
+  view
+    column width=300 height=200
+      box width=200 height=80 {parent} {feedback}
+        button testId="invoker" popovertarget="menu" width=160 height=60 {invoker} {feedback}
+          box testId="child" width=100 height=40 {child} {feedback}
+      column id="menu" popover="auto" role="menu"
+        button press=record
+          text "First"
+"#,
+                parent = at("parent"),
+                invoker = at("invoker"),
+                child = at("child"),
+            );
+            let (mut p, error) = Presenter::boot_with(
+                &crate::test_plan(&source),
+                (),
+                (300., 200.),
+                1.,
+                PathBuf::new(),
+                PainterChoice::Cpu,
+            )
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            p.serve_requests();
+            p.serve_windows(Box::new(Pixels(Rc::new(RefCell::new(Vec::new())))));
+            let (x, y, w, h) = p.rect_of(id(&p, "child")).unwrap();
+            p.pointer_down(x + w / 2., y + h / 2., 1.).unwrap();
+            p.pointer_up(x + w / 2., y + h / 2., 2.).unwrap();
+            actual.push((
+                handler,
+                feedback,
+                p.host.runner().slot("seen").cloned(),
+                p.surface().is_some(),
+            ));
+            expected.push((handler, feedback, Some(Value::str("press ")), true));
+        }
+    }
+    assert_eq!(actual, expected);
 }

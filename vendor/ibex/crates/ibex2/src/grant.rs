@@ -21,10 +21,10 @@ use std::collections::BTreeSet;
 
 /// An origin, for the two network capabilities.
 ///
-/// Compared by exact tuple equality. The one pattern (LLP 0067 §2, the
-/// subdomain grant): a `net.fetch` grant may name every host under one
-/// domain, `https://*.host.example`, and nothing wider. It is its own grant
-/// kind, `FetchSubdomains`, so an exact grant never matches as a pattern.
+/// Compared by exact tuple equality. Patterns are separate grant kinds, so an
+/// exact grant never matches as a pattern: either network family may name every
+/// host under one domain, such as `https://*.host.example` or `wss://*.host.example`,
+/// or every origin of one of its schemes, such as `https:` (LLP 0067 §2).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Origin {
     pub scheme: String,
@@ -74,6 +74,13 @@ impl PathPrefix {
                 return None;
             }
             ("doc:", path)
+        } else if let Some(found) = ["home:", "bundle:"]
+            .into_iter()
+            .find_map(|ns| Some((ns, path.strip_prefix(ns)?.strip_prefix('/')?)))
+        {
+            // Exact patch (exact2 LLP 1133.007 D6): the person's home
+            // directory and the app's installed bundle, resolved by the host.
+            found
         } else if path.starts_with('/') {
             ("", path)
         } else {
@@ -165,7 +172,26 @@ pub enum Grant {
     /// the origin's scheme and port (LLP 0067 §2). The suffix is at least
     /// two labels and not an address.
     FetchSubdomains(Origin),
+    /// `net.fetch http:` or `net.fetch https:`: every origin of the scheme,
+    /// with any host and port, as a CSP scheme source admits it.
+    FetchScheme(String),
     WebSocket(Origin),
+    /// `net.websocket wss://*.<suffix>` or `ws://*.<suffix>`, with the same
+    /// suffix and port rules as `FetchSubdomains`.
+    WebSocketSubdomains(Origin),
+    /// `net.websocket ws:` or `net.websocket wss:`: every origin of the scheme.
+    WebSocketScheme(String),
+    /// Exact patch (exact2 LLP 1133.036 D5): `net.fetch local-network`, an
+    /// `http:` or `https:` origin whose host, as written, is on the local
+    /// network ([`is_local_network`]), at any port; `loopback` for the line
+    /// a development build's bake writes, `net.fetch local-network development`.
+    FetchLocalNetwork {
+        loopback: bool,
+    },
+    /// `net.websocket local-network`: the same hosts, for `ws:` and `wss:`.
+    WebSocketLocalNetwork {
+        loopback: bool,
+    },
     FsRead(PathPrefix),
     FsWrite(PathPrefix),
     EnvRead(String),
@@ -178,7 +204,8 @@ impl Grant {
     fn admits(&self, operation: &Operation) -> bool {
         match (self, operation) {
             (Grant::Fetch(granted), Operation::Fetch { origin }) => granted == origin,
-            (Grant::FetchSubdomains(suffix), Operation::Fetch { origin }) => {
+            (Grant::FetchSubdomains(suffix), Operation::Fetch { origin })
+            | (Grant::WebSocketSubdomains(suffix), Operation::WebSocket { origin }) => {
                 origin.scheme == suffix.scheme
                     && origin.port == suffix.port
                     && origin
@@ -186,7 +213,19 @@ impl Grant {
                         .strip_suffix(suffix.host.as_str())
                         .is_some_and(|head| head.len() > 1 && head.ends_with('.'))
             }
+            (Grant::FetchScheme(scheme), Operation::Fetch { origin }) => origin.scheme == *scheme,
             (Grant::WebSocket(granted), Operation::WebSocket { origin }) => granted == origin,
+            (Grant::WebSocketScheme(scheme), Operation::WebSocket { origin }) => {
+                origin.scheme == *scheme
+            }
+            (Grant::FetchLocalNetwork { loopback }, Operation::Fetch { origin }) => {
+                matches!(origin.scheme.as_str(), "http" | "https")
+                    && is_local_network(&origin.host, *loopback)
+            }
+            (Grant::WebSocketLocalNetwork { loopback }, Operation::WebSocket { origin }) => {
+                matches!(origin.scheme.as_str(), "ws" | "wss")
+                    && is_local_network(&origin.host, *loopback)
+            }
             (Grant::FsRead(prefix), Operation::FsRead { path }) => prefix.covers(path),
             (Grant::FsWrite(prefix), Operation::FsWrite { path }) => prefix.covers(path),
             (Grant::EnvRead(granted), Operation::EnvRead { name }) => granted == name,
@@ -248,7 +287,7 @@ impl GrantSet {
                 if prefix
                     .0
                     .first()
-                    .is_some_and(|p| p == "app:" || p == "doc:" || p.starts_with("win:"))
+                    .is_some_and(|p| p.ends_with(':') || p.starts_with("win:"))
                 {
                     return prefix.clone();
                 }
@@ -361,15 +400,64 @@ impl GrantSet {
             };
             let target = quoted.as_deref().unwrap_or(first);
             let grant = match capability {
-                "net.fetch" if target.contains("://*.") => {
-                    Grant::FetchSubdomains(subdomains(target).map_err(|e| {
+                // Exact patch (exact2 LLP 1133.036 D5): the local network,
+                // decided from a URL's host as written.
+                "net.fetch" | "net.websocket" if target == "local-network" => {
+                    let loopback = match parts.next() {
+                        None => false,
+                        Some("development") => true,
+                        Some(extra) => {
+                            return Err(format!(
+                                "line {}: unexpected `{extra}` after the target",
+                                index + 1
+                            ))
+                        }
+                    };
+                    if capability == "net.fetch" {
+                        Grant::FetchLocalNetwork { loopback }
+                    } else {
+                        Grant::WebSocketLocalNetwork { loopback }
+                    }
+                }
+                // A CSP scheme source is a scheme and its colon. Keep the two
+                // network families disjoint and admit only their URL schemes.
+                "net.fetch" | "net.websocket" if is_scheme_source(target) => {
+                    let scheme = target[..target.len() - 1].to_ascii_lowercase();
+                    match (capability, scheme.as_str()) {
+                        ("net.fetch", "http" | "https") => Grant::FetchScheme(scheme),
+                        ("net.websocket", "ws" | "wss") => Grant::WebSocketScheme(scheme),
+                        _ => {
+                            let schemes = if capability == "net.fetch" {
+                                "`http:` or `https:`"
+                            } else {
+                                "`ws:` or `wss:`"
+                            };
+                            return Err(format!(
+                                "line {}: `{target}`: a scheme-wide `{capability}` line is {schemes}",
+                                index + 1
+                            ));
+                        }
+                    }
+                }
+                "net.fetch" | "net.websocket" if target.contains("://*.") => {
+                    let suffix = subdomains(target).map_err(|e| {
                         format!("line {}: bad origin pattern `{target}`: {e}", index + 1)
-                    })?)
+                    })?;
+                    if capability == "net.fetch" {
+                        Grant::FetchSubdomains(suffix)
+                    } else if matches!(suffix.scheme.as_str(), "ws" | "wss") {
+                        Grant::WebSocketSubdomains(suffix)
+                    } else {
+                        return Err(format!(
+                            "line {}: `{target}`: a subdomain `net.websocket` line needs `ws` or `wss`",
+                            index + 1
+                        ));
+                    }
                 }
                 "net.fetch" | "net.websocket" => {
                     if target.contains('*') {
                         return Err(format!(
-                            "line {}: `{target}`: `*` is allowed only as `net.fetch scheme://*.domain`",
+                            "line {}: `{target}`: `*` is allowed only as `{capability} scheme://*.domain`",
                             index + 1
                         ));
                     }
@@ -401,6 +489,8 @@ impl GrantSet {
                             index + 1
                         )
                     })?;
+                    namespace_refusal(capability, &prefix)
+                        .map_err(|e| format!("line {}: `{target}`: {e}", index + 1))?;
                     match capability {
                         "fs.read" => Grant::FsRead(prefix),
                         "fs.write" => Grant::FsWrite(prefix),
@@ -415,6 +505,14 @@ impl GrantSet {
                             index + 1
                         ));
                     }
+                    if target.starts_with("exact.presence.") {
+                        return Err(format!(
+                            "line {}: `{target}`: `exact.presence.` names are the runner's own",
+                            index + 1
+                        ));
+                    }
+                    let rest: Vec<&str> = parts.by_ref().collect();
+                    presence_words(&rest).map_err(|e| format!("line {}: {e}", index + 1))?;
                     Grant::SecretKeep(target.to_string())
                 }
                 "storage.kv" => {
@@ -443,9 +541,123 @@ impl GrantSet {
     }
 }
 
+/// Exact patch: the words after a `secret.keep` name are its presence policy
+/// (exact2 LLP 1133.010 D4, D10): one of four policies, then `optional`, then
+/// platform words, each once and in that order. The grant is the name's
+/// either way; exact2's runner and hosts read the policy. Mirrors
+/// `exact_grants::presence_words`, word for word.
+fn presence_words(words: &[&str]) -> Result<(), String> {
+    const POLICIES: [&str; 4] = [
+        "user-presence",
+        "biometry-any",
+        "biometry-current-set",
+        "device-credential",
+    ];
+    const PLATFORM: [&str; 5] = [
+        "apple.accessible=whenPasscodeSetThisDeviceOnly",
+        "apple.accessible=whenUnlockedThisDeviceOnly",
+        "apple.orWatch",
+        "apple.orCompanion",
+        "android.strongBox",
+    ];
+    let Some((first, rest)) = words.split_first() else {
+        return Ok(());
+    };
+    if !POLICIES.contains(first) {
+        let why = if *first == "optional" {
+            "`optional` needs a presence policy before it".to_string()
+        } else if PLATFORM.contains(first) {
+            format!("`{first}`: a platform word needs a presence policy before it")
+        } else {
+            format!("`{first}` is not a presence policy")
+        };
+        return Err(format!(
+            "grant-policy-unknown: {why}; write one of {} after the name, then `optional`, then platform words",
+            POLICIES.join(", ")
+        ));
+    }
+    let (mut optional, mut platform) = (false, Vec::<&str>::new());
+    for word in rest {
+        if *word == "optional" && !optional && platform.is_empty() {
+            optional = true;
+        } else if PLATFORM.contains(word) {
+            let key = word.split('=').next().unwrap_or(word);
+            if platform.iter().any(|w| w.split('=').next() == Some(key)) {
+                return Err(format!("grant-policy-unknown: `{key}` is written twice"));
+            }
+            platform.push(word);
+        } else if *word == "optional" || POLICIES.contains(word) {
+            return Err(format!(
+                "grant-policy-unknown: `{word}` is out of order: one policy, then `optional`, then platform words"
+            ));
+        } else {
+            return Err(format!(
+                "grant-policy-unknown: `{word}` is not a presence word ({})",
+                PLATFORM.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "grant_quoted_tests.rs"]
 mod quoted_tests;
+
+/// Exact patch (exact2 LLP 1133.036 D5): whether `host`, as a URL serializes
+/// it, is on the local network: an RFC 1918, link-local IPv4, unique-local
+/// or link-local IPv6 literal (an IPv4-mapped address judged by the IPv4
+/// address it carries) or a name ending in `.local`; with `loopback`, also
+/// 127.0.0.0/8, `[::1]` and `localhost`. Mirrors
+/// `exact_grants::is_local_network`.
+pub fn is_local_network(host: &str, loopback: bool) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let v4 = |a: Ipv4Addr| a.is_private() || a.is_link_local() || loopback && a.is_loopback();
+    let host = host.to_ascii_lowercase();
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return inner
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|a| match a.to_ipv4_mapped() {
+                Some(mapped) => v4(mapped),
+                None => {
+                    let first = a.segments()[0];
+                    (first & 0xfe00) == 0xfc00
+                        || (first & 0xffc0) == 0xfe80
+                        || loopback && a.is_loopback()
+                }
+            });
+    }
+    if let Ok(address) = host.parse::<Ipv4Addr>() {
+        return v4(address);
+    }
+    let name = host.strip_suffix('.').unwrap_or(&host);
+    name.ends_with(".local") && name.len() > ".local".len() || loopback && name == "localhost"
+}
+
+/// Exact patch (exact2 LLP 1133.007 D6): why a path line's namespace refuses
+/// it. A line naming the whole home directory would stop meaning anything
+/// (`home-grant-whole`), and the bundle is read only.
+fn namespace_refusal(capability: &str, prefix: &PathPrefix) -> Result<(), String> {
+    match prefix.components() {
+        [home] if home == "home:" => Err(
+            "home-grant-whole: a line names a subtree of the home directory, such as `home:/.ssh`"
+                .into(),
+        ),
+        [bundle, ..] if bundle == "bundle:" && capability != "fs.read" => Err(format!(
+            "the bundle is read only: `{capability}` cannot name it"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// A CSP3 `scheme-source`: a scheme and its colon, with nothing after it.
+fn is_scheme_source(target: &str) -> bool {
+    target.strip_suffix(':').is_some_and(|scheme| {
+        let mut chars = scheme.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
 
 /// The suffix origin of `scheme://*.suffix[:port]` (LLP 0067 §2): `*` is
 /// the whole leftmost label and appears nowhere else, the suffix is a domain
@@ -552,6 +764,33 @@ mod tests {
     }
 
     #[test]
+    fn websocket_subdomains_keep_the_suffix_scheme_port_and_family() {
+        for (scheme, port) in [("ws", 80), ("wss", 443), ("ws", 8080), ("wss", 8443)] {
+            let set =
+                GrantSet::parse(&format!("net.websocket {scheme}://*.example.com:{port}")).unwrap();
+            let socket = |scheme, host, port| {
+                set.permits(&Operation::WebSocket {
+                    origin: Origin::new(scheme, host, port),
+                })
+            };
+            assert!(socket(scheme, "a.example.com", port));
+            assert!(socket(scheme, "A.B.Example.COM", port));
+            for host in ["example.com", "evilexample.com", "a.example.com.evil.com"] {
+                assert!(!socket(scheme, host, port), "{host}");
+            }
+            assert!(!socket(
+                if scheme == "ws" { "wss" } else { "ws" },
+                "a.example.com",
+                port
+            ));
+            assert!(!socket(scheme, "a.example.com", port + 1));
+            assert!(!set.permits(&Operation::Fetch {
+                origin: Origin::new(scheme, "a.example.com", port),
+            }));
+        }
+    }
+
+    #[test]
     fn a_subdomain_pattern_is_refused_unless_it_names_one_domain() {
         for bad in [
             "net.fetch https://*.com",
@@ -560,13 +799,41 @@ mod tests {
             "net.fetch https://*.127.0.0.1",
             "net.fetch https://*.example.com/path",
             "net.fetch https://*example.com",
-            "net.websocket wss://*.example.com",
             "net.fetch https://*.example.com@evil.com",
             "net.fetch https://*.example.com:pw@evil.com",
         ] {
             assert!(GrantSet::parse(bad).is_err(), "{bad} parsed");
         }
         assert!(GrantSet::parse("net.fetch https://*.example.com:8443").is_ok());
+    }
+
+    #[test]
+    fn a_scheme_line_admits_only_its_scheme_and_capability_family() {
+        let set = GrantSet::parse("net.fetch HTTP:\nnet.websocket ws:").unwrap();
+        let fetch = |origin: Origin| set.permits(&Operation::Fetch { origin });
+        let socket = |origin: Origin| set.permits(&Operation::WebSocket { origin });
+
+        assert!(fetch(Origin::new("http", "127.0.0.1", 49152)));
+        assert!(fetch(Origin::new("http", "laptop.tailnet.ts.net", 80)));
+        assert!(socket(Origin::new("ws", "[::1]", 3773)));
+        assert!(!fetch(Origin::new("https", "127.0.0.1", 49152)));
+        assert!(!socket(Origin::new("wss", "127.0.0.1", 3773)));
+        assert!(!fetch(Origin::new("ws", "127.0.0.1", 3773)));
+        assert!(GrantSet::parse("net.websocket wss:")
+            .unwrap()
+            .permits(&Operation::WebSocket {
+                origin: Origin::new("wss", "example.com", 8443)
+            }));
+
+        for bad in [
+            "net.fetch ws:",
+            "net.fetch file:",
+            "net.websocket https:",
+            "net.fetch *:",
+            "net.fetch :",
+        ] {
+            assert!(GrantSet::parse(bad).is_err(), "{bad} parsed");
+        }
     }
 
     #[test]
@@ -757,6 +1024,10 @@ mod tests {
         // first word.
         assert!(GrantSet::parse("storage.kv payments cache").is_err());
         assert!(GrantSet::parse("secret.keep castle.session old").is_err());
+        // A presence policy is the one thing a `secret.keep` line may add.
+        assert!(GrantSet::parse("secret.keep castle.session user-presence optional").is_ok());
+        assert!(GrantSet::parse("secret.keep castle.session optional").is_err());
+        assert!(GrantSet::parse("secret.keep exact.presence.castle").is_err());
         assert!(GrantSet::parse("fs.read /data /backup").is_err());
         assert!(GrantSet::parse("net.fetch http://a.example # prod").is_err());
         assert!(GrantSet::parse("env.read HOME PATH").is_err());

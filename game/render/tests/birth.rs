@@ -23,7 +23,7 @@ fn assets() -> std::collections::BTreeMap<String, Vec<u8>> {
         ..Default::default()
     }];
     let mut assets = std::collections::BTreeMap::new();
-    assets.insert("rig.model".into(), bin::to_vec(&model));
+    assets.insert("rig.model".into(), exact_game::asset::encode_model(&model));
     assets.insert(
         model.textures[0].clone(),
         include_bytes!("../../bake/tests/fixtures/crate/0-srgb-straight.tex").to_vec(),
@@ -127,7 +127,16 @@ fn first_presented_skin_matches_current_pose_in_its_rectangle() {
             f.period_ms = 1000. / 240.;
             image = fixture::render(gpu, &mut s, &f).unwrap().0;
         }
-        assert_eq!(s.sim().unwrap().world().tick(), 1);
+        if H == 2 && event == "birth" {
+            // First-pose admission now discards bad history. Inject the negative
+            // control on the next tick, after the instance has been admitted.
+            f.now_ms += 1000. / 60.;
+            image = fixture::render(gpu, &mut s, &f).unwrap().0;
+        }
+        assert_eq!(
+            s.sim().unwrap().world().tick(),
+            if H == 2 && event == "birth" { 2 } else { 1 }
+        );
         assert!(s.take_error().is_none());
         image
     }
@@ -211,7 +220,7 @@ fn rigid_node_animation_moves_pixels_and_glow_dims_baked_emission() {
             ));
             w.insert_resource(Environment {
                 fog: None,
-                background: Some([0.; 3]),
+                background: Some([0.; 3].into()),
                 ..Default::default()
             });
         }
@@ -262,7 +271,7 @@ fn rigid_node_animation_moves_pixels_and_glow_dims_baked_emission() {
     surface.device_ready(wgpu::Features::empty());
     surface.bind(&[], None).unwrap();
     assert_eq!(surface.assets().requests, ["rig.model"]);
-    surface.asset("rig.model", Ok(&bin::to_vec(&model)));
+    surface.asset("rig.model", Ok(&exact_game::asset::encode_model(&model)));
     surface.prepare_assets(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
     let mut frame = Frame {
         width: 320.,

@@ -10,7 +10,7 @@ use exact_kernel::invocation::Action;
 use exact_kernel::style::cells::{COLUMN, ROW};
 use exact_kernel::{AxisOffer, Kernel, NodeKey, NodeType, Offer, PropId, ViewId};
 use exact_plan::{EventKind, Plan};
-use exact_runner::{DataSource, Event, Runner, RunnerError, Viewport};
+use exact_runner::{ControlValue, DataSource, Event, Runner, RunnerError, Viewport};
 use std::collections::HashMap;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
@@ -131,6 +131,9 @@ enum ById {
     /// `scrollBy("id", x, y)`: the scroller moves by `y` pixels (its rows
     /// are 16), as the web's `Element.scrollBy`.
     ScrollBy(String, f32),
+    /// `openURL(url, "id")`: `change` there hears whether the URL was
+    /// handed to the system's opener.
+    Opened(String, bool),
 }
 
 impl ById {
@@ -140,7 +143,8 @@ impl ById {
             | ById::Close(id)
             | ById::Focus(id)
             | ById::IntoView(id, _)
-            | ById::ScrollBy(id, _) => id,
+            | ById::ScrollBy(id, _)
+            | ById::Opened(id, _) => id,
         }
     }
 }
@@ -158,7 +162,9 @@ pub enum Mode {
 
 /// One runner, one grid.
 pub struct Host<D: DataSource> {
+    idle_timer_retry: bool,
     pub(crate) runner: Runner<D>,
+    input_clock: Option<std::time::Instant>,
     pub(crate) cols: usize,
     pub(crate) rows: usize,
     /// How the app occupies the terminal.
@@ -168,6 +174,9 @@ pub struct Host<D: DataSource> {
     pub(crate) caret: usize,
     pub(crate) scroll: HashMap<ViewId, f32>,
     pub(crate) collections: crate::collection::Collections,
+    /// The cell a mouse press is at while it is sent, from the painting's
+    /// top-left: its `MouseEvent`'s `clientX`/`clientY` (LLP 1021 D2).
+    pub(crate) press_point: Option<(i32, i32)>,
     /// Open dialogs and popovers, bottom to top, with the focus each took
     /// and whether it was opened modally (`show-modal`) or as a popover.
     pub(crate) layers: Vec<(ViewId, Option<ViewId>, bool)>,
@@ -195,6 +204,11 @@ pub struct Host<D: DataSource> {
     /// frame written before the key was read had shown. No timer.
     pub frames: u64,
     pub(crate) born: HashMap<ViewId, u64>,
+    /// Each `autofocus` control already offered the focus: HTML's
+    /// candidates, each taken once, when it arrives with nothing focused.
+    /// One that can't take the focus yet (disabled, hidden, in a closed
+    /// layer) is offered when it can, as the Linux host has it.
+    autofocused: std::collections::HashSet<exact_kernel::NodeKey>,
     /// Largest settled tree since the last trim; halve before sweeping again.
     trim_at: usize,
     /// The frame count when the keys being handled were read.
@@ -205,7 +219,7 @@ pub struct Host<D: DataSource> {
 }
 
 impl<D: DataSource> Host<D> {
-    /// Boot a plan in a `cols` × `rows` terminal.
+    /// Boot a headless plan on the agent clock in a `cols` × `rows` terminal.
     pub fn boot(
         plan: Plan,
         data: D,
@@ -213,10 +227,26 @@ impl<D: DataSource> Host<D> {
         cols: usize,
         rows: usize,
     ) -> Result<Host<D>, String> {
+        Self::boot_with_clock(plan, data, mode, cols, rows, false)
+    }
+
+    pub(crate) fn boot_with_clock(
+        plan: Plan,
+        data: D,
+        mode: Mode,
+        cols: usize,
+        rows: usize,
+        interactive: bool,
+    ) -> Result<Host<D>, String> {
         exact_kernel::style::link_segments();
         exact_kernel::timeline::link();
+        // The terminal's own column (LLP 1121 stage 11 B2): the web's in every
+        // metric, cells for the base scale's spacings, no corners.
+        exact_kernel::style::metrics::set_column(exact_kernel::style::metrics::Column::Terminal);
         let mut kernel = Kernel::new(Box::new(crate::measure::CellMeasurer::default()));
         kernel.set_cell_borders(true);
+        // And its spaces in whole cells (LLP 1121 stage 11 (c)).
+        kernel.set_cell_spaces(true);
         // LLP 1104 D4/D7: the user's cell face, at one 16px layout row.
         let font = exact_kernel::ControlFont {
             family: "ui-monospace".into(),
@@ -235,8 +265,9 @@ impl<D: DataSource> Host<D> {
         };
         kernel.set_env(env).map_err(|e| format!("{e:?}"))?;
         let viewport = Viewport::sized(cols as f64 * COLUMN as f64, rows as f64 * ROW as f64);
-        let runner =
-            Runner::boot(plan, data, kernel, viewport, "/").map_err(|e| match e {
+        let (launch, notes) = crate::zone::launch(interactive, |key| std::env::var(key).ok());
+        let mut runner = exact_runner::time::launching_with(launch, ||
+            Runner::boot(plan, data, kernel, viewport, "/")).map_err(|e| match e {
                 // The data module answered another declaration than the
                 // screen's: most often a binary older than the shapes.
                 RunnerError::Shape { resource, why } => format!(
@@ -244,8 +275,16 @@ impl<D: DataSource> Host<D> {
                 ),
                 e => format!("{e:?}"),
             })?;
+        for note in notes {
+            runner.log(note);
+        }
+        // The declarations' per-target words are the terminal's: a name a
+        // module marks `unsupported` here is refused (LLP 1133.004 §8).
+        runner.set_module_target("terminal");
         let mut host = Host {
             runner,
+            idle_timer_retry: false,
+            input_clock: None,
             cols,
             rows,
             mode,
@@ -254,6 +293,7 @@ impl<D: DataSource> Host<D> {
             caret: 0,
             scroll: HashMap::new(),
             collections: crate::collection::Collections::default(),
+            press_point: None,
             layers: Vec::new(),
             dark: true,
             painted: None,
@@ -266,6 +306,7 @@ impl<D: DataSource> Host<D> {
             outbound: Vec::new(),
             frames: 0,
             born: HashMap::new(),
+            autofocused: Default::default(),
             trim_at: 0,
             read_at: 0,
             arm: true,
@@ -303,6 +344,9 @@ impl<D: DataSource> Host<D> {
         let (receipts, _) = self.runner.apply_announced();
         if landed || !receipts.is_empty() {
             self.after_commit();
+        } else {
+            // (what a landing asked with no commit, a background round's next request, still goes out)
+            self.run_requests();
         }
     }
 
@@ -320,6 +364,12 @@ impl<D: DataSource> Host<D> {
     /// The grid size.
     pub fn size(&self) -> (usize, usize) {
         (self.cols, self.rows)
+    }
+
+    /// The running plan, by the SHA-256 of its bytes: what every host's
+    /// agent names it by (the runner's inspection digest).
+    pub fn plan_digest(&self) -> &str {
+        self.runner.inspection_digest()
     }
 
     /// Whether an action asked the host to close.
@@ -393,14 +443,11 @@ impl<D: DataSource> Host<D> {
                     layer_ops.push(ById::ScrollBy(id, y as f32));
                 }
                 ("preventDefault", _) => self.prevented = true,
-                ("openURL", Some(url)) => self.open_url(&url),
-                ("showNotification", _) => {
-                    exact_runner::notify::arm(
-                        &mut self.runner,
-                        exact_runner::notify::Notice::from_args(&command.args),
-                        false,
-                        false,
-                    );
+                ("openURL", Some(url)) => {
+                    let opened = self.open_url(&url);
+                    if let Some(id) = command.args.get(1).filter(|v| v.is_str()) {
+                        layer_ops.push(ById::Opened(id.text().to_string(), opened));
+                    }
                 }
                 _ => {}
             }
@@ -408,11 +455,19 @@ impl<D: DataSource> Host<D> {
         self.layers
             .retain(|(id, ..)| self.runner.kernel().node(*id).is_some());
         self.sync_top_layer();
-        if self.focus.is_some_and(|f| !self.focusables().contains(&f)) {
+        // Tab traversal stays in the top layer; focus follows modal eligibility.
+        if self
+            .focus
+            .is_some_and(|f| !self.is_control(f) || !self.input_eligible(f))
+        {
             self.focus = None;
         }
+        // An `autofocus` control takes the focus once, as it arrives with
+        // nothing focused; one arriving while something is (or after a blur
+        // or a click away) is spent, never refilling an empty focus later.
+        let fresh = self.autofocus();
         if self.focus.is_none() {
-            self.focus = self.autofocus();
+            self.focus = fresh;
             if let Some(f) = self.focus {
                 self.caret = self.value(f).graphemes(true).count();
             }
@@ -448,17 +503,21 @@ impl<D: DataSource> Host<D> {
                 ById::Focus(_) => self.focus(Some(node)),
                 ById::IntoView(_, block) => self.reveal_to(node, &block),
                 ById::ScrollBy(_, y) => self.scroll_node_by(node, y),
+                ById::Opened(_, opened) => {
+                    let answer = if opened { "opened" } else { "failed" };
+                    self.dispatch(node, Event::Change(ControlValue::Text(answer.into())));
+                }
                 _ => {}
             }
         }
         if trace {
-            eprintln!(
+            crate::term::diagnostic(format_args!(
                 "commit: layout {:?}, focus {:?}, walks {:?}, nodes {}",
                 t_layout,
                 t_focus - t_layout,
                 t0.elapsed() - t_focus,
                 self.runner.kernel().live_count()
-            );
+            ));
         }
     }
 
@@ -491,6 +550,9 @@ impl<D: DataSource> Host<D> {
             images: &self.images,
             center: self.mode == Mode::Fullscreen,
             env: self.runner.kernel().env(),
+            // A disabled or inert box is still hit, and swallows the press
+            // (`handler`), so nothing beneath it takes it either.
+            presses: Box::new(|id| self.runner.handlers_of(id).contains(&EventKind::Press)),
         }
     }
 
@@ -609,20 +671,65 @@ impl<D: DataSource> Host<D> {
     /// RFC, D1): a repeat that missed beats fires once, and every commit
     /// observes the clock.
     pub fn live_from(&mut self, start: std::time::Instant) {
+        self.input_clock = Some(start);
+        self.runner.hold_waits(exact_runner::WaitKinds::ALL);
         let sample = move || start.elapsed().as_secs_f64() * 1000.0;
         self.runner.set_live_clock(Some(Box::new(sample)));
     }
 
+    /// Run due timers before an external input chooses its target. Internal
+    /// key, press, blur and focus dispatches stay in the same input turn.
+    pub(crate) fn advance_for_input(&mut self) {
+        let now = self.input_clock.map_or(self.runner.now_ms(), |start| {
+            start.elapsed().as_secs_f64() * 1000.0
+        });
+        self.tick(now);
+    }
+
     /// Advance the app's clock: timers fire.
     pub fn tick(&mut self, now_ms: f64) {
-        if !self.runner.advance_timed(now_ms).receipts.is_empty() {
-            self.after_commit();
+        let kinds = exact_runner::WaitKinds::FRAME
+            .union(exact_runner::WaitKinds::UPDATE)
+            .union(exact_runner::WaitKinds::SCROLLEND);
+        loop {
+            let batch = self.runner.release_waits(kinds, now_ms);
+            if !batch.advanced.receipts.is_empty() {
+                self.after_commit();
+            }
+            if !batch.continuing {
+                break;
+            }
+        }
+    }
+
+    /// Admit one idle firing after pending terminal input has been drained.
+    pub fn idle_timer(&mut self, now_ms: f64) {
+        self.idle_timer_retry = false;
+        let waits = self.runner.waits();
+        if waits.idle.held
+            && self
+                .runner
+                .timer_due_ms()
+                .is_none_or(|at| at > now_ms + 1000.0 / 60.0)
+        {
+            let batch = self
+                .runner
+                .release_waits(exact_runner::WaitKinds::IDLE, now_ms);
+            if !batch.advanced.receipts.is_empty() {
+                self.after_commit();
+                self.idle_timer_retry = self.runner.waits().idle.held;
+            }
         }
     }
 
     /// When the next timer is due, in the app's clock.
     pub fn timer_due_ms(&self) -> Option<f64> {
-        self.runner.timer_due_ms()
+        self.runner
+            .timer_wake_ms()
+            .into_iter()
+            .chain(self.runner.waits().next_check())
+            .chain(self.idle_timer_retry.then_some(self.runner.now_ms()))
+            .reduce(f64::min)
     }
 
     /// Dispatch, then lay out. Whether a handler prevented the default is
@@ -640,6 +747,9 @@ impl<D: DataSource> Host<D> {
 
     /// The nearest node at or above `view` with a handler for `kind`.
     pub(crate) fn handler(&self, view: ViewId, kind: EventKind) -> Option<ViewId> {
+        if kind == EventKind::Press && !self.input_eligible(view) {
+            return None;
+        }
         let mut at = Some(view);
         while let Some(id) = at {
             if self.runner.handlers_of(id).contains(&kind) {
@@ -648,6 +758,55 @@ impl<D: DataSource> Host<D> {
             at = self.kernel().node(id)?.parent;
         }
         None
+    }
+
+    fn is_control(&self, id: ViewId) -> bool {
+        self.kernel().node(id).is_some_and(|n| {
+            matches!(
+                n.node_type,
+                NodeType::Pressable | NodeType::TextInput | NodeType::Control
+            )
+        })
+    }
+
+    /// Presented cells identify a target, but its live ancestry can refuse it.
+    pub(crate) fn input_eligible(&self, id: ViewId) -> bool {
+        let kernel = self.kernel();
+        let Some(node) = kernel.node(id) else {
+            return false;
+        };
+        if node.computed_row(exact_kernel::StyleId::Visibility, |s| s.visibility)
+            != exact_kernel::Visibility::Visible
+        {
+            return false;
+        }
+        let modal = self.layers.iter().rposition(|(.., modal)| *modal);
+        let mut in_modal = modal.is_none();
+        let mut in_open_layer = false;
+        let mut at = Some(id);
+        while let Some(id) = at {
+            let Some(node) = kernel.node(id) else {
+                return false;
+            };
+            if node.style.display == exact_kernel::Display::None
+                || node.props.bool(PropId::Disabled) == Some(true)
+                || node.props.bool(PropId::Inert) == Some(true)
+            {
+                return false;
+            }
+            if Self::is_layer(&node) && !in_open_layer {
+                if self.open_mode(id).is_none() {
+                    return false;
+                }
+                in_open_layer = true;
+            }
+            // Layers opened above the modal remain interactive even when
+            // their authored parent is outside it.
+            in_modal |= modal
+                .is_some_and(|start| self.layers[start..].iter().any(|(layer, ..)| *layer == id));
+            at = node.parent;
+        }
+        in_modal
     }
 
     pub(crate) fn is_field(&self, id: ViewId) -> bool {
@@ -690,6 +849,7 @@ impl<D: DataSource> Host<D> {
             let Some(n) = kernel.node(id) else { continue };
             if n.style.display == exact_kernel::Display::None
                 || n.props.bool(PropId::Disabled) == Some(true)
+                || n.props.bool(PropId::Inert) == Some(true)
                 || (Self::is_layer(&n) && !open.contains(&id))
             {
                 continue;
@@ -697,7 +857,8 @@ impl<D: DataSource> Host<D> {
             if matches!(
                 n.node_type,
                 NodeType::Pressable | NodeType::TextInput | NodeType::Control
-            ) {
+            ) && self.input_eligible(id)
+            {
                 out.push(id);
             }
             if n.node_type != NodeType::Text {
@@ -707,18 +868,29 @@ impl<D: DataSource> Host<D> {
         out
     }
 
-    fn autofocus(&self) -> Option<ViewId> {
+    /// The first `autofocus` control not yet offered the focus; every such
+    /// control now present is spent.
+    fn autofocus(&mut self) -> Option<ViewId> {
         let kernel = self.runner.kernel();
-        self.focusables().into_iter().find(|id| {
-            kernel
-                .node(*id)
-                .is_some_and(|n| n.props.bool(PropId::Autofocus) == Some(true))
-        })
+        let fresh: Vec<(ViewId, exact_kernel::NodeKey)> = self
+            .focusables()
+            .into_iter()
+            .filter_map(|id| {
+                let n = kernel.node(id)?;
+                (n.props.bool(PropId::Autofocus) == Some(true)
+                    && !self.autofocused.contains(&n.key))
+                .then_some((id, n.key))
+            })
+            .collect();
+        self.autofocused
+            .retain(|key| kernel.node_by_key(*key).is_some());
+        self.autofocused.extend(fresh.iter().map(|(_, key)| *key));
+        fresh.first().map(|(id, _)| *id)
     }
 
     /// Move the focus to a node (or nowhere), telling the app.
     pub fn focus(&mut self, to: Option<ViewId>) {
-        if to == self.focus {
+        if to.is_some_and(|id| !self.input_eligible(id)) || to == self.focus {
             return;
         }
         if let Some(old) = self.focus.take() {
@@ -779,7 +951,13 @@ impl<D: DataSource> Host<D> {
         let Some(target) = kernel.node(id).map(|n| n.frame) else {
             return;
         };
-        let mut at = kernel.node(id).and_then(|n| n.parent);
+        // A block's root (a popover's, the viewport) is not in what scrolls
+        // above it: the walk stops at it.
+        let blocked = |view: ViewId| kernel.host_block(view).is_some();
+        let mut at = kernel
+            .node(id)
+            .and_then(|n| n.parent)
+            .filter(|_| !blocked(id));
         let mut changes = Vec::new();
         while let Some(p) = at {
             let Some(n) = kernel.node(p) else { break };
@@ -800,7 +978,7 @@ impl<D: DataSource> Host<D> {
                 };
                 changes.push((p, next.clamp(0.0, reach)));
             }
-            at = n.parent;
+            at = n.parent.filter(|_| !blocked(p));
         }
         for (view, offset) in changes {
             if self.scroll.get(&view).copied().unwrap_or(0.0) != offset {
@@ -868,13 +1046,16 @@ impl<D: DataSource> Host<D> {
 
     /// `openURL`: an absolute `http`, `https`, `mailto` or `tel` URL, for the
     /// system to open (the web's one allowlist); anything else is refused.
-    pub(crate) fn open_url(&mut self, url: &str) {
+    /// Whether it was handed on.
+    pub(crate) fn open_url(&mut self, url: &str) -> bool {
         let allowed = ["http://", "https://", "mailto:", "tel:"]
             .iter()
             .any(|p| url.len() > p.len() && url[..p.len()].eq_ignore_ascii_case(p));
-        if allowed && !url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        let handed = allowed && !url.chars().any(|c| c.is_control() || c.is_whitespace());
+        if handed {
             self.outbound.push(url.to_string());
         }
+        handed
     }
 
     /// A press that moves the focus to what was pressed only when `take`:
@@ -890,16 +1071,32 @@ impl<D: DataSource> Host<D> {
     }
 
     fn press_with_inner(&mut self, id: ViewId, take: bool) {
+        if !self.input_eligible(id) {
+            return;
+        }
         if self.is_field(id) {
             self.focus(Some(id));
             return;
         }
         let key = self.runner.kernel().node(id).map(|node| node.key);
         if let Some(target) = self.handler(id, EventKind::Press) {
-            if take && (self.layers.is_empty() || self.focusables().contains(&id)) {
-                self.focus(Some(id));
+            // What can hold the focus takes it (the node pressed, else the
+            // control its press is); a press on what cannot (a pressable
+            // box) moves it away, as a click on a `div` does, never
+            // scrolling the box into view as a focus would.
+            let focusables = if take { self.focusables() } else { Vec::new() };
+            if let Some(f) = [id, target].into_iter().find(|f| focusables.contains(f)) {
+                self.focus(Some(f));
+            } else if take && self.layers.is_empty() {
+                self.focus(None);
             }
-            self.dispatch(target, Event::Press);
+            let (x, y) = self.press_point.unwrap_or_default();
+            let mouse = exact_runner::MouseEvent {
+                client_x: x.into(),
+                client_y: y.into(),
+                ..Default::default()
+            };
+            self.dispatch(target, Event::pressed(mouse));
         }
         if let Some(key) = key {
             self.invoke(key);
@@ -1041,9 +1238,43 @@ impl<D: DataSource> Host<D> {
         !self.layers.is_empty()
     }
 
+    /// The open layers, told to the runner. A popover in the viewport's
+    /// block (stage 14 B) is where it paints, not at its frame: by its
+    /// block's rectangle in the grid, which `frame` and `elementFromPoint`
+    /// map it through; any other layer is at its frame, as before.
     fn sync_top_layer(&mut self) {
         let open: Vec<ViewId> = self.layers.iter().map(|(id, ..)| *id).collect();
-        self.runner.top_layer(&open);
+        let frames = {
+            let scene = self.scene();
+            let kernel = scene.kernel;
+            let shown = |&id: &ViewId| {
+                let used = kernel.host_block_size(id)?;
+                let (dx, dy) = crate::paint::placement(&scene, id, self.cols, self.rows, 0.0);
+                Some((
+                    id,
+                    [-dx as f64, -dy as f64, used.0 as f64, used.1 as f64],
+                    None,
+                ))
+            };
+            let placed: Vec<_> = open.iter().filter_map(shown).collect();
+            let at_frame = |&id: &ViewId| {
+                let f = kernel.node(id)?.frame;
+                let rect = [f.x as f64, f.y as f64, f.width as f64, f.height as f64];
+                Some(
+                    placed
+                        .iter()
+                        .find(|p| p.0 == id)
+                        .copied()
+                        .unwrap_or((id, rect, None)),
+                )
+            };
+            (!placed.is_empty()).then(|| open.iter().filter_map(at_frame).collect::<Vec<_>>())
+        };
+        let Some(frames) = frames else {
+            self.runner.top_layer(&open);
+            return;
+        };
+        self.runner.top_layer_frames(&frames, None);
     }
 
     /// The node an agent names by `testId`.
@@ -1070,7 +1301,7 @@ impl<D: DataSource> Host<D> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod notify_tests {
     use super::*;
     use exact_plan::Value;
@@ -1086,15 +1317,31 @@ mod notify_tests {
         }
     }
 
+    /// `@exact/notifications` has no terminal implementation: a post is
+    /// refused, journaled, never substituted (LLP 1133.004 §8).
     #[test]
     fn a_notification_refused_by_the_terminal_is_journaled() {
-        let source = "component App\n  action remind\n    showNotification(title=\"Hello\", navigate=\"/inbox\")\n  view\n    button press=remind\n      text \"Remind\"";
-        let plan = contract::compile_terminal(source).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("exact-terminal-notify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("node_modules/@exact")).unwrap();
+        let package =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/notifications");
+        std::os::unix::fs::symlink(
+            package.canonicalize().unwrap(),
+            dir.join("node_modules/@exact/notifications"),
+        )
+        .unwrap();
+        let source = "use showNotification from \"@exact/notifications\"\n\ncomponent App\n  action remind\n    showNotification(title=\"Hello\", navigate=\"/inbox\")\n  view\n    button press=remind\n      text \"Remind\"\n";
+        std::fs::write(dir.join("app.contract"), source).unwrap();
+        let plan = contract::compile_path_terminal(&dir.join("app.contract"))
+            .unwrap_or_else(|e| panic!("{e:?}"));
         let mut host = Host::boot(plan, Granted, Mode::Inline, 40, 10).unwrap();
         host.act("remind");
         let logs = exact_runner::agent::logs(&host.runner, 0);
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            logs.contains("showNotification: refused: unavailable"),
+            logs.contains("showNotification: refused: NotSupportedError"),
             "{logs}"
         );
     }
@@ -1107,3 +1354,11 @@ mod invocation_tests;
 #[cfg(test)]
 #[path = "host_clock_tests.rs"]
 mod clock_tests;
+
+#[cfg(test)]
+#[path = "host_top_layer_tests.rs"]
+mod top_layer_tests;
+
+#[cfg(test)]
+#[path = "host_scale_tests.rs"]
+mod scale_tests;

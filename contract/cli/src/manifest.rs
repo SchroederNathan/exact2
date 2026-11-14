@@ -5,6 +5,13 @@
 
 use std::path::Path;
 
+mod widgets;
+pub use widgets::Widget;
+mod activities;
+pub use activities::Activity;
+mod watch;
+pub use watch::{WatchEntry, WATCH_KIND};
+
 /// The app manifest (`app.json`, LLP 1030 D2; 1030.000 D7) as the bake
 /// reads it — the JSON, and the identity every platform derives from it.
 /// An app without one gets the defaults `scripts/app.mjs` gives it.
@@ -166,12 +173,32 @@ impl Manifest {
             .and_then(|v| v.as_str())
             .ok_or_else(|| format!("{}: `app.name` is required", path.display()))?
             .to_string();
-        Ok(Manifest {
+        let manifest = Manifest {
             json,
             id,
             name,
             declared: true,
-        })
+        };
+        manifest.widgets()?;
+        manifest.live_activities()?;
+        Ok(manifest)
+    }
+
+    /// Whether a game's generated `.shells/app.json`, which [`Manifest::read`]
+    /// prefers, was resolved from another `app.json` than `app_dir` holds now.
+    /// The bake records the authored file's content digest beside it
+    /// (`game/app/shells.mjs`); a missing record counts as another.
+    pub fn generated_stale(app_dir: &Path) -> bool {
+        use sha2::{Digest, Sha256};
+        if !app_dir.join(".shells/app.json").is_file() {
+            return false;
+        }
+        let authored = std::fs::read(app_dir.join("app.json")).map_or_else(
+            |_| "none".to_owned(),
+            |bytes| format!("{:x}", Sha256::digest(bytes)),
+        );
+        std::fs::read_to_string(app_dir.join(".shells/app-source.sha256"))
+            .map_or(true, |recorded| recorded.trim() != authored)
     }
 
     /// `host.<platform>` as an object (empty when absent).
@@ -182,6 +209,61 @@ impl Manifest {
             .and_then(|p| p.as_object())
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The painter explicitly selected for this platform (LLP 1149 D12).
+    pub fn painter(&self, platform: &str) -> Result<Option<&'static str>, String> {
+        match self.host(platform).get("painter") {
+            None => Ok(None),
+            Some(value) if platform == "windows" && value.as_str() == Some("cpu") => {
+                Ok(Some("cpu"))
+            }
+            Some(value)
+                if matches!(platform, "windows" | "linux" | "android")
+                    && value.as_str() == Some("ink") =>
+            {
+                Ok(Some("ink"))
+            }
+            Some(_) => Err(format!(
+                "host.{platform}.painter must be \"ink\" on Windows, Linux or Android, or \"cpu\" on Windows"
+            )),
+        }
+    }
+
+    /// `host.windows.window` as the Rust expression of the
+    /// `exact_windows::Window` the app opens in: the fields it names, the
+    /// host's defaults for the rest (no `..` when it names all four, which
+    /// Clippy's `needless_update` would flag in the generated entry).
+    pub fn windows_window(&self) -> Result<String, String> {
+        let window = self.host("windows");
+        let Some(window) = window.get("window") else {
+            return Ok("exact_windows::Window::default()".into());
+        };
+        let mut fields = String::new();
+        let mut named = 0;
+        for (key, field) in [
+            ("width", "width"),
+            ("height", "height"),
+            ("minWidth", "min_width"),
+            ("minHeight", "min_height"),
+        ] {
+            if let Some(value) = window.get(key) {
+                let n = value
+                    .as_f64()
+                    .filter(|n| (1.0..=16384.0).contains(n))
+                    .ok_or_else(|| {
+                        format!("host.windows.window.{key} is a number from 1 to 16384")
+                    })?;
+                fields.push_str(&format!("{field}: {n:?}_f32, "));
+                named += 1;
+            }
+        }
+        let rest = if named < 4 {
+            "..exact_windows::Window::default() "
+        } else {
+            ""
+        };
+        Ok(format!("exact_windows::Window {{ {fields}{rest}}}"))
     }
 
     /// `deploy.signing.keys`: canonical base64 of 32 raw Ed25519 bytes.
@@ -219,8 +301,9 @@ impl Manifest {
     /// of `deploy.channels`; else `prod`) and its origin (`deploy.channels.
     /// <channel>`, else `app.origin`): where the binary's update store checks
     /// (LLP 1030.000 D4). A stream is `(channel, compatibility id)`; the
-    /// channel is not part of the id.
-    pub fn channel(&self) -> (String, Option<String>) {
+    /// channel is not part of the id. The origin `"appdrop"` is AppDrop's
+    /// origin for the signing key (`appdrop_origin`).
+    pub fn channel(&self) -> Result<(String, Option<String>), String> {
         let deploy = self.json.get("deploy");
         let channels = deploy
             .and_then(|d| d.get("channels"))
@@ -244,12 +327,54 @@ impl Manifest {
                     .and_then(|v| v.as_str())
             })
             .map(str::to_string);
-        (channel, origin)
+        let origin = match origin.as_deref() {
+            Some("appdrop") => Some(self.appdrop_origin()?),
+            _ => origin,
+        };
+        Ok((channel, origin))
+    }
+
+    /// AppDrop's update origin for this app: `<base>/u/<key id>`, the key id
+    /// being the first 32 hex digits of the sha256 of the raw public key
+    /// `deploy.signing.key` names (or the only one in `deploy.signing.keys`).
+    /// Only that key's holder can publish there, and no account is needed.
+    /// The base is `https://appdrop.app` unless `EXACT_APPDROP_ORIGIN` names
+    /// another (a local AppDrop, for testing). Matches `scripts/origin.mjs`.
+    pub fn appdrop_origin(&self) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let keys = self.keys()?;
+        let keys = keys.as_object().filter(|keys| !keys.is_empty()).ok_or(
+            "the origin \"appdrop\" is named after the update key: add deploy.signing.keys",
+        )?;
+        let named = self
+            .json
+            .pointer("/deploy/signing/key")
+            .and_then(|v| v.as_str());
+        let key = match named {
+            Some(id) => keys.get(id).ok_or_else(|| {
+                format!("deploy.signing.key names {id:?}, which deploy.signing.keys lacks")
+            })?,
+            None if keys.len() == 1 => keys.values().next().unwrap(),
+            None => {
+                return Err(
+                    "the origin \"appdrop\" needs deploy.signing.key to pick one of deploy.signing.keys"
+                        .into(),
+                )
+            }
+        };
+        let raw = base64_decode(key.as_str().unwrap_or_default())
+            .ok_or("deploy.signing.keys must be base64")?;
+        let digest = Sha256::digest(&raw);
+        let id: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        let base =
+            std::env::var("EXACT_APPDROP_ORIGIN").unwrap_or_else(|_| "https://appdrop.app".into());
+        Ok(format!("{}/u/{id}", base.trim_end_matches('/')))
     }
 
     /// `deploy.activate` (LLP 1030.000 D4): when a staged bundle applies —
-    /// `next-launch` (the default; `deliveryActivate` applies it sooner) or
-    /// `app-decides` (only `deliveryActivate` does). Policy, not identity:
+    /// `next-launch` (the default; `deliveryActivate` applies it sooner),
+    /// `app-decides` (only `deliveryActivate` does) or `immediate` (as soon
+    /// as a check stages it). Policy, not identity:
     /// it rides beside the id, never in it.
     pub fn activate(&self) -> String {
         self.json
@@ -271,6 +396,23 @@ impl Manifest {
             .unwrap_or(if platform == "web" { "0" } else { "A" })
             .to_string()
     }
+}
+
+/// Standard base64 with padding, as `keys` validated it.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits = 0u32;
+    let mut count = 0;
+    let mut out = Vec::new();
+    for byte in text.trim_end_matches('=').bytes() {
+        bits = bits << 6 | ALPHABET.iter().position(|&c| c == byte)? as u32;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+        }
+    }
+    Some(out)
 }
 
 // Depth 2 is global (platform overrides and the module declaration), depth
@@ -426,5 +568,100 @@ mod placement_tests {
             .contains("typescript.sources"));
         let unknown = manifest(serde_json::json!({"typescript": {"elsewhere": 1}}));
         assert!(unknown.placement("typescript", "ios").is_err());
+    }
+}
+
+#[cfg(test)]
+mod appdrop_tests {
+    use super::Manifest;
+
+    fn manifest(json: serde_json::Value) -> Manifest {
+        Manifest {
+            json,
+            id: "test.app".into(),
+            name: "Test".into(),
+            declared: true,
+        }
+    }
+
+    /// "appdrop" names AppDrop's origin for the signing key; the build and
+    /// `scripts/origin.mjs` must agree on the key id.
+    #[test]
+    fn appdrop_is_named_after_the_signing_key() {
+        let m = manifest(serde_json::json!({"deploy": {
+            "channels": {"dogfood": "appdrop"},
+            "signing": {"key": "shelf", "keys": {"shelf": "/dF36/m50wjVH0iDogmQB4FTDF6bx+qwAyD0seHMV70="}},
+        }}));
+        let (channel, origin) = m.channel().unwrap();
+        assert_eq!(channel, "dogfood");
+        assert!(origin
+            .unwrap()
+            .ends_with("/u/832cad2da443ed7c9e8948f16e5b137d"));
+        let unsigned =
+            manifest(serde_json::json!({"deploy": {"channels": {"dogfood": "appdrop"}}}));
+        assert!(unsigned
+            .channel()
+            .unwrap_err()
+            .contains("deploy.signing.keys"));
+    }
+}
+
+#[cfg(test)]
+mod windows_tests {
+    use super::Manifest;
+
+    fn manifest(json: serde_json::Value) -> Manifest {
+        Manifest {
+            json,
+            id: "test.app".into(),
+            name: "Test".into(),
+            declared: true,
+        }
+    }
+
+    #[test]
+    fn the_painter_is_opted_into_on_one_platform() {
+        let mut named = manifest(serde_json::json!({"host": {"windows": {"painter": "ink"}}}));
+        assert_eq!(named.painter("windows").unwrap(), Some("ink"));
+        assert_eq!(named.painter("linux").unwrap(), None);
+        assert_eq!(named.painter("android").unwrap(), None);
+        for value in [
+            serde_json::json!("gpu"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            named.json["host"]["windows"]["painter"] = value;
+            assert!(named
+                .painter("windows")
+                .unwrap_err()
+                .contains("host.windows.painter"));
+        }
+    }
+
+    #[test]
+    fn the_window_names_what_app_json_gives_and_defaults_the_rest() {
+        let named = manifest(serde_json::json!({"host": {"windows": {"window": {
+            "width": 1100, "height": 760, "minWidth": 360,
+        }}}}));
+        assert_eq!(
+            named.windows_window().unwrap(),
+            "exact_windows::Window { width: 1100.0_f32, height: 760.0_f32, min_width: 360.0_f32, \
+             ..exact_windows::Window::default() }"
+        );
+        let all = manifest(serde_json::json!({"host": {"windows": {"window": {
+            "width": 1100, "height": 760, "minWidth": 360, "minHeight": 500,
+        }}}}));
+        assert_eq!(
+            all.windows_window().unwrap(),
+            "exact_windows::Window { width: 1100.0_f32, height: 760.0_f32, min_width: 360.0_f32, \
+             min_height: 500.0_f32, }"
+        );
+        let unsaid = manifest(serde_json::json!({"host": {"windows": {}}}));
+        assert_eq!(
+            unsaid.windows_window().unwrap(),
+            "exact_windows::Window::default()"
+        );
+        let wrong = manifest(serde_json::json!({"host": {"windows": {"window": {"width": 0}}}}));
+        assert!(wrong.windows_window().unwrap_err().contains("window.width"));
     }
 }

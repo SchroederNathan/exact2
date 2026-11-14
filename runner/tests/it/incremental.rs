@@ -63,6 +63,11 @@ impl Fake {
         match row.kind {
             TypeKind::Number => Value::Number((n % 997) as f64),
             TypeKind::Bool => Value::Bool(n % 3 == 0),
+            // An enum's members are its fields: one of them.
+            TypeKind::String if !row.fields.is_empty() => {
+                let f = row.fields.iter().nth((n % row.fields.len as u64) as usize);
+                Value::str(plan.str(plan.field(f.expect("a member")).name))
+            }
             TypeKind::String => Value::str(&format!("#{:06x}", n & 0xff_ffff)),
             TypeKind::Unit => Value::Unit,
             TypeKind::Option if depth < 4 && n % 2 == 0 => {
@@ -222,6 +227,7 @@ fn event(rng: &mut Rng, kind: EventKind) -> Option<Event> {
             mixed: rng.below(2) == 0,
             link: String::new(),
             unavailable: String::new(),
+            atom: String::new(),
         },
         EventKind::Heightrelease => Event::HeightRelease {
             height: (rng.below(5) * 50) as f64,
@@ -289,6 +295,9 @@ fn observe<D: DataSource>(r: &mut Runner<D>) -> (Seen, Vec<u64>) {
         collections,
         r.journal().collect::<Vec<_>>(),
     );
+    // Its own roles, as a host binds them (LLP 1121 stage 5): the two
+    // runners compared share this thread.
+    let _roles = r.bind_roles();
     let kernel = r.kernel().export(None).map_err(|e| format!("{e:?}"));
     (Seen { kernel, rest }, tickets)
 }
@@ -782,6 +791,6 @@ fn store_provenance_propagates_through_unchanged_values() {
 /// A pointer sample somewhere over a node.
 fn pointer(rng: &mut Rng) -> exact_runner::PointerEvent {
     let (x, y) = (rng.below(200), rng.below(200));
-    let line = format!("{x},{y},1,0.5,mouse,1,{x},{y}");
+    let line = format!("{x},{y},0,1,0.5,mouse,1,{x},{y}");
     exact_runner::PointerEvent::parse(&line).unwrap()
 }

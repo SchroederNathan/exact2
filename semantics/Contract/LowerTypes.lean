@@ -212,6 +212,14 @@ theorem VTys.joinAll {sh} : ∀ {vs : List Value} {ts : List STy}, VTys sh vs ts
     exact ⟨vty_join_left h.1, VTyAll.imp (fun hv => vty_join_right hv) (VTys.joinAll h.2)⟩
   | [], _ :: _, h | _ :: _, [], h => by simp [VTys] at h
 
+theorem flat_vty {sh t} : ∀ {xss ys : List Value}, VTyAll sh xss (.list t) →
+    Value.flat xss = .some ys → VTyAll sh ys t
+  | [], ys, _, h => by simp [Value.flat] at h; subst h; trivial
+  | x :: rest, ys, hx, h => by
+    cases x <;> simp [Value.flat] at h
+    obtain ⟨ws, hws, rfl⟩ := h
+    exact VTyAll.append (by simpa [VTy] using hx.1) (flat_vty hx.2 hws)
+
 set_option maxHeartbeats 1000000 in
 theorem stdlib_ty {env : Env} {sh f vs ts v} (h : stdlib env f vs = .ok v) (hts : VTys sh vs ts) :
     VTy sh v (rosterTy f ts) := by
@@ -239,14 +247,14 @@ theorem stdlib_ty {env : Env} {sh f vs ts v} (h : stdlib env f vs = .ok v) (hts 
       · simp [VTy]
       · simp only [VTy]
         exact VTyAll.get (by simpa [VTy] using hts.1) hw
-  case h_30 =>
+  case h_31 =>
     split at h
     · obtain rfl := Except.ok.inj h; simp [VTy]
     · obtain ⟨s, rfl⟩ := bind_str_ok h; simp [VTy]
   case h_12 =>
     unfold includesOf at h
     split at h <;> simp at h <;> subst h <;> simp [VTy]
-  case h_31 _ _ w _ _ =>
+  case h_32 _ _ w _ _ =>
     rcases ts with _ | ⟨t0, ts⟩
     · simp [VTys] at hts
     · simp only [VTys] at hts
@@ -257,14 +265,14 @@ theorem stdlib_ty {env : Env} {sh f vs ts v} (h : stdlib env f vs = .ok v) (hts 
         cases t0 <;> simp [VTy] at hts ⊢
         exact VTyAll.of_mem fun x hx =>
           hts.1.mem x (List.mem_of_mem_drop (List.mem_of_mem_take hx))
-  case h_34 =>
+  case h_35 =>
     unfold indexOfOf at h
     split at h <;> simp at h <;> subst h <;> simp [VTy]
-  case h_35 =>
+  case h_36 =>
     exact VTyAll.of_mem fun x hx => by
       obtain ⟨s, _, rfl⟩ := List.mem_map.mp hx
       simp [VTy]
-  case h_33 _ _ xs ys =>
+  case h_34 _ _ xs ys =>
     rcases ts with _ | ⟨t0, _ | ⟨t1, ts⟩⟩
     · simp [VTys] at hts
     · simp [VTys] at hts
@@ -272,11 +280,33 @@ theorem stdlib_ty {env : Env} {sh f vs ts v} (h : stdlib env f vs = .ok v) (hts 
       cases t0 <;> cases t1 <;> simp [VTy] at hts ⊢
       exact VTyAll.append (VTyAll.imp (fun hv => vty_join_left hv) hts.1)
         (VTyAll.imp (fun hv => vty_join_right hv) hts.2.1)
-  case h_42 =>
+  case h_44 =>
     split <;> simp [VTy]
-  case h_43 =>
+  case h_45 =>
     split at h <;> simp at h; subst h
     split <;> simp [VTy]
+  case h_50 =>
+    split at h <;> simp at h; subst h; simp [VTy]
+  case h_52 =>
+    split at h
+    · split at h <;> simp at h; subst h
+      exact VTyAll.of_mem fun x hx => by
+        obtain ⟨i, _, rfl⟩ := List.mem_map.mp hx
+        simp [VTy]
+    · simp at h
+  case h_53 _ _ xss =>
+    split at h <;> simp at h; subst h
+    rcases ts with _ | ⟨t0, ts⟩
+    · simp [VTys] at hts
+    · simp only [VTys] at hts
+      rename_i ys hys
+      cases t0 <;> try simp [VTy]
+      rename_i t1
+      cases t1 <;> try simp [VTy]
+      · cases xss with
+        | nil => simp [Value.flat] at hys; subst hys; trivial
+        | cons x _ => simp only [VTy, VTyAll] at hts; exact hts.1.1.elim
+      · exact flat_vty (by simpa [VTy] using hts.1) hys
 
 /-! ## Strict operators -/
 

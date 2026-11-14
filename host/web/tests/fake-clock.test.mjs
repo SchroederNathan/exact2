@@ -11,8 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, sep } from 'node:path';
-import * as playwright from 'playwright-core';
-import { chromium as installed } from '../../../scripts/agent-launch.mjs';
+import { chromium as installed, suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { need } from '../../../scripts/coverage.mjs';
 
 const ROOT = resolve(new URL('../../..', import.meta.url).pathname);
@@ -69,7 +68,7 @@ export const answer: Answer = (source, args, store, storage, native) => sources[
 
 async function open(fake) {
   served ??= serve();
-  browser ??= await playwright.chromium.launch({ executablePath: chrome.executable, headless: true });
+  browser ??= await suiteBrowser();
   const context = await browser.newContext({ timezoneId: 'UTC' }), page = await context.newPage(), errors = [];
   page.on('pageerror', error => errors.push(String(error)));
   await fake(page.clock);
@@ -115,7 +114,7 @@ check('the app starts under setFixedTime', async () => {
 // too) guards the engine's DateTimeFormat, and puts it in place of the fake's,
 // whose `format()` would answer an omitted date from the fake clock.
 check("the module realm's prelude installs its guards under clock.install", async () => {
-  browser ??= await playwright.chromium.launch({ executablePath: chrome.executable, headless: true });
+  browser ??= await suiteBrowser();
   const context = await browser.newContext(), page = await context.newPage();
   try {
     await page.clock.install({ time: before });
@@ -126,7 +125,9 @@ check("the module realm's prelude installs its guards under clock.install", asyn
         attempt(() => new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', year: 'numeric' }).format(Date.UTC(2020, 5, 1))),
         attempt(() => new Date(86_400_000).toISOString().slice(0, 10)), attempt(() => new Date()), attempt(() => Date.now()),
         attempt(() => new Intl.DateTimeFormat('en-US').format()), attempt(() => new Intl.DateTimeFormat('en-US').formatToParts())];
-    }, readFileSync(resolve(ROOT, 'js/src/prelude.js'), 'utf8'));
+    }, // A door that answers the prelude's load-time ask for a local listener (LLP 1133.005): a page has none.
+    "globalThis.__exact_host = (op, name) => (op === 12 && name === 'listen' ? '' : undefined);\n"
+      + readFileSync(resolve(ROOT, 'js/src/binary.js'), 'utf8') + '\n' + readFileSync(resolve(ROOT, 'js/src/prelude.js'), 'utf8'));
     expect(answers).toEqual(['loaded', '2020', '1970-01-02', 'new Date() refused', 'Date.now() refused',
       'Intl.DateTimeFormat.format() refused', 'Intl.DateTimeFormat.formatToParts() refused']);
   } finally { await context.close(); }

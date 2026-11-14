@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { DETAILED, instructions, pending, redact, send, setStanding, standing, status } from './feedback.mjs';
-import { needs, summary } from './feedback-worker.js';
+import { DETAILED, attachmentPreview, attachments, instructions, pending, redact, send, setStanding, standing, status, workarounds } from './feedback.mjs';
+import worker, { attachments as stored, needs, summary } from './feedback-worker.js';
 
 function app() {
   const parent = mkdtempSync(resolve(tmpdir(), 'exact-feedback-'));
@@ -79,7 +79,7 @@ test('status prints what to keep under ask, local and always, nothing more under
   try {
     // Each answer says what it asks (the chess diary: `ask` read as undefined), first.
     const ask = status(dir, {});
-    assert.ok(ask.startsWith('ask (keep the diary; ask once before sending): 0 unsent diaries, 0 unsent logged commands\n\n# The authoring diary\n\n## What to keep'), ask);
+    assert.ok(ask.startsWith('ask (keep the diary; ask once before sending): 0 unsent diaries, 0 unsent logged commands\nFeedback goes to Expo (https://exact-diaries.ccheever-0f6.workers.dev) only as this answer allows; EXACT_FEEDBACK=0 refuses every send.\n\n# The authoring diary\n\n## What to keep'), ask);
     assert.match(ask, /### Needed[^]*## What not to write[^]*## Asking to share[^]*feedback send --yes/);
     assert.doesNotMatch(ask, /detailed diary/);
     // The instructions are docs/diary.md's from "What to keep" on, not its list of answers.
@@ -88,7 +88,7 @@ test('status prints what to keep under ask, local and always, nothing more under
     // docs/diary.md reads `never` in this output as the opt-out; the detailed instructions must not say it.
     assert.doesNotMatch(DETAILED, /never/);
     setStanding(dir, 'always');
-    assert.match(status(dir, {}), /^always \(keep the diary; send it at the end of each task, saying so\)[^]*## Asking to share/);
+    assert.match(status(dir, {}), /^always \(keep the diary; send it at the end of each task, saying so; a note sends it at once\)[^]*## Asking to share/);
     // `local` keeps the diary but never asks or sends, so it gets no "Asking to share".
     setStanding(dir, 'local');
     assert.match(status(dir, {}), /^local \(keep the diary; ask nothing, send nothing\)[^]*## What to keep[^]*## What not to write/);
@@ -114,4 +114,88 @@ test('Needed lines are counted per capability across diaries; anything else in t
     { name: 'haptics', provided: 1, 'by hand': 0, missing: 0 },
     { name: 'share sheet', provided: 1, 'by hand': 0, missing: 0 },
   ]);
+});
+
+test('the README goes beside the diary only with consent, its workarounds previewed first, once per text (LLP 1139.004 D5)', async () => {
+  const { parent, dir } = app();
+  try {
+    writeFileSync(resolve(dir, '.exact/diary/2026-10-19-a.md'), '### Rough\n- a slow proof\n');
+    // exact2-4's README (Fishslop rerun): two workarounds among ordinary prose, and the app's name.
+    writeFileSync(resolve(dir, 'README.md'), '# Field Log\n\nSwim and feed the fish.\n\nIf `bun exact.mjs web` fails after `prove`, delete the GPU crate\'s cached outputs.\n\n- If `prove` refuses a new model, `rm -rf assets` and rerun it.\n- Arrow keys steer.\n');
+    writeFileSync(resolve(dir, 'AGENTS.md'), '<!-- exact:begin (exact new writes this block; bun exact.mjs update rewrites it) -->\nRun anything; delete freely.\n<!-- exact:end -->\n');
+    const files = attachments(dir);
+    assert.deepEqual(files.map(f => [f.name, f.workarounds.length]), [['README.md', 2]], 'AGENTS.md with only the generated block is not offered');
+    assert.match(files[0].text, /^# <app>/);
+    assert.match(attachmentPreview(files), /^# Attachment: README\.md[^]*workarounds:\n\n> If `bun exact\.mjs web` fails[^]*> - If `prove` refuses[^]*## README\.md/);
+    assert.deepEqual(workarounds('Arrow keys steer.\n\nPress E to light.'), []);
+    // The collector answers with the attachment names it stored (feedback-worker.js).
+    const posts = [], fetch = async (url, init) => { const body = JSON.parse(init.body); posts.push(body); return { ok: true, json: async () => ({ id: `receipt-${posts.length}`, attachments: (body.attachments ?? []).map(a => a.name) }) }; };
+    // The diary's yes is not the README's: without --readme it stays home.
+    await send(dir, { yes: true, fetch });
+    assert.equal(posts[0].attachments, undefined);
+    writeFileSync(resolve(dir, '.exact/diary/2026-10-19-b.md'), 'b');
+    assert.match(await send(dir, { yes: true, readme: true, fetch }), /and README\.md\. Receipt: receipt-2/);
+    assert.deepEqual(posts[1].attachments.map(a => [a.name, a.workarounds.length]), [['README.md', 2]]);
+    assert.deepEqual(attachments(dir), [], 'sent once in this form');
+    // A README alone, with no diary or command to send, is still sendable with its consent.
+    writeFileSync(resolve(dir, 'README.md'), 'If the web build fails, delete target/ and rerun it.\n');
+    assert.equal(await send(dir, { yes: true, fetch }), 'Nothing unsent.', 'not without --readme');
+    assert.match(await send(dir, { yes: true, readme: true, fetch }), /0 diaries, 0 logged commands and README\.md\. Receipt: receipt-3/);
+    assert.equal(posts[2].text, '');
+    assert.equal(posts[2].attachments[0].workarounds.length, 1);
+    // A collector that keeps only the text (one older than attachments) answers 200 without the names: nothing is marked sent.
+    writeFileSync(resolve(dir, 'README.md'), 'Delete assets/ when a model is refused, then rerun.\n');
+    const old = async (url, init) => (posts.push(JSON.parse(init.body)), { ok: true, json: async () => ({ id: 'receipt-old' }) });
+    assert.match(await send(dir, { yes: true, readme: true, fetch: old }), /did not store README\.md[^]*stays unsent/);
+    assert.equal(attachments(dir).length, 1);
+    // local and never send nothing, README or not.
+    writeFileSync(resolve(dir, '.exact/diary/2026-10-19-c.md'), 'c');
+    writeFileSync(resolve(dir, 'README.md'), 'If it fails, rerun it.\n');
+    setStanding(dir, 'local');
+    assert.match(await send(dir, { yes: true, readme: true, fetch }), /never sends it/);
+    assert.equal(posts.length, 4);
+    // The collector keeps them under the diary's own key, and refuses anything else.
+    const kept = new Map(), env = { DIARIES: { put: async (k, v) => kept.set(k, v) } };
+    const request = body => worker.fetch(new Request('https://x/diary', { method: 'POST', body: JSON.stringify(body) }), env, { waitUntil() {} });
+    const answer = await request({ text: 't', attachments: posts[1].attachments });
+    assert.deepEqual([answer.status, (await answer.json()).attachments], [200, ['README.md']]);
+    assert.equal((await request({ text: '', attachments: posts[1].attachments })).status, 200, 'a README alone');
+    assert.equal((await request({ text: '' })).status, 400);
+    assert.deepEqual(JSON.parse([...kept.values()][0]).attachments, posts[1].attachments);
+    assert.equal((await request({ text: 't', attachments: [{ name: 'lib.rs', text: 'x', workarounds: [] }] })).status, 400);
+    assert.equal(stored(undefined).length, 0);
+  } finally { rmSync(parent, { recursive: true, force: true }); }
+});
+
+
+test('authentication headers are removed from the posted diary and its attachments', async () => {
+  const { parent, dir } = app();
+  try {
+    const tokens = ['OpaqueCredential_123', 'dXNlcjpwYXNzd29yZA==', 'ProxySecret', 'JsonSecret'];
+    const text = `Authorization: Bearer ${tokens[0]}\naUtHoRiZaTiOn: Basic ${tokens[1]}\nProxy-Authorization: Bearer ${tokens[2]}\n{"Authorization":"Bearer ${tokens[3]}"}`;
+    writeFileSync(resolve(dir, '.exact/diary/auth.md'), text);
+    writeFileSync(resolve(dir, 'README.md'), text);
+    let posted;
+    await send(dir, { yes: true, readme: true, fetch: async (_url, init) => {
+      posted = JSON.parse(init.body);
+      return { ok: true, json: async () => ({ id: 'auth', attachments: ['README.md'] }) };
+    } });
+    assert.equal(posted.attachments.length, 1);
+    for (const token of tokens) assert.ok(!JSON.stringify(posted).includes(token));
+    assert.match(posted.text, /Authorization: \[redacted\]/);
+  } finally { rmSync(parent, { recursive: true, force: true }); }
+});
+
+test('diary validation rejects JSON non-objects and bounds incoming bytes before EOF', async () => {
+  const stored = [], env = { DIARIES: { put: async (_key, value) => stored.push(JSON.parse(value)) } };
+  const post = body => worker.fetch(new Request('https://diary.test/diary', { method: 'POST', body }), env, {});
+  for (const body of ['null', '[]', 'true', '7', '"text"', '{']) assert.equal((await post(body)).status, 400);
+  assert.equal((await post(JSON.stringify({ text: 'valid' }))).status, 200);
+  assert.equal(stored.length, 1);
+  let pulls = 0, cancelled = false;
+  const stream = new ReadableStream({ pull(c) { pulls++; c.enqueue(new Uint8Array(64 * 1024)); if (pulls === 20) c.close(); }, cancel() { cancelled = true; } });
+  assert.equal((await post(stream)).status, 413);
+  assert.ok(pulls < 20); assert.ok(cancelled);
+  assert.equal((await post(JSON.stringify({ text: 'é'.repeat(130 * 1024) }))).status, 413);
+  assert.equal((await post(JSON.stringify({ text: 'é'.repeat(120 * 1024) }))).status, 200);
 });

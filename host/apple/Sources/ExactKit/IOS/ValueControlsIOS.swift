@@ -7,6 +7,35 @@
 #if os(iOS) || os(tvOS)
 import UIKit
 
+#if os(iOS)
+private final class SelectButtonIOS: UIButton {
+    var valueAlignment = UIControl.ContentHorizontalAlignment.left {
+        didSet { if oldValue != valueAlignment { setNeedsLayout() } }
+    }
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let title = titleLabel else { return }
+        let rtl = effectiveUserInterfaceLayoutDirection == .rightToLeft
+        let insets = configuration?.contentInsets ?? .zero
+        let left = rtl ? insets.trailing : insets.leading
+        let right = bounds.width - (rtl ? insets.leading : insets.trailing)
+        // Fill pins UIKit's popup indicator to the inline end and centres the
+        // title in the space left beside it. Keep that native indicator slot.
+        let native = title.frame
+        let start = rtl ? 2 * native.midX - right : left
+        let end = rtl ? right : 2 * native.midX - left
+        var frame = native
+        switch valueAlignment {
+        case .left: frame.origin.x = start
+        case .right: frame.origin.x = end - frame.width
+        default: break
+        }
+        title.frame = frame
+        title.textAlignment = valueAlignment == .left ? .left : valueAlignment == .right ? .right : .center
+    }
+}
+#endif
+
 extension ControlHost {
     func makeValueControl(_ kind: String, _ id: UInt32) -> UIControl {
         #if os(tvOS)
@@ -23,13 +52,19 @@ extension ControlHost {
         #else
         config.contentInsets = .zero
         #endif
+        #if os(iOS)
+        let button = SelectButtonIOS(configuration: config)
+        button.contentHorizontalAlignment = .fill
+        #else
         let button = UIButton(configuration: config)
+        #endif
         button.showsMenuAsPrimaryAction = true
         button.changesSelectionAsPrimaryAction = true
         return button
     }
 
-    func configureValue(_ control: UIControl, _ owner: NodeView, accent: UIColor?) {
+    func configureValue(_ control: UIControl, _ owner: NodeView) {
+        let accent = owner.ownTintColor("accent_color")
         #if !os(tvOS)
         if let slider = control as? RangeSlider {
             // The accent is the slider's tint, which draws its filled track as a default slider's: grey behind a modal
@@ -37,20 +72,20 @@ extension ControlHost {
             configureRange(slider, owner)
             return
         }
-        if let picker = control as? UIDatePicker { configureDate(picker, owner, accent: accent); return }
+        if let picker = control as? UIDatePicker { configureDate(picker, owner); return }
         #endif
         guard let button = control as? UIButton else { return }
         assign(button, \.tintColor, accent)
         #if os(iOS)
-        if owner.props["type"] == "select" {
-            let alignment = selectAlignment(owner)
-            if button.contentHorizontalAlignment != alignment {
-                button.contentHorizontalAlignment = alignment
-                // UIKit caches this alignment in its configuration layout.
-                // Reapply only on a change; the button and its menu stay put.
-                let configuration = button.configuration
-                button.configuration = nil
-                button.configuration = configuration
+        if let select = button as? SelectButtonIOS {
+            select.valueAlignment = valueAlignment(owner)
+            let direction: UISemanticContentAttribute = owner.style["direction"]?.string == "rtl" ? .forceRightToLeft : .forceLeftToRight
+            if select.semanticContentAttribute != direction {
+                select.semanticContentAttribute = direction
+                select.traitOverrides.layoutDirection = direction == .forceRightToLeft ? .rightToLeft : .leftToRight
+                let configuration = select.configuration
+                select.configuration = nil
+                select.configuration = configuration
             }
         }
         #endif
@@ -62,17 +97,42 @@ extension ControlHost {
     }
 
     #if os(iOS)
-    /// Align the closed value and its native indicator; an unstyled select
-    /// keeps UIKit's centering. Logical edges follow the computed direction.
-    func selectAlignment(_ owner: NodeView) -> UIControl.ContentHorizontalAlignment {
+    /// Align closed select and date values; logical edges follow the computed direction.
+    func valueAlignment(_ owner: NodeView) -> UIControl.ContentHorizontalAlignment {
         let rtl = owner.style["direction"]?.string == "rtl"
+        // Unwritten label/value rows trail the value; a value on its own line starts.
+        if !owner.wrote("text_align"), ["left", "start", nil].contains(owner.style["text_align"]?.string), let beside = besideLabel(owner) {
+            return beside == rtl ? .left : .right
+        }
         switch owner.style["text_align"]?.string {
         case "left": return .left
         case "right": return .right
         case "start", "justify": return rtl ? .right : .left
         case "end": return rtl ? .left : .right
-        default: return .center
+        case "center": return .center
+        default: return rtl ? .right : .left
         }
+    }
+
+    /// Whether a box shares its line with a sibling before it (true), sits on a line below its siblings
+    /// (false), or has none (nil), by the laid-out frames.
+    private func besideLabel(_ owner: NodeView) -> Bool? {
+        var up = owner.superview
+        while let v = up, !(v is NodeView) { up = v.superview }
+        guard let parent = up as? NodeView else { return nil }
+        // Its siblings before it as layout placed them, those drawn as layers (`FlatLeaves`) too; one not seen
+        // (hidden, `visibility: hidden`, or no area) is no label.
+        let seen = { (v: NodeView) in !v.isHidden && !v.cssVisibilityHidden && v.layoutBounds.width > 0 && v.layoutBounds.height > 0 }
+        let before: [CGRect]
+        if let ids = presenter.flats.children(of: parent.id) {
+            before = ids.prefix { $0 != owner.id }.compactMap { id in
+                if let leaf = presenter.flats.leaves[id] { return leaf.layout.width > 0 && leaf.layout.height > 0 ? leaf.layout : nil }
+                return presenter.views[id].flatMap { seen($0) ? $0.frame : nil }
+            }
+        } else { before = parent.container.subviews.compactMap { $0 as? NodeView }.prefix { $0 !== owner }.filter(seen).map(\.frame) }
+        guard !before.isEmpty else { return nil }
+        let box = owner.frame
+        return before.contains { $0.maxX <= box.minX + 0.5 || $0.minX >= box.maxX - 0.5 ? $0.minY < box.maxY && $0.maxY > box.minY : false }
     }
     #endif
 
@@ -96,6 +156,7 @@ extension ControlHost {
 
     /// HTML sizes a select to its widest option, whichever is shown (D3).
     func naturalSize(_ control: UIControl, _ owner: NodeView) -> CGSize {
+        HostPhases.shared.count(.nativeControlMeasurements)
         #if !os(tvOS)
         // A slider has no width of its own: it is as wide as its node, which
         // the plan makes `width: 100%` (LLP 1115.000 D10.2). 129 is the
@@ -120,6 +181,14 @@ extension ControlHost {
         return size == .zero ? button.intrinsicContentSize : CGSize(width: ceil(size.width), height: ceil(size.height))
     }
 
+    #if os(iOS)
+    /// The select's height at `width`, its shown title wrapped there (a
+    /// frame-sized button's Auto Layout fitting answers its one-line size).
+    func selectHeight(_ button: UIButton, width: CGFloat) -> CGFloat {
+        ceil(button.sizeThatFits(CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)).height)
+    }
+    #endif
+
     /// A choice from the menu: `input` then `change`. The bound value is
     /// shown when it changes, as the web build's select: an action that
     /// wrote none leaves the person's choice showing (LLP 1069.001 D4,
@@ -136,7 +205,7 @@ extension ControlHost {
         picked.removeValue(forKey: id)
         menus.removeValue(forKey: id)
         if let owner = presenter.views[id], let control = controls[id] {
-            configureValue(control, owner, accent: owner.channels("accent_color").map { TextEngine.color($0) })
+            configureValue(control, owner)
         }
     }
 

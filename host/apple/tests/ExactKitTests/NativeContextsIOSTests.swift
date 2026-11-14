@@ -46,6 +46,42 @@ final class NativeContextsIOSTests: XCTestCase {
         XCTAssertEqual(item.title, "Last Parked")
         XCTAssertEqual(item.subtitle, "Updated just now")
     }
+    /// A bare row (its second text on an `if` arm keeps it bare in place)
+    /// whose second text is a line under its first is still title and
+    /// subtitle in UIKit's menu, which draws no box: euxy's sort menu showed
+    /// "Date Added Newest first" as a two-line title. Two texts side by side
+    /// (`Inbox` and its count, `Save` and `⌘S`) stay one title.
+    func testABareMenuRowsStackedSecondTextIsItsSubtitle() throws {
+        var ops: [[String: Any]] = view(1, ["popover": "auto", "id": "menu"])
+        /// A row of `texts`, the second styled `second`.
+        func row(_ id: Int, _ texts: [String], display: String? = nil, second: [String: Any] = [:]) {
+            let kids = texts.indices.map { 100 * id + $0 }
+            var style: [String: Any] = ["text_color": [0, 0, 0, 255]]
+            if let display { style["display"] = display }
+            ops.append(["op": "create", "id": id, "kind": "button", "handlers": ["press"], "props": [:], "style": style])
+            for (i, (kid, text)) in zip(kids, texts).enumerated() {
+                ops.append(["op": "create", "id": kid, "kind": "text", "props": ["text": text], "style": i == 1 ? second : [:]])
+            }
+            ops.append(["op": "children", "id": id, "ids": kids])
+        }
+        row(2, ["Date Added", "Newest first"])
+        row(3, ["BPM"])
+        row(4, ["Tempo", "Fastest first"], display: "flex")
+        row(5, ["Inbox", "3"], display: "flex")
+        row(6, ["Save", "⌘S"], second: ["display": "inline"])
+        // A count positioned at the row's top right, in a block row and in a
+        // flex column: out of the flow, no line under the title.
+        row(7, ["Drafts", "12"], second: ["position_type": "absolute"])
+        row(8, ["Drafts", "12"], display: "flex", second: ["position_type": "absolute"])
+        ops += [["op": "children", "id": 1, "ids": [2, 3, 4, 5, 6, 7, 8]], ["op": "roots", "ids": [1]]]
+        var column = ButtonFace(); column.placement = "top"
+        var across = ButtonFace(); across.placement = "leading"
+        let p = presenter(ops, faces: [4: column, 5: across, 8: column])
+        defer { window.isHidden = true }
+        let items = p.menus.items(of: try XCTUnwrap(p.views[1])).compactMap { $0 as? UIAction }
+        XCTAssertEqual(items.map(\.title), ["Date Added", "BPM", "Tempo", "Inbox 3", "Save ⌘S", "Drafts 12", "Drafts 12"])
+        XCTAssertEqual(items.map(\.subtitle), ["Newest first", nil, "Fastest first", nil, nil, nil, nil])
+    }
     func testCustomHideOnlyButtonClosesNativeContentPopoverInProduction() throws {
         XCTAssertFalse(ExactEnv.agentMode, "this test exercises production handling")
         let p = presenter(native(1, ["popovertarget": "content"])
@@ -122,7 +158,8 @@ final class NativeContextsIOSTests: XCTestCase {
         XCTAssertEqual(pin.image?.isSymbolImage, true, "a custom action's symbol is a system image, not a snapshot")
         XCTAssertEqual(delete.accessibilityLabel, "Delete", "its title names it")
         XCTAssertEqual(mute.accessibilityLabel, "Hide alerts")
-        XCTAssertEqual(mute.backgroundColor, TextEngine.color([88, 86, 214, 255]), "the accent its author wrote on it")
+        let srgb = try XCTUnwrap(mute.backgroundColor?.cgColor.converted(to: CGColorSpace(name: CGColorSpace.sRGB)!, intent: .defaultIntent, options: nil)?.components)
+        for (got, want) in zip(srgb, [88.0 / 255, 86.0 / 255, 214.0 / 255, 1]) { XCTAssertEqual(Double(got), want, accuracy: 0.002, "the accent its author wrote on it") }
         XCTAssertEqual(configuration.actions[4].backgroundColor, UIContextualAction(style: .normal, title: nil) { _, _, _ in }.backgroundColor,
                        "UIKit's grey: an accent the action only inherits is not its own")
         var pressed: [UInt32] = []
@@ -131,15 +168,185 @@ final class NativeContextsIOSTests: XCTestCase {
         XCTAssertEqual(pressed, [5])
     }
 
-    private func tablist(_ faces: [UInt32: ButtonFace], labels: [Int: String] = [:]) -> Presenter {
-        var ops = view(1, ["accessibilityRole": "tablist"])
+    private func tablist(_ faces: [UInt32: ButtonFace], labels: [Int: String] = [:], role: String = "tablist") -> Presenter {
+        var ops = view(1, ["accessibilityRole": role])
         for (i, id) in [2, 3, 4].enumerated() {
-            var props = ["accessibilityRole": "tab"]
-            if i == 0 { props["accessibilitySelected"] = "true" }
+            var props = ["accessibilityRole": role == "radiogroup" ? "radio" : "tab"]
+            if i == 0 { props[role == "radiogroup" ? "accessibilityChecked" : "accessibilitySelected"] = "true" }
             if let label = labels[id] { props["accessibilityLabel"] = label }
             ops += native(id, props, x: Double(i) * 100, w: 100)
         }
         return presenter(ops + [["op": "children", "id": 1, "ids": [2, 3, 4]], ["op": "roots", "ids": [1]]], faces: faces)
+    }
+
+    /// A written `appearance="none"` keeps a radio group's authored keys, as it
+    /// keeps a tablist's: the author's design, not `UISegmentedControl`, with
+    /// WAI-ARIA's radio group keys: one Tab stop (the checked radio), and the
+    /// arrows focus and press the next or previous radio, wrapping.
+    func testAWrittenAppearanceNoneKeepsAnAuthoredRadioGroup() throws {
+        let p = tablist([2: face("Day"), 3: face("Week"), 4: face("Month")], role: "radiogroup")
+        XCTAssertNotNil(p.segments.control(of: 1), "a radio group is a segmented control")
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["appearance": "none", "written": ["appearance"]]]]))
+        XCTAssertNil(p.segments.control(of: 1))
+        XCTAssertFalse(try XCTUnwrap(p.views[2]).isHidden, "its authored radios show")
+        var pressed: [UInt32] = []
+        p.onPress = { pressed.append($0) }
+        p.press(3)
+        XCTAssertEqual(pressed, [3])
+        let (day, week, month) = (try XCTUnwrap(p.views[2]), try XCTUnwrap(p.views[3]), try XCTUnwrap(p.views[4]))
+        XCTAssertEqual([day, week, month].map(\.ariaRadioTabStop), [true, false, false], "the checked radio is the one stop")
+        pressed = []
+        XCTAssertTrue(p.controls.radioKey(day, "ArrowRight", held: ""))
+        XCTAssertTrue(p.controls.radioKey(day, "ArrowLeft", held: ""))
+        XCTAssertFalse(p.controls.radioKey(day, "a", held: ""))
+        XCTAssertEqual(pressed, [3, 4], "the next radio, then the previous one wrapping")
+        p.apply(wireBatch([["op": "props", "id": 2, "set": ["accessibilityChecked": "false"]], ["op": "props", "id": 3, "set": ["accessibilityChecked": "true"]]]))
+        XCTAssertEqual([day, week, month].map(\.ariaRadioTabStop), [false, true, false])
+        // Right-to-left swaps Left and Right; a hidden radio is no target and no stop.
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["appearance": "none", "written": ["appearance"], "direction": "rtl"]]]))
+        pressed = []
+        XCTAssertTrue(p.controls.radioKey(week, "ArrowRight", held: ""))
+        XCTAssertTrue(p.controls.radioKey(week, "ArrowLeft", held: ""))
+        XCTAssertTrue(p.controls.radioKey(week, "ArrowDown", held: ""))
+        XCTAssertEqual(pressed, [2, 4, 4])
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["appearance": "none", "written": ["appearance"]]],
+                           ["op": "style", "id": 4, "style": ["visibility": "hidden"]]]))
+        pressed = []
+        XCTAssertTrue(p.controls.radioKey(week, "ArrowDown", held: ""))
+        XCTAssertEqual(pressed, [2], "the hidden radio is passed over")
+        p.apply(wireBatch([["op": "props", "id": 3, "set": ["accessibilityChecked": "false"]], ["op": "props", "id": 4, "set": ["accessibilityChecked": "true"]]]))
+        XCTAssertEqual([day, week, month].map(\.ariaRadioTabStop), [true, false, false], "a hidden checked radio is not the stop")
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["appearance": "auto", "written": ["appearance"]]]]))
+        XCTAssertNil(day.ariaRadioGroup, "a projected group's keys are the segmented control's")
+        XCTAssertNotNil(p.segments.control(of: 1))
+    }
+
+    /// Opacity only paints (CSS); `visibility: hidden` and `inert` take input away.
+    func testSegmentsFollowTheirStateNotTheirOpacity() throws {
+        let p = tablist([2: face("Day"), 3: face("Week"), 4: face("Month")])
+        let owner = try XCTUnwrap(p.views[1])
+        let segments = try XCTUnwrap(owner.subviews.compactMap { $0 as? UISegmentedControl }.first)
+        owner.alpha = 0
+        p.segments.sync()
+        XCTAssertTrue(segments.isEnabled, "a transparent tablist still takes input")
+        var pressed: [UInt32] = []
+        p.onPress = { pressed.append($0) }
+        XCTAssertEqual(p.segments.activate(try XCTUnwrap(p.views[3])), true)
+        XCTAssertEqual(pressed, [3])
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["visibility": "hidden"]]]))
+        p.segments.sync()
+        XCTAssertFalse(segments.isEnabled, "a hidden tablist takes no input")
+        XCTAssertEqual(p.segments.activate(try XCTUnwrap(p.views[4])), false)
+        XCTAssertEqual(pressed, [3], "nor a pick")
+        p.apply(wireBatch([["op": "style", "id": 1, "style": [:]]]))
+        owner.props["inert"] = "true"
+        p.segments.sync()
+        XCTAssertFalse(segments.isEnabled, "inert disables it too")
+    }
+
+    func testSegmentsKeepTheirEnabledStateWhileTheirRouteIsOffscreen() throws {
+        let p = tablist([2: face("Day"), 3: face("Week"), 4: face("Month")])
+        defer { window.isHidden = true }
+        let owner = try XCTUnwrap(p.views[1]), control = try XCTUnwrap(p.segments.control(of: 1))
+        let parent = try XCTUnwrap(owner.superview)
+        owner.removeFromSuperview()
+        p.segments.sync()
+        XCTAssertTrue(control.isEnabled, "an offscreen route does not disable its controls")
+        XCTAssertEqual(p.segments.activate(try XCTUnwrap(p.views[3])), false, "an offscreen control takes no input")
+        p.apply(wireBatch([
+            ["op": "props", "id": 2, "set": ["accessibilitySelected": "false"]],
+            ["op": "props", "id": 4, "set": ["accessibilitySelected": "true"]],
+        ]))
+        XCTAssertEqual(control.selectedSegmentIndex, 2, "a shared choice reaches the offscreen route")
+        parent.addSubview(owner)
+        XCTAssertTrue(control.isEnabled, "showing the route needs no unrelated state update to enable it")
+        XCTAssertEqual(control.selectedSegmentIndex, 2)
+        parent.isHidden = true
+        p.segments.sync()
+        XCTAssertTrue(control.isEnabled, "a covered route keeps the control's authored state")
+        parent.isHidden = false
+        owner.props["inert"] = "true"
+        p.segments.sync()
+        XCTAssertFalse(control.isEnabled, "authored inert still disables the control")
+    }
+
+    func testModelSelectionAndFinalSegmentLayoutDoNotInheritRouteAnimations() throws {
+        guard hostedWindowScene() != nil else {
+            throw missing("scene", "UIKit's rendered selection needs an app's window")
+        }
+        let p = tablist([2: face("Day"), 3: face("Week"), 4: face("Month")])
+        defer { p.reset(); window.isHidden = true }
+        let control = try XCTUnwrap(p.segments.control(of: 1))
+        control.layoutIfNeeded()
+        func animations(_ layer: CALayer) -> [String] {
+            (layer.animationKeys() ?? []) + (layer.sublayers ?? []).flatMap(animations)
+        }
+        func clear(_ layer: CALayer) {
+            layer.removeAllAnimations()
+            layer.sublayers?.forEach(clear)
+        }
+        clear(control.layer)
+        UIView.animate(withDuration: 1) {
+            p.apply(wireBatch([
+                ["op": "props", "id": 2, "set": ["accessibilitySelected": "false"]],
+                ["op": "props", "id": 4, "set": ["accessibilitySelected": "true"]],
+                ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 170.0, "h": 40.0],
+            ]))
+        }
+        CATransaction.flush()
+        XCTAssertEqual(control.selectedSegmentIndex, 2)
+        XCTAssertTrue(animations(control.layer).isEmpty, "native selection and layout finish without a deferred animation")
+    }
+
+    func testSegmentLabelsKeepSelectionAndAvailabilityCurrent() throws {
+        let control = LabelledSegmentedControl(items: ["One", "Two"])
+        control.frame = CGRect(x: 0, y: 0, width: 300, height: 32)
+        control.segmentIDs = ["one", "two"]
+        control.selectedSegmentIndex = 0
+        control.layoutIfNeeded()
+        let segments = control.segmentViews
+        XCTAssertEqual(segments.count, 2)
+        guard segments.count == 2 else { return }
+        XCTAssertTrue(segments[0].accessibilityTraits.contains(.selected))
+        control.selectedSegmentIndex = 1
+        control.labelSegments()
+        XCTAssertFalse(segments[0].accessibilityTraits.contains(.selected))
+        XCTAssertTrue(segments[1].accessibilityTraits.contains(.selected))
+        control.segmentUnavailable = [false, true]
+        control.labelSegments()
+        XCTAssertTrue(segments[1].accessibilityTraits.contains(.notEnabled))
+        control.isEnabled = false
+        control.labelSegments()
+        XCTAssertTrue(segments.allSatisfy { $0.accessibilityTraits.contains(.notEnabled) })
+        control.isEnabled = true
+        control.segmentUnavailable = [false, false]
+        control.selectedSegmentIndex = 0
+        control.labelSegments()
+        XCTAssertTrue(segments[0].accessibilityTraits.contains(.selected))
+        XCTAssertFalse(segments[1].accessibilityTraits.contains(.selected))
+        XCTAssertFalse(segments.contains { $0.accessibilityTraits.contains(.notEnabled) })
+    }
+
+    func testASegmentedTablistsBackgroundBelongsToTheNativeControlAndReturnsWithItsAuthoredTabs() throws {
+        let p = tablist([2: face("Day"), 3: face("Week"), 4: face("Month")])
+        defer { window.isHidden = true }
+        let owner = try XCTUnwrap(p.views[1]), control = try XCTUnwrap(p.segments.control(of: 1))
+        p.apply(wireBatch([
+            ["op": "style", "id": 1, "style": ["background_color": [255, 0, 0, 255]]],
+            ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 300.0, "h": 80.0],
+        ]))
+        owner.layer.displayIfNeeded()
+        XCTAssertEqual(control.backgroundColor?.cgColor.components, [1, 0, 0, 1])
+        XCTAssertNil(owner.layer.backgroundColor, "no rectangular background around UIKit's compact control")
+        XCTAssertLessThan(control.frame.height, owner.bounds.height)
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["background_color": [0, 0, 255, 255]]]]))
+        XCTAssertEqual(control.backgroundColor?.cgColor.components, [0, 0, 1, 1])
+        p.apply(wireBatch([["op": "style", "id": 1, "style": [:]]]))
+        XCTAssertNil(control.backgroundColor, "removing the colour restores UIKit's appearance")
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["appearance": "none", "background_color": [255, 0, 0, 255], "written": ["appearance"]]]]))
+        owner.layer.displayIfNeeded()
+        XCTAssertNil(p.segments.control(of: 1))
+        XCTAssertEqual(owner.layer.backgroundColor?.components, [1, 0, 0, 1], "the authored box draws its own background again")
     }
 
     func testNativeTabsAreATabBarOrSegmentsFromTheirFaces() throws {
@@ -156,8 +363,7 @@ final class NativeContextsIOSTests: XCTestCase {
         XCTAssertEqual((0..<3).map { segments.titleForSegment(at: $0) }, ["Day", "Week", "Month"])
         // A face that becomes a symbol drops its title.
         p.buttonFace = { [unowned self] id in id == 2 ? self.face(nil, symbol: "sun.max", label: "Day") : self.face(id == 3 ? "Week" : "Month") }
-        p.views[2]?.props["accessibilityLabel"] = "Day"
-        p.segments.sync()
+        p.apply(wireBatch([["op": "props", "id": 2, "set": ["accessibilityLabel": "Day"], "clear": []]]))
         XCTAssertNotNil(segments.imageForSegment(at: 0))
         XCTAssertEqual(segments.titleForSegment(at: 0) ?? "", "", "an image segment shows no title")
         // Symbols alone, named by their labels: image segments.
@@ -288,6 +494,19 @@ final class NativeContextsIOSTests: XCTestCase {
         XCTAssertEqual(node("period-Week")?.props["accessibilityChecked"], "false")
         p.segments.sync()
         XCTAssertEqual(segments.selectedSegmentIndex, 2)
+        // The same choice with radios that paint the chosen one (a class on
+        // one arm, LLP 1104 D2): the plan makes the group the author's, so
+        // it is never a segmented control, before a pick or after it, and its
+        // radios keep the group's keys.
+        let tint = try XCTUnwrap(node("tint"))
+        XCTAssertTrue(tint.subviews.compactMap { $0 as? UISegmentedControl }.isEmpty)
+        XCTAssertEqual(node("tint-Day")?.isHidden, false)
+        XCTAssertTrue(node("tint-Day")?.ariaRadioGroup === tint)
+        p.press(try XCTUnwrap(node("tint-Day")).id)
+        p.segments.sync()
+        XCTAssertTrue(tint.subviews.compactMap { $0 as? UISegmentedControl }.isEmpty, "a pick does not project it")
+        XCTAssertEqual(node("tint-Day")?.props["accessibilityChecked"], "true")
+        XCTAssertTrue(node("tint-Week")?.ariaRadioGroup === tint)
     }
 
     /// LLP 1116.003 (r5 weather: "ExactSegmentedControl covers its middle"):
@@ -313,7 +532,7 @@ final class NativeContextsIOSTests: XCTestCase {
         let control = try XCTUnwrap(p.views[1]?.subviews.compactMap { $0 as? UISegmentedControl }.first)
         control.layoutIfNeeded()
         let reply = Agent(session: session).aim(["id": 3, "aim": ["press": true]])
-        if (reply["error"] as? String)?.contains("foreground") == true { throw missing("foreground", "the test host is in the background: a real touch's aim refuses it") }
+        try requireFront(window)
         let aim = try XCTUnwrap(reply["aim"] as? [String: Any], "\(reply)")
         let w = try XCTUnwrap(aim["window"] as? [Double])
         let local = control.convert(CGPoint(x: w[0], y: w[1]), from: nil)
@@ -486,7 +705,7 @@ final class NativeContextsIOSTests: XCTestCase {
         XCTAssertEqual(p.menus.activate(try XCTUnwrap(p.views[1])), true)
         XCTAssertNotNil(controller.presentedViewController as? UIAlertController)
         names[3] = "Citymapper"
-        p.menus.sync()
+        p.apply(facesBatch())
         XCTAssertNil(p.menus.observation(), "the sheet is gone")
         XCTAssertEqual(p.menus.activate(try XCTUnwrap(p.views[3])), false)
         XCTAssertEqual(pressed, [])

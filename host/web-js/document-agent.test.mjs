@@ -3,6 +3,628 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { open } from '../../scripts/agent.mjs';
 import { webCompiler } from './module.mjs';
+import { suiteBrowser } from '../../scripts/agent-launch.mjs';
+
+test('navigation waits for unknown status capability', async () => {
+  const { pageServer } = await import('./render.mjs');
+  const page = pageServer('/unused', { begin: async () => ({
+    policy: 'request', head: '<!doctype html>',
+    finish: async () => ({ html: 'Missing', rest: 'Missing', status: 404, policy: 'request', failed: [], location: '/missing' }),
+  }) }, () => {});
+  const response = await page('/missing', name => name === 'sec-fetch-dest' ? 'document' : undefined);
+  expect(response.status).toBe(404);
+});
+
+test('an answered open stream settles its page, and the browser subscribes again and asks nothing else', async () => {
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/stream-document-test-'));
+  const streams = new Map(), encoder = new TextEncoder(), connected = Promise.withResolvers();
+  const event = value => encoder.encode(`data: ${value}\n\n`);
+  let labels = 0;
+  const peer = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    const name = new URL(request.url).pathname.slice(1);
+    if (name === 'heartbeat') { return new Response(null, { status: 204 }); }
+    if (name === 'label') { labels++; return Response.json('Label', { headers: { 'access-control-allow-origin': '*' } }); }
+    const body = new ReadableStream({ start(controller) {
+      const connections = streams.get(name) ?? [];
+      connections.push(controller); streams.set(name, connections);
+      if (name === 'home' && connections.length === 2) { connected.resolve(); }
+      if (name !== 'silent') { controller.enqueue(event('first')); }
+    } });
+    return new Response(body, { headers: { 'content-type': 'text/event-stream', 'access-control-allow-origin': '*' } });
+  } });
+  let browser, site;
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Stream Document', app: { id: 'test.stream-document', name: 'Stream Document' }, host: { web: {} } }));
+    writeFileSync(resolve(dir, 'app.contract'), `routes nav
+  home "/" render=request
+  status "/status" render=request
+  silent "/silent" render=request
+  heartbeat "/heartbeat" render=request
+
+component App
+  resource live = feed(top(nav).name) as shape string else empty()
+  resource label = label() as shape string
+  view
+    main
+      if top(nav).name == "status" && live != ""
+        head status=410
+      text live testId="live"
+      text label
+`);
+    writeFileSync(resolve(dir, 'app.ts'), `export const grants = 'net.fetch ${peer.url.origin}';
+export const answer = (name: string, args: string[]): any => name === 'label' ? fetch('${peer.url.origin}/label').then(response => response.json()) : fetch('${peer.url.origin}/' + args[0], {
+  exactStream: (event: any) => event.data,
+  ...(args[0] === 'heartbeat' ? { exactLongPoll: { cursor: 'since', from: 'seq' } } : {}),
+} as RequestInit);
+`);
+    const dist = resolve(dir, 'dist');
+    const built = Bun.spawn([process.execPath, 'host/web-js/build.mjs', 'stream-document-test', '--out', dist, '--render', 'js'], {
+      cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [status, stdout, stderr] = await Promise.all([built.exited, new Response(built.stdout).text(), new Response(built.stderr).text()]);
+    expect(status, stdout + stderr).toBe(0);
+    const { renderer } = await import('./render.mjs');
+    const render = renderer(dist); render.ahead = false;
+    const pages = new Map();
+    for (const [path, expected] of [['/', 200], ['/status', 410], ['/silent', 503], ['/heartbeat', 503]]) {
+      // Give a page that must settle a long deadline: the renderer returns as soon as nothing is in flight
+      const reply = await render(path, expected === 503 ? 500 : 10000);
+      expect([reply.status, reply.settled], path).toEqual([expected, expected !== 503]);
+      expect(reply.html).toContain('data-activate="eager"');
+      // A page at its deadline has every answer asked again; a settled one, only its open stream
+      expect(reply.html.includes('"revalidate":true'), path).toBe(expected === 503);
+      expect(reply.html).toContain(expected === 503 ? '"pending":["live"]' : '"pending":[],"open":["live"]');
+      pages.set(path, reply);
+    }
+    site = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      const path = new URL(request.url).pathname, page = pages.get(path);
+      if (page) { return new Response(page.html, { status: page.status, headers: { 'content-type': 'text/html' } }); }
+      const asset = Bun.file(resolve(dist, path.slice(1)));
+      return await asset.exists() ? new Response(asset) : new Response(null, { status: 404 });
+    } });
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    const rendered = labels;
+    await page.goto(site.url.href);
+    await page.waitForFunction(() => document.querySelector('[data-testid="live"]')?.textContent === 'first');
+    let bound;
+    try {
+      await Promise.race([connected.promise, new Promise((_, reject) => { bound = setTimeout(() => reject(new Error('the browser did not subscribe')), 5000); })]);
+    } finally { clearTimeout(bound); }
+    streams.get('home')[1].enqueue(event('second'));
+    await page.waitForFunction(() => document.querySelector('[data-testid="live"]')?.textContent === 'second');
+    // The label the page was rendered with stands: the browser asked it nothing while it subscribed again
+    expect(await page.evaluate(() => document.querySelector('main')?.textContent)).toContain('Label');
+    expect(labels).toBe(rendered);
+  } finally {
+    await browser?.close(); site?.stop(true); peer.stop(true);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 60000);
+
+test('a refused settlement restores renderer pending state', async () => {
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/rollback-document-test-'));
+  const peer = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    return new URL(request.url).pathname === '/trigger' ? Response.json(1) : new Response(null, { status: 204 });
+  } });
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Rollback Document', app: { id: 'test.rollback-document', name: 'Rollback Document' }, host: { web: {} } }));
+    writeFileSync(resolve(dir, 'app.contract'), `routes nav
+  home "/" render=request
+
+component App
+  resource trigger = trigger() as shape number
+  resource later = later(trigger) as shape number
+  resource bad = bad(trigger) as shape number
+  view
+    main
+      head title="Retained" status=410
+      text \`\${trigger} \${later} \${bad}\`
+`);
+    writeFileSync(resolve(dir, 'app.ts'), `export const grants = 'net.fetch ${peer.url.origin}';
+export const answer = (name: string, [value]: number[]): any => {
+  if (name === 'trigger') return fetch('${peer.url.origin}/trigger').then(response => response.json());
+  if (name === 'later' && value === 0) return fetch('${peer.url.origin}/heartbeat', {
+    exactStream: (event: any) => Number(event.data), exactLongPoll: { cursor: 'since', from: 'seq' },
+  } as RequestInit);
+  if (name === 'bad' && value === 1) throw Object.assign(new Error('source refused'), { refuse: true });
+  return 0;
+};
+`);
+    const dist = resolve(dir, 'dist');
+    const built = Bun.spawn([process.execPath, 'host/web-js/build.mjs', 'rollback-document-test', '--out', dist, '--render', 'js'], {
+      cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [status, stdout, stderr] = await Promise.all([built.exited, new Response(built.stdout).text(), new Response(built.stderr).text()]);
+    expect(status, stdout + stderr).toBe(0);
+    const { renderer } = await import('./render.mjs');
+    const render = renderer(dist); render.ahead = false;
+    // Give the render a long deadline: it returns once the refused settlement has rolled back and nothing is in flight
+    const reply = await render('/', 10000);
+    expect([reply.status, reply.settled]).toEqual([503, false]);
+    expect(reply.html).toContain('0 0 0');
+    expect(reply.html).toContain('"pending":["later"]');
+  } finally { peer.stop(true); rmSync(dir, { recursive: true, force: true }); }
+}, 30000);
+
+test.each([
+  ['navigation waits for a page that can declare its status', [
+    ['plain', '/', 200, false], ['inactive', '/inactive', 200, false],
+    ['missing', '/missing', 404, true], ['gone', '/gone', 410, true], ['unavailable', '/unavailable', 503, true],
+    ['static', '/static', 410, true], ['matched', '/matched', 404, true], ['rows', '/rows', 410, true],
+    ['virtual', '/virtual', 410, true], ['selection', '/selection', 404, true],
+    ['childSelection', '/child-selection', 404, true], ['tabSelection', '/tab-selection', 404, true],
+    ['panelRole', '/panel-role', 404, true], ['panelId', '/panel-id', 404, true], ['tabControls', '/tab-controls', 404, true],
+    ['siblingSelection', '/sibling-selection', 404, true], ['siblingRemoval', '/sibling-removal', 404, true],
+    ['cachedUnavailable', '/cached-unavailable', 503, true], ['cachedUnavailable', '/cached-unavailable', 503, true],
+    ['cachedOk', '/cached-ok', 200, true], ['client', '/client', 200, false],
+  ]],
+  ['navigation waits for store-driven status revalidation', [['storeStatus', '/store-status', 404, true]]],
+  ['navigation waits for a discarded request that can change status', [['discardedStatus', '/discarded-status', 404, true]]],
+  ['navigation waits for discarded held requests', [['discardedHeldStatus', '/discarded-held-status', 404, true]]],
+  ['navigation waits for fetches started in a plain continuation', [
+    ['discardedLooseStatus', '/discarded-loose-status', 404, true],
+    ['discardedDetachedStatus', '/discarded-detached-status', 404, true],
+  ]],
+  ['navigation waits for I/O that outlives a source answer', [
+    ['backgroundSync', '/background-sync', 404, true], ['backgroundHeldSync', '/background-held-sync', 404, true],
+    ['backgroundAnswer', '/background-answer', 404, true], ['backgroundHeldAnswer', '/background-held-answer', 404, true],
+  ]],
+  ['I/O remains unfinished after the source answers', [
+    ['backgroundSync', '/background-sync', 503, true, { deadline: 0 }],
+    ['backgroundHeldSync', '/background-held-sync', 503, true, { deadline: 0 }],
+    ['backgroundAnswer', '/background-answer', 503, true, { deadline: 0 }],
+    ['backgroundHeldAnswer', '/background-held-answer', 503, true, { deadline: 0 }],
+  ]],
+  ['an inferred page recovers when I/O outlives its answer', [['backgroundClient', '/background-client', 503, true, { deadline: 0, recover: true }]]],
+  ['discarded work keeps a render unsettled at the deadline', [
+    ['discardedStatus', '/discarded-status', 503, true, { deadline: 0 }],
+    ['discardedHeldStatus', '/discarded-held-status', 503, true, { deadline: 0 }],
+    ['discardedLooseStatus', '/discarded-loose-status', 503, true, { deadline: 0 }],
+    ['discardedDetachedStatus', '/discarded-detached-status', 503, true, { deadline: 0 }],
+  ]],
+  ['an inferred page recovers from a discarded-work deadline', [['discardedClient', '/discarded-client', 503, true, { deadline: 0, recover: true }]]],
+  ['a status-free snapshot keeps discarded held work off its wait', [['discardedPlain', '/discarded-plain', 200, false, { deadline: 0, settled: true }]]],
+  ['a discarded timer does not hold a settled status page', [
+    ['discardedTimerStatus', '/discarded-timer-status', 200, true, { deadline: 100, settled: true, timer: true }],
+    ['discardedLateTimerStatus', '/discarded-late-timer-status', 200, true, { deadline: 100, settled: true, timer: true }],
+  ]],
+  ['navigation tracks id candidates across ownership boundaries', [
+    ['idShadow', '/id-shadow', 404, true], ['idConditional', '/id-conditional', 404, true], ['idRows', '/id-rows', 404, true],
+  ]],
+  ['navigation tracks an id shadow inside an inactive nested route', [['idInactiveRows', '/id-inactive-rows', 404, true]]],
+  ['navigation waits for a route mounted in an inactive tab', [
+    ['conditionalTab', '/conditional-tab', 404, true],
+    ['conditionalMatch', '/conditional-match', 404, true],
+    ['conditionalRows', '/conditional-rows', 404, true],
+    ['conditionalNaming', '/conditional-naming', 404, true],
+  ]],
+  ['navigation sends its head before an unselectable conditional status', [['conditionalInactive', '/conditional-inactive', 200, false]]],
+  ['navigation sends its head before an unselectable conditional tab', [['conditionalInactiveTab', '/conditional-inactive-tab', 200, false]]],
+  ['navigation ignores data confined to an inactive route', [
+    ['inactiveData', '/inactive-data', 200, false], ['inactiveSelector', '/inactive-selector', 200, false],
+  ]],
+  ['navigation waits for an unnamed copy of a repeated panel', [['repeatedPanel', '/repeated-panel', 404, true]]],
+])('%s', async (_name, cases) => {
+  if (webCompiler().cmd === 'cargo') { throw new Error('build the compiler first: cargo build -p exact-web-js'); }
+  const root = resolve(import.meta.dirname, '../..'), dir = mkdtempSync(resolve(root, 'target/status-document-test-'));
+  const held = new Set(), waiting = new Map(), expiredPages = new Map();
+  let arrived, site, browser;
+  const api = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    if (request.method === 'OPTIONS') { return new Response(null, { status: 204, headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET', 'access-control-allow-headers': '*' } }); }
+    const name = new URL(request.url).pathname.slice(1);
+    return new Promise(done => {
+      const release = () => {
+        held.delete(release);
+        done(Response.json({ ready: name !== 'cachedOk', key: 'second', label: name + ' loaded', rows: name === 'repeatedPanel' ? [410, 503] : [410] }, { headers: { 'cache-control': 'no-store', 'access-control-allow-origin': '*' } }));
+      };
+      held.add(release);
+      waiting.set(name, release);
+      arrived?.(name);
+    });
+  } });
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Status Document Test', app: { id: 'test.status-document', name: 'Status Document Test' }, host: { web: {} } }));
+    writeFileSync(resolve(dir, 'app.contract'), `shape Page
+  ready: bool
+  key: string
+  label: string
+  rows: number[]
+
+routes nav
+  plain "/" render=request activate=never
+  missing "/missing" render=request activate=never
+  gone "/gone" render=request activate=never
+  unavailable "/unavailable" render=request activate=never
+  static "/static" render=request activate=never
+  matched "/matched" render=request activate=never
+  rows "/rows" render=request activate=never
+  virtual "/virtual" render=request activate=never
+  inactive "/inactive" render=request activate=never
+  conditionalInactive "/conditional-inactive" render=request activate=never
+  storeStatus "/store-status" render=request activate=never
+  discardedStatus "/discarded-status" render=request activate=never
+  discardedHeldStatus "/discarded-held-status" render=request activate=never
+  discardedLooseStatus "/discarded-loose-status" render=request activate=never
+  discardedDetachedStatus "/discarded-detached-status" render=request activate=never
+  discardedClient "/discarded-client" render=request
+  discardedPlain "/discarded-plain" render=request activate=never
+  discardedTimerStatus "/discarded-timer-status" render=request activate=never
+  discardedLateTimerStatus "/discarded-late-timer-status" render=request activate=never
+  backgroundSync "/background-sync" render=request activate=never
+  backgroundHeldSync "/background-held-sync" render=request activate=never
+  backgroundAnswer "/background-answer" render=request activate=never
+  backgroundHeldAnswer "/background-held-answer" render=request activate=never
+  backgroundClient "/background-client" render=request
+  idShadow "/id-shadow" render=request activate=never
+  idConditional "/id-conditional" render=request activate=never
+  idRows "/id-rows" render=request activate=never
+  idInactiveRows "/id-inactive-rows" render=request activate=never
+  conditionalInactiveTab "/conditional-inactive-tab" render=request activate=never
+  repeatedPanel "/repeated-panel" render=request activate=never
+  selection "/selection" render=request activate=never
+  childSelection "/child-selection" render=request activate=never
+  siblingSelection "/sibling-selection" render=request activate=never
+  siblingRemoval "/sibling-removal" render=request activate=never
+  tabSelection "/tab-selection" render=request activate=never
+  conditionalTab "/conditional-tab" render=request activate=never
+  conditionalMatch "/conditional-match" render=request activate=never
+  conditionalRows "/conditional-rows" render=request activate=never
+  conditionalNaming "/conditional-naming" render=request activate=never
+  inactiveData "/inactive-data" render=request activate=never
+  inactiveSelector "/inactive-selector" render=request activate=never
+  panelRole "/panel-role" render=request activate=never
+  panelId "/panel-id" render=request activate=never
+  tabControls "/tab-controls" render=request activate=never
+  cachedUnavailable "/cached-unavailable" render=cached activate=never
+  cachedOk "/cached-ok" render=cached activate=never
+  client "/client" render=request activate=idle
+
+component App
+  state pressed = false
+  state selected = "first"
+  resource page = page(top(nav).name) as shape Page else empty(key="first")
+  resource stored = stored() as shape bool
+  resource mode = mode() as shape string
+  resource discarded = discarded(mode, top(nav).name) as shape number
+  resource initialized = initialized(top(nav).name) as shape number
+  action flip
+    pressed = not pressed
+  view
+    main
+      if top(nav).name == "plain" or top(nav).name == "discardedPlain"
+        head title="Plain"
+      else if top(nav).name == "storeStatus" or top(nav).name == "discardedStatus" or top(nav).name == "discardedHeldStatus" or top(nav).name == "discardedLooseStatus" or top(nav).name == "discardedDetachedStatus" or top(nav).name == "discardedClient" or top(nav).name == "discardedTimerStatus" or top(nav).name == "discardedLateTimerStatus" or top(nav).name == "backgroundSync" or top(nav).name == "backgroundHeldSync" or top(nav).name == "backgroundAnswer" or top(nav).name == "backgroundHeldAnswer" or top(nav).name == "backgroundClient"
+        if stored
+          head title="Missing" status=404
+        else
+          head title="Checking"
+        if top(nav).name == "discardedClient" or top(nav).name == "backgroundClient"
+          button press=flip testId="recovery-press"
+            text "Change"
+      else if top(nav).name == "conditionalInactive"
+        view navigationBack="" navigationKey="first"
+          view navigationKey="first"
+            head title="First"
+            view navigationBack="" navigationKey="nested"
+              row role="tablist"
+                button role="tab" aria-controls="unrelated-nested-panel"
+                  text "Nested"
+              view role="tabpanel" id="unrelated-nested-panel"
+                view navigationKey="nested"
+                  text "Nested page"
+          if page.ready
+            view navigationKey="second"
+              head title="Missing" status=404
+      else if top(nav).name == "inactiveSelector"
+        view navigationBack="" navigationKey=selected
+          view navigationKey="first"
+            head title="First"
+          view navigationKey="second"
+            view navigationBack="" navigationKey=page.key
+              view navigationKey="first"
+                head title="Nested first"
+              view navigationKey="second"
+                head title="Missing" status=404
+      else if top(nav).name == "inactiveData"
+        view navigationBack="" navigationKey=selected
+          view navigationKey="first"
+            head title="First"
+          view navigationKey="second" id=(page.ready ? "changed" : "initial")
+            if page.ready
+              view role="group"
+                view navigationBack="" navigationKey="nested"
+                  view navigationKey="nested"
+                    head title="Missing" status=404
+      else if top(nav).name == "conditionalInactiveTab"
+        view navigationBack="" navigationKey="sibling"
+          view id="fixed-first-panel"
+        view navigationBack="" navigationKey="first"
+          view navigationBack="" navigationKey="unrelated"
+            row role="tablist"
+              button role="tab" aria-controls="fixed-second-panel"
+                text "Unrelated tabs"
+          if false
+            row role="tablist"
+              button role="tab" aria-controls="fixed-second-panel"
+                text "Unreachable"
+          if true
+            row role="tablist"
+              if true
+                button role="tab" aria-controls="fixed-first-panel"
+                  text "First"
+                button role="tab" aria-controls="fixed-second-panel"
+                  text "Second"
+          view role="tabpanel" id="fixed-first-panel"
+            view navigationKey="first"
+              head title="First"
+          if page.ready
+            view role="tabpanel" id="fixed-second-panel"
+              view navigationKey="second"
+                head title="Missing" status=404
+      else if top(nav).name == "idShadow" or top(nav).name == "idConditional" or top(nav).name == "idRows" or top(nav).name == "idInactiveRows"
+        view navigationBack="" navigationKey="first"
+          row role="tablist"
+            button role="tab" aria-controls="id-status-panel"
+              text "Status"
+            button role="tab" aria-controls="id-plain-panel"
+              text "Plain"
+          if top(nav).name == "idShadow"
+            view id=(page.ready ? "id-status-panel" : "unused")
+          if top(nav).name == "idRows"
+            view navigationBack="" navigationKey="nested"
+              for code in page.rows key=code
+                view id="id-status-panel"
+          if top(nav).name == "idInactiveRows"
+            view navigationBack="" navigationKey="nested"
+              view navigationKey="nested"
+                text "Selected"
+              view navigationKey="covered"
+                for code in page.rows key=code
+                  view id="id-status-panel"
+          view role="tabpanel" id="id-status-panel"
+            view navigationKey="second"
+              head title="Missing" status=404
+              if top(nav).name == "idConditional" and page.ready
+                view id="id-plain-panel"
+          view role="tabpanel" id="id-plain-panel"
+            view navigationKey="first"
+              head title="First"
+      else if top(nav).name == "repeatedPanel"
+        view navigationBack="" navigationKey="first"
+          row role="tablist"
+            button role="tab" aria-controls="repeated-first-panel"
+              text "First"
+            button role="tab" aria-controls="repeated-second-panel"
+              text "Second"
+          view role="tabpanel" id="repeated-first-panel"
+            view navigationKey="first"
+              head title="First"
+          for code in page.rows key=code
+            view role="tabpanel" id="repeated-second-panel"
+              view navigationKey="second"
+                head title="Missing" status=404
+      else if top(nav).name == "client"
+        if pressed
+          head title="Client missing" status=404
+        else
+          head title="Client"
+        button press=flip testId="flip"
+          text "Change head"
+      else if top(nav).name == "inactive" or top(nav).name == "selection"
+        view navigationBack="" navigationKey=(top(nav).name == "selection" ? page.key : "first")
+          view navigationKey="first"
+            head title="First"
+            text "First"
+          view navigationKey="second"
+            head title="Missing" status=404
+            text "Missing"
+      else if top(nav).name == "gone"
+        if page.ready
+          head title="Gone" status=410
+      else if top(nav).name == "unavailable" or top(nav).name == "cachedUnavailable"
+        if page.ready
+          head title="Unavailable" status=503
+      else if top(nav).name == "static"
+        head title="Static" status=410
+      else if top(nav).name == "childSelection"
+        view navigationBack="" navigationKey="second"
+          view navigationKey=page.key
+            head title="Missing" status=404
+          view navigationKey=(page.ready ? "first" : "second")
+            head title="First"
+      else if top(nav).name == "tabSelection" or top(nav).name == "panelRole" or top(nav).name == "panelId" or top(nav).name == "tabControls"
+        view navigationBack="" navigationKey=(top(nav).name == "tabSelection" ? "second" : "first")
+          row role="tablist"
+            button role="tab" aria-controls=(top(nav).name == "tabControls" and page.ready ? "unused" : "status-panel")
+              text "Status"
+            button role="tab" aria-controls="plain-panel"
+              text "Plain"
+          view role=(top(nav).name == "panelRole" and page.ready ? "group" : "tabpanel") id=(top(nav).name == "panelId" and page.ready ? "unused" : "status-panel")
+            view navigationKey=(top(nav).name == "tabSelection" ? page.key : "second")
+              head title="Missing" status=404
+          view role="tabpanel" id="plain-panel"
+            view navigationKey=(top(nav).name == "tabSelection" and not page.ready ? "second" : "first")
+              head title="First"
+      else if top(nav).name == "siblingSelection" or top(nav).name == "siblingRemoval"
+        view navigationBack="" navigationKey="first"
+          if top(nav).name == "siblingSelection"
+            view navigationKey=(page.ready ? "third" : "first")
+              text "Plain"
+          else if not page.ready
+            view navigationKey="first"
+              text "Plain"
+          view navigationKey="second"
+            head title="Missing" status=404
+      else if top(nav).name == "conditionalTab" or top(nav).name == "conditionalMatch" or top(nav).name == "conditionalRows" or top(nav).name == "conditionalNaming"
+        view navigationBack="" navigationKey="first"
+          view role="tabpanel" id="future-panel"
+            if top(nav).name == "conditionalNaming"
+              if page.ready
+                row role="tablist"
+                  button role="tab" aria-controls="future-panel"
+                    text "Future"
+              view navigationKey="second"
+                head title="Missing" status=404
+            else if top(nav).name == "conditionalTab"
+              if page.ready
+                view navigationKey="first"
+                  head title="Missing" status=404
+            else if top(nav).name == "conditionalMatch"
+              match (page.ready ? some(page.label) : none)
+                case some(label)
+                  view navigationKey="first"
+                    head title=label status=404
+                case none
+                  text "Waiting"
+            else
+              for code in page.rows key=code
+                view navigationKey="first"
+                  head title="Missing" status=404
+          view role="tabpanel" id="current-panel"
+            view navigationKey="first"
+              head title="First"
+          row role="tablist"
+            button role="tab" aria-controls="future-panel"
+              text "Future"
+            button role="tab" aria-controls="current-panel"
+              text "Current"
+      else if top(nav).name == "matched"
+        match (page.ready ? some(page.label) : none)
+          case some(label)
+            head title=label status=404
+          case none
+            text "Waiting"
+      else if top(nav).name == "rows"
+        for code in page.rows key=code
+          view
+            head title="Row" status=410
+            text "Row"
+      else if top(nav).name == "virtual"
+        list virtualized=true height=200
+          for code in page.rows key=code
+            view height=24
+              head title="Virtual row" status=410
+              text "Virtual row"
+      else
+        if page.ready
+          head title="Result" status=404
+      text page.label testId="loaded"
+`);
+    writeFileSync(resolve(dir, 'app.ts'), `import type { Answer } from './app.contract.d.ts';
+export const appId = 'test.status-document';
+export const grants = ${JSON.stringify('net.fetch ' + api.url.origin + '\nsecret.keep status\nsecret.keep mode')};
+export const answer: Answer = (source, args, store) => {
+  const [name] = args;
+  if (source === 'stored') { return (store.get('status') === 'missing') as never; }
+  if (source === 'mode') { return (store.get('mode') ?? 'old') as never; }
+  if (source === 'initialized') {
+    if (String(name).startsWith('discarded')) { store.set('mode', 'new'); }
+    return 0 as never;
+  }
+  if (source === 'discarded') {
+    const [mode, page] = args;
+    const background = String(page).startsWith('background');
+    if ((!String(page).startsWith('discarded') && !background) || mode !== 'old') { return 0 as never; }
+    if (page === 'discardedTimerStatus' || page === 'discardedLateTimerStatus') {
+      return new Promise(done => setTimeout(() => { store.set('status', 'missing'); done(0); }, page === 'discardedTimerStatus' ? 0 : 10_000)) as never;
+    }
+    if (page === 'discardedHeldStatus' || page === 'discardedLooseStatus') { setTimeout(() => {}, 10_000); }
+    const request = () => fetch(${JSON.stringify(api.url.origin)} + '/' + page, { cache: 'no-store', exactHeld: !['discardedStatus', 'backgroundSync', 'backgroundAnswer'].includes(String(page)) });
+    const loose = page === 'discardedLooseStatus' || page === 'discardedDetachedStatus';
+    const answer = (loose ? Promise.resolve().then(request) : request()).then(() => {
+      store.set('status', 'missing');
+      return 0;
+    });
+    if (page === 'discardedDetachedStatus' || background) {
+      answer.catch(() => {});
+      return (page === 'backgroundAnswer' || page === 'backgroundHeldAnswer' ? Promise.resolve(0) : 0) as never;
+    }
+    return answer as never;
+  }
+  if (String(name).startsWith('discarded') || String(name).startsWith('background')) {
+    return { ready: false, key: 'first', label: name + ' loaded', rows: [] } as never;
+  }
+  return (async () => {
+    const value = await (await fetch(${JSON.stringify(api.url.origin)} + '/' + name, { cache: 'no-store' })).json();
+    if (name === 'storeStatus') { store.set('status', 'missing'); }
+    return value;
+  })() as never;
+};
+`);
+    const dist = resolve(dir, 'dist');
+    const build = Bun.spawn([process.execPath, 'host/web-js/build.mjs', 'status-document-test', '--out', dist, '--render', 'js'], {
+      cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [status, stdout, stderr] = await Promise.all([build.exited, new Response(build.stdout).text(), new Response(build.stderr).text()]);
+    expect({ status, error: status ? stdout + stderr : '' }).toEqual({ status: 0, error: '' });
+    const { pageServer, renderer } = await import('./render.mjs');
+    const serve = pageServer(dist, undefined, () => {});
+    site = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === '/favicon.ico') { return new Response(null, { status: 404 }); }
+      const asset = Bun.file(resolve(dist, path.slice(1)));
+      if (path.includes('.') && await asset.exists()) { return new Response(asset); }
+      if (expiredPages.has(path)) { const reply = expiredPages.get(path); return new Response(reply.html, { status: reply.status, headers: { 'content-type': 'text/html' } }); }
+      const reply = await serve(path, name => request.headers.get(name) ?? undefined);
+      return new Response(reply.body, { status: reply.status, headers: reply.headers });
+    } });
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    for (const [name, path, expected, waits, options] of cases) {
+      let seen = new Promise(done => { arrived = found => { if (found === name) { done(); } }; });
+      const waitForData = () => {
+        let bound;
+        return Promise.race([seen, new Promise((_, reject) => {
+          bound = setTimeout(() => reject(new Error(name + ' never asked for its data')), 10_000);
+        })]).finally(() => clearTimeout(bound));
+      };
+      if (options?.deadline !== undefined) {
+        const render = renderer(dist); render.ahead = false;
+        const begun = await render.begin(path);
+        if (!options.timer) { await waitForData().catch(e => { begun.dispose(); throw e; }); }
+        const reply = await begun.finish(options.deadline);
+        expect({ status: reply.status, settled: reply.settled }).toEqual({ status: expected, settled: options.settled ?? false });
+        if (!options.timer) { waiting.get(name)(); waiting.delete(name); }
+        if (options.recover) {
+          expiredPages.set(path, reply);
+          seen = new Promise(done => { arrived = found => { if (found === name) { done(); } }; });
+          expect((await page.goto(site.url.origin + path, { waitUntil: 'commit' })).status()).toBe(expected);
+          await waitForData();
+          waiting.get(name)(); waiting.delete(name);
+          await page.waitForFunction(() => document.title === 'Missing');
+        }
+        continue;
+      }
+      let headers = false;
+      const navigation = page.goto(site.url.origin + path, { waitUntil: 'commit' }).then(response => { headers = true; return response; });
+      navigation.catch(() => {});
+      await waitForData();
+      if (waits) {
+        expect(headers, name + ' commits its status after the data answers').toBe(false);
+      } else {
+        expect((await navigation).status(), name + ' sends its head before the data answers').toBe(200);
+      }
+      waiting.get(name)();
+      const response = await navigation;
+      expect(response.status(), name).toBe(expected);
+      if (expected !== 200) { expect(response.headers()['cache-control'], name).toBe('no-store'); }
+      if (expected === 503) { expect(response.headers()['retry-after'], name).toBe('1'); }
+      if (name === 'cachedOk') { expect(response.headers()['cache-control']).toBe('public, max-age=0, s-maxage=60'); }
+      await page.locator('[data-testid="loaded"]').waitFor({ state: 'attached' });
+      expect(await page.locator('[data-testid="loaded"]').textContent()).toBe(name + ' loaded');
+      if (name === 'client') {
+        await page.locator('[data-testid="flip"]').click();
+        await page.waitForFunction(() => document.title === 'Client missing');
+      }
+      waiting.delete(name);
+    }
+  } finally {
+    for (const release of held) { release(); }
+    await browser?.close(); site?.stop(true); api.stop(true);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 120_000);
 
 test('a second navigation root keeps its split list live while its detail supplies the head', async () => {
   if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
@@ -24,9 +646,11 @@ test('a second navigation root keeps its split list live while its detail suppli
     });
     const [status, stdout, stderr] = await Promise.all([build.exited, new Response(build.stdout).text(), new Response(build.stderr).text()]);
     expect({ status, error: status ? stdout + stderr : '' }).toEqual({ status: 0, error: '' });
-    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(req) {
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
       const path = new URL(req.url).pathname;
-      return new Response(Bun.file(resolve(dir, 'dist', path === '/' ? 'index.html' : path.slice(1))));
+      const file = Bun.file(resolve(dir, 'dist', path === '/' ? 'index.html' : path.slice(1)));
+      // (the agent asks a page's /exact.json, a dev envelope this build doesn't write)
+      return await file.exists() ? new Response(file) : new Response('not found', { status: 404 });
     } });
     browser = await open({ host: 'web', url: server.url.href, size: [1000, 900] });
     expect(await browser.carrier.evaluate('document.querySelectorAll("[navigationBack]").length')).toBe(2);
@@ -38,9 +662,10 @@ test('a second navigation root keeps its split list live while its detail suppli
       await browser.clock('settle');
       const wide = width >= 900, copies = (await browser.tree()).nodes.filter(n => n.props.testId === 'list-commit');
       expect(copies).toHaveLength(2);
+      // A covered route is hidden too (LLP 1153 D8), and so is the split's list where the detail covers it.
       const [covered, list] = copies, observed = await browser.op({ op: 'check' });
-      expect({ covered: !!covered.inactive, list: !!list.inactive, checked: observed.items.some(item => item.id === list.id && item.control === 'button') })
-        .toEqual({ covered: true, list: !wide, checked: wide });
+      expect({ covered: [!!covered.inactive, !!covered.hidden], list: [!!list.inactive, !!list.hidden], checked: observed.items.some(item => item.id === list.id && item.control === 'button') })
+        .toEqual({ covered: [true, true], list: [!wide, !wide], checked: wide });
       if (wide) {
         expect((await browser.tree('list-commit', { shallow: true })).nodes[0].id).toBe(list.id);
         await browser.tap('list-commit');
@@ -84,9 +709,11 @@ component SplitDocumentAgent
     });
     const [status, stdout, stderr] = await Promise.all([build.exited, new Response(build.stdout).text(), new Response(build.stderr).text()]);
     expect({ status, error: status ? stdout + stderr : '' }).toEqual({ status: 0, error: '' });
-    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(req) {
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
       const path = new URL(req.url).pathname;
-      return new Response(Bun.file(resolve(dist, path === '/' ? 'index.html' : path === '/a' ? 'a/index.html' : path.slice(1))));
+      const file = Bun.file(resolve(dist, path === '/' ? 'index.html' : path === '/a' ? 'a/index.html' : path.slice(1)));
+      // (the agent asks a page's /exact.json, a dev envelope this build doesn't write)
+      return await file.exists() ? new Response(file) : new Response('not found', { status: 404 });
     } });
     browser = await open({ host: 'web', url: new URL('a', server.url).href, size: [1280, 844] });
     const state = await browser.state();
@@ -143,10 +770,12 @@ component TabsDocument
     const html = readFileSync(resolve(dist, 'index.html'), 'utf8');
     expect(html).toContain('data-testid="bump-a"');
     expect(html).toContain('data-testid="bump-b"');
-    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(req) {
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
       const path = new URL(req.url).pathname;
       // `/b` is served the page rendered for `/`, which selects tab A.
-      return new Response(Bun.file(resolve(dist, path === '/' || path === '/b' ? 'index.html' : path.slice(1))));
+      const file = Bun.file(resolve(dist, path === '/' || path === '/b' ? 'index.html' : path.slice(1)));
+      // (the agent asks a page's /exact.json, a dev envelope this build doesn't write)
+      return await file.exists() ? new Response(file) : new Response('not found', { status: 404 });
     } });
     browser = await open({ host: 'web', url: server.url.href, size: [420, 900] });
     expect(await browser.carrier.evaluate('exact.journal.some(l => l.endsWith("adopted the document"))')).toBe(true);
@@ -169,3 +798,139 @@ component TabsDocument
     await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
   }
 }, 30000);
+
+// LLP 1153 D8 — a flowed paragraph's runs are held off the page while its fragments paint (flow.js), so the tree
+// gives them their paragraph's route flags: hidden under a pushed route, inactive under a sheet.
+test('a flowed paragraph\'s runs keep their route\'s flags', async () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/flow-agent-test-'));
+  let browser, server;
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Flow Agent Test', app: { id: 'test.flow-agent', name: 'Flow Agent Test' }, host: { web: {} } }));
+    writeFileSync(resolve(dir, 'app.contract'), `routes nav
+  home "/"
+    detail "/detail"
+    sheet "/sheet"
+
+component FlowAgent
+  action open(url: string)
+    nav = push(nav, url)
+  action back
+    nav = back(nav)
+  view
+    main navigationKey=\`\${top(nav).id}\` navigationBack="back" width="100%" height="100%"
+      for e in stack(nav) key=e.id
+        column navigationKey=\`\${e.id}\` position="absolute" inset=0 navigationPresentation=(e.name == "sheet" ? "modal" : "auto")
+          if e.name == "home"
+            box display="block" position="relative" width=300 height=160
+              text width=300 height=160 testId="prose"
+                text "Words that flow around a square, " testId="run-a"
+                text "and more words after them." testId="run-b"
+              box position="absolute" left=0 top=0 width=60 height=60 wrap-flow="both"
+            button press=open("/detail") testId="open-detail"
+              text "Detail"
+            button press=open("/sheet") testId="open-sheet"
+              text "Sheet"
+          else
+            button press=back testId=\`back-\${e.name}\`
+              text "Back"
+`);
+    const build = Bun.spawn([process.execPath, 'host/web-js/build.mjs', 'flow-agent-test', '--out', resolve(dir, 'dist'), '--render', 'none'], {
+      cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [status, stdout, stderr] = await Promise.all([build.exited, new Response(build.stdout).text(), new Response(build.stderr).text()]);
+    expect({ status, error: status ? stdout + stderr : '' }).toEqual({ status: 0, error: '' });
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+      const path = new URL(req.url).pathname;
+      const file = Bun.file(resolve(dir, 'dist', path.includes('.') ? path.slice(1) : 'index.html'));
+      return await file.exists() ? new Response(file) : new Response('not found', { status: 404 });
+    } });
+    browser = await open({ host: 'web', url: server.url.href, size: [420, 900] });
+    // The runs are off the page once the flow paints its fragments, which it loads after first paint.
+    const flowed = () => browser.carrier.evaluate('!!document.querySelector(\'[data-testid="prose"] > [data-flow-fragment]\') && !document.querySelector(\'[data-testid="run-a"]\')?.isConnected');
+    for (let at = Date.now(); !await flowed(); await new Promise((r) => setTimeout(r, 50))) if (Date.now() - at > 20000) throw new Error('the paragraph was never flowed');
+    const runs = async () => {
+      const { nodes } = await browser.tree();
+      return ['run-a', 'run-b'].map((id) => nodes.find((n) => n.props.testId === id)).map((n) => [!!n.inactive, !!n.hidden]);
+    };
+    expect(await runs()).toEqual([[false, false], [false, false]]);
+    await browser.tap('open-detail');
+    await browser.clock('settle');
+    expect(await flowed()).toBe(true);
+    expect(await runs()).toEqual([[true, true], [true, true]]);
+    await browser.tap('back-detail');
+    await browser.clock('settle');
+    await browser.tap('open-sheet');
+    await browser.clock('settle');
+    expect(await flowed()).toBe(true);
+    expect(await runs()).toEqual([[true, false], [true, false]]);
+  } finally {
+    await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
+  }
+}, 60000);
+
+for (const render of ['none', 'js']) for (const literal of [false, true]) {
+  test(`${render} navigation preserves ${literal ? 'literal' : 'bound'} inert on its tabs`, async () => {
+    if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+    const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/inert-tabs-test-'));
+    let browser, server;
+    try {
+      writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Inert Tabs', app: { id: 'test.inert-tabs', name: 'Inert Tabs' }, host: { web: {} } }));
+      writeFileSync(resolve(dir, 'app.contract'), `routes nav
+  tab a "/" render=build
+  tab b "/b"
+
+component InertTabs
+  state covered = false
+  action cover
+    covered = not covered
+  action pick(name: string)
+    nav = select(nav, name)
+  view
+    main navigationKey=\`\${top(nav).id}\` width="100%" height="100%" display="flex" flex-direction="column"
+      column flex=1 position="relative"
+        for tab in nav.tabs key=tab.name
+          column role="tabpanel" id=\`panel-\${tab.name}\` position="absolute" inset=0
+            for entry in tab.stack key=entry.id
+              column navigationKey=\`\${entry.id}\` position="absolute" inset=0
+                text entry.name
+      row role="tablist" appearance="none" inert=${literal ? 'true' : 'covered'} testId="tabs"
+        button role="tab" aria-controls="panel-a" aria-selected=(nav.tab == "a") press=pick("a") testId="tab-a"
+          text "A"
+        button role="tab" aria-controls="panel-b" aria-selected=(nav.tab == "b") press=pick("b") testId="tab-b"
+          text "B"
+      button press=cover testId="cover"
+        text "Toggle cover"
+`);
+      const dist = resolve(dir, 'dist');
+      const build = Bun.spawn([process.execPath, 'host/web-js/build.mjs', 'inert-tabs-test', '--out', dist, '--render', render], {
+        cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+      });
+      const [status, stdout, stderr] = await Promise.all([build.exited, new Response(build.stdout).text(), new Response(build.stderr).text()]);
+      expect({ status, error: status ? stdout + stderr : '' }).toEqual({ status: 0, error: '' });
+      server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+        const path = new URL(req.url).pathname;
+        const file = Bun.file(resolve(dist, path === '/' ? 'index.html' : path.slice(1)));
+        return await file.exists() ? new Response(file) : new Response('not found', { status: 404 });
+      } });
+      browser = await open({ host: 'web', url: server.url.href, size: [420, 900] });
+      if (render === 'js') expect(await browser.carrier.evaluate('exact.journal.some(l => l.endsWith("adopted the document"))')).toBe(true);
+      await browser.tap('cover');
+      expect(await browser.carrier.evaluate('document.querySelector("[data-testid=tabs]").inert')).toBe(true);
+      const { x, y } = await browser.carrier.evaluate('(()=>{const r=document.querySelector("[data-testid=tab-b]").getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2}})()');
+      await browser.carrier.call('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
+      await browser.carrier.call('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
+      await browser.clock('settle');
+      expect((await browser.state()).navigation.url).toBe('/');
+      await expect(browser.tap('tab-b')).rejects.toThrow(/hidden or inert/);
+      await browser.tap('cover');
+      expect(await browser.carrier.evaluate('document.querySelector("[data-testid=tabs]").inert')).toBe(literal);
+      if (!literal) {
+        await browser.tap('tab-b');
+        expect((await browser.state()).navigation.url).toBe('/b');
+      }
+    } finally {
+      await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30000);
+}

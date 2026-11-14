@@ -49,13 +49,14 @@ extension NodeView {
     }
 
     /// Whether a press shows the platform's look: a node this host presses,
-    /// with no `-exact-press-scale` written (any value, 1 included, is the
-    /// author's), no `pointerdown` or `pointerup` of its own (the author
-    /// paints its pressed state from those; a `hover` handler replaces
+    /// with no pressed look written (`authorsPress`: a `-exact-press-scale`
+    /// or pressed paint, any value, 1 included, is the author's), no
+    /// `pointerdown` or `pointerup` of its own (the author paints its
+    /// pressed state from those; a `hover` handler replaces
     /// nothing), and not a scrim covering the window. The same test iOS's
     /// dim makes (`platformPressDims`), less a list's rows.
     var platformPressTints: Bool {
-        guard pressable, customPressable, style["press_scale"] == nil,
+        guard pressable, customPressable, !authorsPress,
               !handlers.contains("pointerdown"), !handlers.contains("pointerup") else { return false }
         if let content = window?.contentView {
             let box = convert(bounds, to: nil)
@@ -68,8 +69,11 @@ extension NodeView {
     /// `NSButton` highlights: a layer over the node's views, masked by the
     /// node's own picture as it stands, so it tints the ink and nothing
     /// around it (a card's whole box, a text button's glyphs). The picture
-    /// is the capture's copy of the node's layers, their contents shared: it
-    /// is drawn in the geometry the real ones are, and costs no bitmap.
+    /// is a bitmap of the capture's copy of the node's layers. The copy is
+    /// never committed, and what AppKit draws it draws again rather than
+    /// share AppKit's backing stores: a committed layer sharing one left the
+    /// view blank once the wash was gone and the view next moved, and under
+    /// a page zoom an uncommitted one did as well.
     func tintPress(_ down: Bool) {
         guard let layer else { return }
         let showing = layer.sublayers?.first { $0.name == Self.washName }
@@ -78,14 +82,20 @@ extension NodeView {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        let wash = CALayer(), ink = Capture.paintOrderLayer(of: self, root: layer)
+        let scale = pixelScale ?? layer.contentsScale
+        let tree = Capture.paintOrderLayer(of: self, root: layer, redraw: scale)
+        defer { Capture.releasePaintCopy(tree) }
+        // The copy stands where the node does in its parent: here it is the wash's own box, whole and unshadowed.
+        tree.transform = CATransform3DIdentity
+        tree.opacity = 1; tree.isHidden = false; tree.shadowOpacity = 0; tree.mask = nil
+        guard let picture = Capture.picture(of: tree, size: layer.bounds.size, scale: scale) else { return }
+        let wash = CALayer(), ink = CALayer()
         wash.name = Self.washName
         wash.frame = layer.bounds
         wash.backgroundColor = dark ? CGColor(gray: 1, alpha: Self.pressedWash.dark) : CGColor(gray: 0, alpha: Self.pressedWash.light)
-        // The copy stands where the node does in its parent: here it is the wash's own box, whole and unshadowed.
-        ink.transform = CATransform3DIdentity
         ink.frame = wash.bounds
-        ink.opacity = 1; ink.isHidden = false; ink.shadowOpacity = 0; ink.mask = nil
+        ink.contents = picture
+        ink.contentsScale = scale
         wash.mask = ink
         wash.zPosition = 1 // over the node's own views, whose ranks are thousandths
         layer.addSublayer(wash)

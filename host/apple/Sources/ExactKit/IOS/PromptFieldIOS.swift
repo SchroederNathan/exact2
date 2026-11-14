@@ -8,16 +8,33 @@
 // checks, a keystroke is its `input`, its focus and selection are the
 // input's, and Return is the input's (its key, then its `submit` if it has
 // one, and that is all) before it is the prompt's first action that is not
-// destructive.
+// destructive. UIKit owns the field's class, so its keys are heard with
+// public API alone: a hardware key by a gesture recognizer on the field
+// (`PromptKeys`), which UIKit gives a press before the field, and what a key
+// does by the field's delegate, which refuses the edit or Return of a key a
+// handler prevented. A software keyboard's Backspace is the delegate's
+// deletion before the caret.
 #if os(iOS) || os(tvOS)
 import UIKit
-import ObjectiveC
 
 final class PromptField: NSObject, UITextFieldDelegate {
     private(set) weak var node: NodeView?
     private weak var presenter: Presenter?
     private weak var field: UITextField?
-    private var heard: String?
+    /// The key whose `key` handlers ran as it was pressed: its own edit or
+    /// Return does not run them again (the agent's keys say theirs).
+    var heard: String?
+    /// Whether a handler prevented `heard`: its edit and Return are refused.
+    private var prevented = false
+    struct Snapshot {
+        weak var node: NodeView?
+        let incarnation: UInt64
+        let value: String?
+        let text: String
+        let selection: NSRange?
+    }
+    private var restoring: Snapshot?
+    private var relocating = false
     /// The alert's own delegate for the field, which answers what this does
     /// not.
     private weak var alertDelegate: UITextFieldDelegate?
@@ -25,6 +42,24 @@ final class PromptField: NSObject, UITextFieldDelegate {
     /// prompt's first action that is not destructive (`MenuHost`).
     var returned: (() -> Void)?
     init(_ node: NodeView, presenter: Presenter) { self.node = node; self.presenter = presenter }
+    func snapshot() -> Snapshot? {
+        guard let node = live(), let field else { return nil }
+        return Snapshot(node: node, incarnation: node.incarnation, value: node.props["value"],
+                        text: field.text ?? "", selection: node.liveSelection)
+    }
+    func restore(_ state: Snapshot) {
+        guard let node = live(), node === state.node, node.incarnation == state.incarnation,
+              node.props["value"] == state.value, let field else { return }
+        field.text = state.text
+        restoring = state
+    }
+    func restoreSelection() {
+        defer { restoring = nil }
+        guard let state = restoring, let node = live(), node.incarnation == state.incarnation,
+              node.props["value"] == state.value, field?.text == state.text, let selection = state.selection else { return }
+        // UIKit focuses the prompt during presentation; setting its range earlier is lost.
+        _ = node.showSelection(selection)
+    }
 
     /// Give UIKit's field what the authored one says: its value, placeholder,
     /// name and keyboard (`type`, `inputmode`, `autocomplete`, `autocapitalize`,
@@ -39,10 +74,22 @@ final class PromptField: NSObject, UITextFieldDelegate {
             field.isSecureTextEntry = own.isSecureTextEntry
             field.textContentType = own.textContentType
             field.keyboardType = own.keyboardType
-            field.autocapitalizationType = own.autocapitalizationType
-            field.autocorrectionType = own.autocorrectionType
-            field.spellCheckingType = own.spellCheckingType
-            field.returnKeyType = own.returnKeyType
+            // What the author leaves unsaid stays the alert field's own:
+            // no capitalization, no correction (so no QuickType echo of
+            // its text), and the Return key ↵, not the sentences,
+            // correction and Done an authored field takes. A type that
+            // turns correction off says it.
+            let said = { (name: String) in node.props[name] != nil }
+            let plain = ["email", "url", "password"].contains((node.props["type"] ?? "").lowercased())
+            if said("autocapitalize") || plain { field.autocapitalizationType = own.autocapitalizationType }
+            if said("autocorrect") || plain {
+                // Smart quotes and dashes go with correction (`inputSmartQuotes`).
+                field.autocorrectionType = own.autocorrectionType
+                field.smartQuotesType = own.smartQuotesType
+                field.smartDashesType = own.smartDashesType
+            }
+            if said("spellcheck") { field.spellCheckingType = own.spellCheckingType }
+            if said("enterKeyHint") { field.returnKeyType = own.returnKeyType }
         } else {
             field.placeholder = node.props["placeholder"]
         }
@@ -50,9 +97,10 @@ final class PromptField: NSObject, UITextFieldDelegate {
         field.accessibilityIdentifier = node.props["testId"]
         field.isEnabled = !node.disabled
         node.headerField = field
+        node.applyFieldDirection()
         alertDelegate = field.delegate
         field.delegate = self
-        Self.installKeys(on: field)
+        field.addGestureRecognizer(PromptKeys(self))
         field.addAction(UIAction { [weak self] _ in self?.typed() }, for: .editingChanged)
     }
 
@@ -65,7 +113,10 @@ final class PromptField: NSObject, UITextFieldDelegate {
     }
 
     func textField(_ textField: UITextField, shouldChangeCharactersIn range: NSRange, replacementString string: String) -> Bool {
-        guard let node = live(), node.textField(textField, shouldChangeCharactersIn: range, replacementString: string) else { return false }
+        guard let node = live(), !prevented else { return false }
+        if string.isEmpty, heard != "Backspace", !node.disabled, Self.deletesBackward(textField, range),
+           presenter?.keyDown(at: node, "Backspace") == true { return false }
+        guard node.textField(textField, shouldChangeCharactersIn: range, replacementString: string) else { return false }
         return alertDelegate?.textField?(textField, shouldChangeCharactersIn: range, replacementString: string) ?? true
     }
     func textFieldShouldClear(_ textField: UITextField) -> Bool {
@@ -73,16 +124,18 @@ final class PromptField: NSObject, UITextFieldDelegate {
         return alertDelegate?.textFieldShouldClear?(textField) ?? true
     }
     func textFieldDidBeginEditing(_ textField: UITextField) {
+        presenter?.keyboardPrompt = textField
         alertDelegate?.textFieldDidBeginEditing?(textField)
         if let node = live() { presenter?.focus(node.id) }
     }
     func textFieldDidChangeSelection(_ textField: UITextField) {
         alertDelegate?.textFieldDidChangeSelection?(textField)
         if let node = live() { presenter?.fieldSelections.changed(node) }
+        live()?.applyFieldDirection() // a `direction` that came while it composed (LLP 1001 §1)
     }
     func textFieldDidEndEditing(_ textField: UITextField) {
         alertDelegate?.textFieldDidEndEditing?(textField)
-        live()?.textFieldDidEndEditing(textField) // the `change`, then the blur
+        if !relocating { live()?.textFieldDidEndEditing(textField) } // the `change`, then the blur
     }
     /// Return, one rule on every host (docs/contract-for-agents.md): the
     /// input's `key` handlers first (prevented, nothing more); its `change`;
@@ -91,7 +144,7 @@ final class PromptField: NSObject, UITextFieldDelegate {
     /// that is not destructive (`returned`), not UIKit's preferred action,
     /// which is the author's to draw.
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
-        guard let node = live(), let presenter, !node.disabled else { return false }
+        guard let node = live(), let presenter, !node.disabled, !prevented else { return false }
         if heard != "Enter", presenter.keyDown(at: node, "Enter") { return false }
         return returnHeard(textField)
     }
@@ -120,71 +173,66 @@ final class PromptField: NSObject, UITextFieldDelegate {
         node.typedText(field.text ?? "")
         // The page's value written while text was marked waited (`writeValue`).
         if field.markedTextRange == nil, let held = node.pendingValue { node.writeValue(held, into: field) }
+        node.applyFieldDirection() // a `direction` that came while it composed (LLP 1001 §1)
     }
 
-    private func presses(_ presses: Set<UIPress>, phase: UIPress.Phase) -> Set<UIPress> {
-        if phase != .began { heard = nil }
-        guard let node = live() else { return presses }
+    /// A hardware key at the field, as `PromptKeys` hears it before UIKit
+    /// does: its `key` or `keyup` handlers, and whether one prevented it.
+    func pressed(_ presses: Set<UIPress>, phase: UIPress.Phase) {
+        if phase != .began { heard = nil; prevented = false }
+        guard let node = live() else { return }
         let remaining = node.pressedControls(presses, down: phase == .began)
-        guard !remaining.isEmpty else { return remaining }
+        guard !remaining.isEmpty else { return }
         if phase == .began {
-            if node.editorKeyDown(remaining) { return [] }
             heard = remaining.first?.key.map(NodeView.keyName)
+            prevented = node.editorKeyDown(remaining)
         } else if phase == .ended { node.editorKeyUp(remaining) }
-        return remaining
     }
 
-    private func deleteBackward(_ field: UITextField, perform: () -> Void) {
-        guard let node = live() else { perform(); return }
-        if heard != "Backspace", !node.disabled, presenter?.keyDown(at: node, "Backspace") == true { return }
-        if let selections = presenter?.fieldSelections {
-            selections.nativeEdit(node, replacement: "", marked: field.markedTextRange != nil, perform)
-        } else { perform() }
+    /// A Backspace whose key is already heard (the agent's): UIKit's deletion
+    /// through the input's edit checks, which a keyboard's reaches through
+    /// the delegate and `deleteBackward` alone does not.
+    func deleteBackward(_ field: UITextField) {
+        guard let node = live(), let selections = presenter?.fieldSelections else { return field.deleteBackward() }
+        selections.nativeEdit(node, replacement: "", marked: field.markedTextRange != nil) { field.deleteBackward() }
     }
 
-    /// `addTextField` owns the field's class. Give this instance the same key
-    /// paths as `TextField`, retaining UIKit's implementations as its defaults.
-    /// No ivars or methods on UIKit's classes are changed.
-    private static func installKeys(on field: UITextField) {
-        let base: AnyClass = object_getClass(field)!
-        let name = "ExactPromptKeys_" + NSStringFromClass(base)
-        if let existing = NSClassFromString(name) { object_setClass(field, existing); return }
-        let subclass = objc_allocateClassPair(base, name, 0)!
-        typealias Presses = @convention(c) (UITextField, Selector, NSSet, UIPressesEvent?) -> Void
-        let phases: [(Selector, UIPress.Phase)] = [
-            (#selector(UIResponder.pressesBegan(_:with:)), .began),
-            (#selector(UIResponder.pressesEnded(_:with:)), .ended),
-            (#selector(UIResponder.pressesCancelled(_:with:)), .cancelled),
-        ]
-        for (selector, phase) in phases {
-            let method = class_getInstanceMethod(base, selector)!
-            let original = unsafeBitCast(method_getImplementation(method), to: Presses.self)
-            let replacement: @convention(block) (UITextField, NSSet, UIPressesEvent?) -> Void = { field, presses, event in
-                let values = presses as! Set<UIPress>
-                let remaining = (field.delegate as? PromptField)?.presses(values, phase: phase) ?? values
-                if !remaining.isEmpty { original(field, selector, remaining as NSSet, event) }
-            }
-            class_addMethod(subclass, selector, imp_implementationWithBlock(replacement), method_getTypeEncoding(method))
-        }
-        let selector = #selector(UITextField.deleteBackward)
-        let method = class_getInstanceMethod(base, selector)!
-        typealias Delete = @convention(c) (UITextField, Selector) -> Void
-        let original = unsafeBitCast(method_getImplementation(method), to: Delete.self)
-        let replacement: @convention(block) (UITextField) -> Void = { field in
-            let perform = { original(field, selector) }
-            if let prompt = field.delegate as? PromptField { prompt.deleteBackward(field, perform: perform) }
-            else { perform() }
-        }
-        class_addMethod(subclass, selector, imp_implementationWithBlock(replacement), method_getTypeEncoding(method))
-        objc_registerClassPair(subclass)
-        object_setClass(field, subclass)
+    /// Whether replacing `range` with nothing is Backspace's edit with no
+    /// selection: the text just before the caret. A selection's deletion is
+    /// not told apart from Cut's, so it is not taken for Backspace.
+    private static func deletesBackward(_ field: UITextField, _ range: NSRange) -> Bool {
+        guard range.length > 0, field.markedTextRange == nil, let selection = field.selectedTextRange, selection.isEmpty else { return false }
+        return field.offset(from: field.beginningOfDocument, to: selection.start) == range.location + range.length
     }
 
     /// The alert is going: the edit commits, and the authored field is its
     /// own again.
-    func end() {
-        if let node = live() { presenter?.commitEdit(node.id, node.fieldText, change: node.handlers.contains("change")) }
+    func end(relocating: Bool = false) {
+        self.relocating = relocating
+        heard = nil; prevented = false
+        if !relocating, let node = live() { presenter?.commitEdit(node.id, node.fieldText, change: node.handlers.contains("change")) }
         if let node, node.headerField === field { node.headerField = nil }
     }
+}
+
+/// Hears a hardware key at a prompt's field before UIKit's field does, and
+/// takes nothing from it: it recognizes no gesture, delays and cancels no
+/// press, and prevents no other recognizer. A prevented key is refused where
+/// it would act, at the field's delegate (`PromptField`).
+final class PromptKeys: UIGestureRecognizer {
+    private weak var prompt: PromptField?
+    init(_ prompt: PromptField) {
+        self.prompt = prompt
+        super.init(target: nil, action: nil)
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+    }
+    override func shouldReceive(_ event: UIEvent) -> Bool { event.type == .presses }
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent) { prompt?.pressed(presses, phase: .began) }
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent) { prompt?.pressed(presses, phase: .ended) }
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent) { prompt?.pressed(presses, phase: .cancelled) }
 }
 #endif

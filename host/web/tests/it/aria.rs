@@ -25,7 +25,7 @@ fn aria_modal_is_the_html_attribute() {
 #[test]
 fn form_states_and_haspopup_are_the_html_attributes() {
     let plan = contract::compile(
-        "component App\n  view\n    column\n      input aria-invalid=true aria-required=true aria-describedby=\"err\" testId=\"email\"\n      text \"Wrong\" id=\"err\"\n      button aria-haspopup=\"menu\" testId=\"menu\"\n        text \"File\"\n      button aria-current=\"page\" testId=\"home\"\n        text \"Home\"\n",
+        "component App\n  view\n    column\n      input aria-invalid=true aria-required=true aria-describedby=\"err\" testId=\"email\"\n      text \"Wrong\" id=\"err\"\n      button aria-haspopup=\"menu\" testId=\"menu\"\n        text \"File\"\n      button aria-current=\"page\" testId=\"home\"\n        text \"Home\"\n      text \"Name\" role=\"columnheader\" aria-sort=\"ascending\"\n",
     )
     .unwrap();
     let (_host, batch) = Host::boot(
@@ -41,6 +41,7 @@ fn form_states_and_haspopup_are_the_html_attributes() {
         "\"aria-describedby\":\"err\"",
         "\"aria-haspopup\":\"menu\"",
         "\"aria-current\":\"page\"",
+        "\"aria-sort\":\"ascending\"",
     ] {
         assert!(batch.contains(attr), "{attr} in {batch}");
     }
@@ -173,4 +174,26 @@ fn headings_are_heading_elements_and_a_level_alone_is_not() {
     // The role is the author's: four headings wrote one, and the host adds
     // none to the level that has none.
     assert_eq!(batch.matches("\"role\":\"heading\"").count(), 4, "{batch}");
+}
+
+/// A role an element has natively is not restated (ARIA in HTML): a single
+/// `select` is a combobox already, and a restated one makes an accessibility
+/// checker demand the `aria-expanded` a native control never carries (LLP
+/// 1153 §1, the Pokédex runs' accessibility score). A role an element lacks
+/// stays.
+#[test]
+fn a_native_elements_own_role_is_not_restated() {
+    let plan = contract::compile(
+        "component App\n  state v = \"a\"\n  action pick(s: string)\n    v = s\n  view\n    column\n      select value=v change=pick testId=\"kind\"\n        option value=\"a\"\n          text \"A\"\n      button press=pick(\"b\") role=\"radio\" aria-checked=true testId=\"b\"\n        text \"B\"\n",
+    )
+    .unwrap();
+    let (_host, batch) = Host::boot(
+        &plan.encode(),
+        caltrain_data::Caltrain,
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    assert!(!batch.contains("\"role\":\"combobox\""), "{batch}");
+    assert!(batch.contains("\"role\":\"radio\""), "{batch}");
 }

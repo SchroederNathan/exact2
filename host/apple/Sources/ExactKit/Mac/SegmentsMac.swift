@@ -137,7 +137,7 @@ final class SegmentHost {
         let natural = control.intrinsicContentSize
         var size = CGSize(width: max(natural.width, 1), height: natural.height)
         // The padding and border around the content box layout sent
-        if owner.style["box_sizing"]?.string == "border-box" { size.height += owner.bounds.height - owner.contentBox().height }
+        if owner.style["box_sizing"]?.string == "border-box" { size.height += owner.layoutBounds.height - owner.contentBox().height }
         guard size.width.isFinite, size.height.isFinite, size.height > 0, sizes[owner.id] != size else { return }
         sizes[owner.id] = size
         report(owner, size)
@@ -165,7 +165,7 @@ final class SegmentHost {
         // nor a header's that the window's toolbar shows as its own group (D2).
         let owners = (presenter.carrying("role:tablist") + presenter.carrying("role:radiogroup")).filter {
             $0.props["accessibilityOrientation"] != "vertical" && !presenter.sidebar.adopts($0) && !presenter.toolbar.adopts($0) &&
-                !($0.props["accessibilityRole"] == "tablist" && $0.wrote("appearance") && $0.style["appearance"]?.string == "none")
+                !($0.wrote("appearance") && $0.style["appearance"]?.string == "none")
         }
         let live = Set(owners.map(\.id))
         for id in Array(controls.keys) where !live.contains(id) { restore(owner: id) }
@@ -186,6 +186,7 @@ final class SegmentHost {
                 decide(owner, unshown.map { "kept as authored: \(member) #\($0.id) is not one image or its label alone, which a segment cannot show" } ?? "kept as authored: fewer than two pressable \(member)s")
                 continue
             }
+            for tab in tabs { tab.rejectNativeActiveProperties(on: "NSSegmentedControl") }
             decide(owner, "projected to NSSegmentedControl (\(tabs.count) segments)")
             let ids = tabs.map(\.id)
             if members[owner.id] != ids {
@@ -212,7 +213,8 @@ final class SegmentHost {
             for (index, tab) in tabs.enumerated() {
                 if case .image(let icon)? = tab.segmentFace {
                     // Keep the native accessibility description even with no glyph.
-                    let image = (icon.image?.copy() as? NSImage) ?? NSImage(size: NSSize(width: 1, height: 1))
+                    // A symbol in the control's tint, not the page's ink (`faceImage`).
+                    let image = (icon.faceImage?.copy() as? NSImage) ?? NSImage(size: NSSize(width: 1, height: 1))
                     if icon.bounds.width > 0, icon.bounds.height > 0 { image.size = icon.bounds.size }
                     image.accessibilityDescription = tab.accessibleName
                     control.setImage(image, forSegment: index)
@@ -221,7 +223,7 @@ final class SegmentHost {
                     control.setToolTip(tab.accessibleName, forSegment: index)
                 } else if case .symbol(let name)? = tab.segmentFace {
                     // A native tab's symbol, carrying its label (LLP 1069.011.000 D4).
-                    let image = NSImage(systemSymbolName: name, accessibilityDescription: tab.accessibleName)
+                    let image = FaceSymbol.image(name, accessibilityDescription: tab.accessibleName)
                         ?? NSImage(size: NSSize(width: 1, height: 1))
                     image.accessibilityDescription = tab.accessibleName
                     control.setImage(image, forSegment: index)

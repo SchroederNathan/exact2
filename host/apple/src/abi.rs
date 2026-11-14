@@ -9,11 +9,12 @@
 //! Every export takes a runtime handle (LLP 1031 D2): `exact_create` returns
 //! a never-reused `u32` from the thread-local [`Registry`], never a pointer.
 //! Invalid/destroyed handles are refused; `exact_destroy` frees the session.
-//! Calls stay on the thread that created the runtime: on Apple, ExactKit's
-//! owner thread (LLP 1072 T1). Re-entrant calls return a `busy`
-//! batch instead of trapping. [`host!`] exports one app's source and baked plan;
+//! Calls stay on their runtime's creating thread: ExactKit's owner thread on Apple (LLP 1072 T1).
+//! Re-entrant calls return `busy` instead of trapping. [`host!`] exports one app's source and baked plan;
 //! each process links one app archive because the C names are fixed.
 mod control_text;
+mod navigation;
+mod share;
 use crate::host::{Host, PlanBytes};
 use crate::measure::{install_fonts, CallbackMeasurer, FontsFn, MeasureFn};
 use exact_kernel::{MonospaceMeasurer, TextMeasurer};
@@ -23,40 +24,8 @@ use exact_runner::{
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::rc::Rc;
-/// What the presenter hands the library at boot: the text measurer (LLP
-/// 1008 §3) and the wake for a request's reply (LLP 1016 D2), each with an
-/// opaque context the library passes back untouched.
-#[derive(Clone, Copy)]
-pub struct Hooks {
-    /// Measures a paragraph; `None` for the monospace reference measurer.
-    pub measure: Option<MeasureFn>,
-    /// Passed back to `measure` and `lines`.
-    pub ctx: *mut c_void,
-    /// A paragraph's line boxes (LLP 1093 D6); `None` keeps paragraphs whole.
-    pub lines: Option<crate::measure::LinesFn>,
-    /// Called on the executor's thread when a reply is queued; `None`: replies wait for `exact_pump`.
-    pub wake: Option<crate::executor::WakeFn>,
-    /// Passed back to `wake`.
-    pub wake_ctx: *mut c_void,
-    /// Measures a Canvas 2D run with Core Text (LLP 1056 D8), with `ctx`.
-    pub canvas_text: Option<crate::canvas_text::CanvasTextFn>,
-    /// Measures a system symbol (`TextMeasurer::symbol_size`), with `ctx`.
-    pub symbol: Option<crate::measure::SymbolFn>,
-}
-impl Hooks {
-    /// No callbacks: the reference measurer, and replies on `pump` only.
-    pub const fn none() -> Hooks {
-        Hooks {
-            measure: None,
-            ctx: std::ptr::null_mut(),
-            lines: None,
-            wake: None,
-            wake_ctx: std::ptr::null_mut(),
-            canvas_text: None,
-            symbol: None,
-        }
-    }
-}
+mod hooks;
+pub use hooks::Hooks;
 /// The buffers and the host behind the exports.
 pub struct Bridge<D: DataSource> {
     document_owner: u64,
@@ -100,22 +69,18 @@ pub struct Bridge<D: DataSource> {
     /// boots: a runner booted later lays out its first frame with them, not
     /// with a mouse's defaults and then again.
     preferences: exact_runner::Preferences,
+    launch_layout: crate::host::LaunchLayout,
     /// The date and place last told before a boot (`set_launch_time`,
     /// `set_launch_place`): a runner booted later reads them from its first settle.
     launch_facts: exact_runner::time::Launch,
+    /// A share claimed before the boot, and whether its files move from an inbox (`share_land`).
+    cold_share: Option<(exact_runner::share_in::Claimed, bool)>,
     /// The host's live clock while it owns time, kept for every boot (`set_live_clock`)
     live_clock: Option<LiveClockFn>,
+    wait_kinds: u8,
+    native_timers: bool,
     input: Vec<u8>,
     output: Vec<u8>,
-}
-
-struct PreparedHost<D: DataSource> {
-    host: Host<D>,
-    batch: String,
-    bindings: Option<ibex2::host::Bindings>,
-    hooks: Hooks,
-    module: bool,
-    let_go: bool,
 }
 
 fn not_booted() -> String {
@@ -156,8 +121,12 @@ impl<D: DataSource> Bridge<D> {
             pan: crate::pan_velocity::PanVelocity::new(),
             canvas_deferred: false,
             preferences: exact_runner::Preferences::NONE,
+            launch_layout: crate::host::LaunchLayout::NONE,
             launch_facts: exact_runner::time::Launch::NONE,
+            cold_share: None,
             live_clock: None,
+            wait_kinds: 0,
+            native_timers: false,
             input: Vec::new(),
             output: Vec::new(),
         }
@@ -278,7 +247,12 @@ impl<D: DataSource> Bridge<D> {
             if !h.runner_mut().intersect_due().is_empty() {
                 x.notify();
             }
+            // An app's aborted fetches first (any method), then what the runner let go.
+            x.cancel(&h.runner_mut().take_explicit_aborts());
             x.forget(&|ticket| h.runner().holds(ticket));
+            // Of the uploads it let go, which had begun to go out (LLP 1016.000 D10).
+            let started = x.let_go_started(&|ticket| h.runner().holds(ticket));
+            h.runner_mut().uploads_started(&started);
             if !h.has_ordered_request_refusals() {
                 for (ticket, reason) in x.resume_ordered() {
                     h.refuse_request(ticket, reason, true);
@@ -289,9 +263,20 @@ impl<D: DataSource> Bridge<D> {
             let mut presenter = crate::batch::Batch::new();
             Self::auth_forgotten(h, &mut presenter);
             for r in h.take_requests() {
-                // A deadline the auth and surface paths can't keep: the executor refuses it, fencing ordered work.
-                if r.request.timeout_refusal().is_some() {
+                // A deadline the auth and surface paths can't keep, or a long poll on work that is no HTTP
+                // request (LLP 1016.000 D8): the executor refuses it, fencing ordered work.
+                if r.request
+                    .timeout_refusal()
+                    .or(r.request.long_poll_refusal())
+                    .is_some()
+                {
                     Self::run_dispatch(h, x, parked, r, exact_runner::Dispatch::Missing);
+                    continue;
+                }
+                if r.request.url == "exact-activity:" {
+                    if let Ok(request) = std::str::from_utf8(&r.request.body) {
+                        presenter.activity(r.ticket, request);
+                    }
                     continue;
                 }
                 if r.request.is_auth() {
@@ -320,6 +305,11 @@ impl<D: DataSource> Bridge<D> {
                     Self::run_dispatch(h, x, parked, r, dispatch);
                 }
             }
+            // An abort made in this batch's turns is answered at the next pump: wake it.
+            if h.runner_mut().collected_aborts() {
+                x.notify();
+            }
+            presenter.presences(h.runner_mut().take_presence_asks());
             h.runner_mut().publish_sockets(|batch| x.socket(batch)); // LLP 1016.000 D7
             presenter.prepend_to(&mut s);
         }
@@ -352,46 +342,6 @@ impl<D: DataSource> Bridge<D> {
             h.refuse_request(ticket, reason, ordered);
             x.notify();
         }
-    }
-
-    /// The executor's queued outcomes into the runner (LLP 1016 D2): the
-    /// presenter calls this on its thread after the wake; the output is the
-    /// batch of every reply's commit.
-    pub fn pump(&mut self, now_ms: f64) -> u32 {
-        self.refusal_turn = !self.refusal_turn;
-        let outcomes = match (self.host.as_mut(), self.executor.as_deref()) {
-            (Some(host), Some(executor)) => {
-                executor.begin_pump();
-                let mut outcomes = if self.refusal_turn {
-                    host.take_request_refusal(executor.ordered_idle())
-                        .into_iter()
-                        .map(|(ticket, outcome)| (ticket, outcome, None))
-                        .collect()
-                } else {
-                    executor.drain()
-                };
-                if outcomes.is_empty() {
-                    outcomes = if self.refusal_turn {
-                        executor.drain()
-                    } else {
-                        host.take_request_refusal(executor.ordered_idle())
-                            .into_iter()
-                            .map(|(ticket, outcome)| (ticket, outcome, None))
-                            .collect()
-                    };
-                }
-                if host.has_request_refusals(executor.ordered_idle()) {
-                    executor.notify();
-                }
-                outcomes
-            }
-            _ => vec![],
-        };
-        let out = match self.host.as_mut() {
-            Some(h) => h.fulfill_all(outcomes, now_ms),
-            None => not_booted(),
-        };
-        self.emit(out)
     }
 
     /// Whether the current runner still owns a presenter-work ticket.
@@ -511,8 +461,7 @@ impl<D: DataSource> Bridge<D> {
         }
         let measurer: Box<dyn TextMeasurer> = match hooks.measure {
             Some(f) => Box::new(
-                CallbackMeasurer::new(f, hooks.ctx, hooks.lines)
-                    .with_symbol(hooks.symbol)
+                CallbackMeasurer::of(f, &hooks)
                     .with_field_chrome(self.field_chrome)
                     .with_button_measure(self.button_measure)
                     .with_measure_revision(
@@ -535,6 +484,7 @@ impl<D: DataSource> Bridge<D> {
             snapshot,
             secrets,
             unbound,
+            presence,
         } = match self.links.io {
             Some(io) => (io.endow)(data.grants(), data.app_id(), true),
             None => crate::store::Endowed::none(),
@@ -542,13 +492,16 @@ impl<D: DataSource> Bridge<D> {
         let fonts = self.fonts;
         let fonts_ctx = self.fonts_ctx;
         let control_text = self.control_text;
+        let native_timers = self.native_timers;
+        let wall = self.live_clock;
         let ctx = hooks.ctx;
-        let launch = self.launch_facts.clone();
+        let launch = self.launch();
         match exact_runner::time::launching_with(launch, || {
             Host::boot_stored_after_decode(
                 plan,
                 data,
                 measurer,
+                self.launch_layout,
                 self.boot_viewport(width, height),
                 None,
                 snapshot,
@@ -562,6 +515,10 @@ impl<D: DataSource> Bridge<D> {
                 self.links.clone(),
                 fonts.map(|callback| (callback, fonts_ctx)),
                 move |runner| {
+                    if native_timers {
+                        runner.use_native_timers(true);
+                        runner.set_live_clock(wall.map(preferences::sampler));
+                    }
                     if let Some(callback) = fonts {
                         let stacks = runner.runtime_font_stacks();
                         install_fonts(runner.plan(), &stacks, callback, fonts_ctx);
@@ -573,6 +530,9 @@ impl<D: DataSource> Bridge<D> {
             Ok((mut host, batch)) => {
                 if let Some(why) = unbound {
                     host.log(&format!("{why}; every request is refused"));
+                }
+                if let Some((backend, keystore)) = presence {
+                    host.runner_mut().install_presence(backend, keystore);
                 }
                 host.commit_boot();
                 let executor = self.links.io.map(|io| {
@@ -626,9 +586,14 @@ impl<D: DataSource> Bridge<D> {
     }
 
     /// The app module announced `topic` (LLP 1016.002): the live source's
-    /// watching answers are asked again.
+    /// watching answers are asked again. An `app:/` topic is a file the
+    /// module wrote (`ExactModuleContext.wrote`): the commit reports a
+    /// storage change too, so a widget reloads as after a TypeScript write.
     pub fn app_changed(&mut self, topic: &str) {
-        if let Some(host) = &self.host {
+        if let Some(host) = &mut self.host {
+            if topic.starts_with("app:/") {
+                host.runner_mut().data().note_storage_changed();
+            }
             host.native_slot().changed(topic);
         }
     }
@@ -641,6 +606,17 @@ impl<D: DataSource> Bridge<D> {
         }
     }
 
+    /// The presenter has painted this session: evaluate the deferred logic
+    /// without committing it (`Host::prepare_data`); `data_ready` commits.
+    pub fn prepare_data(&mut self) {
+        if self.host.is_none() {
+            return;
+        }
+        self.painted = true;
+        self.adopt_app_module();
+        self.host.as_mut().expect("checked").prepare_data();
+    }
+
     /// The presenter has painted this session; deferred logic can now load.
     pub fn data_ready(&mut self) -> u32 {
         if self.host.is_none() {
@@ -649,6 +625,15 @@ impl<D: DataSource> Bridge<D> {
         self.painted = true;
         self.adopt_app_module();
         let out = self.host.as_mut().expect("checked").activate_data();
+        self.emit(out)
+    }
+
+    /// A peer published a store revision; first-pixel activation remains separate.
+    pub fn store_changed(&mut self, retry_only: bool) -> u32 {
+        let out = match &mut self.host {
+            Some(host) => host.refresh_store_after(retry_only),
+            None => not_booted(),
+        };
         self.emit(out)
     }
 
@@ -756,8 +741,9 @@ impl<D: DataSource> Bridge<D> {
         // The real candidate remains deferred through all-session acceptance.
         // After commit, its paint receipt configures storage before activation
         // and data_ready refreshes its baked/kept external-reading resources.
-        let length =
-            self.prepare_plan_carried(plan_len, data, hooks, width, height, delivery, validated);
+        let length = self.prepare_plan_carried(
+            plan_len, data, hooks, width, height, delivery, validated, None,
+        );
         if let Some(prepared) = &mut self.prepared {
             prepared.module = true;
             prepared.let_go = let_go;
@@ -788,11 +774,11 @@ impl<D: DataSource> Bridge<D> {
         height: f32,
         delivery: Option<exact_runner::Delivery>,
     ) -> u32 {
-        self.prepare_plan_carried(len, data, hooks, width, height, delivery, None)
+        self.prepare_plan_carried(len, data, hooks, width, height, delivery, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare_plan_carried(
+    pub(super) fn prepare_plan_carried(
         &mut self,
         len: usize,
         mut data: D,
@@ -801,6 +787,7 @@ impl<D: DataSource> Bridge<D> {
         height: f32,
         delivery: Option<exact_runner::Delivery>,
         carried: Option<exact_runner::Carried>,
+        entry: Option<&str>,
     ) -> u32 {
         if let Some(refusal) = self.refuse_analysis() {
             return refusal;
@@ -813,8 +800,7 @@ impl<D: DataSource> Bridge<D> {
         let carried = carried.or_else(|| self.host.as_ref().map(Host::carry));
         let measurer: Box<dyn TextMeasurer> = match hooks.measure {
             Some(f) => Box::new(
-                CallbackMeasurer::new(f, hooks.ctx, hooks.lines)
-                    .with_symbol(hooks.symbol)
+                CallbackMeasurer::of(f, &hooks)
                     .with_field_chrome(self.field_chrome)
                     .with_button_measure(self.button_measure)
                     .with_measure_revision(
@@ -833,6 +819,7 @@ impl<D: DataSource> Bridge<D> {
             snapshot,
             secrets,
             unbound,
+            presence,
         } = match self.links.io {
             Some(io) => (io.endow)(data.grants(), data.app_id(), carried.is_none()),
             None => crate::store::Endowed::none(),
@@ -840,13 +827,16 @@ impl<D: DataSource> Bridge<D> {
         let fonts = self.fonts;
         let fonts_ctx = self.fonts_ctx;
         let control_text = self.control_text;
+        let native_timers = self.native_timers;
+        let wall = self.live_clock;
         let ctx = hooks.ctx;
-        let launch = self.launch_facts.clone();
+        let launch = self.launch();
         match exact_runner::time::launching_with(launch, || {
             Host::boot_stored_after_decode(
-                PlanBytes::Copied(&plan),
+                PlanBytes::input(&plan, entry),
                 data,
                 measurer,
+                self.launch_layout,
                 self.boot_viewport(width, height),
                 carried.as_ref(),
                 snapshot,
@@ -860,6 +850,10 @@ impl<D: DataSource> Bridge<D> {
                 self.links.clone(),
                 fonts.map(|callback| (callback, fonts_ctx)),
                 move |runner| {
+                    if native_timers {
+                        runner.use_native_timers(true);
+                        runner.set_live_clock(wall.map(preferences::sampler));
+                    }
                     if let Some(callback) = fonts {
                         let stacks = runner.runtime_font_stacks();
                         install_fonts(runner.plan(), &stacks, callback, fonts_ctx);
@@ -872,6 +866,9 @@ impl<D: DataSource> Bridge<D> {
                 if let Some(why) = unbound {
                     host.log(&format!("{why}; every request is refused"));
                 }
+                if let Some((backend, keystore)) = presence {
+                    host.runner_mut().install_presence(backend, keystore);
+                }
                 self.output = batch.as_bytes().to_vec();
                 self.prepared = Some(PreparedHost {
                     host,
@@ -880,20 +877,11 @@ impl<D: DataSource> Bridge<D> {
                     hooks,
                     module: false,
                     let_go: false,
+                    carried_from: self.host.as_ref().map(Host::carry),
                 });
                 self.output.len() as u32
             }
             Err(e) => self.prepare_error(&format!("boot: {e:?}")),
-        }
-    }
-
-    /// Prepare and commit a single session's plan replacement.
-    pub fn boot_plan(&mut self, len: usize, data: D, hooks: Hooks, width: f32, height: f32) -> u32 {
-        let len = self.prepare_plan(len, data, hooks, width, height);
-        if self.prepared.is_some() {
-            self.commit_plan()
-        } else {
-            len
         }
     }
 
@@ -921,17 +909,20 @@ impl<D: DataSource> Bridge<D> {
     /// Commit the already-accepted candidate, without decoding or laying it
     /// out again. The app calls this only after every session prepared.
     pub fn commit_plan(&mut self) -> u32 {
-        let module = self
-            .prepared
-            .as_ref()
-            .is_some_and(|c| c.module && !c.let_go);
-        if module && self.host.as_ref().is_some_and(|h| h.runner().has_pending()) {
-            return self.refuse_pending();
+        if let Some(refusal) = self.preparation_refusal() {
+            return refusal;
         }
         let Some(mut candidate) = self.prepared.take() else {
             return self.prepare_error("no prepared plan");
         };
         candidate.host.commit_boot();
+        // The old executor lets go of everything, then says which uploads had
+        // begun to go out; the rest never left (LLP 1016.000 D10).
+        if let Some(old) = self.executor.as_deref() {
+            old.forget(&|_| false);
+            let started = old.let_go_started(&|_| false);
+            candidate.host.runner_mut().uploads_started(&started);
+        }
         let executor = self.links.io.map(|io| {
             (io.start)(
                 candidate.bindings,
@@ -1027,8 +1018,10 @@ impl<D: DataSource> Bridge<D> {
             // beforeunload, wheel and drop, and a text field's `input`,
             // `change` and `select` with its selection (x2apps codeedit #2),
             // replacement input (48), a key's down (6), up (43) and capture (44) with its code and repeat
-            // toggle (50), focusin (46) and focusout (47) with their targets, and scrollend (51) (`Event::of_host_kind`).
-            6 | 10 | 13 | 19 | 20 | 21 | 28..=38 | 40..=44 | 46..=48 | 50..=54 => {
+            // toggle (50), focusin (46) and focusout (47) with their targets, scrollend (51),
+            // a file drag's enter (55) and leave (56), a paste with files (57), an iframe's record (58), an atom's press (59),
+            // the history swipe the Mac tracks (60) (`Event::of_host_kind`).
+            6 | 10 | 13 | 19 | 20 | 21 | 28..=38 | 40..=44 | 46..=48 | 50..=60 => {
                 match Event::of_host_kind(kind, &payload) {
                     Ok(event) => event,
                     Err(error) => return self.refuse(error),
@@ -1072,16 +1065,6 @@ impl<D: DataSource> Bridge<D> {
         };
         let out = match self.host.as_mut() {
             Some(h) => h.dispatch_at(view, event, now_ms),
-            None => not_booted(),
-        };
-        self.emit(out)
-    }
-
-    /// `exact_host_back`: the platform's own Back from visit `id` (LLP 1115
-    /// D5), a batch.
-    pub fn host_back(&mut self, id: u64, now_ms: f64) -> u32 {
-        let out = match self.host.as_mut() {
-            Some(h) => h.host_back(id, now_ms),
             None => not_booted(),
         };
         self.emit(out)
@@ -1220,7 +1203,7 @@ impl<D: DataSource> Bridge<D> {
     /// `then`s already armed, the clock unmoved (an agent's input's end).
     pub fn advance(&mut self, now_ms: f64, mode: u32) -> u32 {
         let out = self.host.as_mut().map_or_else(not_booted, |h| match mode {
-            2 => h.land_then(),
+            2 | 3 => h.land_then(mode == 3),
             1 => h.advance_until_request(now_ms),
             _ => h.advance(now_ms),
         });
@@ -1228,12 +1211,6 @@ impl<D: DataSource> Bridge<D> {
     }
 
     /// Whether the display drives frame tasks (LLP 1073 D4).
-    pub fn present_frames(&mut self, on: bool) {
-        if let Some(h) = self.host.as_mut() {
-            h.present_frames(on);
-        }
-    }
-
     /// A presented display frame (LLP 1073 D5).
     pub fn frame(&mut self, now_ms: f64) -> u32 {
         let out = self
@@ -1270,30 +1247,27 @@ impl<D: DataSource> Bridge<D> {
 
     /// The viewport changed.
     pub fn resize(&mut self, width: f32, height: f32) -> u32 {
+        let observed = self.live_clock.map(|clock| clock());
         let out = self
             .host
             .as_mut()
-            .map_or_else(not_booted, |h| h.resize(width, height));
+            .map_or_else(not_booted, |h| match observed {
+                Some(now) => h.resize_at(width, height, now),
+                None => h.resize(width, height),
+            });
         self.emit(out)
     }
 
-    /// The root font size in points (LLP 1069.000 D3): a relayout.
-    pub fn set_root_font_size(&mut self, px: f64) -> u32 {
+    /// A placement root's margins and its width's authorship (LLP 1126.001
+    /// WP10): a measurement, written to the output as it is, with no batch
+    /// around it (`emit` prepends the presenter's pending ops to a batch).
+    pub fn placement_box(&mut self, view: u32) -> u32 {
         let out = self
             .host
             .as_mut()
-            .map_or_else(not_booted, |h| h.set_root_font_size(px));
-        self.emit(out)
-    }
-
-    /// The display's scale (LLP 1115.000 D10.3): a relayout where a row is a
-    /// hairline.
-    pub fn set_display_scale(&mut self, scale: f64) -> u32 {
-        let out = self
-            .host
-            .as_mut()
-            .map_or_else(not_booted, |h| h.set_display_scale(scale));
-        self.emit(out)
+            .map_or_else(not_booted, |h| h.placement_box(view));
+        self.output = out.into_bytes();
+        self.output.len() as u32
     }
 
     /// The page's facts changed or became known (LLP 1069.000 D2): bit 0
@@ -1309,7 +1283,7 @@ impl<D: DataSource> Bridge<D> {
 
     /// The locale and time zone, as `locale NUL timeZone` in the input buffer.
     pub fn set_place(&mut self, len: usize) -> u32 {
-        // `locale NUL timeZone`, then `NUL seed` at launch.
+        // `locale NUL timeZone`, then `NUL seed` and `NUL formatLocale`.
         let text = std::str::from_utf8(&self.input[..len.min(self.input.len())]).unwrap_or("");
         let mut fields = text.split('\0');
         let (Some(locale), Some(zone)) = (fields.next(), fields.next()) else {
@@ -1317,10 +1291,9 @@ impl<D: DataSource> Bridge<D> {
         };
         let seed = fields.next().and_then(|s| s.parse::<f64>().ok());
         let (locale, zone) = (locale.to_owned(), zone.to_owned());
-        let out = self
-            .host
-            .as_mut()
-            .map_or_else(not_booted, |h| h.set_place(&locale, &zone, seed));
+        let out = self.host.as_mut().map_or_else(not_booted, |h| {
+            h.set_place(&locale, &zone, seed, fields.next())
+        });
         self.emit(out)
     }
 
@@ -1468,8 +1441,13 @@ fn escape(s: &str) -> String {
 /// A thread-local bridge cell, for the exports.
 pub type Cell<D> = RefCell<Bridge<D>>;
 
+mod boot;
+use boot::PreparedHost;
 mod colors;
+mod preparation;
+mod pump;
 mod registry;
+mod snapshot;
 #[cfg(test)]
 use registry::REFUSAL;
 pub use registry::{refusal_ptr, with_entry, with_runtime, Entry, Registry};

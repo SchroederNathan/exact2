@@ -138,7 +138,9 @@ fn env_lengths_parse_by_the_css_grammar_and_resolve_against_the_environment() {
 
 #[test]
 fn defaults_are_the_css_defaults() {
+    assert!(std::mem::size_of::<taffy::Style>() <= 304);
     let s = StyleProps::default().to_taffy(NodeType::View, &Env::default());
+    assert!(s.rare.is_initial());
     assert_eq!(s.display, taffy::style::Display::Block);
     assert_eq!(s.box_sizing, taffy::style::BoxSizing::ContentBox);
     assert_eq!(s.flex_direction, taffy::style::FlexDirection::Row);
@@ -407,9 +409,16 @@ fn grid_tracks_lower_to_engine_tracks() {
     ]);
     p.rare.grid_row = GridPlacement::from_lines(GridLine::Line(1), GridLine::Span(2));
     let s = p.to_taffy(NodeType::View, &Env::default());
-    assert_eq!(s.grid_template_columns.len(), 3);
-    assert_eq!(s.grid_row.start, line(1));
-    assert_eq!(s.grid_row.end, span(2));
+    assert_eq!(s.rare.grid_template_columns.len(), 3);
+    assert_eq!(s.rare.grid_row.start, line(1));
+    assert_eq!(s.rare.grid_row.end, span(2));
+    assert!(!s.rare.is_initial());
+    p.rare.grid_template_columns = GridTracks::default();
+    p.rare.grid_row = GridPlacement::default();
+    assert!(p
+        .to_taffy(NodeType::View, &Env::default())
+        .rare
+        .is_initial());
 }
 
 /// Content regions check padding and border without the engine's style;
@@ -915,5 +924,27 @@ fn takes_text_is_what_set_dynamic_reads_on_a_number_row() {
         StyleId::StrokeWidth,
     ] {
         assert!(takes_text(row), "{row:?}");
+    }
+}
+
+#[test]
+fn clip_keeps_content_minimums_without_becoming_a_scroll_container() {
+    use taffy::Overflow as O;
+    for (x, y, expected) in [
+        ("clip", "clip", (O::Clip, O::Clip)),
+        ("clip", "visible", (O::Clip, O::Visible)),
+        ("visible", "clip", (O::Visible, O::Clip)),
+        ("clip", "hidden", (O::Hidden, O::Hidden)),
+        ("auto", "clip", (O::Scroll, O::Hidden)),
+    ] {
+        let mut style = StyleProps::default();
+        style
+            .set_dynamic(StyleId::OverflowX, &StyleValue::Text(x.into()))
+            .unwrap();
+        style
+            .set_dynamic(StyleId::OverflowY, &StyleValue::Text(y.into()))
+            .unwrap();
+        let layout = style.to_taffy(NodeType::View, &Env::default());
+        assert_eq!((layout.overflow.x, layout.overflow.y), expected);
     }
 }

@@ -5,14 +5,16 @@
   "id": "com.exact.duolab",
   "start_url": "/",
   "display": "standalone",
-  "theme_color": "#f4f1ea",
-  "background_color": "#f4f1ea",
+  "icons": [{ "src": "assets/icon.png", "sizes": "1024x1024", "type": "image/png" }],
   "app": {
     "id": "com.exact.duolab",
     "name": "Duo Lab"
   },
+  "data": ["keyboard-screen", "focus-on-show", "pane-layout"],
+  "hatches": { "keyboard-field": ["ios"], "keyboard-route": ["ios"], "arranged-panes": ["ios"] },
   "host": {
     "ios": {
+      "icon": "art/DuoLab.icon",
       "minimumOS": "17.0",
       "deviceFamily": [
         "iphone",
@@ -20,6 +22,7 @@
       ]
     },
     "macos": {
+      "icon": "art/DuoLab.icon",
       "minimumOS": "14.0",
       "window": {
         "width": 951,

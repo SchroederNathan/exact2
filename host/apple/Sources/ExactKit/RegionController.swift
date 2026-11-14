@@ -151,7 +151,8 @@ final class RegionController {
     private func schedule() {
         guard !busy, validateAppearance(), let session, let snapshot, let service else { return }
         if snapshot.request != 0 && submitted != snapshot.request {
-            let existing = sources[snapshot.source]?.value
+            // A source captured at another line scale rounds its line boxes as that display did.
+            let existing = sources[snapshot.source]?.value.flatMap { $0.lineScale == session.text.lineScale ? $0 : nil }
             guard let wire = session.runtime.regionRequest(snapshot.request, knownSource: existing == nil ? 0 : snapshot.source),
                   RegionSnapshot.uint(wire["request"]) == snapshot.request,
                   let width = wire["width"] as? Double, let height = wire["height"] as? Double,
@@ -205,6 +206,7 @@ final class RegionController {
             let batch = session.runtime.regionComplete(value)
             if let error = batch.error { refuse(error); return }
             session.apply(batch)
+        case .selection: break
         case .raster(let value):
             if submittedRaster == value.request.serial { submittedRaster = 0 }
             guard desiredRaster?.serial == value.request.serial,
@@ -230,6 +232,7 @@ final class RegionController {
             if desiredRaster?.serial == value.request.serial { desiredRaster = nil }
         case .refused(let job, let reason):
             switch job {
+            case .selection: break
             case .shape(let request):
                 if submitted == request.id { submitted = 0 }
                 if snapshot?.request == request.id && request.generation == generation { refuse(reason) }

@@ -1,5 +1,5 @@
 // An app's Rust data source as a standalone logic module (LLP 1029.000,
-// ABI 3) for the JS runtime, when the app declares none of its own: a
+// ABI 4) for the JS runtime, when the app declares none of its own: a
 // generated crate exporting the same DataSource the web build bakes with
 // (`apps/<app>/web/build.rs`'s `contract::bake(plan, <expr>)`).
 // usage: bun host/web-js/module.mjs <app> [--out <dir>] → <dir>/app.module.wasm
@@ -8,12 +8,15 @@
 //        machine, so no app's first build compiles them.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 // Also for its PATH: the pinned binaryen (and Cargo) as every web build has
 // them, so a prebuild optimizes and keeps what an app's build would.
-import { WEB_STD, WEB_TOOLCHAIN, wasmRemapFlags } from '../../scripts/app.mjs';
+import { WEB_STD, WEB_SIZE, WEB_TOOLCHAIN, wasmRemapFlags } from '../../scripts/app.mjs';
+import { withHostDeployment } from '../../scripts/filesystem.mjs';
+import { replaceBuild } from '../web/serve.mjs';
+import { proofInputs } from '../../game/inputs.mjs';
 import { keptProducts } from '../../scripts/kept.mjs';
 import { BINARYEN_DOWNLOAD } from '../web/stages.mjs';
 
@@ -191,12 +194,13 @@ function ownModule(app, out, dir) {
   return module(manifest, pkg.replaceAll('-', '_'), out, `${app}: ${pkg}`);
 }
 
-/** A logic module's grants (ABI 3's first call, `meta`): what its storage
+/** A logic module's grants (the seam's first call, `meta`): what its storage
  * requests may name, which decides whether the page ships the storage
  * adapters. */
 export async function moduleGrants(path) {
   const { instance } = await WebAssembly.instantiate(readFileSync(path), {}), e = instance.exports;
-  const session = e.exact_logic_create(), request = new Uint8Array([3, 0, 0, 0, 0]), p = e.exact_logic_alloc(request.length);
+  const session = e.exact_logic_create(), request = new Uint8Array(5), p = e.exact_logic_alloc(request.length);
+  new DataView(request.buffer).setUint32(0, e.exact_logic_abi(), true);
   new Uint8Array(e.memory.buffer, p, request.length).set(request);
   if (e.exact_logic_call(session, p, request.length) !== 0) return '';
   const out = new Uint8Array(e.memory.buffer, e.exact_logic_output(session), e.exact_logic_output_len(session)).slice(), d = new DataView(out.buffer);
@@ -217,12 +221,17 @@ export function buildMarkdown({ out = resolve(MODULES, 'markdown'), keepFresh = 
 static mut OUT: Vec<u8> = Vec::new();
 #[no_mangle]
 pub extern "C" fn alloc(len: usize) -> *mut u8 { let mut v = Vec::<u8>::with_capacity(len); let p = v.as_mut_ptr(); std::mem::forget(v); p }
-/// # Safety: \`ptr\` holds \`len\` UTF-8 bytes from \`alloc\`.
+/// # Safety: \`ptr\` holds \`len\` UTF-8 bytes from \`alloc\`: the source, then
+/// \`atoms\` bytes of its \`atoms\` JSON and \`faces\` of its \`atomFaces\`.
 #[no_mangle]
-pub unsafe extern "C" fn pieces(ptr: *mut u8, len: usize) -> usize {
-    let source = String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).into_owned();
+pub unsafe extern "C" fn pieces(ptr: *mut u8, len: usize, atoms: usize, faces: usize) -> usize {
+    let all = std::slice::from_raw_parts(ptr, len);
+    let (source, rest) = all.split_at(len - atoms - faces);
+    let (atoms, faces) = rest.split_at(atoms);
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    let (source, atoms, faces) = (text(source), text(atoms), text(faces));
     drop(Vec::from_raw_parts(ptr, len, len));
-    OUT = exact_web_capabilities::markdown::pieces(&source).into_bytes();
+    OUT = exact_web_capabilities::markdown::pieces(&source, &atoms, &faces).into_bytes();
     #[allow(static_mut_refs)]
     OUT.len()
 }
@@ -327,6 +336,28 @@ ${patch}`;
 /** `text` without its `// dev-only {` … `// dev-only }` regions: what a
  * build that is not the dev loop's copies of a runtime file (modes.js's
  * live table, LLP 1121 stage 4), so no release page carries it. */
+/** A development build's copy of rt.js with inspect mode's two hooks
+ * (LLP 1122 T2b; inspect-dev.js), so rt.js itself, and every other build's
+ * copy, has none: an element's view id (`$exactViewId`), and every `each`
+ * region with its rows and key function (`$exactEaches`), which a
+ * development build's emitter names (regions.rs passes the region id) and
+ * which leaves with its scope. Throws when rt.js no longer has the lines
+ * they hang on. */
+export function withInspectHooks(text) {
+  const hooks = [
+    [/^export function viewId\(e\) \{.*\n/m, (line) => `${line}globalThis.$exactViewId = viewId;\n`],
+    [/^  let rows = new Map\(\), single = false, order = null;\n/m, (line) => `${line}  if (arguments[5] !== undefined) { const e = { region: arguments[5], rows: () => order ?? [], key, live: () => a.isConnected }; (globalThis.$exactEaches ??= new Set()).add(e); onEnd(() => globalThis.$exactEaches.delete(e)); }\n`],
+  ];
+  for (const [at, hook] of hooks) {
+    if (!at.test(text)) throw new Error(`rt.js: inspect mode's hook has no line to hang on (${at})`);
+    text = text.replace(at, hook);
+  }
+  return text;
+}
+/** B5 (lower.js `RUNTIME`): the arms sheet's host stamp, a digest of the runtime files the build copies first (`files`:
+ * `{ path, text }`, lower.js's unstamped source among them), so a runtime whose helpers or rule builder changed under a
+ * kept document starts its sheet over, where the arm names (the recipe, its literals, its constants) did not change. */
+export const withRuntimeStamp = (text, files) => text.replace('"exact-runtime-unstamped"', JSON.stringify(createHash('sha256').update(files.map(f => `${f.path}\0${f.text}`).join('\0')).digest('hex').slice(0, 24)));
 export const withoutDev = (text) => text.replace(/^[ \t]*\/\/ dev-only \{.*\n[\s\S]*?^[ \t]*\/\/ dev-only \}.*\n/gm, '');
 
 /** The plan-to-JavaScript compiler (`exact-web-js`) as `[cmd, args]`: its
@@ -334,8 +365,24 @@ export const withoutDev = (text) => text.replace(/^[ \t]*\/\/ dev-only \{.*\n[\s
  * or `cargo run`, whose binary `done()` keeps. */
 const COMPILER = resolve(TARGET_DIR, 'debug/exact-web-js');
 const compilerKept = () => kept({ crate: 'exact-web-js', product: COMPILER, depInfo: `${COMPILER}.d`, group: ['debug'], buildDirs: [resolve(TARGET_DIR, 'debug/build')], stamp: resolve(MODULES, 'kept', 'exact-web-js.json') });
+/** `fresh`, for a compiler binary: also stale after an edit to the lockfile
+ * or to the manifest of the workspace or of any crate it was built from. */
+export function freshCompiler(product) {
+  try {
+    const text = readFileSync(`${product}.d`, 'utf8');
+    const files = text.slice(text.indexOf(': ') + 2).trim().split(/(?<!\\)\s+/).map(f => f.replace(/\\ /g, ' '));
+    const crates = new Set(files.filter(f => f.lastIndexOf('/src/') > 0).map(f => resolve(f.slice(0, f.lastIndexOf('/src/')), 'Cargo.toml')));
+    return fresh(product, `${product}.d`, [resolve(root, 'Cargo.lock'), resolve(root, 'Cargo.toml'), ...crates]);
+  } catch { return false; }
+}
 export function webCompiler() {
-  if (fresh(COMPILER, `${COMPILER}.d`)) return { cmd: COMPILER, pre: [], done() {} };
+  // The optimised compiler (`host-dev`) the JS dev loop built for its design
+  // reader: a copy it makes for one build while that build is done and
+  // fresh (dev.mjs), the same output, about ten times faster on a large app
+  // (the Bluesky clone: 1.2 s, not 11.8).
+  const fast = process.env.EXACT_WEB_COMPILER;
+  if (fast && freshCompiler(fast)) return { cmd: fast, pre: [], done() {} };
+  if (freshCompiler(COMPILER)) return { cmd: COMPILER, pre: [], done() {} };
   const at = compilerKept();
   const taken = at.find();
   if (taken) return { cmd: taken, pre: [], done() {} };
@@ -351,7 +398,7 @@ async function prebuild() {
   if (spawnSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' }).stdout) console.warn('web-js: this checkout has uncommitted changes; what they touch is built but not kept');
   const compiler = compilerKept();
   const compiling = (async () => {
-    const again = fresh(COMPILER, `${COMPILER}.d`) ? compiler.keepAgain() : null;
+    const again = freshCompiler(COMPILER) ? compiler.keepAgain() : null;
     if (again !== null) return held.set('exact-web-js', again);
     rmSync(COMPILER, { force: true });
     // Already kept from these sources (this checkout took it): nothing to do.
@@ -365,6 +412,127 @@ async function prebuild() {
   const names = (kept) => [...held].filter(([, k]) => k === kept).map(([name]) => name).join(', ');
   console.log(`web-js: kept for this machine (~/.cache/exact/web-modules): ${names(true) || 'nothing'}`);
   if (names(false)) console.warn(`web-js: built, not kept (uncommitted or changed while compiling): ${names(false)}`);
+}
+
+// A game's resident producer and its proof share completed development web
+// products locally. The snapshot supplies its own inputs; the live world is never read.
+export function warmGameEnvironment(env) {
+  // The bake's own environment, which every cargo call's host deployment target is in (scripts/filesystem.mjs).
+  return {...withHostDeployment(env), EXACT_UPDATE_TRUST:env.EXACT_UPDATE_TRUST ?? 'development',
+    EXACT_GAME_PARANOID:env.EXACT_GAME_PARANOID ?? '0', EXACT_WEB_LINK:env.EXACT_WEB_LINK ?? 'all',
+    RUSTUP_TOOLCHAIN:WEB_TOOLCHAIN, EXACT_WEB_SIZE:WEB_SIZE};
+}
+// Cargo-provided paths and package metadata follow the captured sources. Other
+// compiler env-deps must match the caller or a recorded build-script output;
+// the script's own watched environment must match the caller in either case.
+function warmConfigurationMatches(app, configuration, environment) {
+  if (!configuration || configuration.target !== 'wasm32-unknown-unknown'
+      || !Array.isArray(configuration.units) || !Array.isArray(configuration.builders)
+      || !configuration.units.length || !configuration.rustc || !configuration.flags) return false;
+  const env = warmGameEnvironment(environment);
+  const hash = value => value == null ? null : createHash('sha256').update(value).digest('hex');
+  for (const [key,value] of Object.entries(configuration.flags)) if ((env[key] ?? null) !== value) return false;
+  for (const builder of configuration.builders) {
+    if (!Array.isArray(builder.environment) || !Array.isArray(builder.env)) return false;
+    for (const [key,value] of builder.environment) if (hash(env[key]) !== value) return false;
+  }
+  for (const unit of configuration.units) {
+    if (!Array.isArray(unit.environment)) return false;
+    for (const [key,value] of unit.environment) {
+      if (key === 'OUT_DIR' && value === `generated:${unit.package}:${unit.role}/`) continue;
+      if (key === 'CARGO_MANIFEST_DIR' && /^crate:[^/]+\/$/.test(value ?? '')) continue;
+      if (/^CARGO_PKG_(VERSION(?:_MAJOR|_MINOR|_PATCH|_PRE)?|NAME|AUTHORS|DESCRIPTION|HOMEPAGE|REPOSITORY|LICENSE|LICENSE_FILE|RUST_VERSION|README)$/.test(key)) continue;
+      const generated = configuration.builders.filter(b => b.package === unit.package && b.role === unit.role)
+        .flatMap(b => b.env).filter(([name]) => name === key);
+      if (generated.length) { if (generated.some(([,v]) => v !== value)) return false; }
+      else if (hash(env[key]) !== value) return false;
+    }
+  }
+  const compiler = spawnSync('rustc', ['-vV'], {cwd:app.workspace ?? root, env, encoding:'utf8'});
+  return compiler.status === 0 && compiler.stdout === configuration.rustc;
+}
+
+// Cache the owned stage before the directory swap can expose another build's dist.
+export function publishWarmGame(app, stage, dist, before, build, env = process.env, publish = replaceBuild) {
+  keepWarmGame(app, stage, before, env, build);
+  publish(stage, dist);
+}
+export function warmGameInputs(app, env = process.env) {
+  if (!app.manifest.game || env.EXACT_GAME_PROOF_PROFILE !== 'gpu-dev'
+      || (env.EXACT_UPDATE_TRUST ?? 'development') !== 'development') return null;
+  env = warmGameEnvironment(env);
+  const inputs = proofInputs(root, app.dir, resolve(app.target, 'proof-web-inputs.json'));
+  const flags = Object.entries(env).filter(([key]) => /^(RUST|CARGO_PROFILE_|CARGO_ENCODED_|CARGO_TARGET_.*_(RUSTFLAGS|LINKER)$|EXACT_GAME_PARANOID_COMPARE$)/.test(key)).sort();
+  const configuration = JSON.stringify([app.id, app.manifest, env.EXACT_GAME_PARANOID ?? '0', env.EXACT_UPDATE_ORIGIN ?? null, env.EXACT_BACKEND_ORIGIN ?? null, env.EXACT_WEB_LINK, env.EXACT_WEB_NAMES ?? null, flags]);
+  return {...inputs, configuration, key:createHash('sha256').update(inputs.all + configuration).digest('hex')};
+}
+function warmFiles(directory) {
+  const files = [];
+  const walk = (dir, prefix = '') => {
+    for (const entry of readdirSync(dir, {withFileTypes:true}).sort((a,b) => a.name.localeCompare(b.name))) {
+      const name = prefix + entry.name, path = resolve(dir, entry.name);
+      if (entry.isDirectory()) walk(path, name + '/');
+      else if (entry.isFile()) files.push([name, createHash('sha256').update(readFileSync(path)).digest('hex')]);
+      else throw new Error('warm web product contains a non-file');
+    }
+  };
+  walk(directory);
+  return files;
+}
+export function keepWarmGame(app, dist, before, env = process.env, build) {
+  if (!before || !warmConfigurationMatches(app, build?.binary?.configuration, env)) return false;
+  let stage;
+  try {
+    const after = warmGameInputs(app, env);
+    // A bake may create assets, but may not take credit for moving authored sources.
+    if (!after || before.authored !== after.authored || before.authoredState !== after.authoredState
+        || before.configuration !== after.configuration) return false;
+    const cache = resolve(app.target, 'proof-web'); mkdirSync(cache, {recursive:true});
+    stage = mkdtempSync(resolve(cache, 'build-'));
+    const copied = resolve(stage, 'dist');
+    cpSync(dist, copied, {recursive:true});
+    const current = warmGameInputs(app, env);
+    if (current?.key !== after.key || current.authoredState !== after.authoredState || current.assetState !== after.assetState) return false;
+    const receipt = {key:after.key, directory:stage, files:warmFiles(copied), configuration:build.binary.configuration};
+    const path = resolve(cache, `${after.key}.json`);
+    let previous;
+    try { previous = JSON.parse(readFileSync(path, 'utf8')); } catch {}
+    replace(path, temp => writeFileSync(temp, JSON.stringify(receipt)));
+    stage = null;
+    if (typeof previous?.directory === 'string' && previous.directory !== receipt.directory && dirname(previous.directory) === cache)
+      rmSync(previous.directory, {recursive:true,force:true});
+    // Evict by receipt publication mtime; this never enters simulation state.
+    const entries = readdirSync(cache).filter(name => /^[a-f0-9]{64}\.json$/.test(name)).sort((a,b) => statSync(resolve(cache,b)).mtimeMs - statSync(resolve(cache,a)).mtimeMs);
+    for (const name of entries.slice(6)) {
+      const old = JSON.parse(readFileSync(resolve(cache,name),'utf8'));
+      if (dirname(old.directory) === cache) rmSync(old.directory,{recursive:true,force:true});
+      rmSync(resolve(cache,name),{force:true});
+    }
+    return copied;
+  } catch (error) { console.warn(`web: warm game product not kept (${error.message})`); return false; }
+  finally { if (stage) rmSync(stage, {recursive:true,force:true}); }
+}
+export function takeWarmGame(app, dist, env = process.env) {
+  const inputs = warmGameInputs(app, env);
+  if (!inputs) return false;
+  let stage;
+  try {
+    const cache = resolve(app.target, 'proof-web');
+    const receipt = JSON.parse(readFileSync(resolve(cache, `${inputs.key}.json`), 'utf8'));
+    if (receipt.key !== inputs.key || dirname(receipt.directory) !== cache
+        || !warmConfigurationMatches(app, receipt.configuration, env)) return false;
+    stage = mkdtempSync(resolve(app.target, 'proof-web-copy-'));
+    cpSync(resolve(receipt.directory, 'dist'), stage, {recursive:true});
+    if (JSON.stringify(warmFiles(stage)) !== JSON.stringify(receipt.files)) return false;
+    // Driver staleness paths are local to the captured source tree. Relocate only
+    // after the complete portable input identity and copied products agree.
+    // The caller refreshes the driver's path-based marker after this copy.
+    rmSync(dist, {recursive:true,force:true});
+    renameSync(stage, dist); stage = null;
+    console.log('BUILD warm web producer: matching input identity');
+    return true;
+  } catch { return false; }
+  finally { if (stage) rmSync(stage, {recursive:true,force:true}); }
 }
 
 if (import.meta.main) {

@@ -6,6 +6,7 @@ import XCTest
 import AppKit
 #endif
 @testable import ExactKit
+import ExactCore
 
 // Exercise the production decoder even when a fixture is written as JSON values.
 func batchFixture(ops: [[String: Any]], timers: Bool, motion: Bool, clock: Double?, error: String?, timerDueMs: Double? = nil, pending: Bool = false) -> Batch {
@@ -43,6 +44,11 @@ final class SessionClockTimerTests: XCTestCase {
         for _ in 0..<64 { XCTAssertLessThan(LaunchPlace(environment: [:]).seed, 1 << 32) }
         XCTAssertEqual(LaunchPlace(environment: ["EXACT_AGENT": "1", "EXACT_AGENT_SEED": "4294967296"]).seed, 1)
         XCTAssertEqual(custom.epoch, 1_790_000_000_000)
+        // The Region's format: the agent's own, else none (the runner answers
+        // the locale); off the agent, `Locale.current`.
+        XCTAssertEqual(defaults.formatLocale, "")
+        XCTAssertEqual(LaunchPlace(environment: ["EXACT_AGENT": "1", "EXACT_AGENT_FORMAT_LOCALE": "en-KR"]).formatLocale, "en-KR")
+        XCTAssertEqual(LaunchPlace(environment: [:]).formatLocale, SessionFacts.currentFormatLocale)
         let session = ExactApp.shared.makeSession()
         defer { session.destroy() }
         let launch = session.launchPlace
@@ -50,6 +56,57 @@ final class SessionClockTimerTests: XCTestCase {
         session.tellTime()
         session.tellTime()
         XCTAssertEqual(session.launchPlace, launch)
+    }
+
+    /// The hour cycle the user forces is the format locale's `hc` keyword,
+    /// read from the locale's preferred hour, and told again when Foundation
+    /// says the locale changed. `hourPatternOverride` stands in for the
+    /// setting, which a process cannot set for itself.
+    func testTheFormatLocaleCarriesAForcedHourCycle() throws {
+        let region = Locale(identifier: "en_US@rg=gbzzzz")
+        XCTAssertEqual(SessionFacts.formatLocale(region, hourCycle: nil), "en-US-u-rg-gbzzzz")
+        XCTAssertEqual(SessionFacts.formatLocale(region, hourCycle: .oneToTwelve), "en-US-u-hc-h12-rg-gbzzzz")
+        XCTAssertEqual(SessionFacts.formatLocale(Locale(identifier: "en_KR"), hourCycle: .zeroToTwentyThree), "en-KR-u-hc-h23")
+        XCTAssertEqual(SessionFacts.formatLocale(Locale(identifier: "en_US@hours=h11"), hourCycle: .zeroToTwentyThree), "en-US-u-hc-h23")
+        // A cycle only where the person's preferred hour differs from the Region's.
+        XCTAssertNil(SessionFacts.forcedHourCycle("h a", regional: "h a"))
+        XCTAssertEqual(SessionFacts.forcedHourCycle("HH", regional: "h a"), .zeroToTwentyThree)
+        XCTAssertEqual(SessionFacts.forcedHourCycle("h a", regional: "HH"), .oneToTwelve)
+        XCTAssertEqual(SessionFacts.forcedHourCycle("Bh時", regional: "H時"), .oneToTwelve, "a day period other than a")
+        XCTAssertEqual(SessionFacts.forcedHourCycle("HH 'h'", regional: "h a"), .zeroToTwentyThree, "a quoted h is no hour")
+        XCTAssertNil(SessionFacts.forcedHourCycle("HH 'h'", regional: "HH"))
+        defer {
+            SessionFacts.hourPatternOverride = nil
+            NotificationCenter.default.post(name: NSLocale.currentLocaleDidChangeNotification, object: nil) // any live session reads it back
+        }
+        // The Region's own cycle adds nothing; the other one is its keyword.
+        let regional = DateFormatter.dateFormat(fromTemplate: "j", options: 0, locale: Locale(identifier: Locale.current.identifier)) ?? ""
+        let twelve = SessionFacts.forcedHourCycle(regional, regional: "HH") == .oneToTwelve
+        let own = twelve ? "h a" : "HH", other = twelve ? "HH" : "h a"
+        let forced = SessionFacts.formatLocale(.current, hourCycle: twelve ? .zeroToTwentyThree : .oneToTwelve)
+        SessionFacts.hourPatternOverride = own
+        XCTAssertEqual(SessionFacts.currentFormatLocale, Locale.current.identifier(.bcp47))
+        SessionFacts.hourPatternOverride = other
+        XCTAssertEqual(SessionFacts.currentFormatLocale, forced)
+        XCTAssertEqual(LaunchPlace(environment: ["EXACT_AGENT": "1"]).formatLocale, "")
+        #if os(macOS)
+        SessionFacts.hourPatternOverride = own
+        let source = "shape Time\n  formatLocale: string\ncomponent App\n  resource time = exactTime() as shape Time\n  view\n    text time.formatLocale testId=\"format\"\n"
+        let session = ExactSession(app: ExactApp.shared, label: "format-locale", launchPlace: LaunchPlace(environment: [:]))
+        defer { session.destroy() }
+        XCTAssertNil(session.boot(plan: try TableFixture.plan(source), size: CGSize(width: 390, height: 844)).error)
+        func shows(_ tag: String) -> Bool { session.agent("{\"op\":\"tree\"}").contains("\"\(tag)\"") }
+        func wait(for tag: String) -> Bool {
+            let deadline = Date().addingTimeInterval(10)
+            while !shows(tag), Date() < deadline { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05)) }
+            return shows(tag)
+        }
+        XCTAssertTrue(wait(for: Locale.current.identifier(.bcp47)))
+        SessionFacts.hourPatternOverride = other
+        NotificationCenter.default.post(name: NSLocale.currentLocaleDidChangeNotification, object: nil)
+        XCTAssertTrue(wait(for: forced), "the running app reads the forced cycle")
+        XCTAssertEqual(session.launchPlace.formatLocale, forced)
+        #endif
     }
 
     func testTargetedLayoutDigestStaysWithEachSessionsNode() throws {
@@ -185,12 +242,32 @@ final class SessionClockTimerTests: XCTestCase {
         XCTAssertFalse(timer.isValid)
     }
 
-    func testDeadlineSelectsFramesOnlyForNearTimers() {
-        XCTAssertEqual(SessionClockTimer.wake(due: 116, now: 100), .frame)
-        XCTAssertEqual(SessionClockTimer.wake(due: 0, now: 100), .frame, "a hitch catches up next frame")
+    func testEveryOrdinaryDeadlineUsesANativeWake() {
+        XCTAssertEqual(SessionClockTimer.wake(due: 116, now: 100), .timeout(16))
+        XCTAssertEqual(SessionClockTimer.wake(due: 0, now: 100), .timeout(0))
         XCTAssertEqual(SessionClockTimer.wake(due: 1100, now: 100), .timeout(1000))
         XCTAssertEqual(SessionClockTimer.wake(due: nil, now: 100), .none)
         XCTAssertEqual(SessionClockTimer.wake(due: 116, now: 100, agent: true), .none)
+    }
+
+    func testNearTimersNeverAddDisplayLinkDemandAndKeepAnUnchangedWake() throws {
+        let session = ExactApp.shared.makeSession()
+        defer { session.destroy() }
+        session.clock = nil
+        let due = session.now() + 40
+        let empty = batchFixture(ops: [], timers: true, motion: false, clock: nil, error: nil, timerDueMs: due)
+        session.applyUnlessEmpty(empty)
+        XCTAssertFalse(session.frames.timerSoon)
+        XCTAssertNil(session.frames.link)
+        let timer = try XCTUnwrap(session.clockTimer)
+        for _ in 0..<3 {
+            session.applyUnlessEmpty(empty)
+            XCTAssertTrue(session.clockTimer === timer)
+            XCTAssertFalse(session.frames.timerSoon)
+        }
+        session.apply(empty)
+        XCTAssertTrue(session.clockTimer === timer)
+        XCTAssertNil(session.frames.link)
     }
 
     func testNestedTransformBatchPreservesTimerDeadline() throws {
@@ -204,13 +281,9 @@ final class SessionClockTimerTests: XCTestCase {
             let reply = try XCTUnwrap(TransformDragReply(data))
             XCTAssertEqual(reply.batch.timerDueMs, due)
             session.apply(reply.batch)
-            if delta == 16 {
-                XCTAssertTrue(session.frames.timerSoon)
-                XCTAssertNotNil(session.frames.link)
-            } else {
-                XCTAssertFalse(session.frames.timerSoon)
-                XCTAssertNotNil(session.clockTimer)
-            }
+            XCTAssertFalse(session.frames.timerSoon)
+            XCTAssertNil(session.frames.link)
+            XCTAssertNotNil(session.clockTimer)
         }
     }
 
@@ -219,8 +292,9 @@ final class SessionClockTimerTests: XCTestCase {
         defer { session.destroy() }
         session.clock = nil
         session.scheduleClock(due: session.now() + 16)
-        XCTAssertTrue(session.frames.timerSoon)
-        XCTAssertNotNil(session.frames.link)
+        XCTAssertFalse(session.frames.timerSoon)
+        XCTAssertNil(session.frames.link)
+        XCTAssertNotNil(session.clockTimer)
         session.scheduleClock(due: session.now() + 1000)
         XCTAssertFalse(session.frames.timerSoon)
         XCTAssertNil(session.frames.link)
@@ -249,5 +323,84 @@ final class SessionClockTimerTests: XCTestCase {
         run(mode, seconds: 0.1)
         XCTAssertFalse(timer.isValid)
         XCTAssertEqual(ticks.count, stopped)
+    }
+}
+
+
+extension SessionClockTimerTests {
+    func testTimerAdmissionObservationsResampleDemandAndEveryIdleTerm() {
+        var observation = TimerAdmissions.Observation(now: 100, waits: [-1, -1, -1, -2])
+        XCTAssertTrue(observation.idle)
+        XCTAssertEqual(observation.kinds, 4 | 8)
+        observation.frame = true
+        XCTAssertEqual(observation.kinds, 2 | 4 | 8)
+        observation.frame = false
+        for term in 0..<5 {
+            var blocked = observation
+            switch term {
+            case 0: blocked.scrolling = true
+            case 1: blocked.motion = true
+            case 2: blocked.applying = true
+            case 3: blocked.waits[1] = -2
+            default: blocked.next = blocked.now + 1000 / 60
+            }
+            XCTAssertFalse(blocked.idle, "Idle term \(term) blocks admission")
+        }
+        observation.next = (observation.now + 1000 / 60).nextUp
+        XCTAssertTrue(observation.idle)
+        observation.scrolling = true
+        XCTAssertEqual(observation.kinds, 0)
+        observation.hidden = true
+        XCTAssertTrue(observation.idle)
+        XCTAssertEqual(observation.kinds, 2 | 4 | 8)
+        observation.hidden = false; observation.scrolling = false
+        observation.tasks = true
+        XCTAssertFalse(observation.idle)
+        XCTAssertEqual(observation.kinds, 8)
+        observation.tasks = false; observation.next = nil; observation.lastUpdate = observation.now
+        XCTAssertFalse(observation.idle)
+        observation.update = true
+        XCTAssertEqual(observation.kinds, 4 | 8)
+        observation.update = false
+        observation.now += 1000 / 60
+        XCTAssertFalse(observation.idle)
+        observation.now = observation.now.nextUp; observation.next = nil
+        XCTAssertTrue(observation.idle)
+        XCTAssertEqual(observation.kinds, 4 | 8)
+    }
+
+    func testHeldFiringsWaitForEligibleObservationsWithoutRequestingOwnerWork() {
+        for index in 0..<4 {
+            var observation = TimerAdmissions.Observation(now: 100, lastUpdate: 100, scrolling: true,
+                                                        waits: Array(repeating: -1, count: 4))
+            observation.waits[index] = -2
+            XCTAssertFalse(observation.eligible, "An ineligible held firing needs no owner turn")
+            observation.frame = true
+            XCTAssertEqual(observation.eligible, index == 0)
+            observation.frame = false; observation.update = true
+            XCTAssertEqual(observation.eligible, index == 1)
+            observation.update = false; observation.scrolling = false
+            XCTAssertEqual(observation.eligible, index == 2)
+            observation.waits[index] = 101
+            XCTAssertFalse(observation.eligible)
+            observation.waits[index] = 100
+            XCTAssertTrue(observation.eligible, "A nominal deadline still needs its first holding check")
+        }
+    }
+
+    func testTolerantWakesUseNativeTimerTolerance() {
+        XCTAssertEqual(SessionClockTimer.wake(due: 100, now: 0), .timeout(100))
+        XCTAssertEqual(SessionClockTimer.wake(due: 100, now: 0), .timeout(100))
+        let timer = SessionClockTimer.schedule(after: 100, tolerance: 0.05) { _ in XCTFail("The test invalidates its timer before it is due") }
+        XCTAssertEqual(timer.tolerance, 0.05)
+        timer.invalidate()
+    }
+
+    func testTimerAdmissionMetadataUsesTheProductionBatchDecoder() throws {
+        let batch = try JSONDecoder().decode(Batch.self, from: Data("{\"ops\":[],\"timers\":true,\"motion\":false,\"waits\":[-2,50,-1,100],\"waitContinue\":true,\"nativeTimers\":[{\"index\":0,\"generation\":\"18446744073709551615\",\"due\":100,\"interval\":100,\"tolerance\":25,\"once\":true}]}".utf8))
+        XCTAssertEqual(batch.timerWaits, [-2, 50, -1, 100])
+        XCTAssertTrue(batch.waitContinue)
+        XCTAssertEqual(batch.nativeTimers?.first?.tolerance, 25)
+        XCTAssertEqual(batch.nativeTimers?.first?.generation, UInt64.max)
     }
 }

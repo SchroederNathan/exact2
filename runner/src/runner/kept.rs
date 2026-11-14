@@ -9,7 +9,7 @@
 //! bytes no longer decode, or whose value no longer fits the declared shape
 //! is simply not used, and the compiled empty-store placeholder stands.
 
-use super::{DataSource, ResourceState, Runner, RunnerError};
+use super::{CallOrigin, DataSource, ResourceState, Runner, RunnerError};
 use crate::store::Store;
 use exact_kernel::CommitReceipt;
 use exact_plan::Value;
@@ -39,6 +39,25 @@ pub(super) struct Keeping {
     /// Kept answers this boot refused, by resource, with why: journaled
     /// with the ones it shows, so a refusal is never silent.
     pub(super) refused: Vec<(usize, String)>,
+    /// Whether a module source declared `kept` keeps its answers (LLP
+    /// 1133.015 D4): always, but in a private session.
+    pub(super) modules: bool,
+}
+
+/// Whether resource `i` reads a module's live source declared `"kept":
+/// true` (LLP 1133.015 D4): its implementation loads after first pixel
+/// whatever the data source, so its last answer is kept as a TypeScript
+/// source's is.
+pub(super) fn kept_module(plan: &exact_plan::Plan, i: usize) -> bool {
+    let source = plan.resources[i].source;
+    plan.resources[i].each.len == 0
+        && (plan.modules.iter()).any(|m| {
+            m.live
+                && !m.send
+                && plan.sources[m.source.0 as usize].name == source
+                && serde_json::from_str::<serde_json::Value>(plan.str(m.substitute))
+                    .is_ok_and(|sub| sub["kept"] == true)
+        })
 }
 
 /// Note that resource `i`'s kept answer, kept for `kept`, was refused
@@ -83,10 +102,10 @@ pub(super) fn obsolete(plan: &exact_plan::Plan, snapshot: &[(String, Vec<u8>)]) 
         .iter()
         .filter_map(|(name, _)| {
             let resource = name.strip_prefix(Store::KEPT)?;
-            (!plan
-                .resources
-                .iter()
-                .any(|r| r.reader && plan.str(r.name) == resource))
+            (!(0..plan.resources.len()).any(|i| {
+                (plan.resources[i].reader || kept_module(plan, i))
+                    && plan.str(plan.resources[i].name) == resource
+            }))
             .then(|| name.clone())
         })
         .collect()
@@ -277,10 +296,105 @@ impl<D: DataSource> Runner<D> {
         seed
     }
 
+    /// Before the source is ready, each store reader is asked again at
+    /// `data_ready`, and shows the answer kept from the last launch where it
+    /// still fits (`seeded`: a document's answers already seeded it). A
+    /// launch that begins with a presence secret locked or pending shows
+    /// none (LLP 1133.010 D5): a kept answer is the account's content, and
+    /// the person has not passed the check yet.
+    pub(super) fn seed_kept(&mut self, seeded: &[bool], device_state: bool) {
+        let locked = self.store.opened_locked();
+        if locked {
+            self.log("kept answers not shown: the launch begins with a presence secret locked (LLP 1133.010 D5)");
+        }
+        for (i, &taken) in seeded.iter().enumerate() {
+            if !self.plan.resources[i].reader
+                || exact_plan::runner_owned_source(self.plan.str(self.plan.resources[i].source))
+            {
+                continue;
+            }
+            // An answer the runtime already has isn't asked again when
+            // the module loads, unless the device's store may change it.
+            if taken && !device_state {
+                continue;
+            }
+            self.stale[i] = true;
+            if self.resources[i].is_some() || locked {
+                continue;
+            }
+            if let Some((args, value)) = self.kept_seed(i) {
+                self.resources[i] = Some(ResourceState {
+                    inspection_generation: 0,
+                    args,
+                    value: crate::held::Held::new(value),
+                    store_revision: self.store.revision(),
+                    placeholder: false,
+                    kept_seed: true,
+                    answered_for: None,
+                    origin: 0,
+                });
+            }
+        }
+    }
+
+    /// The first frame's kept answers: a store reader's while the data
+    /// source is not ready, and a kept module source's always.
+    pub(super) fn seed_at_boot(
+        &mut self,
+        seeded: &[bool],
+        device_state: bool,
+        ready: bool,
+        private: bool,
+    ) {
+        if !ready {
+            self.seed_kept(seeded, device_state);
+        }
+        self.seed_kept_modules(ready, private);
+    }
+
+    /// Each resource reading a kept module source (LLP 1133.015 D4) shows
+    /// the answer kept from the last launch where it still fits, and is
+    /// asked again: at `data_ready` when the data source is not ready yet,
+    /// else at once. The seed is provisional, as any kept answer is. A
+    /// private session keeps none.
+    pub(super) fn seed_kept_modules(&mut self, ready: bool, private: bool) {
+        self.keeping.modules = !private;
+        if private || self.store.opened_locked() {
+            return;
+        }
+        for i in 0..self.plan.resources.len() {
+            if !kept_module(&self.plan, i) || self.resources[i].is_some() {
+                continue;
+            }
+            let Some((args, value)) = self.kept_seed(i) else {
+                continue;
+            };
+            self.resources[i] = Some(ResourceState {
+                inspection_generation: 0,
+                args,
+                value: crate::held::Held::new(value),
+                store_revision: self.store.revision(),
+                placeholder: false,
+                kept_seed: true,
+                answered_for: None,
+                origin: 0,
+            });
+            match ready {
+                true => self.refresh_next.push(i),
+                false => self.stale[i] = true,
+            }
+        }
+    }
+
     /// Keep a store-reading resource's fresh answer for the next boot's
     /// first frame (LLP 1027 D4), when this source may not be ready then.
     pub(super) fn keep_answer(&mut self, i: usize, args: &[Value], value: &Value) {
-        if !self.keeping.on || !self.store_readers[i] {
+        // An element of a resource over a list is the launch's to ask.
+        if self.member(i).is_some() {
+            return;
+        }
+        let module = self.keeping.modules && kept_module(&self.plan, i);
+        if !module && (!self.keeping.on || !self.store_readers[i]) {
             return;
         }
         // @ref LLP 1039 D3 / LLP 1030 D7 — runner facts are never kept answers.
@@ -407,6 +521,93 @@ impl<D: DataSource> Runner<D> {
         false
     }
 
+    /// A peer committed to the app's store (LLP 1126.001 WP12). The host
+    /// supplies a fresh snapshot; only store readers and persisted slots
+    /// are refreshed. Ordinary window state and pure resources stay local.
+    pub fn store_changed(
+        &mut self,
+        snapshot: Vec<(String, Vec<u8>)>,
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
+        let was_poisoned = self.poisoned;
+        let checkpoint = self.checkpoint(false);
+        let result = self.restore_store(snapshot).and_then(|change| {
+            if !change.any {
+                return Ok(None);
+            }
+            if change.read {
+                let readers = self.store_readers();
+                self.owe(&readers);
+                self.refresh_next.extend(readers);
+            }
+            if self.poisoned {
+                return Err(RunnerError::Poisoned);
+            }
+            self.settle(false)
+                .and_then(|_| self.gate_step())
+                .and_then(|_| self.update())
+                .map(Some)
+        });
+        self.conclude(checkpoint, &result, was_poisoned);
+        self.arm_next(result.is_ok());
+        match result {
+            Ok(receipt) => {
+                if let Some(receipt) = &receipt {
+                    self.log_outcome("store changed", &Ok(receipt.clone()), was_poisoned);
+                }
+                Ok(receipt)
+            }
+            Err(error) => {
+                let refused = Err(error);
+                self.log_outcome("store changed", &refused, was_poisoned);
+                refused.map(Some)
+            }
+        }
+    }
+
+    /// Adopt a pre-pixel change without asking; `data_ready_after_store`
+    /// performs the activation's one settlement, including queued sends.
+    pub fn adopt_store(
+        &mut self,
+        snapshot: Vec<(String, Vec<u8>)>,
+    ) -> Result<crate::StoreChange, RunnerError> {
+        let was_poisoned = self.poisoned;
+        let checkpoint = self.checkpoint(false);
+        let result = self.restore_store(snapshot);
+        self.conclude(checkpoint, &result, was_poisoned);
+        result
+    }
+
+    fn restore_store(
+        &mut self,
+        snapshot: Vec<(String, Vec<u8>)>,
+    ) -> Result<crate::StoreChange, RunnerError> {
+        let change = self.store.refresh_snapshot(snapshot);
+        if !change.any {
+            return Ok(change);
+        }
+        for i in 0..self.slots.len() {
+            if self.plan.slots[i].persist {
+                let initial = self.eval(self.plan.slots[i].init, &[], &[])?;
+                self.slots[i] = self.restore_persisted(i, initial);
+            }
+        }
+        Ok(change)
+    }
+
+    pub(super) fn store_readers(&self) -> Vec<usize> {
+        self.store_readers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, reads)| {
+                (*reads
+                    && !exact_plan::runner_owned_source(
+                        self.plan.str(self.plan.resources[i].source),
+                    ))
+                .then_some(i)
+            })
+            .collect()
+    }
+
     /// The data source is ready — a host loaded its TypeScript module after
     /// the first pixel (LLP 1027 D4): every deferred resource shown
     /// from a placeholder is asked again, and every send made before now
@@ -416,19 +617,37 @@ impl<D: DataSource> Runner<D> {
     /// commit, and a refusal fails the resource, which `refresh` asks again,
     /// as after a failed reply.
     pub fn data_ready(&mut self) -> Result<Option<CommitReceipt>, RunnerError> {
+        self.data_ready_after_store(crate::StoreChange::default())
+    }
+
+    /// Activation after adopting a peer's pre-pixel store revision.
+    pub fn data_ready_after_store(
+        &mut self,
+        change: crate::StoreChange,
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
         if !self.data.ready() {
             self.log("data_ready: the data source is not ready");
             return Ok(None);
         }
-        let stale: Vec<usize> = (0..self.stale.len()).filter(|i| self.stale[*i]).collect();
+        // A pending presence move runs once the source has loaded (LLP
+        // 1133.010 D4), so the store's readers see it from this commit on.
+        self.presence_ready();
+        let readers = if change.read {
+            self.store_readers()
+        } else {
+            Vec::new()
+        };
+        let stale: Vec<usize> = (0..self.stale.len())
+            .filter(|i| self.stale[*i] || readers.contains(i))
+            .collect();
         // Writes made before the source was ready are overlaid from here
         self.overlays.iter_mut().for_each(|o| *o = None);
         if self.unsent.is_empty() {
-            if stale.is_empty() && self.writes.records.is_empty() {
+            if !change.any && stale.is_empty() && self.writes.records.is_empty() {
                 return Ok(None);
             }
             self.owe(&stale);
-            return self.commit_again(stale, "data_ready").map(Some);
+            return (self.reasking(|r| r.commit_again(stale, "data_ready"))).map(Some);
         }
         let what = format!(
             "data_ready ({} asked again, {} sent)",
@@ -442,18 +661,23 @@ impl<D: DataSource> Runner<D> {
         let result = if self.poisoned {
             Err(RunnerError::Poisoned)
         } else {
-            let later = self.send_unsent();
+            let (by, later) = self.send_unsent();
             // The gate step joins this settlement as every commit's (LLP
             // 1092 D8; b6 review A2): a gate the sent answers open arms its
-            // task, and a key that is no key refuses this commit.
+            // task, and a key that is no key refuses this commit. Each
+            // resource asks under its waiting ask's origin, and each send
+            // under its own (LLP 1133.002 D12).
             match self
                 .router_change()
-                .and_then(|_| self.settle(false))
+                .and_then(|_| self.reasking(|r| r.settle(false)))
                 .and_then(|_| self.gate_step())
             {
                 Ok(()) => {
-                    for (m, source, args, request) in later {
-                        self.enqueue(super::Target::Mutation(m), source, args, request, false);
+                    for ((origin, id), (m, source, args, request)) in by.into_iter().zip(later) {
+                        let target = super::Target::Mutation(m);
+                        self.as_invocation(origin, id, |r| {
+                            r.enqueue(target, source, args, request, false)
+                        });
                     }
                     self.update()
                 }
@@ -487,71 +711,102 @@ impl<D: DataSource> Runner<D> {
         // reply.
         if dropped {
             self.owe(&stale);
-            return self
-                .commit_again(stale, "the sends a refused data_ready dropped")
-                .map(Some);
+            let what = "the sends a refused data_ready dropped";
+            return (self.reasking(|r| r.commit_again(stale, what))).map(Some);
         }
         result.map(Some)
     }
 
-    /// Each waiting send asks its source now, as the action would have: an
+    /// Each waiting send asks its source now, as the action would have,
+    /// under the origin and invocation of the commit that made it: an
     /// answer lands in the mutation's slot (its `then` armed, what it
-    /// refreshes asked again); a request is returned, to go out once the
-    /// commit stands. The action that made it committed long ago, so a
-    /// source's refusal ends that one send, said in the journal, as a
-    /// refused reply does — never this commit.
+    /// refreshes asked again); a request is returned with them, to go out
+    /// under them once the commit stands. The action that made it committed
+    /// long ago, so a source's refusal ends that one send, said in the
+    /// journal, as a refused reply does — never this commit.
     #[allow(clippy::type_complexity)]
-    fn send_unsent(&mut self) -> Vec<(usize, String, Vec<Value>, super::Request)> {
-        let mut later = Vec::new();
-        for (m, source, args) in std::mem::take(&mut self.unsent) {
-            let target = super::Target::Mutation(m);
-            let name = self.plan.str(self.plan.mutations[m].name).to_string();
-            self.mutation_requests += 1;
-            let refused = match self
-                .data
-                .answer_for(target, &mut self.store, &source, &args)
-            {
-                Ok(super::Answer::Now(value))
-                    if self.conforms(&value, self.plan.mutations[m].ty) =>
-                {
-                    match self.mutation_slot(m) {
-                        Ok(slot) => {
-                            self.forget_ticket(super::Target::Mutation(m));
-                            self.land_write(m, None, &value);
-                            self.slots[slot] = Value::some(value);
-                            self.landed.push(m);
-                            for r in self.declared_refreshes(m) {
-                                self.force_refresh(r);
-                            }
-                            None
-                        }
-                        Err(e) => Some(format!("{e:?}")),
-                    }
-                }
-                Ok(super::Answer::Now(_)) => {
-                    Some("its answer does not fit the mutation's shape".to_string())
-                }
-                Ok(super::Answer::Later(request)) => {
-                    later.push((m, source, args, request));
-                    None
-                }
-                Err(error) => Some(format!("{error:?}")),
-            };
-            if let Some(why) = refused {
-                self.log(super::lines::unsent_refused(&name, &why));
-                // Its write ends; the resources it showed in drop it in
-                // this commit, and a refusal of the commit does not bring
-                // it back.
-                self.refused_unsent.push((m, self.asked_write(m)));
-                self.end_write(m, None);
-            }
+    fn send_unsent(
+        &mut self,
+    ) -> (
+        Vec<(CallOrigin, u64)>,
+        Vec<(usize, String, Vec<Value>, super::Request)>,
+    ) {
+        let (mut by, mut later) = (Vec::new(), Vec::new());
+        for (m, source, args, (origin, id)) in std::mem::take(&mut self.unsent) {
+            let sent = later.len();
+            self.as_invocation(origin, id, |r| r.send_one(m, source, args, &mut later));
+            by.extend(std::iter::repeat_n((origin, id), later.len() - sent));
         }
         self.sync_pending_flags();
         // Pending until the request goes out with the commit, or is let go.
         for (m, ..) in &later {
             self.pending_mut[*m] = true;
         }
-        later
+        (by, later)
+    }
+
+    /// The origin and invocation a send made now keeps (`unsent`).
+    pub(super) fn sent_by(&self) -> (CallOrigin, u64) {
+        (self.call_origin(), self.invocation_id())
+    }
+
+    /// One of [`Self::send_unsent`]'s sends, under its commit's origin.
+    fn send_one(
+        &mut self,
+        m: usize,
+        source: String,
+        args: Vec<Value>,
+        later: &mut Vec<(usize, String, Vec<Value>, super::Request)>,
+    ) {
+        let target = super::Target::Mutation(m);
+        let name = self.plan.str(self.plan.mutations[m].name).to_string();
+        self.mutation_requests += 1;
+        let answer = if Self::activity_send(&source) {
+            self.activity_request(&source, &args)
+        } else {
+            self.store.set_clock_ms(self.now_ms);
+            let answer = self
+                .data
+                .answer_for(target, &mut self.store, &source, &args);
+            self.refuse_locked(answer)
+        };
+        // What its turn sent as an answer (LLP 1016.000 D7, the amendment
+        // of 2026-10-18).
+        self.stage_answer(target);
+        let refused = match answer {
+            Ok(super::Answer::Now(value)) if self.conforms(&value, self.plan.mutations[m].ty) => {
+                match self.mutation_slot(m) {
+                    Ok(slot) => {
+                        self.forget_ticket(super::Target::Mutation(m));
+                        self.land_write(m, None, &value);
+                        self.slots[slot] = Value::some(value);
+                        self.landed.push(m);
+                        for r in self.declared_refreshes(m) {
+                            self.force_refresh(r);
+                            self.note_reasked(r);
+                        }
+                        None
+                    }
+                    Err(e) => Some(format!("{e:?}")),
+                }
+            }
+            Ok(super::Answer::Now(_)) => {
+                Some("its answer does not fit the mutation's shape".to_string())
+            }
+            Ok(super::Answer::Later(request)) => {
+                later.push((m, source, args, request));
+                None
+            }
+            Err(error) => Some(format!("{error:?}")),
+        };
+        if let Some(why) = refused {
+            self.log(super::lines::unsent_refused(&name, &why));
+            // Its write ends; the resources it showed in drop it in
+            // this commit, and a refusal of the commit does not bring
+            // it back.
+            self.refused_unsent.push((m, self.asked_write(m)));
+            self.end_write(m, None);
+        }
     }
 }
 

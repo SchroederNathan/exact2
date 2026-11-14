@@ -20,9 +20,16 @@ use exact_kernel::{NodeRef, PropValue, RowValue, StyleId};
 use exact_plan::{BindingKind, Plan, TypeKind, TypesId, Value};
 use std::fmt::Write as _;
 
+mod lineage;
+mod looks;
+mod pending;
 mod row;
+/// A row's value as `node` prints it: the JS target's inspect table (LLP 1122 T2b) writes the same words.
+pub use row::row_json;
 mod schedule;
 mod sound;
+mod source;
+mod streams;
 mod transport;
 mod tree;
 
@@ -41,9 +48,18 @@ pub fn handle<D: DataSource>(runner: &Runner<D>, request: &str) -> String {
         // @ref LLP 1103 D3 — the driver's fetch faults, a form of `prefer`:
         // the network is the environment, as `online` is (LLP 1012 §1).
         Some("prefer") if after_key(request, "faults").is_some() => faults(runner, request),
-        // The module's storage still to land (LLP 1097 D10): what a host's
-        // quit or suspension waits for, cheaper than `state`.
-        Some("background") => format!("{{\"operations\":{}}}", runner.background_operations()),
+        // Whether the app must finish work an answer started (`must_finish`):
+        // what a host's quit waits for, cheaper than `state`.
+        Some("background") => format!("{{\"mustFinish\":{}}}", runner.must_finish()),
+        // A polled module source's ask in flight (LLP 1133.009 D10 item 7):
+        // what a jump waits for before it replies.
+        Some("polls") => format!("{{\"asking\":{}}}", runner.polls_asking()),
+        // The requests the server holds and the replies landed for them (LLP
+        // 1016.000 D9): what `clock held` polls and a clock reply names,
+        // cheaper than `state`.
+        Some("held") => pending::held(runner),
+        // The runner's outstanding work, which time-to-interactive waits on.
+        Some("outstanding") => runner.outstanding().json(),
         Some("perf") => crate::perf::reply(runner, request),
         // What `showPicker(id)` names (LLP 1069.002 D2): the file input's
         // view, `accept` and `multiple`, for the host that presents it.
@@ -61,6 +77,12 @@ pub fn handle<D: DataSource>(runner: &Runner<D>, request: &str) -> String {
         // Every view's plan site, and the plan's digest (LLP 1122 D5): what a
         // development page outlines by, without a node's whole explanation.
         Some("sites") => runner.view_sites_json(),
+        // A view and each logical ancestor to the root with its plan site (null for none): what a development
+        // page walks to move a selection up its call sites (tamber/1.16 `inspect` `select`), with no node's rows.
+        Some("ancestors") => match field_num(request, "id") {
+            Some(n) if n >= 0.0 && n == n.trunc() => lineage::ancestors(runner, n as u32),
+            _ => error("ancestors needs a numeric id"),
+        },
         Some("node") => match field_num(request, "id") {
             Some(n) if n >= 0.0 && n == n.trunc() => {
                 let mut reply = node(runner, n as u32);
@@ -103,7 +125,7 @@ pub fn tags<D: DataSource>(runner: &Runner<D>) -> String {
 /// The kernel's half of `layout agree` (LLP 1080.001 D2), a private
 /// message: `{"op":"frames","limit":N}` answers every live node in preorder
 /// as `[id, parent|null, x, y, w, h, bits]` — the parent-relative frame a
-/// host is sent — with bit 1 for the node's own `display: none`, 2 for an
+/// host is sent, a block's root's in its block — with bit 1 for the node's own `display: none`, 2 for an
 /// own transform row (`translate`, `translate_z`, `rotate`, `rotate_axis`,
 /// `scale`, `transform`) whose value is not the initial one (`scale: 1`,
 /// `translate: 0`, `transform: none` move nothing), 4 for a frame the host owns rather than the
@@ -152,8 +174,10 @@ pub fn frames<D: DataSource>(
         }
         count += 1;
         let f = node.frame;
+        // A block's root is in its block's space, not its parent's.
         let (px, py) = node
             .parent
+            .filter(|_| kernel.host_block(id).is_none())
             .and_then(|p| kernel.node(p))
             .map_or((0.0, 0.0), |p| (p.frame.x, p.frame.y));
         let mut bits = 0u32;
@@ -250,6 +274,18 @@ pub fn answer<D: DataSource>(
         quote(&(picker.picked_path)(runner, &name), &mut s);
         s.push('}');
         return Some((s, None));
+    }
+    if op == "frameRequest" {
+        let reply = runner.hold_frame_request(request);
+        return Some((reply.unwrap_or_else(|e| error(&e)), None));
+    }
+    // A module's listed entry: `tap @ref`, or a relaunch's launch flag (LLP 1133.004 §7).
+    if let Some(reply) = runner.listed_op(&op, request) {
+        return Some((reply.unwrap_or_else(|e| error(&e)), None));
+    }
+    // A system's call of a tool, and the content index's query (LLP 1133.023 §10).
+    if let Some(reply) = runner.call_agent(&op, request) {
+        return Some((reply.unwrap_or_else(|e| error(&e)), None));
     }
     if !matches!(op.as_str(), "tap" | "type") || after_key(request, "ticket").is_none() {
         return None;
@@ -377,7 +413,8 @@ pub(crate) fn target<D: DataSource>(
 
 /// The tree: every live node in preorder — id, parent, depth, type, props by
 /// their schema names, the events it handles, `inactive` when it is under a
-/// route its navigation root has not selected, `unopened` on a tab panel not
+/// route its navigation root has not selected, and `hidden` too when that
+/// route is not shown (any but one a sheet covers), `unopened` on a tab panel not
 /// yet built (LLP 1075.003 §9.14), its children — plus the kernel's epoch
 /// and incarnation (the consistency token: nothing moves between two calls
 /// unless the agent moved it).
@@ -438,6 +475,17 @@ fn token_json<D: DataSource>(runner: &Runner<D>, id: u32, row: StyleId, s: &mut 
     let Some((names, text, modes, implied)) = runner.row_token(id, row) else {
         return;
     };
+    token_fields(&names, &text, &modes, implied, s);
+}
+
+/// `,"token":{…}` (`token_json`'s).
+pub(super) fn token_fields(
+    names: &[String],
+    text: &str,
+    modes: &str,
+    implied: bool,
+    s: &mut String,
+) {
     s.push_str(",\"token\":{\"names\":[");
     for (i, n) in names.iter().enumerate() {
         if i > 0 {
@@ -446,19 +494,20 @@ fn token_json<D: DataSource>(runner: &Runner<D>, id: u32, row: StyleId, s: &mut 
         quote(n, s);
     }
     s.push_str("],\"text\":");
-    quote(&text, s);
+    quote(text, s);
     s.push_str(",\"modes\":");
-    quote(&modes, s);
+    quote(modes, s);
     let _ = write!(s, ",\"implied\":{implied}}}");
 }
 
 /// One node, explained (LLP 1035.002 D1): every row it sets or inherits with
 /// where the value came from — `authored` (the own row), `inherited` from
-/// the ancestor whose own row won (CSS inheritance, LLP 1035.000 D1), or
-/// `initial` — its props, the plan site it was instantiated from with the
+/// the ancestor whose own row won (CSS inheritance, LLP 1035.000 D1), the
+/// `style` or `heading` that gives it (LLP 1115.000 D12.2), or `initial`
+/// ([`source::write`]) — its props, the plan site it was instantiated from with the
 /// instance path to it (D6), and the kernel's frames: `frame` relative to
-/// the parent, `absolute` in the root's space, or in its host block's for a
-/// node inside one (LLP 1115.002 D8.2), `content` when it scrolls.
+/// the parent, `absolute` in the root's space or the viewport when the host
+/// places its block (as `frame()` reports it), `content` when it scrolls.
 /// Observations of the runner's memory, tagged with the epoch and
 /// incarnation; a host adds the spaces and what it mounted. An id that is
 /// not a live node in this incarnation is refused by name.
@@ -551,25 +600,16 @@ pub fn node<D: DataSource>(runner: &Runner<D>, id: u32) -> String {
         if own {
             token_json(runner, id, row, &mut s);
         }
-        if own && dynamic(row) {
-            s.push_str(",\"source\":\"dynamic\"}");
-        } else if own {
-            s.push_str(",\"source\":\"authored\"}");
-        } else {
-            match node.source_of(row) {
-                Some(from) => {
-                    // And the token the ancestor's own row read, its link.
-                    let _ = write!(s, ",\"source\":\"inherited\",\"from\":{from}");
-                    token_json(runner, from, row, &mut s);
-                    s.push('}');
-                }
-                None => s.push_str(",\"source\":\"initial\"}"),
-            }
-        }
+        source::write(runner, &node, row, own, own && dynamic(row), &mut s);
     }
-    s.push_str("},\"props\":{");
+    s.push('}');
+    // @ref LLP 1121 D8 — its state looks' rows, each as a style row is (its
+    // value, the token it read), for inspect on a held state (LLP 1122 D8).
+    looks::write(runner, &node, &mut s);
+    s.push_str(",\"props\":{");
     props_json(&node, &mut s);
     let f = node.frame;
+    let absolute = runner.top_layer_open().agent_frame(kernel, node.id, f);
     let (px, py) = node
         .parent
         .and_then(|p| kernel.node(p))
@@ -581,10 +621,10 @@ pub fn node<D: DataSource>(runner: &Runner<D>, id: u32) -> String {
         num((f.y - py) as f64),
         num(f.width as f64),
         num(f.height as f64),
-        num(f.x as f64),
-        num(f.y as f64),
-        num(f.width as f64),
-        num(f.height as f64)
+        num(absolute.x),
+        num(absolute.y),
+        num(absolute.width),
+        num(absolute.height)
     );
     // @ref LLP 1043.000 §3 D4, §8 — leaf-local geometry, or why auto height refused it.
     if !node.flow_shapes().is_empty() {
@@ -684,19 +724,18 @@ fn state_with<D: DataSource>(runner: &Runner<D>, request: &str) -> String {
         num(runner.now_ms())
     );
     let mut first = true;
-    for row in plan.slots.iter() {
+    for (i, row) in plan.slots.iter().enumerate() {
         if row.owner.is_some() {
             // A row slot has a value per row, not one here (LLP 1017 P4c).
             continue;
         }
-        let name = plan.str(row.name);
         if !first {
             s.push(',');
         }
         first = false;
-        quote(name, &mut s);
+        quote(plan.str(row.name), &mut s);
         s.push(':');
-        match runner.slot(name) {
+        match runner.slot_at(i) {
             Some(v) => typed_json(plan, row.ty, v, &mut s),
             None => s.push_str("null"),
         }
@@ -725,10 +764,14 @@ fn state_with<D: DataSource>(runner: &Runner<D>, request: &str) -> String {
         runner.page(),
         runner.viewport().fold,
     );
-    let (files, pictures) = (page.can_share_files, page.can_share_pictures);
+    let (files, pictures, partition) = (
+        page.can_share_files,
+        page.can_share_pictures,
+        page.iframe_partition,
+    );
     let _ = write!(
         s,
-        "}},\"device\":{{\"prefersReducedMotion\":{},\"prefersReducedTransparency\":{},\"prefersContrast\":\"{}\",\"prefersColorScheme\":\"{}\",\"visibilityState\":\"{}\",\"onLine\":{},\"canShare\":{},\"canShareFiles\":{files},\"canSharePictures\":{pictures},\"canOpenFiles\":{},\"hasFocus\":{},\"rootFontSize\":{},\"devicePosture\":\"{}\",\"horizontalViewportSegments\":{},\"verticalViewportSegments\":{},\"colorGamut\":\"{}\",\"dynamicRange\":\"{}\"",
+        "}},\"device\":{{\"prefersReducedMotion\":{},\"prefersReducedTransparency\":{},\"prefersContrast\":\"{}\",\"prefersColorScheme\":\"{}\",\"visibilityState\":\"{}\",\"onLine\":{},\"canShare\":{},\"canShareFiles\":{files},\"canSharePictures\":{pictures},\"canOpenFiles\":{},\"iframePartition\":{partition},\"hasFocus\":{},\"rootFontSize\":{},\"devicePosture\":\"{}\",\"horizontalViewportSegments\":{},\"verticalViewportSegments\":{},\"colorGamut\":\"{}\",\"dynamicRange\":\"{}\"",
         media.reduced_motion,
         media.reduced_transparency,
         media.contrast.keyword(),
@@ -749,6 +792,15 @@ fn state_with<D: DataSource>(runner: &Runner<D>, request: &str) -> String {
     quote(media.display_mode.keyword(), &mut s);
     s.push_str(",\"navigationType\":");
     quote(page.navigation_type(), &mut s);
+    let _ = write!(
+        s,
+        ",\"persisted\":{},\"restores\":{},\"background\":{}",
+        page.persisted,
+        page.restores,
+        page.in_background()
+    );
+    s.push_str(",\"gpuTier\":");
+    quote(page.gpu_tier(), &mut s);
     s.push('}');
     // The driver's fetch faults (LLP 1103 D3), when any are armed or spent.
     if !runner.faults().is_empty() {
@@ -763,20 +815,20 @@ fn state_with<D: DataSource>(runner: &Runner<D>, request: &str) -> String {
         }
         quote(name, &mut s);
         s.push(':');
-        match runner.derive(name) {
+        match runner.derive_at(i) {
             Some(v) => typed_json(plan, row.ty, v, &mut s),
             None => s.push_str("null"),
         }
     }
     s.push_str("},\"resources\":{");
-    for (i, row) in plan.resources.iter().enumerate() {
+    for (i, row) in runner.declared_resources().iter().enumerate() {
         let name = plan.str(row.name);
         if i > 0 {
             s.push(',');
         }
         quote(name, &mut s);
         s.push(':');
-        match runner.shown_resource(name) {
+        match runner.shown_resource_at(i) {
             Some(v) => typed_json(plan, row.ty, v, &mut s),
             None => s.push_str("null"),
         }
@@ -816,66 +868,16 @@ fn state_with<D: DataSource>(runner: &Runner<D>, request: &str) -> String {
         }
         s.push('}');
     }
-    s.push_str(",\"pending\":[");
-    let in_flight = runner.in_flight();
-    for (i, (name, ticket)) in in_flight.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str("{\"name\":");
-        quote(name, &mut s);
-        let _ = write!(s, ",\"ticket\":{ticket}}}");
+    crate::perf::failures(runner, &mut s);
+    runner.resource_inspection(&mut s);
+    s.push(',');
+    pending::state(runner, &mut s);
+    s.push(',');
+    streams::state(runner, &mut s);
+    // Native modules, as the runner answers them (LLP 1133.002 §6).
+    if let Some(extensions) = runner.extensions_json() {
+        let _ = write!(s, ",\"extensions\":{extensions}");
     }
-    // Held device requests, after the network's (LLP 1069.007 D3): each
-    // with its capability and that capability's inspection summary.
-    let network = in_flight.len();
-    for (i, hold) in runner.device_holds().iter().enumerate() {
-        if i > 0 || network > 0 {
-            s.push(',');
-        }
-        s.push_str("{\"name\":");
-        quote(&hold.name, &mut s);
-        let _ = write!(
-            s,
-            ",\"ticket\":{},\"device\":{{\"capability\":",
-            hold.ticket
-        );
-        quote(&hold.capability, &mut s);
-        s.push_str(",\"args\":");
-        if hold.args.starts_with('{') && hold.args.ends_with('}') {
-            s.push_str(&hold.args);
-        } else {
-            s.push_str("{}");
-        }
-        s.push_str("}}");
-    }
-    // Open streams (LLP 1016.000 D5): pending until their first message,
-    // then listed here with what they delivered and what coalesced.
-    s.push_str("],\"streams\":[");
-    for (i, (name, ticket, count)) in runner.streams().iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str("{\"name\":");
-        quote(name, &mut s);
-        let _ = write!(
-            s,
-            ",\"ticket\":{ticket},\"messages\":{},\"coalesced\":{}",
-            count.messages, count.coalesced
-        );
-        // A two-way socket's state, as the web JS target lists it (D7).
-        if let Some(socket) = count.socket {
-            let _ = write!(
-                s,
-                ",\"readyState\":{},\"bufferedAmount\":{},\"sent\":{}",
-                socket.ready_state,
-                runner.socket_buffered(*ticket, socket.buffered),
-                socket.sent
-            );
-        }
-        s.push('}');
-    }
-    s.push(']');
     // The documents the answers watch (LLP 1069.010.000 D1), whether or not
     // the host can listen for them.
     s.push_str(",\"watches\":[");
@@ -909,17 +911,17 @@ fn state_with<D: DataSource>(runner: &Runner<D>, request: &str) -> String {
     }
     schedule::tasks(runner, &mut s);
     schedule::queued(runner, &mut s);
-    // Notifications posted under the agent, where none reaches the system.
-    s.push_str(",\"notifications\":[");
-    for (i, n) in runner.notifications().iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        n.summary(&mut s);
+    // What a module's declared substitute keeps (LLP 1133.004 §7).
+    runner.declared_state_json(&mut s);
+    // The wake running, else the last (LLP 1133.017 §10).
+    if let Some(wake) = runner.wake_state() {
+        s.push_str(",\"wake\":");
+        s.push_str(&wake.to_string());
     }
-    s.push(']');
     sound::state(runner, request, &mut s);
-    crate::wakelock::state(runner.kernel(), &mut s);
+    crate::wakelock::state(runner, &mut s);
+    crate::orientation::state(runner, &mut s);
+    crate::desktop::state(runner, &mut s);
     transport::state(runner, request, &mut s);
     // The store's names, never its values (LLP 1018 D5).
     s.push_str(",\"store\":[");
@@ -1410,90 +1412,4 @@ fn after_key<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn base64_round_trips_every_byte_and_refuses_what_is_not_base64() {
-        let all: Vec<u8> = (0..=255).collect();
-        for n in 0..=4 {
-            let bytes = &all[..all.len() - n];
-            assert_eq!(unbase64(&base64(bytes)).as_deref(), Some(bytes));
-        }
-        assert_eq!(unbase64("").as_deref(), Some(&[][..]));
-        assert_eq!(unbase64("AP+ACg0A").unwrap(), [0, 255, 128, 10, 13, 0]);
-        assert_eq!(unbase64("AP-A"), None);
-        assert_eq!(unbase64("AP A"), None);
-    }
-
-    #[test]
-    fn flat_fields_parse() {
-        let r = r#"{"op":"logs","since":12,"text":"a \"b\" \\ c\n","wheel":true}"#;
-        assert_eq!(field_str(r, "op").as_deref(), Some("logs"));
-        assert_eq!(field_num(r, "since"), Some(12.0));
-        assert_eq!(field_str(r, "text").as_deref(), Some("a \"b\" \\ c\n"));
-        assert!(field_bool(r, "wheel"));
-        assert!(!field_bool(r, "since"));
-        assert_eq!(field_str(r, "missing"), None);
-        assert_eq!(field_num(r, "op"), None);
-    }
-
-    #[test]
-    fn keys_inside_values_and_nested_objects_never_match() {
-        // A string value that contains `"op":`, a nested object with an `op`,
-        // and an array — only the top-level `op` counts.
-        let r =
-            r#"{"text":"{\"op\":\"logs\"}","meta":{"op":"state"},"list":[{"op":"x"}],"op":"tree"}"#;
-        assert_eq!(field_str(r, "op").as_deref(), Some("tree"));
-        assert_eq!(field_str(r, "text").as_deref(), Some(r#"{"op":"logs"}"#));
-        assert_eq!(field_str(r#"{"meta":{"op":"state"}}"#, "op"), None);
-        // A key at the top level whose value is not a string.
-        assert_eq!(field_str(r#"{"op":3}"#, "op"), None);
-        assert_eq!(field_num(r#"{"since":"3"}"#, "since"), None);
-        // Unterminated strings and requests are `None`, never a panic.
-        assert_eq!(field_str(r#"{"op":"tre"#, "op"), None);
-        assert_eq!(field_str(r#"{"op"#, "op"), None);
-        assert_eq!(field_str(r#"{"op\"#, "op"), None);
-        // Surrogate pairs decode to one character; a lone surrogate is refused.
-        assert_eq!(field_str(r#"{"t":"😀"}"#, "t").as_deref(), Some("😀"));
-        assert_eq!(field_str(r#"{"t":"\ud83d"}"#, "t"), None);
-    }
-
-    #[test]
-    fn numbers_render_as_json() {
-        assert_eq!(num(3.0).to_string(), "3");
-        assert_eq!(num(-0.0).to_string(), "0");
-        assert_eq!(num(-0.5).to_string(), "-0.5");
-        assert_eq!(num(1e-8).to_string(), "0.00000001");
-        assert_eq!(num(f64::NAN).to_string(), "null");
-        assert_eq!(num(f64::INFINITY).to_string(), "null");
-        assert_eq!(num(f64::NEG_INFINITY).to_string(), "null");
-        assert_eq!(num(1e20).to_string(), "100000000000000000000");
-        let mut output = String::from("[");
-        write!(output, "{},{},{}]", num(-0.0), num(1e-8), num(f64::NAN)).unwrap();
-        assert_eq!(output, "[0,0.00000001,null]");
-        let mut s = String::new();
-        quote("tab\there \"q\" \u{1}", &mut s);
-        assert_eq!(s, "\"tab\\there \\\"q\\\" \\u0001\"");
-    }
-
-    #[test]
-    fn quoted_strings_preserve_unicode_and_escape_boundaries() {
-        for input in [
-            "",
-            "plain",
-            "é🦀",
-            "\"é\\🦀\n",
-            "\u{2028}\u{2029}",
-            "\t\r\n",
-        ] {
-            let mut json = String::from("{\"text\":");
-            quote(input, &mut json);
-            json.push('}');
-            assert_eq!(field_str(&json, "text").as_deref(), Some(input));
-        }
-        let mut json = String::new();
-        quote("é\u{0}🦀\u{8}\u{c}\u{1f}\u{7f}", &mut json);
-        assert_eq!(json, "\"é\\u0000🦀\\u0008\\u000c\\u001f\u{7f}\"");
-    }
-}
+mod tests;

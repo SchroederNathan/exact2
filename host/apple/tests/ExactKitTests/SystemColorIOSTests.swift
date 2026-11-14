@@ -2,11 +2,14 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+import ExactCore
 @testable import ExactMarkdown
 
 extension UIColor {
     /// Named like a colour, returning none: what the lookup must not `perform`.
     @objc class func exactTestNumberColor() -> Int { 3 }
+    /// A colour by a class method Apple does not document: what the lookup must not reach.
+    @objc class func exactTestUndocumentedColor() -> UIColor { .systemRed }
 }
 
 /// LLP 1095 D5: a colour row naming a platform colour shows UIKit's own
@@ -68,7 +71,7 @@ final class SystemColorIOSTests: XCTestCase {
         window.makeKeyAndVisible()
         let blue: [String: Any] = ["sys": "systemBlueColor", "c": [[0, 0, 255, 255], [0, 0, 255, 255]]]
         p.apply(wireBatch([
-            ["op": "create", "id": 1, "kind": "text", "style": ["background_color": blue]],
+            ["op": "create", "id": 1, "kind": "text", "style": ["background_color": blue, "symbol_rendering": "palette", "symbol_palette": [blue]]],
             ["op": "paragraph", "id": 1, "runs": [["id": 2, "parent": 1, "paint": true, "props": ["text": "blue"], "style": ["text_color": blue]]]],
             ["op": "roots", "ids": [1]],
             ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 100.0, "h": 40.0],
@@ -80,18 +83,39 @@ final class SystemColorIOSTests: XCTestCase {
         let high = UITraitCollection(traitsFrom: [UITraitCollection(userInterfaceStyle: .light), UITraitCollection(accessibilityContrast: .high)])
         XCTAssertEqual(node.channels("background_color"), channels(.systemBlue, normal))
         XCTAssertEqual(node.paragraphSpec().runs.first?.color, channels(.systemBlue, normal))
-        let key = node.symbolLookKey
+        let configuration = node.symbolConfiguration(UIImage.SymbolConfiguration(pointSize: 17))
         node.traitOverrides.accessibilityContrast = .high
         node.updateTraitsIfNeeded()
         XCTAssertEqual(node.drawsHighContrast, true)
         XCTAssertNotEqual(channels(.systemBlue, normal), channels(.systemBlue, high))
         XCTAssertEqual(node.channels("background_color"), channels(.systemBlue, high))
         XCTAssertEqual(node.paragraphSpec().runs.first?.color, channels(.systemBlue, high), "the run resolves now, not at decoding")
-        XCTAssertNotEqual(node.symbolLookKey, key, "a palette resolved for the old contrast is made again")
+        XCTAssertFalse(node.symbolConfiguration(UIImage.SymbolConfiguration(pointSize: 17)).isEqual(configuration), "the view configuration resolves the new contrast")
     }
 
     func testAColourNamedMethodReturningNoObjectIsTheFallback() {
         XCTAssertEqual(SystemColor.channels("exactTestNumberColor", dark: false, fallback: [1, 2, 3, 255]), [1, 2, 3, 255])
+    }
+
+    /// Only a documented class colour resolves (`SystemColorNames`): one by
+    /// any other class method, a colour though it is, is the fallback.
+    func testAnUndocumentedColourIsTheFallback() {
+        XCTAssertEqual(SystemColor.channels("exactTestUndocumentedColor", dark: false, fallback: [1, 2, 3, 255]), [1, 2, 3, 255])
+        XCTAssertNil(SystemColor.native(.object(["sys": .string("exactTestUndocumentedColor")])))
+        XCTAssertNotEqual(SystemColor.channels("systemRedColor", dark: false, fallback: [1, 2, 3, 255]), [1, 2, 3, 255])
+    }
+
+    /// Every class colour the role table names for this platform, and those
+    /// the repo's apps and docs write in `-exact-platform-color()`, is on
+    /// the documented list.
+    func testEveryColourTheRepoNamesIsDocumented() throws {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("../../../../kernel/tables/schema.json").standardized
+        let schema = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        let rows = try XCTUnwrap(schema?["colors"] as? [[String]])
+        let named = rows.map { String($0[2].split(separator: "/")[0]) }.filter { !$0.hasPrefix("@") && $0 != "exactGroupedCardColor" }
+        XCTAssertGreaterThan(named.count, 20)
+        for name in named + ["systemTealColor", "systemMintColor", "systemPinkColor", "systemOrangeColor", "systemBlueColor", "labelColor", "secondaryLabelColor", "tintColor"] { XCTAssertNotNil(SystemColorNames.color(name), name) }
     }
 
     /// LLP 1095 D8: `@tint` is the requesting view's own tint, its window's,
@@ -148,8 +172,9 @@ final class SystemColorIOSTests: XCTestCase {
         XCTAssertEqual(beside.channels("background_color"), channels(.systemBlue, beside.traitCollection))
     }
 
-    /// The view's own tint reaches a plain text run, its shadow, a box
-    /// shadow and a palette symbol, and a tint change rebuilds the glyph.
+    /// The view's own tint reaches a plain text run, its shadow and a box
+    /// shadow, and a palette symbol's colour of the tint is UIKit's tint,
+    /// which UIKit resolves by the view it draws the symbol in.
     func testEveryResolverTakesTheViewsTint() throws {
         let p = Presenter()
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 300, height: 300))
@@ -176,9 +201,8 @@ final class SystemColorIOSTests: XCTestCase {
         let shade = try XCTUnwrap(node.boxShadows.first?.color.components).map { Double($0) * 255 }
         XCTAssertEqual(shade.count, 4)
         for (got, want) in zip(shade, red) { XCTAssertEqual(got, want, accuracy: 0.01, "a box shadow") }
-        let key = node.symbolLookKey
-        p.viewport.tintColor = .systemGreen
-        XCTAssertNotEqual(node.symbolLookKey, key, "a palette naming the tint is made again")
+        let base = UIImage.SymbolConfiguration(pointSize: 17)
+        XCTAssertTrue(node.symbolConfiguration(base).isEqual(base.applying(UIImage.SymbolConfiguration(paletteColors: [UIColor.tintColor]))), "the palette is UIKit's tint")
     }
 
     func testMarkdownAndPlainTextResolveTheSameViewTintAndTraits() throws {

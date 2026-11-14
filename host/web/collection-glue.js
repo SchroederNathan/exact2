@@ -3,7 +3,9 @@
 // commits a collection (LLP 1047 D5); navigation.js stands in until then.
 // `fill` (LLP 1050.000 §6): `velocity` in CSS px/s toward the end, and
 // `limit`, the rows past what the report owes it may build (null: any);
-// `ancestorMoving`, an enclosing list is moving (LLP 1070 F2). Wire v4:
+// `ancestorMoving`, an enclosing list is moving (LLP 1070 F2); `scrolling`, the reader's scroll is under way, and
+// `gesture`, one began since the list's `scrollIntoView` (LLP 1070.000 §2.6); `animating`, a smooth correction
+// runs (§11). Wire v4:
 // offset, port, padding and row sizes on the list's main and cross axes.
 export function collectionBytes(facts, fill = {}) {
   const valid = n => Number.isFinite(n) && n >= 0 && n <= 3.4028234663852886e38;
@@ -26,7 +28,7 @@ export function collectionBytes(facts, fill = {}) {
   [facts.offset, facts.port_main, facts.port_cross, facts.cross, facts.padding[0], facts.padding[1]].forEach((n, i) => d.setFloat64(24 + i * 8, n, true));
   d.setUint32(72, facts.focus_view ?? 0, true); d.setUint32(76, facts.interaction_view ?? 0, true);
   d.setFloat64(80, velocity, true); d.setUint32(88, limit, true);
-  d.setUint32(92, fill.ancestorMoving ? 1 : 0, true); d.setUint32(96, rows.length, true);
+  d.setUint32(92, (fill.ancestorMoving ? 1 : 0) | (fill.scrolling ? 32 : 0) | (fill.gesture ? 64 : 0) | (fill.animating ? 128 : 0), true); d.setUint32(96, rows.length, true);
   rows.forEach((row, i) => {
     d.setUint32(100 + i * 20, row.view, true); d.setBigUint64(104 + i * 20, u64(row.epoch), true);
     d.setFloat64(112 + i * 20, row.size, true);
@@ -34,8 +36,10 @@ export function collectionBytes(facts, fill = {}) {
   return bytes;
 }
 
-// The reader's own hand on a port (LLP 1070.000 §2.5: it cancels a request).
-const INPUT = ['wheel', 'touchstart', 'keydown', 'pointerdown'];
+// The reader's motion is taken to have ended QUIET after its last `scroll` event when no `scrollend` came first: a
+// browser without one, an end the glue's own write took, a pause in a drag. Above the longest gaps measured between
+// `scroll` events (LLP 1070.000 §2.6).
+const QUIET = 300;
 // A list's main axis (LLP 1070 H1): `y` for a block list, `x` for a flex row.
 // Every main-axis read and write goes through one of these.
 const AXES = {
@@ -53,25 +57,95 @@ export function applyCollectionFeedback(batch, applyBatch) {
 // `report(bytes, facts, fill)`: the wire bytes for the wasm runner, the
 // same facts as values for the JS target's (host/web-js/list.js).
 export function collectionController({ root, views, report, settled=()=>{}, agent = false,
-  requestFrame = fn => requestAnimationFrame(fn), cancelFrame = id => cancelAnimationFrame(id), now = () => performance.now() }) {
+  requestFrame = fn => requestAnimationFrame(fn), cancelFrame = id => cancelAnimationFrame(id), now = () => performance.now(),
+  setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = id => clearTimeout(id) }) {
   const states = new Map(), dirty = new Set(), waiting = new Set(), rowOwners = new WeakMap(), doc = root.ownerDocument;
-  let settling = false, frame = null, delivering = false, interaction = null, reportsLeft = 4, notification=false, reported = 0;
+  let scrollsFired = 0; // scroll events the lists' ports have delivered (fireOwedScrolls)
+  let early = { frame: undefined, left: 0, lists: new Map() }, settling = false, frame = null, delivering = false, interaction = null, reportsLeft = 4, notification=false, reported = 0;
   // LLP 1050.000 stage 1. The browser scrolls on its own thread and never
   // waits for rows (the declared deviation), so each frame's reports share a
   // slice of time: every row a report owes (what shows, the pins), then as
   // many more as the measured per-row cost fits, or the next two frames of
   // travel uncover. A report's reply that leaves rows unbuilt (`pending`)
   // continues in the next frame. Authored jumps build first, then move (§6).
-  let interval = 1000 / 60, lastFrame = null, deadline = 0;
+  let interval = 1000 / 60, lastFrame = null, deadline = 0, frames = 0; // `frames`: the frames flushed so far
   const jumps = [];
+  let lastSnapshots = []; // the last commit's, for a list whose port a report finds moved
   const slice = () => Math.min(4, Math.max(1, interval * 0.24));
   // A `scrollIntoView` under way (LLP 1070.000 §2.5): the port's moves are
   // its own and the browser's clamps, never travel, until the reader's input.
   const authored = s => s.seeking && !s.input;
+  // The reader's activity on each scrollport (LLP 1070.000 §2.6), shared by the lists in it: motion the reader started,
+  // and whether the glue's own write owns the next `scrollend`. A list's request waits while that motion is under way.
+  const ports = new Map();
+  function activity(s) {
+    let a = ports.get(s.port);
+    if (!a) {
+      a = { port: s.port, lists: new Set(), moving: false, quiet: null, ownEnd: false };
+      // An end that answers the glue's own write (one since the last end) is not the reader's. It also lands any of
+      // the glue's own animations in the port.
+      a.ended = () => { if (a.ownEnd) a.ownEnd = false; else ended(a); for (const o of a.lists) animationEnded(o); };
+      s.eventTarget.addEventListener('scrollend', a.ended, { passive: true });
+      ports.set(s.port, a);
+    }
+    a.lists.add(s);
+    return a;
+  }
+  function leave(s) {
+    const a = s.activity;
+    a.lists.delete(s);
+    if (a.lists.size) return;
+    s.eventTarget.removeEventListener('scrollend', a.ended);
+    clearTimer(a.quiet);
+    ports.delete(s.port);
+  }
+  const tell = a => { for (const s of a.lists) enqueue(s, true); };
+  // The port's offset read: a move found there is the reader's motion, wherever it is first seen (the report, the
+  // commit, the scroll event, a reorder drag's mapping), unless the glue's own smooth correction made it
+  // (`hostMoves`). Whether it changed.
+  function readScroll(s) {
+    const changed = scrollChanged(s);
+    if (changed && !hostMoves(s)) moved(s.activity);
+    return changed;
+  }
+  // The port moves by the glue's own smooth correction, of any list in it: one running, or one stopped this frame,
+  // whose last position the page reads a frame later (`stopAnimation`). One that landed did so at its `scrollend`,
+  // which the browser fires after that frame's `scroll` events.
+  const hostMoves = s => {
+    for (const o of s.activity.lists) if (o.animating != null || o.stoppedIn === frames) return true;
+    return false;
+  };
+  // A write the glue made to a port is its own for every list in it: another list takes the new offset as a move it
+  // has not reported (a correction it planned before it does not land), not as the reader's motion. A smooth write
+  // moves the port only later, so it copies no offset.
+  function echo(s) {
+    const at = scrollOffset(s.port, s.axis);
+    for (const o of s.activity.lists) {
+      if (o === s) continue;
+      // The write aborted the browser's smooth scroll of any other list in the port (CSSOM View, "scroll an element"):
+      // its animation stops where the write put the port
+      if (o.animating != null) { halt(o); enqueue(o, true); }
+      if (o.axis !== s.axis) continue;
+      if (at !== o.offset) { o.offset = at; o.sequence++; o.exact = o.clamp = o.clampAt = null; }
+    }
+  }
+  // The reader's scroll moved the port: the motion ends at its `scrollend` or, failing one, QUIET after its last move.
+  function moved(a) {
+    a.moving = true;
+    clearTimer(a.quiet); a.quiet = setTimer(() => ended(a), QUIET);
+    // A request that has moved the port is the reader's once the reader moves it, whatever the input: its
+    // corrections no longer land whatever the port did, and the next report ends it (LLP 1070.000 §2.5)
+    for (const s of a.lists) if (authored(s)) s.input = true;
+  }
+  // Motion over: the next reports say it ended.
+  function ended(a) {
+    if (!a.moving) return;
+    a.moving = false; clearTimer(a.quiet); tell(a);
+  }
   // Nor while a smooth correction animates (LLP 1070.000 §11).
   const velocity = s => !authored(s) && s.animating == null && s.travel && now() - s.travel.time < 150 ? s.travel.velocity : 0;
   function sample(s) {
-    const A = AXES[s.axis], time = now(), at = s.port[A.offset], t = s.travel;
+    const A = AXES[s.axis], time = now(), at = s.offset, t = s.travel;
     if (s.clampAt === at) { s.travel = { at, time, velocity: 0 }; return; }
     // A step longer than the port is a jump, not travel: nothing to lead.
     if (!t || Math.abs(at - t.at) > s.port[A.client]) { s.travel = { at, time, velocity: 0 }; return; }
@@ -97,15 +171,17 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
     if (!(mean > 0)) return 0;
     const top = viewport(s.port, A).start, bottom = top + g.portMain;
     let shortfall;
+    // The run that covers the port from its edge: a kept row past a gap of
+    // unbuilt rows is not in it (CollectionIOS.swift `rowsToCover`).
     if (ahead > 0) {
-      if (rows.at(-1).index === count - 1) return 0;
-      let reached = top;
-      for (const r of rows) if (r.top <= reached + 0.5) reached = Math.max(reached, r.bottom);
+      let reached = top, last = null;
+      for (const r of rows) if (r.top <= reached + 0.5 && r.bottom >= reached) { reached = r.bottom; last = r.index; }
+      if (last === count - 1) return 0;
       shortfall = bottom + ahead - reached;
     } else {
-      if (rows[0].index === 0) return 0;
-      let reached = bottom;
-      for (const r of rows.toReversed()) if (r.bottom >= reached - 0.5) reached = Math.min(reached, r.top);
+      let reached = bottom, first = null;
+      for (const r of rows.toReversed()) if (r.bottom >= reached - 0.5 && r.top <= reached) { reached = r.top; first = r.index; }
+      if (first === 0) return 0;
       shortfall = reached - (top + ahead);
     }
     return shortfall > 0 ? Math.min(64, Math.ceil(shortfall / mean)) : 0;
@@ -118,6 +194,9 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
     }
     return doc.scrollingElement;
   };
+  // Keep Safari's vertical rubber-band travel out of collection corrections; the browser owns that motion
+  const scrollOffset = (port, axis, at = port[AXES[axis].offset]) => axis === 'y'
+    ? Math.max(0, Math.min(at, Math.max(0, port.scrollHeight - port.clientHeight))) : at;
   // The port's start edge (viewport px) and its size on each axis.
   const viewport = (port, A) => port === doc.scrollingElement
     ? { start: 0, main: doc.documentElement[A.client], cross: doc.documentElement[A.crossClient] }
@@ -128,9 +207,10 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
   function geometry(s) {
     if (!s.el.isConnected || !s.el.getClientRects().length) return null;
     const A = AXES[s.axis], css = getComputedStyle(s.el), port = viewport(s.port, A), leading = number(css[A.padStart]);
+    const at = s.port[A.offset], bounce = at - scrollOffset(s.port, s.axis, at);
     const origin = s.el.getBoundingClientRect()[A.start] + s.el[A.clientStart] + leading
-      - (s.el === s.port ? s.port[A.offset] : 0);
-    return { raw: port.start - origin, portMain: port.main, portCross: port.cross,
+      - (s.el === s.port ? at : 0);
+    return { raw: port.start - origin - bounce, portStart: port.start, portMain: port.main, portCross: port.cross,
       cross: s.el[A.crossClient] - number(css[A.crossPads[0]]) - number(css[A.crossPads[1]]), padding: [leading, number(css[A.padEnd])] };
   }
   const dimensionsOf = g => `${g.portCross},${g.portMain},${g.cross}`;
@@ -161,12 +241,19 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
   // relative to the read-back offset would lose up to a pixel each time, and the reader's row
   // creep (two corrections: 2 px). It holds only while the port still reads exactly that.
   function place(s, at, smooth) {
-    const name = AXES[s.axis].offset;
+    const name = AXES[s.axis].offset, was = s.port[name];
     s.port.scrollTo({ [name === 'scrollTop' ? 'top' : 'left']: at, behavior: smooth ? 'smooth' : 'instant' });
+    const read = s.port[name];
+    if (smooth || read !== was) s.owesScroll = true;
+    // Block admission only for confirmed movement; an ignored smooth write may never emit an event
+    if (read !== was) s.positionEventPending = true;
+    // Its `scrollend` answers this write, not the reader's scroll
+    if (!smooth && read !== was) s.activity.ownEnd = true;
     // Only a rounding residual (under a pixel): a target the browser clamped (an offset below 0 or past
     // the end) is not where the port is, and a later correction builds on the port.
-    const A = AXES[s.axis], read = s.port[name], max = s.port[A.scrollSize] - s.port[A.client];
+    const A = AXES[s.axis], max = s.port[A.scrollSize] - s.port[A.client];
     s.exact = !smooth && at >= 0 && at <= max && Math.abs(at - read) < 1 ? { at, read } : null;
+    echo(s);
   }
   // A smooth correction (LLP 1070.000 §6.2) is the browser's smooth scroll
   // to `s.animating`. While it runs the sequence stays, nothing is sampled
@@ -181,39 +268,46 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
     s.animating = to; s.owed = null; s.travel = null; s.animationMoved = false;
     place(s, to, true);
   }
-  // It landed (or the browser clamped it short): what was owed goes next.
-  // A successor starts only from the predecessor's `scrollend`, after the
-  // browser has queued it, so that event never lands the successor; where
-  // the browser has no `scrollend`, from the arriving scroll.
+  // Its `scrollend`: it landed at its target clamped to the content as it is now, or anywhere once it has moved the
+  // port (a snap or a clamp stopped it short). A `scrollend` for an earlier scroll, before it moved, lands nothing.
+  function animationEnded(s) {
+    if (s.animating == null) return;
+    const A = AXES[s.axis], at = s.port[A.offset], max = s.port[A.scrollSize] - s.port[A.client];
+    if (Math.abs(at - Math.max(0, Math.min(s.animating, max))) > 0.5 && !s.animationMoved) return;
+    s.offset = at; landed(s); enqueue(s, true);
+  }
+  // It landed: what was owed goes next, from that `scrollend`, after which the browser fires the next one's.
   function landed(s) {
     const owed = s.owed;
     s.animating = s.owed = null; s.travel = null;
     if (owed != null) animate(s, owed);
   }
-  // The reader, an authored offset or an ordinary correction takes over: the
-  // browser's animation stops where it is.
+  // The reader, an authored offset or an ordinary correction stops the browser's animation where it is; whether one
+  // ran. The browser runs it on its compositor, so the offset the page reads can move once more in the next frame:
+  // the list reports again only from then (`stoppedIn`). The stop sends no `scrollend` of its own (Chrome).
   function stopAnimation(s) {
-    if (s.animating == null) return;
-    s.animating = s.owed = null; s.travel = null;
+    if (s.animating == null) return false;
+    halt(s);
     place(s, s.port[AXES[s.axis].offset], false);
+    return true;
   }
+  // An animation stopped where the port is: the list reports again from the next frame
+  function halt(s) { s.animating = s.owed = null; s.travel = null; s.stoppedIn = frames; }
   function scrollChanged(s) {
-    const A = AXES[s.axis], at = s.port[A.offset];
+    const A = AXES[s.axis], at = scrollOffset(s.port, s.axis);
     if (at === s.offset) return false;
-    if (s.animating != null) {
-      s.offset = at; s.animationMoved = true;
-      if (Math.abs(at - s.animating) > 0.5) return false;
-      if (s.owed != null && 'onscrollend' in s.port) return false;
-      landed(s);
-      return true;
-    }
+    // The glue's own animation, which lands at its `scrollend`
+    if (s.animating != null) { s.offset = at; s.animationMoved = true; return false; }
     // The browser clamping the port to an extent a row laid out smaller than
     // its estimate shortened: not a scroll. The runner's coordinates are the
     // painted frame's, where the port was still where it was (LLP 1070.000).
-    const max = s.port[A.scrollSize] - s.port[A.client];
-    if (at < s.offset && s.offset > max && Math.abs(at - max) <= 1) {
-      s.clamp = { from: s.clamp?.from ?? s.offset, at }; s.offset = s.clampAt = at;
-      return false;
+    // (Read only on a move backward: the extent and client sizes force layout in the handler, LLP 1071.001 A2.)
+    if (at < s.offset) {
+      const max = s.port[A.scrollSize] - s.port[A.client];
+      if (s.offset > max && Math.abs(at - max) <= 1) {
+        s.clamp = { from: s.clamp?.from ?? s.offset, at }; s.offset = s.clampAt = at;
+        return false;
+      }
     }
     s.clamp = s.clampAt = null; s.offset = at; s.sequence++; s.exact = null; // the reader's own scroll
     return true;
@@ -228,22 +322,28 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
     return old && ((old.focus_view != null && old.focus_view !== next[0])
       || (old.interaction_view != null && old.interaction_view !== next[1]));
   }
-  function flush(beforePaint = false, only = null) {
+  function flush(beforePaint = false, only = null, beforeFrame = false) {
     if (!beforePaint) {
-      frame = null; reportsLeft = 4;
+      frame = null; reportsLeft = 4; early.frame = undefined;
       const time = now();
       if (lastFrame !== null && time - lastFrame > 4 && time - lastFrame < 50) interval = time - lastFrame;
-      lastFrame = time; deadline = time + slice();
+      lastFrame = time; deadline = time + slice(); frames++;
     }
     const attempted = new Set();
     // The agent's settle visits every list each round, not four a frame.
-    for (let pass = 0; pass < (settling ? states.size + 4 : 4) && (reportsLeft > 0 || only?.jump != null); pass++) {
+    for (let pass = 0; pass < (settling ? states.size + 4 : 4) && (reportsLeft > 0 || only?.jump != null || beforeFrame); pass++) {
       const releases = [...states.values()].filter(retiring);
       const candidates = [...dirty].filter(s => !attempted.has(s) && (!only || s === only));
       const s = candidates.find(s => releases.includes(s)) ?? candidates[0];
       if (!s) break;
       dirty.delete(s); attempted.add(s);
       if (!states.has(s.snapshot.view) || s.budget <= 0) continue;
+      // A list whose animation stopped this frame reports from the next, where the browser stopped it; a jump's own
+      // write replaces that position
+      if (s.stoppedIn === frames && s.jump == null) { dirty.add(s); continue; }
+      // The port is found again here, where layout is read anyway, not in the commit (LLP 1071.001 A3): one that
+      // moved (an ancestor's overflow changed) starts the list over, as the commit did.
+      if (s.valid && s.el.isConnected && portOf(s.el, s.axis) !== s.port) { detach(s); api.commit(lastSnapshots); continue; }
       const next = desired(s), old = s.lastFacts;
       const pins = releases.length ? next.map((pin, i) =>
         pin === (i === 0 ? old?.focus_view : old?.interaction_view) ? pin : null) : next;
@@ -253,19 +353,28 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
       let measurements = [];
       const measuredSizes = new Map(), rects = [], jump = s.jump;
       const A = AXES[s.axis];
+      // A row's size is its last measurement or observer notification (LLP 1071.001 A1), read again when a commit
+      // wrote inside the row since (`written`) or the rows' cross size changed; its position, for the fill's reach, is
+      // the index's. A row never notified, or notified at no size (unrendered, or empty), is read here.
+      const reflowed = g && s.dimensions !== null && dimensionsOf(g) !== s.dimensions, mainOf = o => +o.split(',')[A.size === 'height' ? 1 : 0];
+      const known = row => { const o = reflowed || s.written.has(row.el) ? null : s.observed.get(row.el); return o && mainOf(o) > 0 ? o : null; };
       const visible = g && g.portMain > 0 && g.cross > 0
-        && s.rows.every(row => row.el.isConnected && row.el.getClientRects().length);
+        && s.rows.every(row => row.el.isConnected && (known(row) || row.el.getClientRects().length));
       if (visible) {
+        const origin = g.portStart - g.raw;
         measurements = s.rows.map(row => {
+          const o = known(row);
+          if (o) { const size = mainOf(o), start = origin + row.start; rects.push({ [A.start]: start, [A.end]: start + size }); measuredSizes.set(row.el, o); return { view: row.view, epoch: row.epoch, size }; }
           const rect = row.el.getBoundingClientRect();
           rects.push(rect);
           measuredSizes.set(row.el, `${rect.width},${rect.height}`);
           return { view: row.view, epoch: row.epoch, size: rect[A.size] };
         });
+        s.written.clear();
       } else if (releases.includes(s)) {
         g = { raw: old.offset, portCross: old.port_cross, portMain: old.port_main, cross: old.cross, padding: old.padding };
       } else continue;
-      scrollChanged(s);
+      readScroll(s);
       // The jump's target, clamped as the browser will: reported before it
       // is assigned, so its rows exist before any frame shows it.
       if (jump != null) {
@@ -278,7 +387,9 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
       const facts = { view: s.snapshot.view, revision: s.snapshot.revision, scroll_sequence: s.sequence,
         offset: Math.max(-g.padding[0], g.raw + (s.animating != null ? (s.owed ?? s.animating) - s.port[A.offset] : s.clamp?.at === s.port[A.offset] ? s.clamp.from - s.clamp.at : 0)), port_main: g.portMain, port_cross: g.portCross, cross: g.cross,
         padding: g.padding, focus_view: pins[0], interaction_view: pins[1], measurements };
-      const signature = [facts.offset, facts.scroll_sequence, dimensions, ...g.padding, ...pins,
+      // What the report says of the reader: motion under way, and a gesture since the request
+      const reader = s.activity.moving, gesture = s.request != null && !!s.input;
+      const signature = [facts.offset, facts.scroll_sequence, dimensions, ...g.padding, ...pins, reader, gesture, s.animating != null,
         ...measurements.flatMap(r => [r.view, r.epoch, r.size])].join('|');
       for (const [el, value] of measuredSizes) if (s.observed.has(el)) s.observed.set(el, value);
       if (s.signature === signature && jump == null && !s.snapshot.pending) continue;
@@ -291,11 +402,11 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
       const outer = s.snapshot.parent == null ? null : states.get(s.snapshot.parent);
       // The agent's settle ends motion and builds all a report owes at once,
       // as the native pumps do.
-      const fill = { velocity: v, ancestorMoving: !settling && !agent && !!outer && velocity(outer) !== 0, limit: settling || agent ? null : jump != null ? 2
+      const fill = { velocity: v, scrolling: reader, gesture, animating: s.animating != null, ancestorMoving: !settling && !agent && !!outer && velocity(outer) !== 0, limit: settling || agent ? null : jump != null ? 2
         : Math.max(1, fits(s, deadline - now()), rowsToCover(s, rects, g, v * interval * 2 / 1000)) };
       let bytes;
       try { bytes = collectionBytes(facts, fill); } catch { continue; }
-      s.budget--; reportsLeft--; reported++;
+      s.budget--; if (!beforeFrame) reportsLeft--; reported++;
       for (const el of s.observed.keys()) if (!measuredSizes.has(el)) s.observed.set(el, size(el));
       measuredSizes.clear();
       delivering = true;
@@ -310,6 +421,7 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
       // An anchor correction in the reply already moved the port there.
       if (jump != null) { s.jump = null; if (s.offset === at) move(s, jump); }
       if (accepted) {
+        s.reportedMoving = reader;
         s.signature = signature; s.lastFacts = facts;
         if (s.clamp === clamp) s.clamp = null; // reported; one in its own commit is the next report's
         if(!notification){notification=true;queueMicrotask(()=>{notification=false;settled();});}
@@ -320,8 +432,10 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
     if (!delivering) for (const [s, at] of jumps.splice(0)) jumpTo(s, at);
   }
   function move(s, at) {
-    const name = AXES[s.axis].offset;
+    const name = AXES[s.axis].offset, was = s.port[name];
     s.port[name] = at; s.offset = s.port[name]; s.travel = null; s.exact = null;
+    if (s.offset !== was) s.owesScroll = s.positionEventPending = s.activity.ownEnd = true;
+    echo(s);
   }
   function jumpTo(s, at) {
     if (!states.has(s.snapshot.view)) return;
@@ -332,20 +446,32 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
     if (s.jump != null) { s.jump = null; move(s, at); scrollChanged(s); enqueue(s, true); }
   }
   function detach(s) {
-    dirty.delete(s); waiting.delete(s); s.observer.disconnect();
+    // Its request's animation goes with it, stopped where the port is (LLP 1070.000 §2.5)
+    stopAnimation(s);
+    dirty.delete(s); waiting.delete(s); s.observer.disconnect(); s.mutations.disconnect();
     for (const row of s.rows) if (row.el) rowOwners.delete(row.el);
-    s.port.removeEventListener('scroll', s.scrolled);
-    s.port.removeEventListener('scrollend', s.scrollEnded);
+    s.eventTarget.removeEventListener('scroll', s.scrolled);
+    s.eventTarget.removeEventListener('scroll', s.acked, { capture: true });
     s.el.style.overflowAnchor = s.anchor;
-    for (const name of INPUT) s.port.removeEventListener(name, s.touched);
+    leave(s);
     states.delete(s.snapshot.view);
     for (const held of waiting) enqueue(held);
   }
+  // The rows a commit wrote inside since the last one (text, attributes, children of the row; not the list engine's
+  // bookkeeping on the wrapper itself), from the mutation records pending on the list: read again at the next pass.
+  function touch(s) {
+    for (const r of s.mutations.takeRecords()) {
+      if (r.target === s.el || (r.type === 'attributes' && s.observed.has(r.target) && r.attributeName !== 'style' && r.attributeName !== 'class')) continue;
+      for (let n = r.target; n && n !== s.el; n = n.parentNode) if (s.observed.has(n)) { s.written.add(n); break; }
+    }
+  }
   function observe(s) {
     const elements = new Set([s.el, s.port, ...s.rows.map(r => r.el)]);
-    for (const el of s.observed.keys()) if (!elements.has(el)) { s.observer.unobserve(el); s.observed.delete(el); }
+    for (const el of s.observed.keys()) if (!elements.has(el)) { s.observer.unobserve(el); s.observed.delete(el); s.written.delete(el); }
+    touch(s);
     for (const el of elements) {
       if (!s.observed.has(el)) s.observer.observe(el);
+      else if (el !== s.el && el !== s.port && !s.written.has(el)) continue; // an untouched row's size stands, and a notification for it is external
       // The queued measurement supplies row baselines. Port/list geometry stays
       // current for pre-paint resize feedback. At the final dependent commit no
       // pass remains: read now so its own notification cannot renew the budget.
@@ -354,6 +480,26 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
     }
   }
   function focusChanged() { for (const s of states.values()) enqueue(s, true); }
+  // The reader's own hand, a `pointerdown` the window captures: a gesture that cancels the request under way and stops
+  // its animation (LLP 1070.000 §2.5) on each list it reaches, in every port it lands in (an inner list's port is
+  // inside its outer list's). A finger anywhere on the port can move it; a press counts in the list or on the port's
+  // own box (its scrollbar), as a port can hold more than its list. It counts against the request under way when it
+  // began, not one a handler made in answer to it: the event's time against the request's, both on the page's clock,
+  // which WebKit counts in whole milliseconds (a tie is not after). A list reports it when that changes its report:
+  // the first gesture against a request, or an animation it stopped. A wheel or a key is not heard: what it scrolls is
+  // motion like any other, and no wheel event says whether it begins a scroll or carries a trackpad's momentum.
+  function input(e) {
+    for (const a of ports.values()) {
+      if (!a.port.contains(e.target)) continue;
+      for (const s of a.lists) {
+        if (e.pointerType !== 'touch' && e.target !== a.port && !s.el.contains(e.target)) continue;
+        if (e.timeStamp <= s.requestAt) continue;
+        const first = s.request != null && !s.input;
+        s.input = true;
+        if (stopAnimation(s) || first) enqueue(s, true);
+      }
+    }
+  }
   function pointerDown(event) {
     if (interaction?.lease) return; // Terminal source still owns the single slot.
     interaction = { element: event.target, pointer: event.pointerId };
@@ -370,13 +516,23 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
   root.addEventListener('focusout', focusChanged, true);
   root.addEventListener('pointerdown', pointerDown, true);
   for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) doc.addEventListener(name, pointerUp);
-  return {
+  doc.defaultView?.addEventListener('pointerdown', input, { capture: true, passive: true });
+  const api = {
+    scrollPending() {
+      for (const s of states.values()) {
+        if (!s.valid || !s.el.isConnected || !s.el.getClientRects().length) continue;
+        if (readScroll(s)) enqueue(s, true);
+        if (s.reportedMoving && !s.activity.moving) enqueue(s, true);
+        if (s.activity.moving || s.reportedMoving || s.positionEventPending) return true;
+      }
+      return false;
+    },
     releaseInteraction(pointer) { pointerUp({pointerId:pointer}); },
     reporting() { return delivering; },
     reorderContact(element,pointer) { pointerDown({target:element,pointerId:pointer}); },
     reorderMapping(view,y) {
       const s=states.get(view); if(!s?.valid||s.axis!=='y'||portOf(s.el,s.axis)!==s.port)return null;
-      if(scrollChanged(s))enqueue(s,true);
+      if(readScroll(s))enqueue(s,true);
       enqueue(s);if(!delivering)flush(true);
       const g=geometry(s),f=s.lastFacts,p=viewport(s.port,AXES.y);
       if(!g||!f||f.offset!==Math.max(-g.padding[0],g.raw)||f.port_cross!==g.portCross||f.port_main!==g.portMain
@@ -419,23 +575,29 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
     // A full O(W) snapshot list, after all ordinary extent/children ops. No DOM
     // mutation is deferred with feedback; corrections happen before this paint.
     commit(snapshots) {
+      lastSnapshots = snapshots;
       const active = new Set(snapshots.map(s => s.view));
+      const fresh = new Set();
       for (const s of states.values()) if (!active.has(s.snapshot.view)) detach(s);
       for (const snapshot of snapshots) {
         const el = views.get(snapshot.view);
         if (!el?.isConnected) continue;
-        const axis = snapshot.axis === 'x' ? 'x' : 'y', port = portOf(el, axis);
+        const axis = snapshot.axis === 'x' ? 'x' : 'y';
         let s = states.get(snapshot.view);
+        // A known list keeps its port: finding it again walks computed styles inside the commit, where every read
+        // forces a style pass; the next report checks it (LLP 1071.001 A3).
+        const port = s && s.el === el && s.axis === axis ? s.port : portOf(el, axis);
         if (s && (s.el !== el || s.port !== port || s.axis !== axis)) { detach(s); s = null; }
         if (s && BigInt(snapshot.revision) < BigInt(s.snapshot.revision)) continue;
         if (!s) {
-          s = { el, port, axis, snapshot, rows: [], valid: false, observed: new Map(), budget: 2, travel: null, perRow: null, lastRows: 1, jump: null,
-            sequence: BigInt(snapshot.scrollSequence), offset: port[AXES[axis].offset],
-            dimensions: null, signature: null, lastFacts: null, corrected: null, anchor: el.style.overflowAnchor };
+          // The port's `scroll` and `scrollend` fire at the document for the viewport, at the port for an element
+          // (CSSOM View, "run the scroll steps")
+          s = { el, port, eventTarget: port === doc.scrollingElement ? doc : port, axis, snapshot, rows: [], valid: false, observed: new Map(), written: new Set(), mutations: new MutationObserver(() => {}), budget: 2, travel: null, perRow: null, lastRows: 1, jump: null,
+            sequence: BigInt(snapshot.scrollSequence), offset: scrollOffset(port, axis),
+            dimensions: null, signature: null, lastFacts: null, corrected: null, anchor: el.style.overflowAnchor, requestAt: -Infinity };
           // A smooth correction's ticks are never sampled as travel.
-          s.scrolled = () => { const animated = s.animating != null, changed = scrollChanged(s); if (!animated) sample(s); if (changed) enqueue(s, true); };
-          s.touched = () => { s.input = true; stopAnimation(s); };
-          for (const name of INPUT) port.addEventListener(name, s.touched, { passive: true });
+          s.activity = activity(s);
+          s.scrolled = () => { const own = hostMoves(s), changed = readScroll(s); if (!own) sample(s); if (changed) enqueue(s, true); };
           s.observer = new ResizeObserver(entries => {
             let changed = false, resizedPort = false, pending = false;
             for (const { target } of entries) {
@@ -456,20 +618,13 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
               if (resizedPort && !delivering) flush(true);
             } else if (pending) enqueue(s); // Coalesce an own notification, never replenish.
           });
-          port.addEventListener('scroll', s.scrolled, { passive: true });
-          // A smooth correction that ended short of its target (clamped, or
-          // the reader took over) reports where it rests.
-          s.scrollEnded = () => {
-            if (s.animating == null) return;
-            // Its own end: at its target clamped to the content as it is
-            // now, or anywhere once it has moved the port (a snap or a clamp
-            // stopped it short). A `scrollend` for an earlier scroll, before
-            // this animation moved, lands nothing.
-            const A = AXES[s.axis], at = s.port[A.offset], max = s.port[A.scrollSize] - s.port[A.client];
-            if (Math.abs(at - Math.max(0, Math.min(s.animating, max))) > 0.5 && !s.animationMoved) return;
-            s.offset = at; landed(s); enqueue(s, true);
-          };
-          port.addEventListener('scrollend', s.scrollEnded, { passive: true });
+          s.eventTarget.addEventListener('scroll', s.scrolled, { passive: true });
+          s.mutations.observe(el, { subtree: true, childList: true, attributes: true, characterData: true });
+          // A scroll event acknowledged before any reader's handler (capture runs
+          // first at the target), so a jump that handler makes stays owed; only
+          // the port's own (a descendant's passes through capture too).
+          s.acked = e => { if (e.target !== s.eventTarget) return; s.owesScroll = s.positionEventPending = false; scrollsFired++; };
+          s.eventTarget.addEventListener('scroll', s.acked, { passive: true, capture: true });
           states.set(snapshot.view, s);
         }
         // A new wrapper/epoch is new measurement work, including membership
@@ -487,9 +642,12 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
         if (!s.valid) { if (retiring(s)) enqueue(s, !delivering); else dirty.delete(s); continue; }
         for (const row of s.rows) rowOwners.set(row.el, s);
         el.style.overflowAnchor = 'none';
-        scrollChanged(s); // catches new user scroll before its scroll event runs
-        if (snapshot.seeking && !s.seeking) s.input = false;
-        s.seeking = snapshot.seeking === true;
+        readScroll(s); // catches new user scroll before its scroll event runs
+        // A gesture counts against the request it began after: a new one starts with none. A request that ends or is
+        // replaced takes its animation with it, stopped where it is (LLP 1070.000 §2.5), as CSSOM View's next scroll
+        // aborts a smooth one; a newer request is admitted from the report that follows.
+        if (snapshot.request !== s.request) { s.input = false; stopAnimation(s); s.requestAt = performance.now(); }
+        s.request = snapshot.request; s.seeking = snapshot.seeking === true;
         const correction = snapshot.correction;
         // An anchor's correction (`from`) is relative: the rows before the
         // anchor moved by `offset - from` in this commit, so the port moves
@@ -534,8 +692,11 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
             }
           }
         } else
-        // A request's correction is authored: the browser's clamps and
-        // scroll anchoring since the runner's last report don't void it.
+        // A correction planned at the port's current sequence lands though this commit resized the port (not reported
+        // yet, so the sequence has not moved past it): that is not the reader moving, and the browser clamps it to the
+        // new port, as on Apple and Linux (a sent message's end-follow as the composer shrinks back). A
+        // request's correction is authored and lands whatever the port did since (LLP 1070.000 §2.6): the browser's
+        // clamps and scroll anchoring since the runner's last report don't void it.
         if (correction && s.corrected !== snapshot.revision
             && (BigInt(correction.scrollSequence) === s.sequence || authored(s))
             && Number.isFinite(correction.offset)) {
@@ -544,17 +705,12 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
           // its next report carries the uncorrected offset and the runner
           // re-anchors from that. Vertical lists correct as before.
           const moving = axis === 'x' && velocity(s) !== 0;
-          // A port this commit resized (not reported yet, so the sequence
-          // has not moved past the correction's) is not the reader moving:
-          // a correction planned at that sequence still lands, clamped by
-          // the browser to the new port, as on Apple and Linux (review B5:
-          // a sent message's end-follow as the composer shrinks back).
-          const planned = BigInt(correction.scrollSequence) === s.sequence;
-          if (g && !moving && (planned || s.dimensions === null || s.dimensions === dimensionsOf(g))) {
+          if (g && !moving) {
             s.corrected = snapshot.revision;
             // Relative conversion also handles a list below siblings in its port.
             const to = port[name] + correction.offset - g.raw;
-            if (correction.smooth === true && !agent) animate(s, to);
+            // Smooth where the browser says where it lands (`scrollend`); without it, at once
+            if (correction.smooth === true && !agent && 'onscrollend' in port) animate(s, to);
             else {
               stopAnimation(s);
               place(s, to, false);
@@ -566,6 +722,28 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
         observe(s);
         // A reply that left rows unbuilt owes the next slice a report.
         enqueue(s, !delivering || freshRows || snapshot.pending === true);
+        if (freshRows) fresh.add(s);
+      }
+      // Measure new rows before paint, including during scrolling, so scroll
+      // events read measured geometry. Allow two early reports per list
+      // per frame to measure size changes and check their corrections.
+      // Use a separate allowance of four reports plus two per list with new
+      // rows in an app commit. Apply these limits to feedback replies so
+      // repeated corrections cannot postpone painting indefinitely.
+      if (fresh.size) {
+        // The last frame's time names the frame these reports come before;
+        // a frame's flush renews them too, where there is no timeline.
+        const at = doc.timeline?.currentTime ?? null;
+        if (early.frame !== at) early = { frame: at, left: 4, lists: new Map() };
+        if (!delivering) early.left += 2 * fresh.size;
+        queueMicrotask(() => {
+          for (const s of fresh) {
+            const n = early.lists.get(s) ?? 0;
+            if (delivering || states.get(s.snapshot.view) !== s || n >= 2 || early.left <= 0) continue;
+            early.lists.set(s, n + 1); early.left--;
+            flush(true, s, true);
+          }
+        });
       }
       if (!dirty.size && frame !== null && !delivering) { cancelFrame(frame); frame = null; }
     },
@@ -576,6 +754,7 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
       for (const s of states.values()) {
         const f = s.lastFacts, A = AXES[s.axis];
         if (!f || !s.valid || !s.el.isConnected) continue;
+        touch(s); // a row this commit wrote inside is read at the next pass, which its own notification asks for
         const css = getComputedStyle(s.el);
         if (number(css[A.padStart]) !== f.padding[0] || number(css[A.padEnd]) !== f.padding[1]) enqueue(s, true);
       }
@@ -595,6 +774,9 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
     // measured when the agent reads it. Bounded, like the native pumps'.
     settle() {
       settling = true;
+      // The agent's settle ends the reader's motion (agent-input.js `glidesSettled` has seen the page's scrolls go
+      // quiet): a request that waits for it lands here, and motion after it is new
+      for (const a of ports.values()) ended(a);
       try { for (let round = 0; round < 8; round++) {
         const before = reported;
         reportsLeft = 4 * Math.max(1, states.size);
@@ -602,6 +784,24 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
         if (!delivering) flush(true);
         if (reported === before) break;
       } } finally { settling = false; }
+    },
+    // Lists whose offset this moved and whose `scroll` event the browser
+    // hasn't fired yet: it fires at a rendering step, and a reader's handler
+    // (an author's `scroll=`, its ScrollEvent) runs then, so the agent's
+    // settle waits for those frames before it says settled.
+    owedScrolls() {
+      let n = 0;
+      for (const s of states.values()) if (s.owesScroll) n++;
+      return n;
+    },
+    scrollsFired: () => scrollsFired,
+    // Waits, up to `frames` frames, while scrolls are owed: `fired`, any
+    // event delivered meanwhile (its handler's work wants a round), and what
+    // is still `owed` when the frames ran out (not settled).
+    async fireOwedScrolls(frames = 8) {
+      const before = scrollsFired;
+      for (let f = 0; f < frames && this.owedScrolls(); f++) await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
+      return { fired: scrollsFired > before, owed: this.owedScrolls() };
     },
     dataReady() {
       // A refused pre-activation action stays armed. Retry unchanged geometry
@@ -619,8 +819,10 @@ export function collectionController({ root, views, report, settled=()=>{}, agen
       root.removeEventListener('focusout', focusChanged, true);
       root.removeEventListener('pointerdown', pointerDown, true);
       for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) doc.removeEventListener(name, pointerUp);
+      doc.defaultView?.removeEventListener('pointerdown', input, { capture: true });
     },
   };
+  return api;
 }
 
 if (globalThis.exact) globalThis.exact.collectionGlue = { collectionBytes, applyCollectionFeedback, collectionController };

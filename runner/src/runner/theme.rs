@@ -80,6 +80,9 @@ impl<D: DataSource> Runner<D> {
             .filter(|(view, r)| r.tokens & bits != 0 && kernel.node(*view).is_some())
             .collect();
         rows.sort_by_key(|(view, r)| (*view, r.style as u16));
+        // What each row reads as set again, kept beside what it read.
+        let mut reads = Vec::with_capacity(rows.len());
+        exact_kernel::style::theme::take_named();
         for (view, row) in rows {
             let at = match patches.last_mut() {
                 Some((v, p)) if *v == view => p,
@@ -96,12 +99,71 @@ impl<D: DataSource> Runner<D> {
                 }
                 set += 1;
             }
+            reads.push((view, row.style, exact_kernel::style::theme::take_named()));
         }
-        exact_kernel::style::theme::take_named();
-        let ops = patches
+        for (view, style, tokens) in reads {
+            self.ids.theme.also_read(view, style, tokens);
+        }
+        let mut ops: Vec<Op> = patches
             .into_iter()
             .map(|(id, patch)| Op::SetStyle { id, patch })
             .collect();
+        // A node's state looks that read one, whole (LLP 1121 D8).
+        let mut looks: Vec<_> = self
+            .ids
+            .theme
+            .looks()
+            .filter(|(view, l)| l.tokens & bits != 0 && kernel.node(*view).is_some())
+            .collect();
+        looks.sort_by_key(|(view, _)| *view);
+        let mut read = Vec::with_capacity(looks.len());
+        for (view, l) in looks {
+            let (op, tokens) = crate::instance::looks::op(view, l, &self.plan);
+            ops.push(op);
+            read.push((view, tokens));
+            set += l.states.iter().map(|(_, rows)| rows.len()).sum::<usize>();
+        }
+        // What they read now, kept beside what they read (as a row's).
+        for (view, tokens) in read {
+            self.ids.theme.looks_read(view, tokens);
+        }
+        // A Markdown node's faces that read one, read again in their own
+        // tuple (LLP 1045.000 D2), as a row is. Faces the edit leaves with a
+        // colour that is none, where the faces as set took it, keep their
+        // old value, as a row its parse refuses does, and the journal names
+        // it; a colour the faces as set refused is refused again silently.
+        let mut faces: Vec<_> = self
+            .ids
+            .theme
+            .faces()
+            .filter(|(view, f)| f.tokens & bits != 0 && kernel.node(*view).is_some())
+            .map(|(view, f)| (view, f.text.clone(), f.tuple, f.refused.clone()))
+            .collect();
+        faces.sort_by_key(|(view, ..)| *view);
+        for (view, text, tuple, as_set) in faces {
+            let _tuple = Tuple::new(tuple);
+            exact_kernel::style::theme::take_named();
+            let (prop, mut refused) = (exact_kernel::PropId::AtomFaces, Vec::new());
+            let value = crate::bridge::atom_face_paint(&self.plan, prop, text, &mut refused);
+            let tokens = exact_kernel::style::theme::take_named();
+            self.ids.theme.faces_read(view, tokens);
+            let newly = crate::instance::theme::newly_refused(&refused, &as_set);
+            if !newly.is_empty() {
+                for text in newly {
+                    let kept = crate::instance::theme::KEPT;
+                    self.notes
+                        .push(crate::instance::invalid_face(view, text, kept));
+                }
+                continue;
+            }
+            self.ids.theme.faces_set(view, refused);
+            ops.push(Op::SetProp {
+                id: view,
+                prop,
+                value,
+            });
+            set += 1;
+        }
         Ok((self.apply(ops)?, set))
     }
 }
@@ -120,3 +182,7 @@ impl Drop for Tuple {
         crate::bridge::set_tuple(self.0);
     }
 }
+
+#[cfg(test)]
+#[path = "theme_tests.rs"]
+mod tests;

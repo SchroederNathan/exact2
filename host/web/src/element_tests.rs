@@ -7,9 +7,18 @@ fn written(
     prop: PropId,
     value: PropValue,
 ) -> super::SortedMap<String, String> {
+    written_props(node_type, &[(prop, value)])
+}
+
+fn written_props(
+    node_type: NodeType,
+    values: &[(PropId, PropValue)],
+) -> super::SortedMap<String, String> {
     let style = StyleProps::default();
     let mut props = PropList::new();
-    props.set(prop, value);
+    for (prop, value) in values {
+        props.set(*prop, value.clone());
+    }
     super::props_of(&NodeFacts {
         id: 1,
         node_type,
@@ -17,6 +26,7 @@ fn written(
         props: &props,
         is_root: false,
         inline_run: false,
+        symbol_color: false,
     })
 }
 
@@ -90,6 +100,7 @@ fn a_progress_with_a_value_is_htmls_progress_element() {
         props: &props,
         is_root: false,
         inline_run: false,
+        symbol_color: false,
     };
     assert_eq!(super::tag_of(&facts, false), "progress");
     assert_eq!(
@@ -135,6 +146,7 @@ fn a_progress_is_a_busy_progressbar_box_the_page_draws_a_ring_in() {
         props: &props,
         is_root: false,
         inline_run: false,
+        symbol_color: false,
     };
     assert_eq!(super::tag_of(&facts, false), "div");
     assert_eq!(super::tag_of(&facts, true), "span", "in a button");
@@ -174,11 +186,69 @@ fn a_progress_is_a_busy_progressbar_box_the_page_draws_a_ring_in() {
             props: &PropList::default(),
             is_root: false,
             inline_run: false,
+            symbol_color: false,
         };
         let css = super::host_css_of(&facts, Some(&parent), String::new(), "div");
         assert!(!css.contains("justify-self"), "{display:?}: {css}");
     }
     assert!(include_str!("../index.html").contains("[data-exact-progress]::before"));
+}
+
+/// A progress (and a canvas) keeps its width in block flow with `justify-self: start` only where a
+/// `div` would stretch: under a block parent whose `justify-items` is `normal` or `stretch`. Under
+/// one that says `start`, `center` or `end`, the parent's own justification aligns it, as the
+/// kernel's block layout does (Chrome's too), so nothing is written over it.
+#[test]
+fn a_progress_or_canvas_in_block_flow_follows_the_parents_justify_items() {
+    use exact_kernel::{StyleId, StyleValue};
+    let mut props = PropList::default();
+    props.set(PropId::Type, PropValue::Str("progress".into()));
+    let (parent_props, empty) = (PropList::default(), PropList::default());
+    let style = StyleProps::default();
+    let node = |node_type, props| NodeFacts {
+        id: 1,
+        node_type,
+        style: &style,
+        props,
+        is_root: false,
+        inline_run: false,
+        symbol_color: false,
+    };
+    for (items, forced) in [
+        ("normal", true),
+        ("stretch", true),
+        ("start", false),
+        ("center", false),
+        ("end", false),
+    ] {
+        let mut parent_style = StyleProps::default();
+        parent_style
+            .set_dynamic(StyleId::Display, &StyleValue::Text("block".into()))
+            .unwrap();
+        parent_style
+            .set_dynamic(StyleId::JustifyItems, &StyleValue::Text(items.into()))
+            .unwrap();
+        let parent = NodeFacts {
+            id: 2,
+            node_type: NodeType::View,
+            style: &parent_style,
+            props: &parent_props,
+            is_root: false,
+            inline_run: false,
+            symbol_color: false,
+        };
+        for (kind, props, tag) in [
+            (NodeType::Control, &props, "div"),
+            (NodeType::Canvas, &empty, "canvas"),
+        ] {
+            let css = super::host_css_of(&node(kind, props), Some(&parent), String::new(), tag);
+            assert_eq!(
+                css.contains("justify-self:start;"),
+                forced,
+                "{tag} under justify-items {items}: {css}"
+            );
+        }
+    }
 }
 
 /// LLP 1116.001 D1: a date, time or local date-time control is marked for
@@ -200,6 +270,7 @@ fn a_date_or_time_control_takes_the_field_look_unless_the_author_has_it() {
             props: &props,
             is_root: false,
             inline_run: false,
+            symbol_color: false,
         })
         .contains_key("data-exact-field")
     };
@@ -233,6 +304,7 @@ fn a_textfield_appearance_is_native_and_marked_for_the_page() {
             props: &props,
             is_root: false,
             inline_run: false,
+            symbol_color: false,
         });
         (
             out.contains_key("data-native"),
@@ -265,6 +337,7 @@ fn a_link_out_of_the_app_opens_a_new_browsing_context() {
             props: &props,
             is_root: false,
             inline_run: false,
+            symbol_color: false,
         });
         let get = |k: &str| out.get(k).cloned();
         (get("target"), get("rel"))
@@ -328,6 +401,21 @@ fn every_data_name_the_host_writes_is_a_reserved_word() {
             }
         }
     }
+    let time = written_props(
+        NodeType::View,
+        &[
+            (PropId::SemanticTag, PropValue::Str("time".into())),
+            (PropId::Text, PropValue::Str("now".into())),
+        ],
+    );
+    assert!(time.contains_key("data-time-shown"));
+    for name in time.keys() {
+        if let Some(word) = name.strip_prefix("data-") {
+            if !contract_lower::dataset::reserved(word) {
+                unreserved.insert(format!("`{name}` (from a formatted time)"));
+            }
+        }
+    }
     assert!(
         unreserved.is_empty(),
         "not reserved in contract/lower/src/dataset.rs: {unreserved:?}"
@@ -339,11 +427,28 @@ fn menu_hints_write_no_dom_attributes() {
     for (kind, prop, value) in [
         (NodeType::Pressable, PropId::MenuPlacement, "help"),
         (NodeType::View, PropId::MenuRemove, "close-all"),
+        (NodeType::View, PropId::MenuKeys, "close-window=none"),
     ] {
         let out = written(kind, prop, PropValue::Str(value.into()));
         assert!(out.get("data-menuplacement").is_none());
         assert!(out.get("data-menuremove").is_none());
     }
+}
+
+/// LLP 1045.000 D2: a Markdown node's faces go to the page with each
+/// face's paint as the CSS a pill takes, and one that is none empty.
+#[test]
+fn a_faces_paint_is_written_as_css() {
+    let faces = r##"[{"source":"@a","label":"","icon":"","title":"","color":"light-dark(#d52c36ff, #ff6762ff)","backgroundColor":"no colour"}]"##;
+    let out = written(
+        NodeType::TextInput,
+        PropId::AtomFaces,
+        PropValue::Str(faces.into()),
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(out.get("data-atom-faces").unwrap()).unwrap();
+    assert_eq!(written[0]["color"], "light-dark(#d52c36ff, #ff6762ff)");
+    assert_eq!(written[0]["backgroundColor"], "");
 }
 
 #[test]
@@ -399,6 +504,7 @@ fn svg_geometry_attributes_preserve_css_lengths() {
             props: &props,
             is_root: false,
             inline_run: false,
+            symbol_color: false,
         };
         let mut out = super::SortedMap::new();
         super::svg_props_of(&|_, _| None, &facts, &mut out);
@@ -447,6 +553,7 @@ fn complex_svg_geometry_attributes_take_the_initial_value() {
                 props: &props,
                 is_root: false,
                 inline_run: false,
+                symbol_color: false,
             };
             let mut out = super::SortedMap::new();
             super::svg_props_of(&|_, _| None, &facts, &mut out);
@@ -510,8 +617,28 @@ fn a_live_region_says_whether_it_is_announced_whole() {
         props: &props,
         is_root: false,
         inline_run: false,
+        symbol_color: false,
     };
     let out = super::props_of(&facts);
     assert_eq!(out.get("aria-live").map(String::as_str), Some("polite"));
     assert_eq!(out.get("aria-atomic").map(String::as_str), Some("true"));
+}
+
+/// @ref LLP 1020.002 D5 — every frame grants its guest fullscreen, sandboxed
+/// or not; no other element is told.
+#[test]
+fn a_frame_grants_its_guest_fullscreen() {
+    let sandboxed = written(
+        NodeType::WebView,
+        PropId::Sandbox,
+        PropValue::Str("allow-scripts".into()),
+    );
+    assert_eq!(
+        sandboxed.get("allow").map(String::as_str),
+        Some("fullscreen *")
+    );
+    assert_eq!(
+        written(NodeType::Video, PropId::Src, PropValue::Str("a.mp4".into())).get("allow"),
+        None
+    );
 }

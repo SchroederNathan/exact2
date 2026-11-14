@@ -97,7 +97,10 @@ fn interview_table_shapes_roundtrip_and_launch_fill() {
     for (name, fields) in [
         ("Router", vec!["tab", "tabs", "next"]),
         ("Tab", vec!["name", "stack"]),
-        ("Entry", vec!["id", "name", "url", "tab", "params"]),
+        (
+            "Entry",
+            vec!["id", "name", "url", "tab", "params", "fragment"],
+        ),
         ("Params", vec!["post", "question", "person"]),
     ] {
         let row = plan
@@ -279,7 +282,17 @@ fn corpus_verb_sequences_run_through_compiled_actions_without_copying_expectatio
                     .unwrap_or_default();
                 r.act(step["verb"].as_str().unwrap(), args).unwrap();
             }
-            if state(&r)["slots"]["nav"] != step["expected"] {
+            // The corpus leaves an empty fragment unwritten, as `exact_route::Entry`
+            // serializes it; the agent's state names every field.
+            let mut nav = state(&r)["slots"]["nav"].clone();
+            for tab in nav["tabs"].as_array_mut().into_iter().flatten() {
+                for entry in tab["stack"].as_array_mut().into_iter().flatten() {
+                    if entry["fragment"] == "" {
+                        entry.as_object_mut().map(|e| e.remove("fragment"));
+                    }
+                }
+            }
+            if nav != step["expected"] {
                 failures.push(format!(
                     "{} step {index}: {}",
                     sequence["name"],
@@ -304,7 +317,10 @@ fn route_diagnostics_and_dynamic_location_boundary() {
         let error = contract::compile(&base.replace("DEST", expr)).unwrap_err();
         assert_eq!(error.id, id, "{expr}: {error}");
         if id == "route-template" {
-            assert_eq!(error.message, "use `path()`");
+            assert!(
+                error.message.ends_with("write `path(\"post\", id)`"),
+                "{error}"
+            );
         }
     }
     for expr in [
@@ -715,6 +731,22 @@ component App
             .contains("`main > column > column > column > column`"),
         "{error}"
     );
+    // @ref LLP 1116.020 D2 — beside the tabpanels: with tabs a route is a
+    // panel's, so a sheet drawn there is no sheet (round 18's contacts).
+    let sheet = "if top(nav).name == \"item\"\n        column navigationKey=`${top(nav).id}` navigationPresentation=\"modal\" position=\"absolute\" inset=0\n          text \"Item\"\n      row role=\"tablist\"";
+    let beside = tabs
+        .replace("STACK", stack)
+        .replacen("row role=\"tablist\"", sheet, 1);
+    let error = contract::compile(&beside).unwrap_err();
+    assert_eq!(error.id, "lower-route-place", "{error}");
+    assert!(
+        error.message.contains("beside the root's tabpanels")
+            && error.message.contains("is no sheet"),
+        "{error}"
+    );
+    // A root without tabs keeps its own children as routes.
+    let plain = "routes nav\n  home \"/\"\n    add \"/add\"\ncomponent App\n  view\n    main navigationKey=`${top(nav).id}`\n      for e in stack(nav) key=e.id\n        column navigationKey=`${e.id}` navigationPresentation=(e.name == \"add\" ? \"modal\" : \"\") position=\"absolute\" inset=0\n          text e.url\n";
+    contract::compile(plain).unwrap();
     // A key outside any root is not a route: below a root that carries
     // none, nothing is a navigation root (LLP 1116 D6 makes the first root
     // with a key one).
@@ -754,6 +786,12 @@ component App
     );
     assert_eq!(selected(&state(&r)["slots"]["nav"]).len(), 1);
     assert_rows(&r);
+    // @ref LLP 1115.000 D5.5 — Back left the detail ahead: the platform's
+    // Forward goes there by the runner's own `go`, and nothing is ahead then.
+    assert_eq!(r.location_ahead().as_deref(), Some("/detail"));
+    r.host_go("/detail").unwrap().unwrap();
+    assert_eq!(selected(&state(&r)["slots"]["nav"]).len(), 2);
+    assert_eq!(r.location_ahead(), None);
     // Routes now sit where every host finds them, or are refused.
     let wrapped = source.replace(
         "      for e in stack(nav) key=e.id\n        column navigationKey",

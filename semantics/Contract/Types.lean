@@ -21,7 +21,7 @@ has type `?` (`Contract.ValTy`), so such an operand never produces one.
 What the judgments leave to the Rust checker (it refuses more): `let`
 shadowing and reassignment rules, host command signatures (a command's
 arguments need only be well typed), presentation attributes (only a
-`text`'s text, `testId` and handlers are typed), placeholders and
+`text`'s text, `testId`, navigation attributes and handlers are typed), placeholders and
 `t(...)`, and cycles among derives and `fn`s (settlement and the fuel bound
 deal with those, not typing).
 -/
@@ -85,13 +85,15 @@ def unsupportedTy (name : String) (ts : List Ty) : Option Ty :=
     match ts with | [.number, .string, .string] => .some .string | _ => .none
   else if name = "toFixed" ∨ name = "formatDecimal" then
     match ts with | [.number, .number] => .some .string | _ => .none
+  else if name = "formatDay" then
+    match ts with | [.number, .number, .number, .string] => .some .string | _ => .none
   else if name = "t" then
     match ts with
     | .string :: .string :: rest => if rest.all (· == .string) then .some .string else .none
     | _ => .none
   else if name = "frame" ∨ name = "measure" then
     match ts with | [.string] => .some (.record "Geometry") | _ => .none
-  else if name = "toLowerCase" then match ts with | [.string] => .some .string | _ => .none
+  else if name = "toLowerCase" ∨ name = "toUpperCase" then match ts with | [.string] => .some .string | _ => .none
   else if name = "elementFromPoint" then
     match ts with | [.number, .number] => .some (.option .string) | _ => .none
   else .none
@@ -117,15 +119,23 @@ def routerTy (name : String) (ts : List Ty) : Option Ty :=
     | _ => .none
   else if name = "searchParam" then
     match ts with | [.record r, .string] => if r = "Entry" then .some .string else .none | _ => .none
+  else if name = "fragment" then
+    match ts with | [.record r] => if r = "Entry" then .some .string else .none | _ => .none
   else if name = "encodeRouteSegment" then match ts with | [.string] => .some .string | _ => .none
   else unsupportedTy name ts
+
+/-- What a `sortBy` key may be: a number or a string (an enum is a string
+here), or `?`, which no value has (the Rust checker's `infer_sort_by`). -/
+def Ty.sortKey : Ty → Bool
+  | .number | .string | .unknown => true
+  | _ => false
 
 /-- The roster (plan/tables/format.json `stdlib`) as types: the result of a
 call with arguments of these types, or `none` when the call is refused.
 `any` is held to what the runner reads (`roster_accepts`). The entries the
 semantics refuses as unsupported (formats, routes, geometry) are typed as
 the roster spells them: their calls never produce a value here. `map`,
-`filter`, `pending`, `failed`, `failure` and `path` are typed by rules of their own. -/
+`filter`, `sortBy`, `pending`, `failed`, `failure` and `path` are typed by rules of their own. -/
 def rosterTy (name : String) (ts : List Ty) : Option Ty :=
   if name = "performanceNow" then match ts with | [] => .some .number | _ => .none
   else if name = "length" then match ts with | [.string] | [.list _] => .some .number | _ => .none
@@ -133,7 +143,12 @@ def rosterTy (name : String) (ts : List Ty) : Option Ty :=
   else if name = "toString" then
     match ts with | [t] => if t.displayable then .some .string else .none | _ => .none
   else if name = "floor" then match ts with | [.number] => .some .number | _ => .none
-  else if name = "ceil" ∨ name = "round" then match ts with | [.number] => .some .number | _ => .none
+  else if name = "ceil" ∨ name = "round" ∨ name = "sin" ∨ name = "cos" then match ts with | [.number] => .some .number | _ => .none
+  else if name = "sum" then
+    match ts with | [.list .number] | [.list .unknown] => .some .number | _ => .none
+  else if name = "range" then match ts with | [.number] => .some (.list .number) | _ => .none
+  else if name = "flat" then
+    match ts with | [.list (.list a)] => .some (.list a) | [.list .unknown] => .some (.list .unknown) | _ => .none
   else if name = "parseNumber" then match ts with | [.string] => .some (.option .number) | _ => .none
   else if name = "calendarDiff" then
     match ts with | [.string, .string, .string] => .some (.option .number) | _ => .none
@@ -214,13 +229,13 @@ def shapeTys (p : Program) (s : String) : Option (List Ty) :=
 /-- The compiler's router shapes, when the program has them (a program
 without routes may declare an `Entry` of its own), are the
 values `Contract.Route` builds: `Router(tab, tabs, next)`, `Tab(name,
-stack)`, `Entry(id, name, url, tab, params)`, and `Params` with a string
+stack)`, `Entry(id, name, url, tab, params, fragment)`, and `Params` with a string
 per parameter of the table (`Route.paramNames`). -/
 def routeShapesOK (p : Program) : Bool :=
   !(shapeTys p "Router").isSome ||
     (decide (shapeTys p "Router" = .some [.string, .list (.record "Tab"), .number]) &&
      decide (shapeTys p "Tab" = .some [.string, .list (.record "Entry")]) &&
-     decide (shapeTys p "Entry" = .some [.number, .string, .string, .string, .record "Params"]) &&
+     decide (shapeTys p "Entry" = .some [.number, .string, .string, .string, .record "Params", .string]) &&
      decide (shapeTys p "Params" = .some ((Route.paramNames p.routes).map fun _ => .string)))
 
 /-- The router slot, when the program has one, is a state of type `Router`
@@ -285,6 +300,11 @@ inductive HasTy (p : Program) (G : Scope) : Scope → Expr → Ty → Prop
   | filter : p.fns.find? (·.name == "filter") = .none → ps.length ≤ 2 → HasTy p G Γ l (.list a) →
       HasTy p G (bindTy ps a Γ) body b → b.le .bool = true →
       HasTy p G Γ (.call "filter" [l, .arrow ps body]) (.list a)
+  /-- `sortBy` (LLP 1116.016 §5): a key of a number or a string, a literal
+  direction; the list's own type. -/
+  | sortBy : p.fns.find? (·.name == "sortBy") = .none → ps.length ≤ 2 → HasTy p G Γ l (.list a) →
+      HasTy p G (bindTy ps a Γ) body k → k.sortKey = true → sortDir dir = .ok d →
+      HasTy p G Γ (.call "sortBy" (l :: .arrow ps body :: dir)) (.list a)
   /-- `pending(x)` names a resource or a mutation in scope (the checker's
   `scope.lookup`: no local shadows it, and the component scope has it). -/
   | pending : p.fns.find? (·.name == "pending") = .none → (isResource p x || isMutation p x) = true →
@@ -374,13 +394,14 @@ def ArmInits (p : Program) (G Γ : Scope) (owner : Nat × Nat) : Prop :=
   ∀ st ∈ p.states, st.owner = .some owner → ∃ t, HasTy p G Γ st.init t ∧ t.le st.ty = true
 
 /-- What a rendered element evaluates: a `text`'s text and a `testId`
-are displayable; a handler names an action, its curried arguments at most
+are displayable; navigation attributes are typed; a handler names an action, its curried arguments at most
 the action's leading parameters. -/
 def ElementTy (p : Program) (G Γ : Scope) (tag : String) (pos : List Expr)
     (props : List (String × Expr)) (hs : List (String × String × List Expr)) : Prop :=
   (tag == "text" || tag == "tspan" || tag == "option" →
     ∀ e ∈ pos.head?, ∃ t, HasTy p G Γ e t ∧ t.displayable = true) ∧
   (∀ e ∈ lookupField "testId" props, ∃ t, HasTy p G Γ e t ∧ t.displayable = true) ∧
+  (∀ prop ∈ tabProps props, ∃ t, HasTy p G Γ prop.2 t) ∧
   (∀ h ∈ hs, ∃ a, p.actions.find? (·.name == h.2.1) = .some a ∧
     ∃ ts, ListTy p G Γ h.2.2 ts ∧ Ty.lePrefix ts (a.params.map (·.2)) = true)
 
@@ -428,6 +449,22 @@ it is read, and a resource lives in the root). So settlement, which boot
 runs before the late slots are initialized, reads none of them. -/
 def settleScope (p : Program) : Scope := (compScope p).filter fun q => !lifted p q.1
 
+/-- A resource's arguments typed as `ts` in `G`. Over a list (LLP 1017.000
+P4c, amended 2026-11-04) the list is a list of some `te`, and the key and
+the arguments are typed with the element bound to `e.item` at `te`. -/
+def ResTy (p : Program) (G : Scope) (r : ResourceDecl) (ts : List Ty) : Prop :=
+  match r.each with
+  | .none => ListTy p G [] r.args ts
+  | .some e => ∃ te, HasTy p G [] e.list (.list te) ∧ ListTy p G [(e.item, te)] r.args ts ∧
+      ∀ k, e.key = .some k → ∃ u, HasTy p G [(e.item, te)] k u
+
+/-- What a resource's source answers each request: an element of `S[]`
+over a list, else the resource's type. -/
+def ResourceDecl.answer (r : ResourceDecl) : Ty :=
+  match r.each, r.ty with
+  | .some _, .list t => t
+  | _, t => t
+
 /-- The names a component declares. -/
 def compNames (p : Program) : List String :=
   p.states.map (·.name) ++ p.derives.map (·.name) ++ p.resources.map (·.name) ++
@@ -456,8 +493,8 @@ structure WellTyped (p : Program) : Prop where
     ∃ t, HasTy p (lateScope p i) [] st.init t ∧ t.le st.ty = true
   derives : ∀ d ∈ p.derives, ∃ t, HasTy p (settleScope p) [] d.body t ∧ t.le d.ty = true
   /-- A resource's arguments type, and meet its source's one signature. -/
-  resources : ∀ r ∈ p.resources, ∃ ts, ListTy p (settleScope p) [] r.args ts ∧
-    sourceOk p r.source ts r.ty = true
+  resources : ∀ r ∈ p.resources, ∃ ts, ResTy p (settleScope p) r ts ∧
+    sourceOk p r.source ts r.answer = true
   actions : ∀ a ∈ p.actions, StmtsTy p (compScope p) a.params.reverse a.body
   tasks : ∀ t ∈ p.tasks, ∃ u, HasTy p (compScope p) [] t.ms u ∧ u.le .number = true
   /-- A task names an action, which takes no parameters (the analyzer's

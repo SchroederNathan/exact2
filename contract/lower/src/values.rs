@@ -1,8 +1,9 @@
 //! Attribute values checked against what they set, at compile time: a
 //! literal style value by the kernel's own row parser, a computed one and a
 //! prop by type (LLP 1017 P1a).
+use crate::style_names::press_refusal;
 use crate::{edits, err, media, symbols, tags, vocab, FontUse, LowerError};
-use contract_syntax::{Attr, Expr, Span, UnOp};
+use contract_syntax::{Attr, Expr, Span, TemplatePart, UnOp};
 use contract_types::{Ref, Scope, Shapes, Ty};
 use exact_kernel::style::sides as box_sides;
 use exact_kernel::{PropId, StyleId, StyleProps, StyleValue, StyleValueError};
@@ -16,6 +17,79 @@ fn literal_text(e: &Expr) -> String {
         _ => "…".into(),
     }
 }
+/// A string literal's text, or a template's whose every part is literal, as
+/// a component's prop can leave one: what the attribute says, whatever the app does.
+fn constant_text(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Str(s, _) => Some(s.clone()),
+        Expr::Template(parts, _) => parts
+            .iter()
+            .map(|part| match part {
+                TemplatePart::Text(t) | TemplatePart::Expr(Expr::Str(t, _)) => Some(t.as_str()),
+                TemplatePart::Expr(_) => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+/// A grid track list with each length token it names written as the token's
+/// value (`minmax(card-min-width, 1fr)`, the loader having written
+/// `var(--card-min-width)` as the name), as a browser substitutes `var()` before
+/// it parses the tracks (CSS Variables 1 §3). Only a token with one value in
+/// every app mode is written in; the kernel's track parser refuses any other.
+pub(crate) fn grid_tokens(a: &Attr, rows: &[StyleId]) -> Option<Attr> {
+    if !rows
+        .iter()
+        .any(|r| matches!(r, StyleId::GridTemplateColumns | StyleId::GridTemplateRows))
+    {
+        return None;
+    }
+    fn write(e: &mut Expr, changed: &mut bool) {
+        match e {
+            Expr::Str(text, _) => {
+                let mut out = String::with_capacity(text.len());
+                let mut rest = text.as_str();
+                while let Some(start) = rest.find(|c: char| c.is_ascii_alphabetic()) {
+                    let (before, word) = rest.split_at(start);
+                    let end = word
+                        .find(|c: char| {
+                            !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                        })
+                        .unwrap_or(word.len());
+                    // A word that follows a digit is the number's unit (`1fr`, `9.5rem`).
+                    let unit = before.ends_with(|c: char| c.is_ascii_digit() || c == '.');
+                    out.push_str(before);
+                    match crate::theme::measure_written(&word[..end]).filter(|_| !unit) {
+                        Some((exact_tamber::Kind::Length, values)) if values.len() == 1 => {
+                            out.push_str(&values[0]);
+                            *changed = true;
+                        }
+                        _ => out.push_str(&word[..end]),
+                    }
+                    rest = &word[end..];
+                }
+                out.push_str(rest);
+                *text = out;
+            }
+            Expr::Ternary(_, yes, no, _)
+            | Expr::Match {
+                some: yes,
+                none: no,
+                ..
+            } => {
+                write(yes, changed);
+                write(no, changed);
+            }
+            Expr::Let { body, .. } => write(body, changed),
+            _ => {}
+        }
+    }
+    let mut out = a.clone();
+    let mut changed = false;
+    write(&mut out.value, &mut changed);
+    changed.then_some(out)
+}
+
 /// `navigationSplit`'s column width written as a number: its text, as the
 /// prop carries it (LLP 1116.004 D1.2).
 pub(crate) fn split_width(prop: PropId, e: &Expr) -> Option<Expr> {
@@ -130,6 +204,7 @@ pub(crate) fn describe(e: &StyleValueError) -> String {
         StyleValueError::WrongKind { expected, .. } => format!("expected {expected}"),
         StyleValueError::BadEnv { refusal, .. } => refusal.reason().into(),
         StyleValueError::BadComparison { reason, .. } => (*reason).into(),
+        StyleValueError::UnknownEnumValue { style: StyleId::FontVariantLigatures } => "expected `normal`, `none`, or a space-separated list taking at most one of each pair: `common-ligatures` or `no-common-ligatures`, `discretionary-ligatures` or `no-discretionary-ligatures`, `historical-ligatures` or `no-historical-ligatures`, `contextual` or `no-contextual`".into(),
         StyleValueError::UnknownEnumValue { style } => format!(
             "expected one of {}",
             style.enum_names().iter().map(|name| format!("{name:?}")).collect::<Vec<_>>().join(", ")
@@ -143,11 +218,12 @@ pub(crate) fn describe(e: &StyleValueError) -> String {
         StyleValueError::BadBackgroundImage { .. } => "expected none, or up to four of linear-gradient(…), radial-gradient(…) and conic-gradient(…)".into(),
         StyleValueError::BadMaskImage { .. } => "expected none, or one linear-gradient(…), radial-gradient(…) or conic-gradient(…)".into(),
         StyleValueError::BadTextShadow { .. } => "expected none, or one shadow: <offset-x> <offset-y> [<blur>] and an optional colour".into(),
+        StyleValueError::BadFontVariations { .. } => "expected normal, or up to eight axes as `\"wght\" 650, \"wdth\" 90`: a quoted four-character tag and a number".into(),
         StyleValueError::BadCornerShape { .. } => "expected one to four of round, squircle, square, bevel, scoop, notch, superellipse(<number>) or -exact-continuous".into(),
         StyleValueError::BadDragTimeline { .. } => "expected none, or a `--name` and an optional axis (`x` or `y`)".into(),
         StyleValueError::BadAnimationTimeline { .. } => "expected auto or a `--name`".into(),
         StyleValueError::BadAnimationRange { .. } => "expected normal, or two distinct lengths (`0px 300px`)".into(),
-        StyleValueError::BadPositionTryFallbacks { .. } => "expected none, or comma-separated flip-block/flip-inline combinations; flip-start and named rules are not implemented".into(),
+        StyleValueError::BadPositionTryFallbacks { .. } => "expected none, or comma-separated attempts, each one to three of flip-block, flip-inline and flip-start, applied in order; flip-x, flip-y and named rules are not implemented".into(),
         StyleValueError::BadTimelineScope { .. } => "expected none, all, or `--name`s separated by commas".into(),
         StyleValueError::BadTransition { .. } => "unsupported transition property or invalid timing components; exact2 supports transform components, opacity, paint and SVG properties, and admitted numeric height transitions; general layout interpolation is not implemented".into(),
         StyleValueError::BadPaint { .. } => "SVG paint is `none`, `currentcolor`, or a colour (hex, `rgb()`, `hsl()`, `hwb()`, a named colour, `light-dark()`); paint servers (`url(#…)`) are refused (LLP 1055 D12)".into(),
@@ -159,7 +235,7 @@ pub(crate) fn describe(e: &StyleValueError) -> String {
         StyleValueError::BadTransformOrigin { .. } => "`transform-origin` is one or two of left, center, right, top, bottom, a length or a percentage".into(),
         StyleValueError::BadAnimation { .. } => "not a CSS `animation` shorthand: `<name> <duration> [<easing>] [<delay>] [<count>|infinite] [<direction>] [<fill-mode>] [<play-state>]`".into(),
         StyleValueError::Unsupported { .. } => "this row has no dynamic form".into(),
-        StyleValueError::BadGridTracks { .. } => "expected at most 10,000 CSS grid tracks the kernel can lay out: px, %, fr, auto, min-content, max-content, fit-content(), minmax(), repeat() (including auto-fill/auto-fit), and named lines".into(),
+        StyleValueError::BadGridTracks { .. } => "expected at most 10,000 CSS grid tracks the kernel can lay out: px, rem, %, fr, auto, min-content, max-content, calc()/min()/max()/clamp() over px, rem and %, fit-content(px or %), minmax(), repeat() (including auto-fill/auto-fit), and named lines; a length token (`var(--name)`, or its name) with one value in every app mode is its value; env() is not a track".into(),
         StyleValueError::BadGridPlacement { .. } => "expected `auto`, a nonzero or named line through 10,000, or `span N` through 10,000, optionally followed by `/` and a second line".into(),
         StyleValueError::BadTextStroke { reason, .. } => (*reason).into(),
         StyleValueError::BadSymbolPalette { .. } => "expected none, or one to three colours".into(),
@@ -168,167 +244,11 @@ pub(crate) fn describe(e: &StyleValueError) -> String {
         StyleValueError::BadBackdropFilter { reason, .. } => (*reason).into(),
     }
 }
-/// Whether these rows are one of CSS's `<value>{1,4}` box shorthands.
+/// Whether these rows are one of CSS's `<value>{1,4}` box shorthands or
+/// its `<value>{1,2}` pairs, which are split into their rows the same way.
 pub(crate) fn four_sided(rows: &[StyleId]) -> bool {
     box_sides::FAMILIES.iter().any(|f| rows == f)
-}
-/// A computed value that builds a list for a box shorthand (a template
-/// such as `` `${pad}px 0` ``, a concatenation, or a `fn` returning one): no
-/// host splits a list at run time, since an overriding longhand, an
-/// `env()` and the rows' own grammars would each split it differently
-/// (LLP 1001 §1). Refused, naming the longhands. A literal (or a literal
-/// arm) is split here; a computed single value (`padding=pad`) is every
-/// side's, and a computed list that reaches a row is refused there.
-pub(crate) fn computed_list<'e>(
-    name: &str,
-    value: &'e Expr,
-    body: &dyn Fn(&str) -> Option<&'e Expr>,
-) -> Result<(), LowerError> {
-    // The text a computed value spells, a computed part as one word.
-    fn shape<'e>(e: &'e Expr, body: &dyn Fn(&str) -> Option<&'e Expr>, depth: u8) -> String {
-        match e {
-            Expr::Str(s, _) => s.clone(),
-            Expr::Template(parts, _) => parts
-                .iter()
-                .map(|p| match p {
-                    contract_syntax::TemplatePart::Text(t) => t.clone(),
-                    contract_syntax::TemplatePart::Expr(e) => shape(e, body, depth),
-                })
-                .collect(),
-            Expr::Binary(contract_syntax::BinOp::Add, l, r, _) => {
-                shape(l, body, depth) + &shape(r, body, depth)
-            }
-            Expr::Call(f, _, _) if depth < 8 => {
-                body(f).map_or_else(|| "x".into(), |b| shape(b, body, depth + 1))
-            }
-            _ => "x".into(),
-        }
-    }
-    fn lists<'e>(e: &'e Expr, body: &dyn Fn(&str) -> Option<&'e Expr>) -> Option<Span> {
-        match e {
-            // A literal is split at compile time.
-            Expr::Str(..) => None,
-            Expr::Ternary(_, yes, no, _) => lists(yes, body).or_else(|| lists(no, body)),
-            Expr::Match { some, none, .. } => lists(some, body).or_else(|| lists(none, body)),
-            Expr::Let { body: b, .. } => lists(b, body),
-            e => (box_sides::values(&shape(e, body, 0)).len() > 1).then(|| e.span()),
-        }
-    }
-    let Some(span) = lists(value, body) else {
-        return Ok(());
-    };
-    let sides = ["top", "right", "bottom", "left"];
-    let longhands: Vec<String> = match name {
-        "border-radius" => ["top-left", "top-right", "bottom-right", "bottom-left"]
-            .map(|c| format!("`border-{c}-radius`"))
-            .to_vec(),
-        "inset" => sides.map(|s| format!("`{s}`")).to_vec(),
-        n => match n.strip_prefix("border-") {
-            Some(part) => sides.map(|s| format!("`border-{s}-{part}`")).to_vec(),
-            None => sides.map(|s| format!("`{n}-{s}`")).to_vec(),
-        },
-    };
-    err(
-        "lower-css-shorthand",
-        format!(
-            "`{name}` is computed here as a list of values, which no host splits at run time; write {} (each may be computed), or a literal `{name}`",
-            longhands.join("/")
-        ),
-        span,
-    )
-}
-
-/// A box shorthand (`padding: <length>{1,4}`, `border-color: <color>{1,4}`,
-/// …) as four longhand expressions (top, right, bottom, left): every literal
-/// the value can produce — a string, or an arm of a conditional — is split
-/// into its sides, and a computed leaf is one value for all four. `None` when
-/// no literal names more than one value, so the shorthand stays one binding
-/// for four rows.
-pub(crate) fn sides(name: &str, value: &Expr) -> Result<Option<[Expr; 4]>, LowerError> {
-    fn widest(name: &str, e: &Expr) -> Result<usize, LowerError> {
-        Ok(match e {
-            Expr::Str(s, span) => {
-                let n = box_sides::values(s).len();
-                if name == "border-radius" && box_sides::elliptical(s) {
-                    return err(
-                        "lower-attr-value",
-                        format!("`border-radius` takes one to four corners, each one length (top-left, top-right, bottom-right, bottom-left); \"{s}\" is an elliptical radius (`/`), which no host draws"),
-                        *span,
-                    );
-                }
-                if n > 4 {
-                    let order = if name == "border-radius" {
-                        "top-left, top-right, bottom-right, bottom-left; no `/` elliptical radii"
-                    } else {
-                        "top, right, bottom, left"
-                    };
-                    return err(
-                        "lower-attr-value",
-                        format!("`{name}` takes one to four values ({order}); \"{s}\" has {n}"),
-                        *span,
-                    );
-                }
-                n
-            }
-            Expr::Ternary(_, yes, no, _) => widest(name, yes)?.max(widest(name, no)?),
-            Expr::Match { some, none, .. } => widest(name, some)?.max(widest(name, none)?),
-            Expr::Let { body, .. } => widest(name, body)?,
-            _ => 1,
-        })
-    }
-    fn side(e: &Expr, i: usize) -> Expr {
-        match e {
-            Expr::Str(s, span) => {
-                let v = box_sides::values(s);
-                if v.is_empty() {
-                    return e.clone();
-                }
-                let pick = box_sides::pick(v.len(), i);
-                // A length in pixels is the number it would be on its own
-                // (`border-width` takes only numbers).
-                let piece = v[pick];
-                match piece.strip_suffix("px").unwrap_or(piece).parse::<f64>() {
-                    Ok(n) if n.is_finite() => Expr::Number(n, *span),
-                    _ => Expr::Str(piece.to_string(), *span),
-                }
-            }
-            Expr::Ternary(c, yes, no, span) => Expr::Ternary(
-                c.clone(),
-                Box::new(side(yes, i)),
-                Box::new(side(no, i)),
-                *span,
-            ),
-            Expr::Match {
-                subject,
-                var,
-                some,
-                none,
-                span,
-            } => Expr::Match {
-                subject: subject.clone(),
-                var: var.clone(),
-                some: Box::new(side(some, i)),
-                none: Box::new(side(none, i)),
-                span: *span,
-            },
-            Expr::Let {
-                name,
-                value,
-                body,
-                span,
-            } => Expr::Let {
-                name: name.clone(),
-                value: value.clone(),
-                body: Box::new(side(body, i)),
-                span: *span,
-            },
-            other => other.clone(),
-        }
-    }
-    if widest(name, value)? < 2 {
-        return Ok(None);
-    }
-    Ok(Some([0, 1, 2, 3].map(|i| side(value, i))))
+        || super::shorthands::PAIRS.iter().any(|p| rows == p)
 }
 /// A literal style value is checked now by the kernel's own parser
 /// (`StyleProps::set_dynamic`), so `width=true` and `align-items="middle"`
@@ -445,6 +365,25 @@ pub(crate) fn check_position_area(attrs: &[Attr]) -> Result<(), LowerError> {
         a.span,
     )
 }
+/// Refuse `paragraphDirs` except on a `textarea` with a literal
+/// `markup="markdown"`, whose editor draws each line of the source as a
+/// paragraph (LLP 1045 D11).
+pub(crate) fn check_paragraph_dirs(tag: &str, attrs: &[Attr]) -> Result<(), LowerError> {
+    let Some(a) = attrs.iter().find(|a| a.name == "paragraphDirs") else {
+        return Ok(());
+    };
+    let markdown = attrs.iter().any(|a| {
+        a.name == "markup" && matches!(&a.value, Expr::Str(word, _) if word == "markdown")
+    });
+    if tag == "textarea" && markdown {
+        return Ok(());
+    }
+    err(
+        "lower-paragraph-dirs-field",
+        "`paragraphDirs` belongs on a `textarea` with `markup=\"markdown\"`: its words are the base directions of the Markdown editor's lines (LLP 1045 D11). A whole text or field takes one with `direction`",
+        a.span,
+    )
+}
 impl crate::Lowerer<'_> {
     /// `check_style_value` with this lowering's shapes.
     pub(crate) fn check_style(
@@ -470,6 +409,14 @@ pub(crate) fn check_style_value(
     if rows == [StyleId::Mode] {
         return crate::theme::mode_pins(a);
     }
+    // A length or number token in a row of another kind (LLP 1121 D3).
+    crate::theme::measure_row(a, rows, ty.is_string(), &|alt| {
+        let ty = match alt.value {
+            Expr::Number(..) => Ty::Number,
+            _ => Ty::String,
+        };
+        style_value(alt, rows, &ty, fonts, scope, shapes)
+    })?;
     // A name the design lacks, or a colour token in another row (LLP 1121 D3).
     style_value(a, rows, ty, fonts, scope, shapes)
         .map_err(|e| crate::theme::token_error(a, rows, e))
@@ -489,7 +436,7 @@ fn style_value(
         super::shorthands::portable_literal(&a.value, &a.name)?;
     }
     if four_sided(rows) {
-        if let Some(sides) = sides(&a.name, &a.value)? {
+        if let Some(sides) = super::shorthands::sides(&a.name, &a.value)? {
             for (row, value) in rows.iter().zip(sides) {
                 let side = Attr { value, ..a.clone() };
                 check_style_value(&side, std::slice::from_ref(row), ty, fonts, scope, shapes)?;
@@ -571,19 +518,11 @@ fn style_value(
                     span,
                 );
             }
-            if rows.contains(&StyleId::Resize)
-                && matches!(
-                    v.as_str(),
-                    "both" | "horizontal" | "vertical" | "block" | "inline"
-                )
-            {
-                return err("lower-css-resize", "CSS resize handles are not implemented by the native layout presenters; only `resize=\"none\"` is portable. Other values require user-controlled box geometry, not a different property name", span);
-            }
-            // @ref LLP 1115.000 D11.6 — `text` is honoured where a host has
-            // text selection (the web, macOS, iOS); the other two name a
-            // selection behaviour no native presenter has.
-            if rows.contains(&StyleId::UserSelect) && matches!(v.as_str(), "all" | "contain") {
-                return err("lower-css-user-select", format!("CSS `user-select=\"{v}\"` is not implemented by the native presenters: `all` selects an element whole on one press and `contain` keeps a selection from leaving its element, and their text selection ownership has neither. Supported values are auto, none and text"), span);
+            // @ref LLP 1115.000 D11.6 — `text` and `all` are honoured where a
+            // host has text selection (the web, macOS, iOS); `contain` names
+            // a selection behaviour no native presenter has.
+            if rows.contains(&StyleId::UserSelect) && v == "contain" {
+                return err("lower-css-user-select", "CSS `user-select=\"contain\"` is not implemented by the native presenters: it keeps a selection from leaving its element, and their text selection ownership has no such bound. Supported values are auto, none, text and all", span);
             }
             if rows.contains(&StyleId::PositionArea)
                 && !StyleId::PositionArea.enum_names().contains(&v.trim())
@@ -606,8 +545,7 @@ fn style_value(
                     let supported = "translate, scale, rotate, opacity; color, background-color, border-color (and each side), -exact-tint-color, box-shadow; SVG fill, stroke, stroke-dashoffset, r, cx, cy, x, y, rx, ry, d; numeric height on admitted height owners";
                     let why = match reason {
                         exact_motion::ParseError::UnknownProperty(property) => {
-                            let layout = matches!(property.as_str(), "width" | "min-width" | "max-width" | "min-height" | "max-height" | "top" | "right" | "bottom" | "left" | "margin" | "padding" | "flex-basis" | "gap");
-                            format!("`{property}` {}: transitions animate {supported}. General layout-property interpolation would require layout per frame and is not implemented; `-exact-layout-transition` animates changes to the laid-out box", if layout { "is a CSS layout property, but exact2 cannot transition it" } else { "is not a supported transition property" })
+                            crate::motion::layout_property_refusal(&property, supported).unwrap_or_else(|| format!("`{property}` is not a supported transition property: transitions animate {supported}"))
                         }
                         other => format!("invalid transition components ({other:?}); supported properties: {supported}"),
                     };
@@ -636,7 +574,14 @@ fn style_value(
                 }
             }
             // @ref LLP 1066, LLP 1077 — the kernel's parse says why, by name.
-            let why = if rows.contains(&StyleId::BackgroundImage) {
+            // A shadow token's name: its values were checked as this row's
+            // (`theme::measure_row`), not the name's own text.
+            // A metric's name in a sheet the compiler wrote is its platform's value (LLP 1115.002 D6).
+            let why = if crate::theme::measure_named(v).is_some()
+                || (!a.written && exact_kernel::style::metrics::named(v).is_some())
+            {
+                None
+            } else if rows.contains(&StyleId::BackgroundImage) {
                 exact_kernel::gradient::BackgroundImage::check(v).err()
             } else if rows.contains(&StyleId::MaskImage) {
                 exact_kernel::gradient::BackgroundImage::check_mask(v).err()
@@ -677,12 +622,18 @@ fn style_value(
             if rows.contains(&StyleId::TextWrapStyle) && matches!(v.trim(), "pretty" | "stable") {
                 return err("lower-attr-value", format!("`{}=\"{v}\"`: exact2 implements `auto` and `balance`; Chrome's `pretty` and `stable` line breakers are not implemented on the native hosts. Use `auto` for ordinary wrapping", a.name), span);
             }
+            // @ref LLP 1019 D12: WebKit's keywords no native host draws.
+            if rows.contains(&StyleId::FontSmoothing)
+                && matches!(v.trim(), "none" | "subpixel-antialiased")
+            {
+                return err("lower-attr-value", format!("`{}=\"{v}\"`: exact2 implements `auto` and `antialiased`; `none` (aliased glyphs) and `subpixel-antialiased` are not implemented. `auto` is the platform's own smoothing", a.name), span);
+            }
             // @ref LLP 1034 §8: `light` or `dark`. CSS's `normal` means the
             // page's schemes, not the parent's, and `light dark` and `only`
             // ask a browser to choose: none is implemented; leaving the
             // attribute off follows the surrounding scheme.
             if rows.contains(&StyleId::ColorScheme) && !matches!(v.trim(), "light" | "dark") {
-                return err("lower-attr-value", format!("`color-scheme=\"{v}\"`: exact2 implements `light` and `dark` on a subtree (LLP 1034 §8); leave it off to follow the surrounding scheme. CSS's `normal`, `light dark` and `only` are not implemented"), span);
+                return err("lower-attr-value", format!("`color-scheme=\"{v}\"`: exact2 implements `light` and `dark` on a subtree (LLP 1034 §8); leave it off to follow the surrounding scheme. CSS's `normal`, `light dark` and `only` are not implemented. A Theme setting (Auto, Light, Dark) is `setScheme(\"system\" | \"light\" | \"dark\")` in the action; `color-scheme` fixes a subtree's scheme"), span);
             }
             if rows.contains(&StyleId::ShapeMargin) && v.trim().ends_with('%') {
                 return err("lower-attr-value", "percentage `shape-margin` is not implemented in exact2 v1; use a nonnegative length in points/px", span);
@@ -698,17 +649,8 @@ fn style_value(
                 span,
             );
         }
-        // @ref LLP 1061 D1 — a press that makes a node vanish or flip is a
-        // typo, not a feel.
-        if rows.contains(&StyleId::PressScale) && numeric_literal(value).is_some_and(|n| n <= 0.0) {
-            return err(
-                "lower-attr-value",
-                format!(
-                    "`{}` takes a positive scale (0.97 is a button's, 1 is none)",
-                    a.name
-                ),
-                span,
-            );
+        if let Some(why) = numeric_literal(value).and_then(|n| press_refusal(rows, n, &a.name)) {
+            return err("lower-attr-value", why, span);
         }
         // @ref LLP 1064 D1 — a shadow is text; a number is no shadow.
         if rows.contains(&StyleId::BoxShadow)
@@ -796,6 +738,11 @@ fn style_value(
                                 .to_string()
                         })
                         .or_else(|| match value {
+                            // A notification haptic reports a task's outcome, which a
+                            // press has not had at touch-down.
+                            Expr::Str(t, _) if rows == [StyleId::PressHaptic] && matches!(t.as_str(), "success" | "warning" | "error") => {
+                                Some(format!("; \"{t}\" is an outcome, which a press has not had at touch-down: play it from the action that has it, `haptic(\"{t}\")`"))
+                            }
                             Expr::Str(t, _) => {
                                 edits::role_hint(t, false).map(|e| format!("; {}", e.clause()))
                             }
@@ -880,7 +827,15 @@ fn style_value(
     // A metric in a sheet the compiler wrote is a string that every host
     // reads as its platform's number (LLP 1115.002 D6).
     let metric = !a.written && crate::metrics::names(&a.value);
-    if !metric && !rows.iter().any(|row| exact_kernel::style::takes_text(*row)) {
+    // So is a number token's name, which the runner reads as its number
+    // (LLP 1121 D3).
+    // A computed string may name one too, when the design has one (D7).
+    let token = crate::theme::names_measures(&a.value)
+        || crate::theme::number_tokens()
+            && rows.iter().all(|r| {
+                exact_kernel::style::theme::admits(exact_kernel::style::theme::Kind::Number, *r)
+            });
+    if !metric && !token && !rows.iter().any(|row| exact_kernel::style::takes_text(*row)) {
         let offending = computed_string_arm(&a.value, scope, shapes, rows, &[]).or_else(|| {
             (ty.is_string() && !css_wide_branches(&a.value, rows)).then_some(a.value.span())
         });
@@ -1005,8 +960,8 @@ fn computed_string_arm<'a>(
 /// HTML's enumerated attributes whose IDL attributes are bools, as the words
 /// a bool is written: `spellcheck`'s `true`/`false`, `autocorrect`'s
 /// `on`/`off`.
-/// An ARIA state whose value is a word, a bool among them (`true`/`false`):
-/// the words it takes, a bool expression written as one of the first two.
+/// An ARIA state whose value is a word: the words it takes. When the first
+/// two are `true` and `false` it also takes a bool, written as one of them.
 pub(crate) fn aria_words(prop: PropId) -> Option<(&'static str, &'static [&'static str])> {
     Some(match prop {
         PropId::AccessibilityPressed => ("aria-pressed", &["true", "false", "mixed"]),
@@ -1019,12 +974,23 @@ pub(crate) fn aria_words(prop: PropId) -> Option<(&'static str, &'static [&'stat
             "aria-current",
             &["true", "false", "page", "step", "location", "date", "time"],
         ),
+        PropId::AccessibilitySort => ("aria-sort", &["ascending", "descending", "none", "other"]),
         _ => return None,
     })
 }
-pub(crate) fn aria_disabled_literal(prop: PropId, value: &Expr) -> Option<Expr> {
-    match (prop, value) {
-        (PropId::AccessibilityDisabled, Expr::Str(s, span)) if s == "true" || s == "false" => {
+pub(crate) fn aria_takes_bool(words: &[&str]) -> bool {
+    words.starts_with(&["true", "false"])
+}
+/// An ARIA state that is a bool, written as the WAI-ARIA token: `aria-hidden="true"` is
+/// `aria-hidden=true` (WAI-ARIA 1.2 §8.2, "true/false"). Not an HTML boolean attribute, whose
+/// `disabled="false"` would mean present.
+pub(crate) fn aria_bool_literal(name: &str, prop: PropId, value: &Expr) -> Option<Expr> {
+    match value {
+        Expr::Str(s, span)
+            if name.starts_with("aria-")
+                && tags::prop_ty(prop) == tags::PropTy::Bool
+                && (s == "true" || s == "false") =>
+        {
             Some(Expr::Bool(s == "true", *span))
         }
         _ => None,
@@ -1048,6 +1014,11 @@ pub(crate) fn check_prop_value(
 ) -> Result<(), LowerError> {
     media::check(name, value, span)?;
     let want = tags::prop_ty(prop);
+    if prop == PropId::Popover
+        && matches!(ty, Ty::Option(inner) if matches!(**inner, Ty::String | Ty::Enum(_) | Ty::Unknown))
+    {
+        return Ok(());
+    }
     // An app's browsing contexts are its window and new ones: `_parent` and
     // `_top` name frames an app does not have, a name one it cannot open.
     if prop == PropId::Target
@@ -1073,14 +1044,11 @@ pub(crate) fn check_prop_value(
     // of the sheet's maximum (§9.13).
     if prop == PropId::NavigationDetent {
         if let Expr::Str(s, _) = value {
-            if let Some(word) = s.split(' ').filter(|w| !w.is_empty()).find(|w| {
-                !matches!(*w, "large" | "medium" | "fit-content")
-                    && !w.parse::<f64>().is_ok_and(|h| h.is_finite() && h > 0.0)
-                    && !w.strip_suffix('%').is_some_and(|p| {
-                        p.parse::<f64>()
-                            .is_ok_and(|p| p.is_finite() && p > 0.0 && p <= 100.0)
-                    })
-            }) {
+            if let Some(word) = s
+                .split(' ')
+                .filter(|w| !w.is_empty())
+                .find(|w| !vocab::detent_word(w))
+            {
                 return err(
                     "lower-attr-value",
                     format!(
@@ -1111,6 +1079,34 @@ pub(crate) fn check_prop_value(
             }
         }
     }
+    // @ref LLP 1045 D11 — HTML's `dir` words, one per source line; a literal,
+    // which never sends new words, says one for every line. The literal's
+    // place is the error's: through a component's prop, the caller's.
+    if prop == PropId::ParagraphDirs {
+        if let Some(s) = constant_text(value) {
+            let span = value.span();
+            if let Some(word) = s
+                .split_ascii_whitespace()
+                .find(|w| !matches!(*w, "ltr" | "rtl" | "auto"))
+            {
+                return err(
+                    "lower-attr-value",
+                    format!(
+                        "`paragraphDirs` accepts {}; given \"{word}\"",
+                        vocab::accepts(prop).unwrap()
+                    ),
+                    span,
+                );
+            }
+            if s.split_ascii_whitespace().nth(1).is_some() {
+                return err(
+                    "lower-paragraph-dirs-literal",
+                    format!("a literal `paragraphDirs` says one word, which every line takes: it never sends new words, so a list written here drifts from its lines with the first edit; bind a list the app derives from the value, `paragraphDirs=dirs`, one word per source line (LLP 1045 D11); given \"{s}\""),
+                    span,
+                );
+            }
+        }
+    }
     // @ref LLP 1116.004 D1.2, LLP 1116.006 D2 — a stack's split on a wide window: off, or the list column's
     // width; or, on a box in the root route, the detail pane's placeholder.
     if prop == PropId::NavigationSplit
@@ -1126,11 +1122,16 @@ pub(crate) fn check_prop_value(
     let words: Option<(&[&str], &str)> = match prop {
         PropId::StatusBarAnimation => Some((&["none", "fade"], "`status-bar-animation` takes \"none\" or \"fade\"")),
         // @ref LLP 1115.000 D5.2 — no bar is something a route says, in one word.
-        PropId::NavigationBar => Some((&["none", "auto"], "`navigationBar` takes \"none\" (this route shows no navigation bar: a full-bleed screen that draws its own way back) or \"auto\" (the platform's bar, the default)")),
+        PropId::NavigationBar => Some((&["none", "auto", "transparent"], "`navigationBar` takes \"none\" (this route shows no navigation bar: a full-bleed screen that draws its own way back), \"transparent\" (the bar drawn clear at the top of the route's scroller, whose content starts under it: a full-bleed picture) or \"auto\" (the platform's bar, the default)")),
         // A sheet's grabber, said or left to the platform (LLP 1115 §2).
         PropId::NavigationGrabber => Some((&["visible", "hidden", "auto"], "`navigationGrabber` takes \"visible\", \"hidden\" or \"auto\" (the default: the platform's, a grabber on a sheet with several detents)")),
+        // @ref LLP 1115.000 D5.5 — the ways the navigation root offers now.
+        PropId::NavigationHistory => Some((&["back forward", "back", "forward", "none"], "`navigationHistory` takes \"back forward\" (the default: Back and Forward, wherever the router has somewhere to go), \"back\", \"forward\" or \"none\", the ways through history the navigation root offers now")),
+        // @ref LLP 1115.000 D7.3 — Return presses a focused pressable under the node, as Chromium's Enter does.
+        PropId::ReturnPresses => Some((&["descendants", "none"], "`-exact-return-presses` takes \"descendants\" (Return presses a focused button under this node, as Space does) or \"none\" (the default: Return is the dialog's default button's)")),
         PropId::FocusGuide => Some((&["auto"], "`focusGuide` takes \"auto\"")),
         PropId::Wakelock => Some((&["screen", "none"], "`wakelock` takes \"screen\" (the display stays awake while this element is displayed) or \"none\" (the default)")),
+        PropId::Orientationlock => Some((&["portrait", "landscape", "portrait-primary", "portrait-secondary", "landscape-primary", "landscape-secondary", "natural", "any", "current", "none"], "`orientationlock` takes a Screen Orientation API lock type (\"portrait\", \"landscape\", \"portrait-primary\", \"portrait-secondary\", \"landscape-primary\", \"landscape-secondary\", \"natural\", \"any\"), \"current\" (the orientation the window has when the lock begins) or \"none\" (the default)")),
         PropId::AccessibilityLive => Some((&["off", "polite", "assertive"], "`aria-live` takes \"off\", \"polite\" or \"assertive\"")),
         _ => None,
     };
@@ -1139,17 +1140,20 @@ pub(crate) fn check_prop_value(
             return err("lower-attr-value", why, span);
         }
     }
-    // @ref LLP 1053.000 D4 — a material is a name in the schema's table.
+    // @ref LLP 1053.000 D4 — a material is a name in the schema's table, or
+    // `none`, no material; each string a computed value can take is one.
     if prop == PropId::BackgroundMaterial {
-        if let Expr::Str(name, _) = value {
-            if exact_kernel::generated::material(name).is_none() {
+        let mut leaves = Vec::new();
+        string_leaves(value, &mut leaves);
+        for (name, at) in leaves {
+            if name != "none" && exact_kernel::generated::material(name).is_none() {
                 return err(
                     "lower-attr-value",
                     format!(
-                        "`backgroundMaterial=\"{name}\"` is not a material; materials: {}",
+                        "`backgroundMaterial=\"{name}\"` is not a material; materials: {}, or `none` for no material",
                         exact_kernel::generated::MATERIALS.join(", ")
                     ),
-                    span,
+                    if matches!(value, Expr::Str(..)) { span } else { at },
                 );
             }
         }
@@ -1172,16 +1176,18 @@ pub(crate) fn check_prop_value(
     }
     // ARIA's word-valued states (`aria-pressed`'s `mixed`), or a bool.
     if let Some((attr, words)) = aria_words(prop) {
+        let takes_bool = aria_takes_bool(words);
         if matches!(value, Expr::Str(s, _) if !words.contains(&s.as_str())) {
             let (last, rest) = words.split_last().unwrap();
             let rest: Vec<String> = rest.iter().map(|w| format!("\"{w}\"")).collect();
+            let bool = if takes_bool { "a bool or " } else { "" };
             return err(
                 "lower-attr-value",
-                format!("`{attr}` takes a bool or {} or \"{last}\"", rest.join(", ")),
+                format!("`{attr}` takes {bool}{} or \"{last}\"", rest.join(", ")),
                 span,
             );
         }
-        if matches!(ty, Ty::Bool) {
+        if takes_bool && matches!(ty, Ty::Bool) {
             return Ok(());
         }
     }
@@ -1195,6 +1201,13 @@ pub(crate) fn check_prop_value(
             | (tags::PropTy::Bool, Ty::Bool)
             | (tags::PropTy::Int | tags::PropTy::Float, Ty::Number)
     );
+    if !ok && prop == PropId::Datetime {
+        return err(
+            "lower-time-instant",
+            "`datetime` is an instant in epoch milliseconds; parse a string with `date(…)`",
+            span,
+        );
+    }
     if !ok {
         return err(
             "lower-attr-type",
@@ -1220,6 +1233,21 @@ pub(crate) fn check_prop_value(
     }
     Ok(())
 }
+/// The string literals `e` can be: itself, or the arms of a `?:`, `match` or `let`.
+fn string_leaves<'e>(e: &'e Expr, out: &mut Vec<(&'e str, Span)>) {
+    match e {
+        Expr::Str(s, span) => out.push((s, *span)),
+        Expr::Ternary(_, a, b, _)
+        | Expr::Match {
+            some: a, none: b, ..
+        } => {
+            string_leaves(a, out);
+            string_leaves(b, out);
+        }
+        Expr::Let { body: inner, .. } | Expr::Typed(inner, _, _) => string_leaves(inner, out),
+        _ => {}
+    }
+}
 /// @ref LLP 1053.000.000 D6 — where a glass group cannot be: beside the
 /// element's own material (the group's glass would fuse with it), on a
 /// scroll (its content belongs to the scroll and its rows), on a canvas
@@ -1244,10 +1272,7 @@ pub(crate) fn check_glass_group(tag: &tags::Tag, attrs: &[Attr]) -> Result<(), L
             m.name
         ));
     }
-    let scrolls = attrs.iter().any(|a| {
-        matches!(a.name.as_str(), "overflow" | "overflow-x" | "overflow-y")
-            && matches!(&a.value, Expr::Str(v, _) if v == "scroll" || v == "auto")
-    });
+    let scrolls = super::overflow::Overflow::of(attrs, "visible").may_scroll();
     if tag.node_type.scrolls_by_default() || scrolls {
         return refuse("on an element that scrolls: put the group on a child inside the scroll");
     }

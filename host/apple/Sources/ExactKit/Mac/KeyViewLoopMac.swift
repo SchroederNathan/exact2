@@ -122,10 +122,12 @@ extension Presenter {
             start.nextKeyView = nil
             return
         }
+        // Setting a view's `nextKeyView` makes it the next one's `previousKeyView`: the start's link goes
+        // first, so the last stop's, below, is the first stop's previous and Shift-Tab wraps as Tab does.
+        start.nextKeyView = tabbable[0].view
         for (i, v) in tabbable.enumerated() {
             v.view.nextKeyView = tabbable[(i + 1) % tabbable.count].view
         }
-        start.nextKeyView = tabbable[0].view
         // Shift-Tab from the start (`tabFromStart`): the loop's last.
         keyViewBefore.setObject(tabbable[tabbable.count - 1].view, forKey: start)
     }
@@ -175,7 +177,7 @@ extension Presenter {
     /// Whether nothing of this session's in `window` holds the focus: the
     /// window is its own first responder, or a view that stands for the
     /// whole page is.
-    private func windowHoldsFocus(_ window: NSWindow) -> Bool {
+    func windowHoldsFocus(_ window: NSWindow) -> Bool {
         let current = window.firstResponder
         return current == nil || current === window || current === window.contentView || current === viewport || current === session?.view
     }
@@ -270,9 +272,9 @@ final class InlineKeyView: NSView {
         return true
     }
     override var focusRingMaskBounds: NSRect {
-        guard window?.firstResponder === self, let owner, let run else { return .zero }
+        guard window?.firstResponder === self, let owner, let run, !run.outlineNone else { return .zero }
         let rect = owner.inlineRects(run).reduce(CGRect.null) { $0.union($1) }
-        return rect.isNull ? .zero : convert(rect, from: owner)
+        return uncovered(rect.isNull ? .zero : convert(rect, from: owner))
     }
     override func drawFocusRingMask() {
         guard let owner, let run else { return }

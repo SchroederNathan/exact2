@@ -65,6 +65,21 @@ final class ChooserMacTests: XCTestCase {
         wait(for: [turned], timeout: 5)
     }
 
+    func testAnOpenChooserRejectsNewActivePropertiesWithoutReplacingItsMenu() throws {
+        let p = chooser(["One", "Two"], cancels: 0)
+        defer { p.menus.reset() }
+        p.press(1)
+        let entry = try XCTUnwrap(p.menus.entries.last)
+        let menu = try XCTUnwrap(entry.menu), item = menu.items[1]
+        let row = try XCTUnwrap(p.views[3])
+        XCTAssertNil(row.nativeActiveRefusals["NSMenuItem"])
+        p.apply(wireBatch([["op": "style", "id": 3, "style": ["press_opacity_to": 0.4]]]))
+        XCTAssertTrue(p.menus.entries.last === entry)
+        XCTAssertTrue(entry.menu === menu)
+        XCTAssertTrue(menu.items[1] === item)
+        XCTAssertTrue(row.nativeActiveRefusals["NSMenuItem"]?.contains("opacity") == true)
+    }
+
     func testExplicitSourceWithoutInvokerTargetKeepsTheChooserValid() throws {
         let p = chooser(["One", "Two"], cancels: 0)
         defer { p.menus.reset() }
@@ -391,18 +406,34 @@ final class ChooserMacTests: XCTestCase {
             guard let menu = note.object as? NSMenu, menu.items.contains(where: { $0.title == "Waze" }) else { return }
             seen = true
             RunLoop.current.perform(inModes: [.eventTracking, .default]) {
-                frame = NSApp.windows.filter { $0.isVisible && $0.level.rawValue >= NSWindow.Level.popUpMenu.rawValue }
-                    .map(\.frame).max { $0.height < $1.height }
+                frame = ContextMenuMacTests.shownMenuFrame()
                 menu.cancelTracking()
             }
         }
         defer { NotificationCenter.default.removeObserver(token) }
+        waitFor("an earlier test's menu leaves the screen") { ContextMenuMacTests.shownMenuFrame() == nil }
         p.press(1)
         let done = Date(timeIntervalSinceNow: 5)
         while (!seen || p.menus.isOpen(p.views[2]!)) && Date() < done { RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.02)) }
         let menu = try XCTUnwrap(frame, "the menu's window")
         XCTAssertGreaterThanOrEqual(menu.minY, invoker.maxY - 8, "above the invoker (screen y grows up): \(menu) vs \(invoker)")
         XCTAssertEqual(menu.midX, invoker.midX, accuracy: 12, "centred on it")
+    }
+
+    func testAMenuRetainsARowWhosePressIsDelegatedToAnAncestor() throws {
+        let p = chooser(cancels: 0)
+        defer { p.menus.reset() }
+        let pop = try XCTUnwrap(p.views[2])
+        pop.props["accessibilityRole"] = "menu"
+        pop.handlers.insert("press")
+        try XCTUnwrap(p.views[3]).handlers.remove("press")
+        var pressed: [UInt32] = []
+        p.onPress = { pressed.append($0) }
+        let menu = p.menus.menu(of: pop)
+        let item = try XCTUnwrap(menu.items.first { $0.title == "Apple Maps" })
+        try send(item)
+        turn()
+        XCTAssertEqual(pressed, [2], "the native row dispatches the same ancestor as a button press")
     }
 
     func testAMenuIsTitledByItsLabelAndFitsARowsBitmap() throws {
@@ -423,7 +454,10 @@ final class ChooserMacTests: XCTestCase {
         XCTAssertTrue(p.menus.isMenuShaped(pop), "a row of an img and text is a menu row")
         let menu = p.menus.menu(of: pop)
         XCTAssertTrue(menu.items[0].isSectionHeader)
-        XCTAssertEqual(menu.items.map(\.title), ["Open location in", "Waze", "Cancel"])
+        XCTAssertEqual(menu.items.map(\.title), ["Open location in", "Waze"], "Escape cancels a native menu")
+        try XCTUnwrap(p.views[6]).handlers.insert("press")
+        XCTAssertEqual(p.menus.menu(of: pop).items.map(\.title), ["Open location in", "Waze", "Cancel"],
+                       "a Cancel action with a handler remains an item")
         let ctx = try XCTUnwrap(CGContext(data: nil, width: 64, height: 32, bitsPerComponent: 8, bytesPerRow: 0,
                                           space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
         let image = MenuHost.rowImage(try XCTUnwrap(ctx.makeImage()))

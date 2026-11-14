@@ -1,12 +1,12 @@
 # Recipe: a navigation stack
 
-A list that pushes a detail, a Cancel/Save sheet and an alert (`pattern list-detail`).
-A second screen is a route (`if` over state gets no Back, links or split). Each route block
-fills its `if`.
+A list pushing a detail, a Cancel/Save sheet, an alert (`pattern list-detail`).
+A second screen is a route (`if` over state gets no Back, links or split).
 
-A route's `header` is its bar when first in the route with one heading (the title: large at
-`aria-level=1`, inline at 2); buttons before it lead, after it trail. A pushed route without
-one gets the system Back (`contract vocab header`).
+A route's first `header` with one heading is its bar (title large at `aria-level=1`,
+inline at 2); buttons before it lead, after it trail. A pushed route has
+Back; a `button id="back"` (the root's `navigationBack`) with `text "Notes"`
+titles it "Notes".
 
 <!-- check: app -->
 ```contract
@@ -68,13 +68,12 @@ component App
           text "Cancel"
 ```
 
-The list: a row that only navigates is a `link` (`href=path(…)`, never a template string)
-that `follow` pushes.
+The list: a row that only navigates is a `link` (`href=path(…)`, not a template) that `follow` pushes.
 
 <!-- check: route notes -->
 ```contract
 column navigationKey=`${e.id}` navigationScroll="notes-list" position="absolute" inset=0
-  header display="flex" align-items="center" padding="8px 16px"
+  header display="flex" align-items="center"
     text "Notes" role="heading" aria-level=1 flex=1
     button press=openAdd aria-label="Add Note" testId="add-note"
       image "symbol:add"
@@ -89,7 +88,7 @@ column navigationKey=`${e.id}` navigationScroll="notes-list" position="absolute"
 <!-- check: route note -->
 ```contract
 column navigationKey=`${e.id}` navigationScroll="note-list" position="absolute" inset=0
-  header display="flex" align-items="center" padding="8px 16px"
+  header display="flex" align-items="center"
     text "Note" role="heading" aria-level=2
   list id="note-list" appearance="auto" listStyle="inset-grouped" flex=1 min-height=0
     for n in lib.filter(x => x.id == e.params.id) key=n.id
@@ -100,18 +99,17 @@ column navigationKey=`${e.id}` navigationScroll="note-list" position="absolute" 
 ```
 
 The sheet: `navigationPresentation="modal"`; its Cancel's `id` is the root's `navigationBack`,
-which the swipe down presses. Its last child, the `scroll`, runs to the bottom edge (a
-footer under it stops it short).
+which a swipe down presses. On the web: a dialog, its actions below.
 
 <!-- check: route add -->
 ```contract
 column navigationKey=`${e.id}` navigationPresentation="modal" navigationScroll="add-form" position="absolute" inset=0
-  header display="flex" align-items="center" justify-content="space-between" padding="8px 16px"
-    button id="back" press=back
-      text "Cancel"
+  header display="flex" align-items="center" justify-content="space-between"
+    button id="back" press=back aria-label="Cancel"
+      image "symbol:close"
     text "New Note" role="heading"
-    button press=save buttonStyle="filled" testId="add-save"
-      text "Save"
+    button press=save buttonStyle="bordered-prominent" aria-label="Save" testId="add-save"
+      image "symbol:checkmark"
   list id="add-form" appearance="auto" listStyle="inset-grouped" flex=1 min-height=0
     section
       row
@@ -136,13 +134,15 @@ test "add, open, delete after asking"
   expect state lib == []
 ```
 
-- An alert's `aria-label` is its title. It has text, buttons and one Cancel. Escape/Back
-  chooses Cancel; only written `closedby="any"` dismisses outside. Linux centres it and
-  scrolls content to its actions; another modal is a sheet, closed on ok
-  ([after-a-write](after-a-write.md)).
-- Routes stay mounted: use unique `testId`s. `clock settle` follows a push, sheet or alert;
-  `clock data` precedes reading a save.
-- At 900 px up, pushed rows split list and detail; `follow` replaces it and
-  `navigationSplit="none"` keeps it pushed.
-- An unmatched location keeps its URL and offers home (or uses `notfound`); a missing detail
-  says so.
+- An alert's `aria-label` is its title. Escape/Back chooses Cancel; only `closedby="any"`
+  dismisses outside. Another modal is a sheet, closed on ok ([after-a-write](after-a-write.md)).
+- Routes stay mounted: unique `testId`s. `clock settle` after a push, sheet or alert;
+  `clock data` before reading a save.
+- A run (a workout, a quiz) has one exit that ends it or asks; no Back leaves it running.
+- An unmatched location offers home (`notfound`); a missing detail says so.
+- `link href="#tags"` scrolls to `id="tags"` once data lands.
+
+## A screen open twice
+
+A screen as a component, `Finder(entry=e)` (`props entry: Entry`), has `state` per
+entry, gone when it pops; resources, mutations and tasks are the root's.

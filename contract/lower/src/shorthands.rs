@@ -1,5 +1,7 @@
 //! CSS shorthands project literal choices into existing longhand bindings.
 use super::*;
+use contract_syntax::TemplatePart;
+use exact_kernel::style::sides as box_sides;
 
 /// The shorthand's longhands, in component order.
 pub(crate) fn rows(name: &str) -> &'static [StyleId] {
@@ -29,11 +31,15 @@ pub(crate) fn rows(name: &str) -> &'static [StyleId] {
         "column-rule" => &[ColumnRuleWidth, ColumnRuleStyle, ColumnRuleColor],
         "column-count" => &[ColumnCount],
         "column-rule-width" => &[ColumnRuleWidth],
-        "font" => &[FontStyle, FontWeight, FontSize, LineHeight],
+        // LLP 1115.000 D12.2: only what it writes; the style's weight and
+        // leading are the kernel's, per platform (`fontShorthand`).
+        "font" => &[FontStyle, FontSize],
         // CSS Inline Layout 3 §4: one row holds both edges (`cap-alphabetic`
         // for CSS's `cap alphabetic`); `text-box` is trim, then edge.
         "text-box-edge" => &[TextBoxEdge],
         "text-box" => &[TextBoxTrim, TextBoxEdge],
+        // CSS Inline Layout 3 §4: `alignment-baseline` and `baseline-shift`.
+        "vertical-align" => &[VerticalAlign, BaselineShift],
         _ => unreachable!("known shorthand"),
     }
 }
@@ -47,6 +53,10 @@ pub(crate) fn component(value: &Expr, name: &str, index: usize) -> Result<Expr, 
         // An unset arm of a conditional class clears each expanded longhand.
         Expr::None(_) => {},
         Expr::Str(text, span) if longhand => out = columns_longhand(name, text, *span)?,
+        Expr::Str(text, span) if name == "vertical-align" => out = vertical_align(text, *span)?[index].clone(),
+        Expr::Number(n, span) if name == "vertical-align" => {
+            out = if index == 0 { Expr::Str("baseline".into(), *span) } else { Expr::Number(*n, *span) };
+        }
         Expr::Str(text, span) if name == "font" => out = font(text, *span)?[index].clone(),
         Expr::Number(_, span) if name == "font" => return font("", *span).map(|_| out),
         Expr::Number(n, span) if name == "column-count" && *n < 1.0 => {
@@ -96,6 +106,41 @@ pub(crate) fn component(value: &Expr, name: &str, index: usize) -> Result<Expr, 
         _ => return err("lower-css-shorthand", format!("`{name}` takes a literal CSS shorthand or a choice of literals; computed strings cannot be split into longhands"), value.span()),
     }
     Ok(out)
+}
+
+/// `vertical-align`'s two rows (LLP 1011.002 D3): a keyword and no shift,
+/// or `baseline` raised by a length.
+fn vertical_align(text: &str, span: Span) -> Result<[Expr; 2], LowerError> {
+    let word = text.trim().to_ascii_lowercase();
+    if matches!(
+        word.as_str(),
+        "baseline" | "middle" | "text-top" | "text-bottom"
+    ) {
+        return Ok([Expr::Str(word, span), Expr::Number(0.0, span)]);
+    }
+    if matches!(word.as_str(), "sub" | "super" | "top" | "bottom" | "center") {
+        return err(
+            "lower-css-shorthand",
+            format!("`vertical-align: {word}` is not implemented; an image in text takes `baseline`, `middle`, `text-top`, `text-bottom` or a length"),
+            span,
+        );
+    }
+    let mut probe = exact_kernel::StyleProps::default();
+    if word.contains('%')
+        || probe
+            .set_dynamic(
+                StyleId::BaselineShift,
+                &exact_kernel::StyleValue::Text(word.as_str().into()),
+            )
+            .is_err()
+    {
+        return err(
+            "lower-css-shorthand",
+            format!("`vertical-align` takes `baseline`, `middle`, `text-top`, `text-bottom` or a length such as `-0.2em`, not `{text}`"),
+            span,
+        );
+    }
+    Ok([Expr::Str("baseline".into(), span), Expr::Str(word, span)])
 }
 
 fn words(text: &str) -> Vec<&str> {
@@ -179,6 +224,19 @@ fn border(name: &str, text: &str, span: Span) -> Result<[String; 3], LowerError>
                 if let Some(edit) = crate::edits::role_hint(word, true) {
                     let edit = edit.shifted(text.find(word).unwrap_or(0));
                     return err("lower-css-shorthand", edit.lead(name, text), span);
+                }
+                // A dotted word no token has, in a colour row's words (LLP
+                // 1121 stage 12 B3, QUEUE's item); a base name or a length
+                // token is a length, which the refusal below names.
+                use exact_kernel::style::{scale, theme};
+                let length = scale::is_base(word)
+                    || crate::theme::measure_named(word) == Some(exact_tamber::Kind::Length);
+                if crate::theme::scan::dotted_name(word)
+                    && theme::bound()
+                    && !theme::names(word)
+                    && !length
+                {
+                    return err("tamber-unknown-token", format!("`{name}=\"{text}\"`: `{word}` is no token of this app's design and no role"), span);
                 }
                 return err("lower-css-shorthand", format!("`{word}` is not an admitted `{name}` width, style or color; widths are nonnegative px/pt lengths, `-exact-hairline` or thin/medium/thick"), span);
             }
@@ -282,12 +340,20 @@ fn columns_longhand(name: &str, text: &str, span: Span) -> Result<Expr, LowerErr
     }
 }
 
-/// `font`: a platform text style only (LLP 1115 D3), as WebKit's system
-/// font keywords set every longhand: `normal` style and line height, the
-/// style's weight and its size, which the kernel reads from the platform's
-/// ramp at the root font size. The family stays what it was.
-fn font(text: &str, span: Span) -> Result<[Expr; 4], LowerError> {
+/// `font`: a platform text style only (LLP 1115 D3), or a clear
+/// ([`font_clear`]): a `normal` style and the style's size, which the kernel
+/// reads from the platform's ramp at the root font size. Its weight and leading are the style's on each platform
+/// (LLP 1115.000 D12.2): the node is marked `fontShorthand`, so the kernel
+/// gives them as the shorthand resets them, beating an inherited value. The
+/// family stays what it was.
+fn font(text: &str, span: Span) -> Result<[Expr; 2], LowerError> {
     use exact_kernel::{style::relative::text_style, TEXT_STYLES};
+    if let Some(keyword) = font_clear(text) {
+        return Ok([
+            Expr::Str(keyword.into(), span),
+            Expr::Str(keyword.into(), span),
+        ]);
+    }
     let Some(id) = text_style(text) else {
         let names: Vec<String> = TEXT_STYLES
             .iter()
@@ -302,11 +368,33 @@ fn font(text: &str, span: Span) -> Result<[Expr; 4], LowerError> {
     let style = &TEXT_STYLES[usize::from(id)];
     Ok([
         Expr::Str("normal".into(), span),
-        Expr::Number(f64::from(style.weight), span),
         Expr::Str(format!("-exact-{}", style.name), span),
-        Expr::Str("normal".into(), span),
     ])
 }
+
+/// `font="inherit"` (or `unset`, the same on these inherited rows): every longhand
+/// the shorthand sets or resets takes its parent's value (CSS Fonts 4 §2.8,
+/// CSS Cascade 4 §7.3), as the common reset's `button { font: inherit }` has a
+/// control's text match the text around it. A platform control's start stops
+/// only rows the author did not write (LLP 1104 D4).
+fn font_clear(text: &str) -> Option<&'static str> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "inherit" => Some("inherit"),
+        "unset" => Some("unset"),
+        _ => None,
+    }
+}
+
+const FONT_LONGHANDS: &[StyleId] = &[
+    StyleId::FontStyle,
+    StyleId::FontWeight,
+    StyleId::FontStretch,
+    StyleId::FontSize,
+    StyleId::LineHeight,
+    StyleId::FontFamily,
+    StyleId::FontVariationSettings,
+    StyleId::FontOpticalSizing,
+];
 
 /// `text-box` (`normal`, or a trim and an edge in either order, each
 /// optional, Inline Layout 3 §4) or `text-box-edge` (`auto`, `text`, or an
@@ -424,12 +512,45 @@ impl Lowerer<'_> {
         font: &[FontUse],
         bindings: &mut Vec<BindingsRow>,
     ) -> Result<(), LowerError> {
+        if let (true, Expr::Str(text, span)) = (a.name == "font", &a.value) {
+            if let Some(keyword) = font_clear(text) {
+                let clear = Attr {
+                    value: Expr::Str(keyword.into(), *span),
+                    ..a.clone()
+                };
+                let (code, ty) = self.typed_code(&clear.value, scope, locals)?;
+                values::check_style_value(
+                    &clear,
+                    FONT_LONGHANDS,
+                    &ty,
+                    font,
+                    scope,
+                    &self.types.shapes,
+                )?;
+                for row in FONT_LONGHANDS {
+                    bindings.push(crate::style_row(*row, code, a.written));
+                }
+                return Ok(());
+            }
+        }
+        // Type tokens write only their longhands (stage 6 C).
+        if a.name == "font" && self.type_font(a, scope, locals, font, bindings)? {
+            return Ok(());
+        }
         for (index, row) in rows(&a.name).iter().copied().enumerate() {
             let value = component(&a.value, &a.name, index)?;
             let component = Attr { value, ..a.clone() };
             let (code, ty) = self.typed_code(&component.value, scope, locals)?;
             values::check_style_value(&component, &[row], &ty, font, scope, &self.types.shapes)?;
             bindings.push(crate::style_row(row, code, a.written));
+        }
+        if a.name == "font" {
+            let marked = self.b.constant(&Value::Bool(true));
+            bindings.push(crate::prop_row(
+                exact_kernel::PropId::FontShorthand,
+                marked,
+                crate::IMPLIED,
+            ));
         }
         Ok(())
     }
@@ -551,4 +672,386 @@ fn literals(e: &Expr) -> Option<Vec<(&str, Span)>> {
         Expr::Ternary(_, yes, no, _) => Some([literals(yes)?, literals(no)?].concat()),
         _ => None,
     }
+}
+
+/// CSS's two-value shorthands, each value its own row in this order, one
+/// value both rows': `gap` (row, column; CSS Box Alignment 3 §8.3),
+/// `overflow` (x, y; CSS Overflow 3 §3.1) and `overscroll-behavior` (x, y;
+/// CSS Overscroll Behavior 1 §2).
+pub(crate) const PAIRS: [[StyleId; 2]; 3] = [
+    [StyleId::RowGap, StyleId::ColumnGap],
+    [StyleId::OverflowX, StyleId::OverflowY],
+    [StyleId::OverscrollBehaviorX, StyleId::OverscrollBehaviorY],
+];
+/// The longhands a shorthand's values go to, as an author writes them.
+pub(crate) fn longhands(name: &str) -> Vec<String> {
+    let sides = ["top", "right", "bottom", "left"];
+    match name {
+        "border-radius" => ["top-left", "top-right", "bottom-right", "bottom-left"]
+            .map(|c| format!("border-{c}-radius"))
+            .to_vec(),
+        "inset" => sides.map(String::from).to_vec(),
+        "gap" => vec!["row-gap".into(), "column-gap".into()],
+        "overflow" | "overscroll-behavior" => vec![format!("{name}-x"), format!("{name}-y")],
+        n => match n.strip_prefix("border-") {
+            Some(part) => sides.map(|s| format!("border-{s}-{part}")).to_vec(),
+            None => sides.map(|s| format!("{n}-{s}")).to_vec(),
+        },
+    }
+}
+
+/// Project an authored style into the same rows and expressions lowering binds.
+/// Compiler profiles use this to check shorthand values without a second CSS parser.
+pub fn style_values(name: &str, value: &Expr) -> Result<Vec<(StyleId, Expr)>, LowerError> {
+    match tags::attr_valued(name, value) {
+        Some(tags::AttrTarget::Styles(rows)) => {
+            let split = if rows.len() > 1 {
+                sides(name, value)?
+            } else {
+                None
+            };
+            Ok(rows
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    (
+                        *row,
+                        split
+                            .as_ref()
+                            .map_or_else(|| value.clone(), |v| v[i].clone()),
+                    )
+                })
+                .collect())
+        }
+        Some(tags::AttrTarget::Shorthand) => super::shorthands::rows(name)
+            .iter()
+            .enumerate()
+            .map(|(i, row)| Ok((*row, super::shorthands::component(value, name, i)?)))
+            .collect(),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// A computed value that builds a list for a box shorthand (a
+/// concatenation, or a `fn` returning one): no host splits a list at run
+/// time, since an overriding longhand, an `env()` and the rows' own
+/// grammars would each split it differently (LLP 1001 §1). Refused, naming
+/// the longhands. A literal (or a literal arm) and a template
+/// (`` `${pad}px 0` ``) are split in [`sides`]; a computed single value
+/// (`padding=pad`) is every side's, and a computed list that reaches a row
+/// is refused there.
+pub(crate) fn computed_list<'e>(
+    name: &str,
+    value: &'e Expr,
+    body: &dyn Fn(&str) -> Option<&'e Expr>,
+) -> Result<(), LowerError> {
+    /// The `let`s in scope: each name and its value.
+    type Env<'e> = Vec<(&'e str, &'e Expr)>;
+    /// The texts a computed value can spell, one per way its `?:`, `match`
+    /// and the `fn`s it calls can go, a computed part as one word; `None`
+    /// when they are too many or the calls too deep to tell.
+    fn texts<'e>(
+        e: &'e Expr,
+        body: &dyn Fn(&str) -> Option<&'e Expr>,
+        env: &mut Env<'e>,
+        depth: u8,
+    ) -> Option<Vec<String>> {
+        const MOST: usize = 64;
+        // Every text of `a` followed by every text of `b`.
+        let join = |a: Vec<String>, b: Vec<String>| -> Option<Vec<String>> {
+            (a.len() * b.len() <= MOST).then(|| {
+                a.iter()
+                    .flat_map(|x| b.iter().map(move |y| format!("{x}{y}")))
+                    .collect()
+            })
+        };
+        let either = |mut a: Vec<String>, b: Vec<String>| -> Option<Vec<String>> {
+            a.extend(b);
+            (a.len() <= MOST).then_some(a)
+        };
+        Some(match e {
+            Expr::Str(s, _) => vec![s.clone()],
+            Expr::Template(parts, _) => {
+                let mut out = vec![String::new()];
+                for p in parts {
+                    let part = match p {
+                        TemplatePart::Text(t) => vec![t.clone()],
+                        TemplatePart::Expr(e) => texts(e, body, env, depth)?,
+                    };
+                    out = join(out, part)?;
+                }
+                out
+            }
+            Expr::Binary(contract_syntax::BinOp::Add, l, r, _) => {
+                join(texts(l, body, env, depth)?, texts(r, body, env, depth)?)?
+            }
+            Expr::Ternary(_, yes, no, _) => {
+                either(texts(yes, body, env, depth)?, texts(no, body, env, depth)?)?
+            }
+            Expr::Match { some, none, .. } => either(
+                texts(some, body, env, depth)?,
+                texts(none, body, env, depth)?,
+            )?,
+            Expr::Let {
+                name,
+                value,
+                body: b,
+                ..
+            } => {
+                env.push((name, value));
+                let out = texts(b, body, env, depth);
+                env.pop();
+                out?
+            }
+            Expr::Ident(name, _) => match env.iter().rev().find(|(n, _)| n == name) {
+                Some(&(_, value)) => texts(value, body, env, depth)?,
+                None => vec!["x".into()],
+            },
+            Expr::Call(f, _, _) => match body(f) {
+                // A `fn`'s parameters are computed parts; its `let`s its own.
+                Some(b) if depth < 8 => texts(b, body, &mut Vec::new(), depth + 1)?,
+                Some(_) => return None,
+                None => vec!["x".into()],
+            },
+            _ => vec!["x".into()],
+        })
+    }
+    // Whether a computed value may hold more than `most` values, or cannot
+    // be told not to.
+    fn more<'e>(
+        e: &'e Expr,
+        body: &dyn Fn(&str) -> Option<&'e Expr>,
+        env: &mut Env<'e>,
+        most: usize,
+    ) -> bool {
+        texts(e, body, env, 0)
+            .is_none_or(|all| all.iter().any(|t| box_sides::values(t).len() > most))
+    }
+    // Where the value builds a list that is not split at compile time: a
+    // literal arm and a template's own white space are ([`sides`]); a
+    // `fn`'s result, a `let`'s value and a concatenation are not.
+    fn lists<'e>(
+        e: &'e Expr,
+        body: &dyn Fn(&str) -> Option<&'e Expr>,
+        env: &mut Env<'e>,
+    ) -> Option<Span> {
+        match e {
+            Expr::Str(..) => None,
+            // Refused only where an interpolation adds a value: its white
+            // space outside the template's parentheses.
+            Expr::Template(parts, at) => {
+                let words = template_words(parts, *at).map_or(1, |w| w.len());
+                more(e, body, env, words).then(|| e.span())
+            }
+            Expr::Ternary(_, yes, no, _) => lists(yes, body, env).or_else(|| lists(no, body, env)),
+            Expr::Match { some, none, .. } => {
+                lists(some, body, env).or_else(|| lists(none, body, env))
+            }
+            Expr::Let {
+                name,
+                value,
+                body: b,
+                ..
+            } => {
+                env.push((name, value));
+                let out = lists(b, body, env);
+                env.pop();
+                out
+            }
+            e => more(e, body, env, 1).then(|| e.span()),
+        }
+    }
+    let Some(span) = lists(value, body, &mut Vec::new()) else {
+        return Ok(());
+    };
+    let longhands: Vec<String> = longhands(name).iter().map(|l| format!("`{l}`")).collect();
+    err(
+        "lower-css-shorthand",
+        format!(
+            "`{name}` is computed here as a list of values, which no host splits at run time; write {} (each may be computed), or a literal `{name}`",
+            longhands.join("/")
+        ),
+        span,
+    )
+}
+
+/// A box shorthand (`padding: <length>{1,4}`, `border-color: <color>{1,4}`,
+/// …) as four longhand expressions (top, right, bottom, left), or a pair
+/// (`gap`, `overflow`, `overscroll-behavior`) as two: every literal the
+/// value can produce — a string, or an arm of a conditional — is split into
+/// its rows, as is a template ([`template_words`]), and another computed
+/// leaf is one value for all of them. `None` when no literal or template
+/// names more than one value, so the shorthand stays one binding for its rows.
+pub(crate) fn sides(name: &str, value: &Expr) -> Result<Option<Vec<Expr>>, LowerError> {
+    let rows = longhands(name).len();
+    fn widest(name: &str, rows: usize, e: &Expr) -> Result<usize, LowerError> {
+        Ok(match e {
+            Expr::Str(s, span) => {
+                let n = box_sides::values(s).len();
+                if name == "border-radius" && box_sides::elliptical(s) {
+                    return err(
+                        "lower-attr-value",
+                        format!("`border-radius` takes one to four corners, each one length (top-left, top-right, bottom-right, bottom-left); \"{s}\" is an elliptical radius (`/`), which no host draws"),
+                        *span,
+                    );
+                }
+                if n > rows {
+                    let (count, order) = match name {
+                        "border-radius" => ("one to four", "top-left, top-right, bottom-right, bottom-left; no `/` elliptical radii"),
+                        "gap" => ("one or two", "row, column"),
+                        _ if rows == 2 => ("one or two", "x, y"),
+                        _ => ("one to four", "top, right, bottom, left"),
+                    };
+                    return err(
+                        "lower-attr-value",
+                        format!("`{name}` takes {count} values ({order}); \"{s}\" has {n}"),
+                        *span,
+                    );
+                }
+                n
+            }
+            // Checked as the text it spells, each interpolation one value.
+            Expr::Template(parts, span) => match template_words(parts, *span) {
+                Some(w) if w.len() > 1 => {
+                    let text = parts.iter().map(|p| match p {
+                        TemplatePart::Text(t) => t.as_str(),
+                        TemplatePart::Expr(_) => "${…}",
+                    });
+                    widest(name, rows, &Expr::Str(text.collect(), *span))?
+                }
+                _ => 1,
+            },
+            Expr::Ternary(_, yes, no, _) => widest(name, rows, yes)?.max(widest(name, rows, no)?),
+            Expr::Match { some, none, .. } => {
+                widest(name, rows, some)?.max(widest(name, rows, none)?)
+            }
+            Expr::Let { body, .. } => widest(name, rows, body)?,
+            _ => 1,
+        })
+    }
+    fn side(e: &Expr, i: usize) -> Expr {
+        match e {
+            Expr::Str(s, span) => {
+                let v = box_sides::values(s);
+                if v.is_empty() {
+                    return e.clone();
+                }
+                let pick = box_sides::pick(v.len(), i);
+                // A length in pixels is the number it would be on its own
+                // (`border-width` takes only numbers).
+                let piece = v[pick];
+                match piece.strip_suffix("px").unwrap_or(piece).parse::<f64>() {
+                    Ok(n) if n.is_finite() => Expr::Number(n, *span),
+                    _ => Expr::Str(piece.to_string(), *span),
+                }
+            }
+            Expr::Template(parts, span) => match template_words(parts, *span) {
+                Some(w) if w.len() > 1 => match &w[box_sides::pick(w.len(), i)] {
+                    literal @ Expr::Str(..) => side(literal, 0),
+                    word => word.clone(),
+                },
+                _ => e.clone(),
+            },
+            Expr::Ternary(c, yes, no, span) => Expr::Ternary(
+                c.clone(),
+                Box::new(side(yes, i)),
+                Box::new(side(no, i)),
+                *span,
+            ),
+            Expr::Match {
+                subject,
+                var,
+                some,
+                none,
+                span,
+            } => Expr::Match {
+                subject: subject.clone(),
+                var: var.clone(),
+                some: Box::new(side(some, i)),
+                none: Box::new(side(none, i)),
+                span: *span,
+            },
+            Expr::Let {
+                name,
+                value,
+                body,
+                span,
+            } => Expr::Let {
+                name: name.clone(),
+                value: value.clone(),
+                body: Box::new(side(body, i)),
+                span: *span,
+            },
+            other => other.clone(),
+        }
+    }
+    if widest(name, rows, value)? < 2 {
+        return Ok(None);
+    }
+    Ok(Some((0..rows).map(|i| side(value, i)).collect()))
+}
+
+/// A template's values, split as a literal's are, at CSS white space outside
+/// parentheses in its text: each the template of its pieces, or the literal
+/// it is with no interpolation. `None`, so the template is not split, unless
+/// each interpolation is plainly part of one value: outside parentheses, a
+/// literal one a single token (non-empty, no white space or parentheses),
+/// and in a value that also holds text or only such literals. A computed
+/// interpolation holding white space reaches its row as a list, which the
+/// row refuses as it does `padding=pad` holding one.
+fn template_words(parts: &[TemplatePart], span: Span) -> Option<Vec<Expr>> {
+    const MARK: char = '\u{e000}';
+    let (mut text, mut exprs, mut depth) = (String::new(), Vec::new(), 0usize);
+    for p in parts {
+        match p {
+            TemplatePart::Text(t) if t.contains(MARK) => return None,
+            TemplatePart::Text(t) => {
+                for c in t.chars() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth = depth.checked_sub(1)?,
+                        _ => {}
+                    }
+                }
+                text.push_str(t);
+            }
+            TemplatePart::Expr(e) => {
+                let token = |s: &str| {
+                    !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c == '(' || c == ')')
+                };
+                if depth > 0 || matches!(e, Expr::Str(s, _) if !token(s)) {
+                    return None;
+                }
+                text.push(MARK);
+                exprs.push(e);
+            }
+        }
+    }
+    let mut exprs = exprs.into_iter();
+    let mut out = Vec::new();
+    for word in box_sides::values(&text) {
+        let mut pieces = Vec::new();
+        for (i, chunk) in word.split(MARK).enumerate() {
+            if i > 0 {
+                pieces.push(TemplatePart::Expr(exprs.next()?.clone()));
+            }
+            if !chunk.is_empty() {
+                pieces.push(TemplatePart::Text(chunk.into()));
+            }
+        }
+        // A value of computed interpolations alone may be empty.
+        let known = |p: &TemplatePart| match p {
+            TemplatePart::Text(_) => true,
+            TemplatePart::Expr(e) => matches!(e, Expr::Str(..) | Expr::Number(..)),
+        };
+        let has_text = pieces.iter().any(|p| matches!(p, TemplatePart::Text(_)));
+        if !has_text && !pieces.iter().all(known) {
+            return None;
+        }
+        out.push(match pieces.as_slice() {
+            [TemplatePart::Text(t)] => Expr::Str(t.clone(), span),
+            _ => Expr::Template(pieces, span),
+        });
+    }
+    Some(out)
 }

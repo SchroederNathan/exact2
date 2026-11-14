@@ -6,6 +6,63 @@ import XCTest
 @testable import ExactKit
 
 final class NativeFieldsMacTests: XCTestCase {
+    func testSearchAndPlainComboboxesServeTheirAuthoredExpandedState() throws {
+        _ = NSApplication.shared
+        let p = Presenter()
+        for (id, type) in [(UInt32(11), "text"), (UInt32(12), "search")] {
+            p.apply(wireBatch([["op": "create", "id": id, "kind": "input",
+                "props": ["type": type, "value": "Pira", "accessibilityRole": "combobox", "accessibilityExpanded": "false"]]]))
+            let field = try XCTUnwrap(p.views[id]?.field), cell = try XCTUnwrap(field.cell)
+            XCTAssertEqual(field is NSSearchField, type == "search")
+            XCTAssertEqual(field.accessibilityRole(), .comboBox)
+            XCTAssertEqual(cell.accessibilityAttributeValue(.role) as? String, "AXComboBox")
+            XCTAssertEqual(cell.accessibilityAttributeValue(.roleDescription) as? String, NSAccessibility.Role.comboBox.description(with: nil))
+            XCTAssertTrue(cell.accessibilityAttributeNames().contains(.expanded))
+            XCTAssertFalse(field.isAccessibilityExpanded())
+            XCTAssertEqual(cell.accessibilityAttributeValue(.expanded) as? Bool, false)
+            p.apply(wireBatch([["op": "props", "id": id, "set": ["accessibilityExpanded": "true"]]]))
+            XCTAssertTrue(field.isAccessibilityExpanded())
+            XCTAssertEqual(cell.accessibilityAttributeValue(.expanded) as? Bool, true)
+            p.apply(wireBatch([["op": "props", "id": id, "clear": ["accessibilityRole", "accessibilityExpanded"]]]))
+            XCTAssertEqual(cell.accessibilityAttributeValue(.role) as? String, "AXTextField")
+        }
+    }
+
+    func testInputThemeGroundReplacesTheBezelAndRestoresIt() throws {
+        _ = NSApplication.shared
+        let session = ExactApp.shared.makeSession(label: "input-theme")
+        defer { session.destroy() }
+        let p = session.presenter
+        let node = NodeView(id: 1, kind: "input", presenter: p)
+        p.root.addSubview(node)
+        node.applyProps(set: ["value": "Keep this text"], clear: [])
+        node.applyStyle([:])
+        let field = try XCTUnwrap(node.field)
+        let standard = NSTextField()
+        XCTAssertEqual(field.isBezeled, standard.isBezeled)
+        node.appearance = NSAppearance(named: .aqua)
+        ThemeRoles.apply(wireBatch([["op": "roles", "roles": ["Field": [[12, 200, 40, 255], [200, 12, 40, 255]]]]]), root: p.root)
+        p.applyThemeTint()
+        XCTAssertFalse(field.isBezeled)
+        XCTAssertFalse(field.drawsBackground)
+        let ground = try XCTUnwrap(node.fieldGround)
+        let color = try XCTUnwrap(NSColor(cgColor: ground)?.usingColorSpace(.sRGB))
+        XCTAssertEqual(color.greenComponent, 200 / 255, accuracy: 0.001)
+        node.applyBoxLayer()
+        XCTAssertEqual(node.layer?.backgroundColor, ground)
+        node.appearance = NSAppearance(named: .darkAqua)
+        node.viewDidChangeEffectiveAppearance()
+        XCTAssertEqual(node.layer?.backgroundColor, node.fieldGround, "Field chrome follows appearance without an authored scheme color")
+        XCTAssertEqual(field.stringValue, "Keep this text")
+        ThemeRoles.apply(wireBatch([["op": "roles", "roles": [String: Any]()]]), root: p.root)
+        p.applyThemeTint()
+        XCTAssertNil(node.fieldGround)
+        XCTAssertEqual(field.isBezeled, standard.isBezeled)
+        XCTAssertEqual(field.drawsBackground, standard.drawsBackground)
+        node.applyBoxLayer()
+        XCTAssertNil(node.layer?.backgroundColor)
+    }
+
     private var platformTextareaInset: NSSize {
         let editor = NSTextView(usingTextLayoutManager: true)
         return NSSize(width: editor.textContainerInset.width + (editor.textContainer?.lineFragmentPadding ?? 0), height: editor.textContainerInset.height)
@@ -46,8 +103,10 @@ final class NativeFieldsMacTests: XCTestCase {
                         control.font = font; control.stringValue = "Hg"
                         XCTAssertEqual(exact.minimum_height, Float(control.fittingSize.height))
                         for height in [CGFloat(exact.minimum_height), 60, 90] {
+                            // The glyphs' box: the field editor sets them in
+                            // from the cell's rect by its line fragment padding.
                             let bounds = NSRect(x: 0, y: 0, width: 240, height: height)
-                            let rect = control.cell!.drawingRect(forBounds: bounds)
+                            let rect = control.cell!.drawingRect(forBounds: bounds).insetBy(dx: NodeView.editorPadding, dy: 0)
                             XCTAssertEqual(exact.left, Float(rect.minX), accuracy: 0.00001)
                             // A search cell centres its text and grows its
                             // buttons in a taller box; the host centres the
@@ -107,9 +166,10 @@ final class NativeFieldsMacTests: XCTestCase {
         XCTAssertEqual(field.attributedStringValue.attribute(.kern, at: 0, effectiveRange: nil) as? CGFloat, 2)
         XCTAssertEqual(field.placeholderAttributedString?.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor, .placeholderTextColor)
         XCTAssertEqual(field.frame, node.bounds)
+        // Out by the field editor's padding, which sets the glyphs in to the content box.
         let line = try XCTUnwrap(field.cell?.drawingRect(forBounds: field.bounds))
-        XCTAssertEqual(line.minX, 15)
-        XCTAssertEqual(line.width, 210)
+        XCTAssertEqual(line.minX, 15 - NodeView.editorPadding)
+        XCTAssertEqual(line.width, 210 + 2 * NodeView.editorPadding)
         XCTAssertEqual(line.midY, 40)
         XCTAssertLessThan(line.height, 60)
         let window = NSWindow(contentRect: node.bounds, styleMask: [.titled], backing: .buffered, defer: false)
@@ -130,7 +190,56 @@ final class NativeFieldsMacTests: XCTestCase {
         XCTAssertFalse(field.isBezeled)
         XCTAssertFalse(field.drawsBackground)
         XCTAssertEqual(field.focusRingType, .exterior)
-        XCTAssertEqual(field.frame, node.contentBox())
+        XCTAssertEqual(field.frame, node.contentBox().insetBy(dx: -NodeView.editorPadding, dy: 0))
+    }
+    /// An input the author draws (`appearance: none`) centres its one line in
+    /// a content box taller than it, as CSS does; AppKit's cell top-aligns it.
+    func testAnAuthorDrawnInputCentresItsLine() throws {
+        _ = NSApplication.shared
+        let session = ExactApp.shared.makeSession(label: "authored-field-line")
+        defer { session.destroy() }
+        for type in ["text", "password"] {
+            let node = NodeView(id: 1, kind: "input", presenter: session.presenter)
+            node.frame = NSRect(x: 0, y: 0, width: 240, height: 48)
+            node.applyProps(set: ["type": type, "placeholder": "Search keybindings"], clear: [])
+            node.applyStyle(["appearance": .string("none"), "font_size": .number(14), "padding_left": .number(12), "padding_top": .number(4)])
+            node.applyFieldContent(["rect": [12.0, 4.0, 228.0, 40.0]])
+            let field = try XCTUnwrap(node.field)
+            // Out by the field editor's padding, its text starts at the content box's edge.
+            XCTAssertEqual(field.frame, node.contentBox().insetBy(dx: -NodeView.editorPadding, dy: 0))
+            let plain = type == "password" ? NSSecureTextField() : NSTextField()
+            plain.isBezeled = false
+            plain.isBordered = false
+            plain.font = field.font
+            let topAligned = plain.cell!.drawingRect(forBounds: field.bounds)
+            for line in [field.cell!.drawingRect(forBounds: field.bounds), field.cell!.titleRect(forBounds: field.bounds)] {
+                XCTAssertEqual(line.midY, field.bounds.midY, accuracy: 0.5, "\(type): one line centred in the content box")
+                XCTAssertLessThan(line.height, field.bounds.height)
+                XCTAssertEqual(line.minX, topAligned.minX, "\(type): AppKit's horizontal placement kept")
+                XCTAssertEqual(line.width, topAligned.width)
+            }
+        }
+    }
+    /// A line box as tall as its input's box puts the glyphs half its
+    /// leading below its top, as CSS does; the cell draws its line at the
+    /// rect's top, so the rect starts there, native or author-drawn.
+    func testALineAsTallAsTheBoxKeepsItsHalfLeading() throws {
+        _ = NSApplication.shared
+        let session = ExactApp.shared.makeSession(label: "field-half-leading")
+        defer { session.destroy() }
+        for appearance in ["auto", "none"] {
+            let node = NodeView(id: 1, kind: "input", presenter: session.presenter)
+            node.frame = NSRect(x: 0, y: 0, width: 240, height: 28)
+            node.applyProps(set: ["placeholder": "Search"], clear: [])
+            node.applyStyle(["appearance": .string(appearance), "font_size": .number(14), "line_height": .string("28px")])
+            node.applyFieldContent(["rect": [0.0, 0.0, 240.0, 28.0]])
+            let field = try XCTUnwrap(node.field)
+            let font = try XCTUnwrap(field.font) as CTFont
+            let glyphs = CTFontGetAscent(font).rounded() + CTFontGetDescent(font).rounded()
+            let line = field.cell!.titleRect(forBounds: field.bounds)
+            XCTAssertEqual(line.minY, (28 - glyphs) / 2, accuracy: 1, "\(appearance): the glyphs half the leading down")
+            XCTAssertEqual(line.maxY, 28, accuracy: 1, "\(appearance): the rect ends at the line box's bottom")
+        }
     }
     /// LLP 1115 D8: a native `input type="search"` is AppKit's search field
     /// (its magnifier and clear button, Escape clearing it), its text in the
@@ -146,8 +255,8 @@ final class NativeFieldsMacTests: XCTestCase {
         node.applyStyle([:])
         let standard = NSSearchField(), probe = NSRect(x: 0, y: 0, width: 240, height: 40)
         standard.font = NSFont.systemFont(ofSize: 13)
-        let text = standard.cell!.drawingRect(forBounds: probe)
-        node.applyFieldContent(["rect": [Double(text.minX), 0, Double(text.width), 40]])
+        let text = standard.cell!.drawingRect(forBounds: probe), pad = NodeView.editorPadding
+        node.applyFieldContent(["rect": [Double(text.minX + pad), 0, Double(text.width - 2 * pad), 40]])
         let field = try XCTUnwrap(node.field)
         XCTAssertTrue(field is NSSearchField)
         XCTAssertTrue(field.cell is SearchFieldCell)
@@ -155,7 +264,7 @@ final class NativeFieldsMacTests: XCTestCase {
         XCTAssertEqual(field.frame, node.bounds)
         XCTAssertGreaterThan(text.minX, NSTextField().cell!.drawingRect(forBounds: probe).minX, "room for the magnifier")
         let line = try XCTUnwrap(field.cell?.drawingRect(forBounds: field.bounds))
-        XCTAssertEqual(line.minX, text.minX)
+        XCTAssertEqual(line.minX, text.minX, "AppKit's own placement of the text")
         XCTAssertEqual(line.midY, 20, accuracy: 0.5, "one line centred, as the kernel measures it")
         let window = NSWindow(contentRect: node.bounds, styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -367,6 +476,83 @@ final class NativeFieldsMacTests: XCTestCase {
             window.close()
         }
     }
+    /// A key handler's `blur()` ends the field's editing, and AppKit tells
+    /// the delegate before it takes the editor away, so the app's `blur`
+    /// handler runs while the field still has one. What that handler
+    /// writes to the field lands, and its ring goes with the focus (here
+    /// the value it writes restyles the field). A textarea's `blur`
+    /// handler runs while it is still the first responder; a style it
+    /// changes leaves no ring either, and a placeholder written to an
+    /// empty field as it leaves does not bring its editor back.
+    @MainActor
+    func testABlurHandlersWriteLandsAndLeavesNoRing() throws {
+        let f = try SheetFixture(page: """
+        component Proof
+          state draft = ""
+          state focused = false
+          state notesFocused = false
+          state searchFocused = false
+          state searchBlurs = 0
+          action notesFocus(on: bool)
+            notesFocused = on
+          action searchFocus(on: bool)
+            searchFocused = on
+            searchBlurs = on ? searchBlurs : searchBlurs + 1
+          action focusField(on: bool)
+            focused = on
+            draft = on ? "https://example.com/" : draft
+          action edit(text: string)
+            draft = text
+          action fieldKey(k: string)
+            if k == "Enter"
+              preventDefault()
+              blur()
+          view
+            column width="100%" height="100%" padding=20
+              input testId="address" value=(focused ? draft : "https://example.com/") input=edit key=fieldKey focus=focusField(true) blur=focusField(false) width=240 border-width=0
+              textarea testId="notes" value="" focus=notesFocus(true) blur=notesFocus(false) width=240 height=60 padding=(notesFocused ? 4 : 6)
+              input testId="search" value="" placeholder=(searchFocused ? "Type to search" : "Search") focus=searchFocus(true) blur=searchFocus(false) width=240 border-width=0
+        """, size: CGSize(width: 420, height: 200))
+        defer { f.close() }
+        let node = try f.node("address"), field = try XCTUnwrap(node.field)
+        XCTAssertTrue(f.window.makeFirstResponder(field))
+        f.settle()
+        XCTAssertTrue(node.fieldFocused, "a bare field takes Exact's ring")
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        editor.selectAll(nil)
+        editor.insertText("example.org", replacementRange: editor.selectedRange())
+        f.settle()
+        let enter = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: f.window.windowNumber,
+                                                   context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+        XCTAssertTrue(f.presenter.routeKey(enter, focused: true, in: f.window), "the handler prevents Return")
+        f.settle()
+        XCTAssertNil(field.currentEditor())
+        XCTAssertFalse(node.fieldFocused, "no ring once the field has no focus")
+        XCTAssertEqual(field.stringValue, "https://example.com/", "the value the blur handler wrote")
+        let notes = try f.node("notes"), area = try XCTUnwrap(notes.textArea)
+        func ring() -> CALayer? { notes.layer?.sublayers?.first { $0.name == "exact.fieldFocus" } }
+        XCTAssertTrue(f.window.makeFirstResponder(area))
+        f.settle()
+        XCTAssertNotNil(ring(), "a textarea takes Exact's ring")
+        XCTAssertTrue(f.window.makeFirstResponder(nil))
+        f.settle()
+        XCTAssertNil(ring(), "no ring once the textarea has no focus")
+        // An empty field's new placeholder ends its editor's editing and begins it again (`keepingEditing`): not as it leaves.
+        let search = try f.node("search"), searchField = try XCTUnwrap(search.field)
+        XCTAssertTrue(f.window.makeFirstResponder(searchField))
+        f.settle()
+        XCTAssertTrue(f.window.makeFirstResponder(nil))
+        f.settle()
+        XCTAssertNil(searchField.currentEditor(), "the placeholder the blur handler wrote does not begin editing again")
+        XCTAssertFalse(search.fieldFocused)
+        XCTAssertEqual(searchField.placeholderString ?? searchField.placeholderAttributedString?.string, "Search")
+        XCTAssertEqual(state(f, "searchBlurs"), "1")
+    }
+    @MainActor
+    private func state(_ f: SheetFixture, _ name: String) -> String {
+        let json = try? JSONSerialization.jsonObject(with: Data(f.session.agent(#"{"op":"state"}"#).utf8)) as? [String: Any]
+        return ((json?["slots"] as? [String: Any])?[name]).map { "\($0)" } ?? ""
+    }
 
     /// LLP 1115.000 D7.9: the focus ring leaves a border the author wrote
     /// alone, as a native control with a border of its own keeps it under
@@ -389,7 +575,7 @@ final class NativeFieldsMacTests: XCTestCase {
         func border(_ node: NodeView) throws -> NSColor {
             let rep = try XCTUnwrap(Capture.picture(of: node))
             let scale = CGFloat(rep.pixelsWide) / rep.size.width
-            return try XCTUnwrap(rep.colorAt(x: Int(1 * scale), y: Int(node.bounds.midY * scale))?.usingColorSpace(.sRGB))
+            return try XCTUnwrap(rep.paintedColorAt(x: Int(1 * scale), y: Int(node.bounds.midY * scale))?.usingColorSpace(.sRGB))
         }
         func isRed(_ c: NSColor) -> Bool { c.redComponent > 0.6 && c.greenComponent < 0.25 && c.blueComponent < 0.25 }
         for (style, authored) in [(written, true), (bordered, false)] {
@@ -400,6 +586,7 @@ final class NativeFieldsMacTests: XCTestCase {
             node.wantsLayer = true
             node.applyProps(set: ["value": "Field"], clear: [])
             node.applyStyle(style)
+            node.applyFieldContent(["rect": [2.0, 2.0, 236.0, 36.0]]) // inside the border, as layout publishes it
             XCTAssertEqual(node.bordersItself, authored, what)
             let field = try XCTUnwrap(node.field)
             let window = NSWindow(contentRect: node.bounds, styleMask: [.titled], backing: .buffered, defer: false)

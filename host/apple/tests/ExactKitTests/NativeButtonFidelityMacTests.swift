@@ -306,7 +306,7 @@ final class NativeButtonFidelityMacTests: XCTestCase {
         let name = glass ? String(id.dropFirst(6)) : id
         let b = NSButton(title: "", target: nil, action: nil)
         let borderless: Set<String> = ["plain", "borderless", "get-app", "try-demo", "subscriptions", "sign-out", "clear", "a-plain"]
-        let accent: Set<String> = ["filled", "bordered-prominent", "control-tile", "sign-in", "radius-padding", "pointer-none", "open-dialog", "wide", "narrow"]
+        let accent: Set<String> = ["filled", "bordered-prominent", "control-tile", "sign-in", "radius-padding", "pointer-none", "open-dialog", "wide", "narrow", "active-properties"]
         let glassStyles: Set<String> = ["glass", "prominent-glass", "clear-glass", "prominent-clear-glass", "symbol-only", "a-glass", "a-clear", "a-sf", "g1", "g2", "g3", "pointer-override"]
         let titles: [String: String] = ["defrost-front": "Front Defrost", "defrost-rear": "Rear Defrost", "control-tile": "Lock",
             "subtitle": "Last Parked", "check-update": "Check for update", "sign-in": "Sign In", "resend-code": "Resend Code",
@@ -316,11 +316,11 @@ final class NativeButtonFidelityMacTests: XCTestCase {
             "pointer-override": "Takes touch", "pointer-none": "Passes touch through", "open-dialog": "Open confirmation", "open-popover": "Open popover",
             "confirm-action": "Confirm", "confirm-cancel": "Cancel", "symbol-title": "Send", "title-symbol": "Forward", "wide": "Fixed 240 wide",
             "a-plain": "plain", "a-gray": "gray", "a-bordered": "bordered", "a-glass": "glass", "a-clear": "clear", "a-tinted": "tinted",
-            "narrow": "Send this very long message", "stretched": "Stretched (default bordered)", "disabled": "Disabled", "g1": "Lock", "g2": "Unlock", "g3": "Fade"]
+            "narrow": "Send this very long message", "stretched": "Stretched (default bordered)", "disabled": "Disabled", "active-properties": "Owned title", "g1": "Lock", "g2": "Unlock", "g3": "Fade"]
         let symbols: [String: String] = ["defrost-front": "windshield.front.and.wiper", "defrost-rear": "windshield.rear.and.wiper", "control-tile": "lock.fill",
             "subtitle": "location.fill", "check-update": "arrow.clockwise", "method-email": "envelope.fill", "method-passkey": "key.fill", "clear": "xmark.circle.fill",
             "disabled-authored": "lock.fill", "symbol-only": "plus", "symbol-title": "arrow.up", "title-symbol": "arrowshape.turn.up.right", "a-plain": "arrow.up",
-            "a-gray": "arrow.up", "a-bordered": "arrow.up", "a-glass": "arrow.up", "a-clear": "arrow.up", "a-tinted": "arrow.up", "a-sf": "paperplane.fill"]
+            "a-gray": "arrow.up", "a-bordered": "arrow.up", "a-glass": "arrow.up", "a-clear": "arrow.up", "a-tinted": "arrow.up", "a-sf": "paperplane.fill", "active-properties": "arrow.up"]
         b.bezelStyle = .push
         if #available(macOS 26, *), LinkedDesign.liquidGlass, glass || glassStyles.contains(name) { b.bezelStyle = .glass }
         b.isBordered = glass || !borderless.contains(name)
@@ -328,10 +328,8 @@ final class NativeButtonFidelityMacTests: XCTestCase {
         let small = ["get-app", "try-demo", "subscriptions", "sign-out", "clear"].contains(name)
         let fontSize = small ? 13 : NSFont.systemFontSize(for: b.controlSize)
         if small || name == "sign-in" {
-            // CSS 600 is the SF variable axis, not AppKit's approximate named weight.
-            let base = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
-            let descriptor = CTFontDescriptorCreateWithAttributes([kCTFontVariationAttribute: [0x77676874: 600]] as CFDictionary)
-            b.font = CTFontCreateCopyWithAttributes(base as CTFont, fontSize, nil, descriptor) as NSFont
+            // CSS 600 is AppKit's semibold (LLP 1019 §13 D11).
+            b.font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
         } else { b.font = NSFont.systemFont(ofSize: fontSize) }
         let green = NSColor(red: 52.0 / 255, green: 199.0 / 255, blue: 89.0 / 255, alpha: 1)
         let tint = name.hasPrefix("a-") || name == "wide" ? green : NSColor.controlAccentColor
@@ -353,6 +351,14 @@ final class NativeButtonFidelityMacTests: XCTestCase {
             b.image = image.withSymbolConfiguration(b.symbolConfiguration!.applying(NSImage.SymbolConfiguration(paletteColors: [tint])))
             b.image?.isTemplate = false
         }
+        if name == "active-properties" {
+            let ink = NSColor(srgbRed: 0, green: 1, blue: 0, alpha: 1)
+            b.contentTintColor = ink
+            let paragraph = NSMutableParagraphStyle(); paragraph.alignment = .center
+            b.attributedTitle = NSAttributedString(string: b.title, attributes: [.font: b.font!, .foregroundColor: ink, .paragraphStyle: paragraph])
+            b.image = b.image?.withSymbolConfiguration(b.symbolConfiguration!.applying(NSImage.SymbolConfiguration(paletteColors: [.red])))
+            b.image?.isTemplate = false
+        }
         b.imagePosition = b.image == nil ? .noImage : b.title.isEmpty ? .imageOnly : name == "control-tile" ? .imageAbove : name == "title-symbol" ? .imageTrailing : .imageLeading
         if #available(macOS 26, *), LinkedDesign.liquidGlass, name == "sign-in" || name == "radius-padding" { b.borderShape = .capsule }
         b.lineBreakMode = .byTruncatingTail
@@ -372,7 +378,11 @@ final class NativeButtonFidelityMacTests: XCTestCase {
         let context = try XCTUnwrap(CGContext(data: &bytes, width: cg.width, height: cg.height, bitsPerComponent: 8, bytesPerRow: cg.width * 4,
             space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
         context.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
-        let colours = Set(stride(from: 0, to: bytes.count, by: 4).map { UInt32(bytes[$0]) << 24 | UInt32(bytes[$0 + 1]) << 16 | UInt32(bytes[$0 + 2]) << 8 | UInt32(bytes[$0 + 3]) })
+        var colours = Set<UInt32>()
+        for at in stride(from: 0, to: bytes.count, by: 4) {
+            let high = UInt32(bytes[at]) << 24 | UInt32(bytes[at + 1]) << 16
+            colours.insert(high | UInt32(bytes[at + 2]) << 8 | UInt32(bytes[at + 3]))
+        }
         XCTAssertGreaterThan(colours.count, 2, "capture must contain visible ink, not a blank diff")
         b.removeFromSuperview()
         return bytes

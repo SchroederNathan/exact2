@@ -15,13 +15,66 @@
 // host's `documentHead` writes them (document-glue.js). Where no head sets a
 // title it is the selected route's header's heading, else the app's name
 // (navigation.js `pageTitle`, both web targets': LLP 1115.000 D4.1).
-import { unselected, unselectedForHead, pageTitle, panelsOf } from "./navigation.js";
+import { unselected, unselectedForHead, pageTitle, panelsOf, viewChildren } from "./navigation.js";
 import { scope, owner, onEnd, adopting } from "./rt.js";
 
 /** The active head's fields by prop name (`headTitle` …): what a renderer
  * reads (render.mjs), and the agent's `state.head`. */
 export const Head = {};
 const Heads = new Set();
+let StatusGuards;
+
+// Track the server's live effects: pending data can introduce a head in an unmounted arm
+export function statusSubject(parent, subject, selections) {
+  if (!globalThis.__exactRender) { return subject; }
+  const guards = StatusGuards ??= new Set();
+  let guard;
+  onEnd(() => guards.delete(guard));
+  return () => {
+    if (!guard) {
+      guard = { t: parent.nodeType === 11 ? parent.lastChild : parent, n: owner(), selections };
+      guards.add(guard);
+    }
+    return subject();
+  };
+}
+
+export function canSetStatus() {
+  const root = document.getElementById('exact-root');
+  for (const h of Heads) {
+    if (Object.hasOwn(h.f, 'headStatus') && place(h.t, root)) { return true; }
+  }
+  // A source can be revalidated by another answer's store write or watched change.
+  const seen = new Set();
+  const readsData = n => {
+    if (!n || seen.has(n)) { return false; }
+    seen.add(n);
+    return !!n.resource || n.src.some(readsData);
+  };
+  for (const guard of StatusGuards ?? []) {
+    if (!guard.n?.gone && place(guard.t, root, guard.selections) && readsData(guard.n)) { return true; }
+  }
+  return false;
+}
+
+function place(t, root, selections) {
+  if (!t) { return null; }
+  const at = [], path = new Set([t]);
+  // Panel lookup sees ids even inside an inactive nested root; only roots above its owner exclude them.
+  let through;
+  if (globalThis.__exactRender && selections?.length) for (let p = t; p; p = p.parentNode) if (selections.includes(p)) through = p;
+  if (through === t) through = null;
+  let c = t;
+  for (let p = c.parentNode; p && c !== root; c = p, p = p.parentNode) {
+    if (p.hasAttribute?.('navigationBack')) {
+      if ((!globalThis.__exactRender || !through) && unselectedForHead(p).some(off => path.has(off))) { return null; }
+    }
+    if (globalThis.__exactRender && p === through) through = null;
+    at.unshift([].indexOf.call(p.childNodes, c));
+    path.add(p);
+  }
+  return c === root ? at : null;
+}
 
 /** A head: its node `t` (a `<template>` rt.js placed) and its `fields`, each
  * text or a getter `effect` follows. Its fields are the page's while it is
@@ -42,14 +95,8 @@ function publish() {
   // among its siblings, from the root's children down (the order without
   // `compareDocumentPosition`, which a render's DOM, dom.js, lacks).
   for (const h of Heads) {
-    const at = [], path = new Set([h.t]);
-    let c = h.t;
-    for (let p = c.parentNode; p && c !== root; c = p, p = p.parentNode) {
-      if (p.hasAttribute?.("navigationBack") && unselectedForHead(p).some(off => path.has(off))) break;
-      at.unshift([].indexOf.call(p.childNodes, c));
-      path.add(p);
-    }
-    if (c === root) live.push([at, h.f]);
+    const at = place(h.t, root);
+    if (at) live.push([at, h.f]);
   }
   live.sort(([a], [b]) => { let i = 0; while (i < a.length && a[i] === b[i]) i++; return (a[i] ?? -1) - (b[i] ?? -1); });
   for (const [at, f] of live) for (const k in f) {
@@ -77,18 +124,59 @@ function publish() {
 export function projectRoots(history, navigate, say, after, hostBack, hostGo, routeMatches) {
   const root = document.getElementById("exact-root"), project = () => history.project(root, say);
   history.connect(root, navigate, say, hostBack, hostGo, routeMatches, true);
-  after.push(project); history.activate(root, say);
+  after.push(project, markDocument); history.activate(root, say);
+}
+
+/** Project route visibility before startup. A modal keeps the underlying page
+ * and intervening sheets visible but inert, as navigation.js `project` does. */
+export function markRoutes(root) {
+  for (const nav of [...root.getElementsByTagName("*")].filter(e => e.hasAttribute("navigationBack"))) {
+    const key = nav.getAttribute("navigationKey"), panels = panelsOf(nav);
+    const stacks = (panels.length ? panels : [nav]).map(p => viewChildren(p).filter(r => r.hasAttribute("navigationKey")));
+    const at = stacks.findIndex(routes => routes.some(r => r.getAttribute("navigationKey") === key));
+    if (at < 0) continue;
+    const mark = (e, hidden, inert) => { if (hidden) e.style.setProperty("visibility", "hidden"); if (inert) e.setAttribute("inert", ""); };
+    panels.forEach((p, i) => mark(p, i !== at, i !== at));
+    stacks.forEach((routes, i) => {
+      const shown = i === at ? routes.findIndex(r => r.getAttribute("navigationKey") === key) : routes.length - 1;
+      const sheet = routes[shown]?.getAttribute("navigationPresentation") === "modal";
+      const beneath = routes.findLastIndex((r, j) => j < shown && r.getAttribute("navigationPresentation") !== "modal");
+      routes.forEach((r, j) => mark(r, j !== shown && !(sheet && j >= beneath && j < shown), j !== shown));
+    });
+  }
 }
 
 /** The elements that may be the page's scroller: `<html data-scrolldocument>`
- * while one is (D4), which the shell's rule reads, as the web host's glue. */
+ * while one is (D4), which the shell's rule reads, as the web host's glue.
+ * One in a route or panel the projection hid is `data-exact-offpage`, an inner
+ * scroller again, so a covered route's content leaves the page's height. When
+ * the page's one scroller changes, it is given the page's scroll it last had:
+ * a route opened anew starts at its top, one shown again where the reader left
+ * it. Each one's place is kept as the page scrolls, since by the time a commit
+ * switches them, moving the focus into the route shown may have scrolled the
+ * page. The page's scroller's ancestors in the root are `data-exact-frame`,
+ * which the shell's rule lays out in flow and as tall as their content (a
+ * `:has()` would cost a style recalculation at every change). */
 export const Docs = new Set();
-let Marked = false;
+let Marked = false, Page = null, Listening = false, Path = [];
+const Scrolled = new WeakMap();
+const hidden = e => { for (let a = e; a; a = a.parentElement) if (a.style?.getPropertyValue("visibility") === "hidden") return true; return false; };
 export function markDocument() {
   if (!Docs.size && !Marked) return;
-  Marked = false;
-  for (const e of Docs) if (!e.isConnected) Docs.delete(e); else Marked ||= e.getAttribute("data-scrolldocument") === "true";
+  const live = [];
+  for (const e of Docs) if (!e.isConnected) Docs.delete(e); else if (e.getAttribute("data-scrolldocument") === "true") (hidden(e) ? e.setAttribute("data-exact-offpage", "") : live.push(e));
+  const page = live.length === 1 ? live[0] : null, scrolls = typeof globalThis.scrollTo === "function" && typeof globalThis.scrollY === "number";
+  if (scrolls && !Listening) { Listening = true; addEventListener("scroll", () => { if (Page?.isConnected) Scrolled.set(Page, [scrollX, scrollY]); }, { passive: true }); }
+  for (const e of live) e.removeAttribute("data-exact-offpage");
+  Marked = live.length > 0;
   document.documentElement?.toggleAttribute?.("data-scrolldocument", Marked);
+  const path = [];
+  for (let a = page?.parentElement; a && a.id !== "exact-root"; a = a.parentElement) path.push(a);
+  for (const a of Path) if (!path.includes(a)) a.removeAttribute("data-exact-frame");
+  for (const a of path) if (!a.hasAttribute("data-exact-frame")) a.setAttribute("data-exact-frame", "");
+  Path = path;
+  // One that left the page (a popped route, or the rendered page's, adopted) hands nothing on.
+  if (page && Page !== page) { if (scrolls && (Page?.isConnected || Scrolled.has(page))) scrollTo(...(Scrolled.get(page) ?? [0, 0])); Page = page; }
 }
 
 // @ref LLP 1075.003 §3.7 — a navigation tab is built the first time it is
@@ -127,7 +215,7 @@ function toOpen() {
     const key = root.getAttribute("navigationKey");
     // A panel holds the key once this runtime built it: an adopted page's
     // waiting panel already shows its rendered routes, which only `build` wires.
-    if (panels.some(p => !Waiting.has(p) && [...p.children].some(r => r.getAttribute("navigationKey") === key))) continue;
+    if (panels.some(p => !Waiting.has(p) && viewChildren(p).some(r => r.getAttribute("navigationKey") === key))) continue;
     const named = [...root.getElementsByTagName("*")].filter(t => t.getAttribute("aria-selected") === "true").map(t => t.getAttribute("aria-controls"));
     const waiting = panels.filter(p => Waiting.has(p)), chosen = waiting.find(p => named.includes(p.getAttribute("id"))) ?? waiting[0];
     if (chosen) open.push(chosen);

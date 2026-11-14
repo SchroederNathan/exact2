@@ -59,7 +59,7 @@ fn symbol_identity_and_inherited_font_cross_the_image_boundary() {
   view
     column font-size=(large ? 28 : 17) font-weight=(large ? 600 : 400)
       button "Change" press=change testId="change"
-      image (large ? "symbol:send" : "symbol:search") -exact-tint-color="light-dark(#007aff,#0a84ff)" testId="symbol"
+      image (large ? "symbol:send" : "symbol:search") color="light-dark(#007aff,#0a84ff)" testId="symbol"
 "##).unwrap();
     let (mut host, first) = Host::boot(
         &plan.encode(),
@@ -82,6 +82,53 @@ fn symbol_identity_and_inherited_font_cross_the_image_boundary() {
     assert!(changed.contains("\"symbolName\":\"arrow.up\""), "{changed}");
     assert!(changed.contains("\"font_size\":28"), "{changed}");
     assert!(changed.contains("\"font_weight\":600"), "{changed}");
+}
+
+/// LLP 1121 stage 9 B (D10): a symbol whose `color` its author wrote, on
+/// it or on the nearest ancestor that sets one, says so
+/// (`symbolColorWritten`) beside the colour its style carries; one under no
+/// written colour does not.
+#[test]
+fn a_symbol_under_a_written_colour_says_so() {
+    let plan = contract::compile(
+        r##"component App
+  action pick
+  view
+    column
+      column color="#ff0000"
+        image "symbol:star" testId="under"
+        row role="tablist"
+          button appearance="none" role="tab" aria-label="Library" aria-selected=true press=pick
+            image "symbol:book" testId="tab"
+        column color="AccentColor"
+          image "symbol:star" testId="accent"
+      image "symbol:star" testId="bare"
+"##,
+    )
+    .unwrap();
+    let (host, first) = Host::boot(
+        &plan.encode(),
+        NoData,
+        Box::new(MonospaceMeasurer::default()),
+        402.,
+        874.,
+    )
+    .unwrap();
+    let under = op(&first, view(&host, "under"));
+    assert!(under.contains("\"symbolColorWritten\":\"1\""), "{under}");
+    assert!(under.contains("\"text_color\":[255,0,0,255]"), "{under}");
+    let accent = op(&first, view(&host, "accent"));
+    assert!(accent.contains("\"symbolColorWritten\":\"1\""), "{accent}");
+    assert!(
+        accent.contains("\"text_color\":{\"sys\":\"@tint\""),
+        "{accent}"
+    );
+    // A tab's image is the page's too: where it is shown as a segment, the
+    // host draws the segment in the control's tint (`faceImage`).
+    let tab = op(&first, view(&host, "tab"));
+    assert!(tab.contains("\"symbolColorWritten\":\"1\""), "{tab}");
+    let bare = op(&first, view(&host, "bare"));
+    assert!(!bare.contains("symbolColorWritten"), "{bare}");
 }
 
 #[test]
@@ -201,7 +248,7 @@ fn a_node_read_names_where_each_value_came_from() {
     );
     assert!(
         reply.contains(&format!(
-            "\"line_height\":{{\"value\":\"24px\",\"source\":\"inherited\",\"from\":{root}}}"
+            "\"line_height\":{{\"value\":\"24px\",\"source\":\"inherited\",\"from\":{root},"
         )),
         "{reply}"
     );
@@ -342,6 +389,63 @@ fn patterned_border_styles_reach_the_presenter() {
     let json: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(json["border_style_top"], "dotted");
     assert_eq!(json["border_style_right"], "dashed");
+}
+
+/// A list row that UIKit's cell configuration sizes keeps the `min-height`
+/// its author wrote, so that one crosses to the presenter; the one a grouped
+/// row's sheet implies stays the kernel's, as layout rows do.
+#[test]
+fn an_authored_min_height_reaches_the_presenter() {
+    let plan = contract::compile(
+        r#"component App
+  view
+    list appearance="auto" listStyle="inset-grouped" testId="list"
+      section
+        button "Plain" testId="plain"
+        button "Tall" min-height=60 testId="tall"
+"#,
+    )
+    .unwrap();
+    let (host, first) = Host::boot(
+        &plan.encode(),
+        NoData,
+        Box::new(MonospaceMeasurer::default()),
+        402.0,
+        874.0,
+    )
+    .unwrap();
+    assert!(op(&first, view(&host, "tall")).contains("\"min_height\":60"));
+    assert!(!op(&first, view(&host, "plain")).contains("min_height"));
+}
+
+/// A percentage minimum has no basis for an in-flow grouped row: its
+/// containing block is its section's card, as tall as its rows, so the
+/// kernel lays the row out as it would without one (CSS 2.2 §10.7), and the
+/// host, reading the crossed percentage against 0, leaves UIKit's cell its
+/// own height.
+#[test]
+fn a_percentage_min_height_on_a_list_row_has_no_basis() {
+    let frame = |min: &str| {
+        let plan = contract::compile(&format!(
+            "component App\n  view\n    column height=\"100%\"\n      list appearance=\"auto\" listStyle=\"inset-grouped\" height=400\n        section\n          button \"Row\" {min}testId=\"row\"\n"
+        ))
+        .unwrap();
+        let (host, first) = Host::boot(
+            &plan.encode(),
+            NoData,
+            Box::new(MonospaceMeasurer::default()),
+            402.0,
+            874.0,
+        )
+        .unwrap();
+        let row = view(&host, "row");
+        let crossed = op(&first, row).contains("\"min_height\":{\"pct\":50}");
+        (host.runner().kernel().node(row).unwrap().frame, crossed)
+    };
+    let (none, _) = frame("");
+    let (half, crossed) = frame("min-height=\"50%\" ");
+    assert_eq!(half, none, "laid out as it is without a minimum");
+    assert!(crossed, "the percentage crosses as written");
 }
 
 #[test]
@@ -1004,4 +1108,45 @@ fn explicit_clears_export_computed_values_and_own_declaration_intent() {
         let batch = op(&restored, id);
         assert!(batch.contains("\"written\":[\"text_color\"]"), "{batch}");
     }
+}
+
+/// LLP 1061 D7: a pressed paint cleared by its expression is no pressed
+/// look, so the presenter is sent no row (an initial transparent would
+/// erase the background while held and keep the platform's press away).
+#[test]
+fn a_cleared_pressed_paint_sends_no_row() {
+    let plan = contract::compile(
+        r##"component App
+  state on = true
+  action flip
+    on = not on
+  view
+    button press=flip background-color="#ffffff" -exact-press-opacity=(on ? 0.5 : "unset") testId="b"
+      :active
+        background-color=(on ? "#abcdef" : "unset")
+      text "b"
+"##,
+    )
+    .unwrap();
+    let (mut host, first) = Host::boot(
+        &plan.encode(),
+        NoData,
+        Box::new(MonospaceMeasurer::default()),
+        402.0,
+        874.0,
+    )
+    .unwrap();
+    let b = view(&host, "b");
+    let made = op(&first, b);
+    assert!(
+        made.contains("\"press_background_color\":[171,205,239,255]"),
+        "{made}"
+    );
+    assert!(made.contains("\"press_opacity\":0.5"), "{made}");
+    let cleared = op(&host.dispatch(b, Event::Press), b);
+    assert!(
+        !cleared.contains("\"press_background_color\":"),
+        "{cleared}"
+    );
+    assert!(!cleared.contains("\"press_opacity\":"), "{cleared}");
 }

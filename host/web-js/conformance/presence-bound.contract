@@ -1,0 +1,32 @@
+// data: svg-gallery
+// Computed exit and layout declarations in the shape that reduced motion
+// takes: `none` while calm, a curve or a spring otherwise. Compare settled
+// layout and presence with the wasm host; layout-transition.test.mjs checks
+// the motion in Chromium and WebKit.
+keyframes leave
+  to opacity=0
+
+component PresenceBound
+  state calm = true
+  state shown = true
+  action motion
+    calm = not calm
+  action drop
+    shown = not shown
+  action both
+    calm = not calm
+    shown = not shown
+  view
+    column testId="root" padding=10
+      row gap=8
+        button press=motion testId="motion"
+          text "Motion"
+        button press=drop testId="drop"
+          text "Drop"
+        button press=both testId="both"
+          text "Both"
+      if shown
+        text "First" testId="first" padding=12 background-color="#e8eef6" margin-bottom=6
+          -exact-exit-animation=(calm ? "none" : "leave 200ms linear both")
+      text "Second" testId="second" padding=12 background-color="#e8eef6" margin-bottom=6 -exact-layout-transition=(calm ? "none" : "320ms cubic-bezier(.32,.72,0,1)")
+      text "Third" testId="third" padding=10 background-color="#f3e8d8" margin-bottom=6 -exact-layout-transition=(calm ? "none" : "-exact-spring(300, 24, 1)")

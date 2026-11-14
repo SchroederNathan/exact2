@@ -11,7 +11,7 @@
 //! negative ([`MAX_CONTENT`], [`MIN_CONTENT`]).
 
 use exact_kernel::{
-    AxisOffer, ParagraphStamp, TextAlign, TextMeasureRequest, TextMeasurer, TextMetrics,
+    AxisOffer, InlineBox, ParagraphStamp, TextAlign, TextMeasureRequest, TextMeasurer, TextMetrics,
 };
 
 mod identified;
@@ -47,6 +47,28 @@ pub struct CRun {
     pub letter_spacing: f32,
     /// CSS `font-variant-numeric` bits: 1 is `tabular-nums` (LLP 1053 G4).
     pub font_variant_numeric: u8,
+    /// CSS `font-variant-ligatures` as `FontVariantLigatures`' bits.
+    pub font_variant_ligatures: u8,
+    /// CSS `font-stretch`, percent of normal width (LLP 1019 D8).
+    pub font_stretch: f32,
+    /// CSS `font-variation-settings` (LLP 1019 D9): how many axes are set.
+    pub variation_count: u8,
+    /// Their tags, big-endian (`'wght'` is `0x77676874`).
+    pub variation_tags: [u32; 8],
+    /// Their values, in each axis's units.
+    pub variation_values: [f32; 8],
+    /// 1 for CSS `font-optical-sizing: none`: the face keeps its own `opsz`.
+    pub optical_sizing_none: u8,
+    /// 1 when the run is an image in the paragraph's text (LLP 1011.002).
+    pub inline_box: u8,
+    /// Its `vertical-align` keyword, as `VerticalAlign`'s wire value.
+    pub box_align: u8,
+    /// Its margin box, points.
+    pub box_width: f32,
+    /// See `box_width`.
+    pub box_height: f32,
+    /// Its `vertical-align` length, points: how far it is raised.
+    pub box_shift: f32,
 }
 
 /// One request, as the callback sees it.
@@ -90,7 +112,9 @@ pub struct CRequest {
     pub exclusions: *const crate::textflow::Shape,
     /// Exclusion count.
     pub exclusion_count: usize,
-    /// 1 when the one run is Markdown source the host expands (LLP 1045 D3).
+    /// 1 when the one run is Markdown source the host expands (LLP 1045 D3)
+    /// as a reader shows it; 2 when it is a Markdown text area's value, which
+    /// the host lays out as its editor does (`MARKUP_EDITOR`).
     pub markup: u8,
     /// CSS `text-indent`, points.
     pub text_indent: f32,
@@ -110,6 +134,15 @@ pub struct CRequest {
     pub text_box_under: u8,
     /// CSS `text-wrap-style`: 0 auto, 1 balance (LLP 1001 §6).
     pub text_wrap_style: u8,
+    /// A Markdown paragraph's `atoms` JSON (UTF-8, LLP 1045.000 D2), borrowed
+    /// for this callback; empty for none.
+    pub atoms: *const u8,
+    /// Its length in bytes.
+    pub atoms_len: usize,
+    /// Its `atomFaces` JSON, likewise.
+    pub faces: *const u8,
+    /// Its length in bytes.
+    pub faces_len: usize,
 }
 
 /// What the callback returns.
@@ -160,8 +193,15 @@ pub struct CFontFace {
     pub source_len: usize,
     /// Plan stack id.
     pub stack: u16,
-    /// CSS weight; with an empty source, 0 names a local family and 1 a generic.
+    /// CSS weight, or the low end of a variable face's range; with an empty
+    /// source, 0 names a local family and 1 a generic.
     pub weight: u16,
+    /// The weight range's high end; `weight` for one weight.
+    pub weight_max: u16,
+    /// Widths in tenths of a percent, low and high; 1000 is normal.
+    pub stretch_min: u16,
+    /// The width range's high end.
+    pub stretch_max: u16,
     /// 1 for italic.
     pub italic: u8,
 }
@@ -204,6 +244,9 @@ pub fn install_fonts(plan: &Plan, runtime: &[String], callback: FontsFn, ctx: *m
                     source_len: 0,
                     stack: stack_index as u16,
                     weight: u16::from(family.is_none()),
+                    weight_max: u16::from(family.is_none()),
+                    stretch_min: 1000,
+                    stretch_max: 1000,
                     italic: 0,
                 });
             }
@@ -218,6 +261,9 @@ pub fn install_fonts(plan: &Plan, runtime: &[String], callback: FontsFn, ctx: *m
                         source_len: source.len(),
                         stack: stack_index as u16,
                         weight: face.weight,
+                        weight_max: face.weight_max,
+                        stretch_min: face.stretch_min,
+                        stretch_max: face.stretch_max,
                         italic: u8::from(face.italic),
                     });
                 }
@@ -254,6 +300,9 @@ pub fn install_fonts(plan: &Plan, runtime: &[String], callback: FontsFn, ctx: *m
             source_len: 0,
             stack: *stack,
             weight: u16::from(generic),
+            weight_max: u16::from(generic),
+            stretch_min: 1000,
+            stretch_max: 1000,
             italic: 0,
         });
     }
@@ -267,10 +316,13 @@ pub fn install_fonts(plan: &Plan, runtime: &[String], callback: FontsFn, ctx: *m
 /// A kernel measurer backed by the app's callback.
 pub struct CallbackMeasurer {
     f: MeasureFn,
+    time_format: Option<crate::time::TimeFormatFn>,
     field_chrome: Option<crate::control_text::FieldChromeFn>,
     button_measure: Option<crate::control_text::ButtonMeasureFn>,
     measure_revision: Option<std::rc::Rc<std::cell::Cell<u64>>>,
     lines: Option<LinesFn>,
+    /// Each inline box's origin (LLP 1011.002 D2), with `ctx`.
+    inline_boxes: Option<LinesFn>,
     symbol: Option<SymbolFn>,
     /// Each symbol's answer by its Apple name, point size and weight, under
     /// the measuring traits of `symbols_revision`
@@ -289,10 +341,12 @@ impl CallbackMeasurer {
     pub fn new(f: MeasureFn, ctx: *mut c_void, lines: Option<LinesFn>) -> CallbackMeasurer {
         CallbackMeasurer {
             f,
+            time_format: None,
             field_chrome: None,
             button_measure: None,
             measure_revision: None,
             lines,
+            inline_boxes: None,
             symbol: None,
             symbols: Default::default(),
             symbols_revision: 0,
@@ -311,8 +365,19 @@ fn offer(a: AxisOffer) -> f32 {
     }
 }
 
-fn c_run(text: &str, style: exact_kernel::TextStyle) -> CRun {
+fn c_run(text: &str, style: exact_kernel::TextStyle, inline: Option<InlineBox>) -> CRun {
+    let b = inline.unwrap_or(InlineBox {
+        width: 0.0,
+        height: 0.0,
+        align: exact_kernel::VerticalAlign::Baseline,
+        shift: 0.0,
+    });
     CRun {
+        inline_box: u8::from(inline.is_some()),
+        box_align: b.align as u8,
+        box_width: b.width,
+        box_height: b.height,
+        box_shift: b.shift,
         text: text.as_ptr(),
         len: text.len(),
         font_size: style.font_size,
@@ -323,16 +388,49 @@ fn c_run(text: &str, style: exact_kernel::TextStyle) -> CRun {
         line_height: style.line_height.unwrap_or(0.0),
         letter_spacing: style.letter_spacing,
         font_variant_numeric: style.font_variant_numeric,
+        font_variant_ligatures: style.font_variant_ligatures,
+        font_stretch: style.font_stretch,
+        variation_count: style.font_variations.axes().len() as u8,
+        variation_tags: std::array::from_fn(|i| {
+            style.font_variations.axes().get(i).map_or(0, |a| a.0)
+        }),
+        variation_values: std::array::from_fn(|i| {
+            style.font_variations.axes().get(i).map_or(0.0, |a| a.1)
+        }),
+        optical_sizing_none: u8::from(
+            style.font_optical_sizing == exact_kernel::FontOpticalSizing::None,
+        ),
     }
 }
 
 impl CallbackMeasurer {
+    /// Install the platform date formatter beside text measurement.
+    pub fn with_time_format(mut self, f: Option<crate::time::TimeFormatFn>) -> Self {
+        self.time_format = f;
+        self
+    }
+
     /// Install the optional UIKit chrome callback with the text engine's context.
     pub fn with_field_chrome(
         mut self,
         callback: Option<crate::control_text::FieldChromeFn>,
     ) -> Self {
         self.field_chrome = callback;
+        self
+    }
+
+    /// The measurer `hooks` make with `f`, their measure: its lines, inline
+    /// boxes, symbols and times.
+    pub fn of(f: MeasureFn, hooks: &crate::abi::Hooks) -> CallbackMeasurer {
+        CallbackMeasurer::new(f, hooks.ctx, hooks.lines)
+            .with_inline_boxes(hooks.inline_boxes)
+            .with_symbol(hooks.symbol)
+            .with_time_format(hooks.time_format)
+    }
+
+    /// Place inline boxes with `f` (`TextMeasurer::inline_boxes`).
+    pub fn with_inline_boxes(mut self, f: Option<LinesFn>) -> Self {
+        self.inline_boxes = f;
         self
     }
 
@@ -389,14 +487,14 @@ impl CallbackMeasurer {
         let single;
         let owned;
         let runs: &[CRun] = if let [run] = request.runs {
-            single = c_run(text(0), run.style);
+            single = c_run(text(0), run.style, run.inline);
             std::slice::from_ref(&single)
         } else {
             owned = request
                 .runs
                 .iter()
                 .enumerate()
-                .map(|(i, r)| c_run(text(i), r.style))
+                .map(|(i, r)| c_run(text(i), r.style, r.inline))
                 .collect::<Vec<CRun>>();
             &owned
         };
@@ -408,7 +506,7 @@ impl CallbackMeasurer {
             revision: stamp.map_or(0, ParagraphStamp::metric_revision),
             runs: runs.as_ptr(),
             count: runs.len(),
-            strut: c_run("", request.paragraph.strut),
+            strut: c_run("", request.paragraph.strut, None),
             width: offer(request.width),
             height: offer(request.height),
             // Physical already (`Paragraph::from_style`); `start`/`end` never arrive.
@@ -441,6 +539,10 @@ impl CallbackMeasurer {
             text_box_over: request.paragraph.text_box_edge.over() as u8,
             text_box_under: request.paragraph.text_box_edge.under() as u8,
             text_wrap_style: request.paragraph.text_wrap_style as u8,
+            atoms: request.atoms.kinds.as_ptr(),
+            atoms_len: request.atoms.kinds.len(),
+            faces: request.atoms.faces.as_ptr(),
+            faces_len: request.atoms.faces.len(),
         };
         // The one foreign call: the app's function, with the structs above
         // alive for its duration and read-only.
@@ -464,7 +566,39 @@ fn sanitize(m: CMetrics) -> TextMetrics {
     }
 }
 
+/// [`CRequest::markup`] for a Markdown text area's value: its editor keeps
+/// the syntax at full advance and draws each atom as a pill (LLP 1045 D5,
+/// LLP 1045.000 §4), so its text is not the reader's paragraph.
+pub const MARKUP_EDITOR: u8 = 2;
+
 impl TextMeasurer for CallbackMeasurer {
+    /// A Markdown text area's text as its editor lays it out
+    /// ([`MARKUP_EDITOR`]), which `field-sizing: content` sizes the field
+    /// by; any other field's is the paragraph engine's.
+    fn field_text(
+        &mut self,
+        _kind: exact_kernel::FieldKind,
+        request: &TextMeasureRequest<'_>,
+    ) -> Option<TextMetrics> {
+        if request.paragraph.markup != exact_kernel::Markup::Markdown {
+            return None;
+        }
+        let f = self.f;
+        Some(sanitize(self.foreign(request, None, |ctx, c| {
+            let editor = CRequest {
+                markup: MARKUP_EDITOR,
+                ..*c
+            };
+            f(ctx, &editor)
+        })))
+    }
+
+    fn format_time(&mut self, r: &exact_kernel::time::TimeRequest<'_>) -> Option<String> {
+        match self.time_format {
+            Some(f) => crate::time::format(f, self.ctx, r),
+            None => exact_kernel::time::english(r),
+        }
+    }
     fn measure_revision(&self) -> u64 {
         self.measure_revision
             .as_ref()
@@ -539,6 +673,25 @@ impl TextMeasurer for CallbackMeasurer {
         true
     }
 
+    /// @ref LLP 1011.002 D2 — each inline box's origin, from the app's hook.
+    fn inline_boxes(
+        &mut self,
+        stamp: &ParagraphStamp,
+        request: &TextMeasureRequest<'_>,
+        origins: &mut Vec<(f32, f32)>,
+    ) {
+        let Some(boxes) = self.inline_boxes else {
+            return;
+        };
+        let mut out = vec![0.0f32; 2 * request.runs.len()];
+        let count = self.foreign(request, Some(stamp), |ctx, c| {
+            boxes(ctx, c, out.as_mut_ptr(), out.len())
+        });
+        out.truncate(count.min(out.len()));
+        // A non-finite pair is a box on no line, which the kernel hides.
+        origins.extend(out.chunks_exact(2).map(|p| (p[0], p[1])));
+    }
+
     /// @ref LLP 1093 D6 — the paragraph's line boxes, from the app's hook.
     fn lines(
         &mut self,
@@ -605,15 +758,15 @@ mod tests {
     #[test]
     fn used_zero_and_normal_are_distinct_at_the_c_seam() {
         let mut style = exact_kernel::StyleProps::default();
-        let normal = c_run("", exact_kernel::TextStyle::from_style(&style));
+        let normal = c_run("", exact_kernel::TextStyle::from_style(&style), None);
         assert_eq!(normal.has_line_height, 0);
         style.line_height = exact_kernel::LineHeight::Number(0.0);
-        let zero = c_run("", exact_kernel::TextStyle::from_style(&style));
+        let zero = c_run("", exact_kernel::TextStyle::from_style(&style), None);
         assert_eq!(zero.has_line_height, 1);
         assert_eq!(zero.line_height, 0.0);
         style.font_size = 20.0;
         style.line_height = exact_kernel::LineHeight::Number(1.5);
-        let ratio = c_run("", exact_kernel::TextStyle::from_style(&style));
+        let ratio = c_run("", exact_kernel::TextStyle::from_style(&style), None);
         assert_eq!(ratio.has_line_height, 1);
         assert_eq!(ratio.line_height, 30.0);
     }
@@ -624,6 +777,51 @@ mod tests {
             height: 20.0,
             baseline: 15.0,
         }
+    }
+
+    #[allow(unsafe_code)] // Borrowed synchronous C callback.
+    extern "C" fn by_markup(_: *mut c_void, request: *const CRequest) -> CMetrics {
+        // SAFETY: the request is alive for this synchronous call.
+        let markup = unsafe { (*request).markup };
+        CMetrics {
+            width: 10.0,
+            height: 20.0 * f32::from(markup + 1),
+            baseline: 15.0,
+        }
+    }
+
+    /// A Markdown text area's text is measured as its editor lays it out
+    /// (`MARKUP_EDITOR`), where its pills and syntax take their room; any
+    /// other field's is the paragraph engine's, as before.
+    #[test]
+    fn a_markdown_text_areas_text_is_its_editors() {
+        let mut m = CallbackMeasurer::new(by_markup, std::ptr::null_mut(), None);
+        let runs = [exact_kernel::TextRun::new(
+            "Fix [a.ts](src/a.ts)",
+            exact_kernel::TextStyle::from_style(&exact_kernel::StyleProps::default()),
+        )];
+        let mut request = TextMeasureRequest {
+            atoms: Default::default(),
+            exclusions: &[],
+            runs: &runs,
+            paragraph: exact_kernel::text::Paragraph::from_style(
+                &exact_kernel::StyleProps::default(),
+            ),
+            width: AxisOffer::Definite(200.0),
+            height: AxisOffer::MaxContent,
+        };
+        let textarea = exact_kernel::FieldKind::Textarea;
+        assert_eq!(m.field_text(textarea, &request), None, "plain");
+        request.paragraph.markup = exact_kernel::Markup::Markdown;
+        let editor = m
+            .field_text(textarea, &request)
+            .expect("a Markdown field's own");
+        assert_eq!(editor.height, 20.0 * f32::from(MARKUP_EDITOR + 1));
+        assert_eq!(
+            m.measure(&request).height,
+            40.0,
+            "a reader's paragraph stays markup 1"
+        );
     }
 
     /// ExactKit's measure answers by width (CRequest::height is advisory),

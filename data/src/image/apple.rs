@@ -4,12 +4,16 @@
 //!
 //! Per size, ImageIO's thumbnail decode (orientation applied, subsampled
 //! while decoding JPEG and HEIC; other formats may be decoded whole) is
-//! drawn into an opaque sRGB `w × h` bitmap, filled white: a second scale,
-//! since the thumbnail's own size is ImageIO's rounding, not `floor()`.
-//! Each quality trial encodes that bitmap. No source property is copied
+//! drawn into an sRGB `w × h` bitmap: opaque and filled white for a JPEG,
+//! premultiplied RGBA and left clear for a PNG (A1.11), so alpha survives. It
+//! is a second scale, since the thumbnail's own size is ImageIO's rounding,
+//! not `floor()`. Each trial encodes that bitmap. No source property is copied
 //! into the JPEG: no EXIF, GPS, TIFF, IPTC, XMP or orientation tag; the
 //! encoder writes its own JFIF, sRGB profile and colour-space EXIF.
-use super::{failure, search, Compressed, Deadline};
+use super::edit::{Affine, Edit, Geometry, ResizeQuality};
+use super::{
+    failure, search, search_lossless, Compressed, Deadline, Format, Transform, Transformed,
+};
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 
@@ -149,6 +153,7 @@ const NUMBER_SINT64: CFIndex = 4;
 const NUMBER_DOUBLE: CFIndex = 13;
 const UTF8: u32 = 0x0800_0100;
 const ALPHA_NONE_SKIP_LAST: u32 = 5;
+const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 const INTERPOLATION_HIGH: i32 = 3;
 
 /// An owned Core Foundation reference, released on drop.
@@ -233,6 +238,7 @@ pub(super) fn scratch_bytes(
     source_bytes: usize,
     source: (u32, u32),
     depth: u32,
+    thumbnail: (u32, u32),
     target: (u32, u32),
     max_bytes: u64,
 ) -> Option<u64> {
@@ -249,8 +255,6 @@ pub(super) fn scratch_bytes(
             .map(|row| row & !63)?
             .checked_mul(u64::from(h))
     };
-    // The thumbnail can round up one pixel while contain() floors the target.
-    let thumbnail = (target.0.checked_add(1)?, target.1.checked_add(1)?);
     // Reserve a second source-sized surface for decoder workspace. The
     // measured PNG/TIFF paths can retain it alongside the returned thumbnail.
     (source_bytes as u64)
@@ -262,8 +266,10 @@ pub(super) fn scratch_bytes(
 
 pub(super) fn compress(
     source: &[u8],
+    format: Format,
     max_dimension: u32,
     max_bytes: u64,
+    edit: &Edit,
     deadline: Deadline<'_>,
 ) -> Result<Compressed, String> {
     // ImageIO autoreleases internally; a storage worker lives long, so each
@@ -331,12 +337,37 @@ pub(super) fn compress(
     } else {
         (width as u32, height as u32)
     };
+    // The search runs on the edited picture's size: the crop's, else the turned frame's.
+    let geometry = (!edit.is_identity())
+        .then(|| Geometry::new("compressImage", width, height, edit))
+        .transpose()?;
+    let upright = (width, height);
+    let (width, height) = geometry.as_ref().map_or(upright, Geometry::size);
     // Refuse before the first decode, using component depth rather than
     // assuming every accepted PNG/TIFF/HEIC source has 8-bit channels.
     let target = super::contain(width, height, max_dimension);
-    let scratch = u32::try_from(depth)
-        .ok()
-        .and_then(|depth| scratch_bytes(source.len(), source_size, depth, target, max_bytes));
+    // The thumbnail can round up one pixel while contain() floors the target;
+    // an edit's is the whole upright picture at the target's scale.
+    let thumbnail = match &geometry {
+        None => (target.0 + 1, target.1 + 1),
+        Some(_) => {
+            let side = thumbnail_side(upright, (width, height), target);
+            let long = upright.0.max(upright.1);
+            let scaled =
+                |n: u32| (u64::from(n) * u64::from(side)).div_ceil(u64::from(long)) as u32 + 1;
+            (scaled(upright.0), scaled(upright.1))
+        }
+    };
+    let scratch = u32::try_from(depth).ok().and_then(|depth| {
+        scratch_bytes(
+            source.len(),
+            source_size,
+            depth,
+            thumbnail,
+            target,
+            max_bytes,
+        )
+    });
     // Keep one quarter for opaque native workspace beyond the surfaces above.
     // This is conservative admission headroom, not an ImageIO allocator limit.
     if scratch.is_none_or(|n| n > surface_budget) {
@@ -345,8 +376,12 @@ pub(super) fn compress(
             "image exceeds its codec memory reservation",
         ));
     }
+    let name = match format {
+        Format::Jpeg => "JPEG",
+        Format::Png => "PNG",
+    };
     let mut drawn: Option<(u32, u32, Owned)> = None;
-    let found = search(width, height, max_dimension, max_bytes, |w, h, quality| {
+    let mut trial = |w: u32, h: u32, quality: Option<u32>| {
         // Native temporaries from a failed trial must not accumulate across
         // the quality search or survive until the outer worker pool drains.
         let _trial_pool = Pool::new();
@@ -356,24 +391,37 @@ pub(super) fn compress(
             drawn = Some((
                 w,
                 h,
-                draw(image_source.get(), w, h).ok_or_else(undecodable)?,
+                match &geometry {
+                    None => draw(image_source.get(), w, h, format),
+                    Some(g) => draw_edited(image_source.get(), g, upright, (w, h), format),
+                }
+                .ok_or_else(undecodable)?,
             ));
         }
         let image = drawn.as_ref().expect("drawn above").2.get();
         deadline.check()?;
         encode(image, quality, max_bytes as usize)
-            .ok_or_else(|| failure("unsupported", "ImageIO did not encode a JPEG"))
-    })?;
+            .ok_or_else(|| failure("unsupported", format!("ImageIO did not encode a {name}")))
+    };
+    let found = match format {
+        Format::Jpeg => search(width, height, max_dimension, max_bytes, |w, h, q| {
+            trial(w, h, Some(q))
+        })?,
+        Format::Png => search_lossless(width, height, max_dimension, max_bytes, |w, h| {
+            trial(w, h, None)
+        })?,
+    };
     found.ok_or_else(|| {
         failure(
             "unfit",
-            format!("no JPEG of this image fits {max_bytes} bytes"),
+            format!("no {name} of this image fits {max_bytes} bytes"),
         )
     })
 }
 
-/// The oriented image at exactly `w × h`, on white, as a CGImage.
-fn draw(source: CFTypeRef, w: u32, h: u32) -> Option<Owned> {
+/// The oriented image at exactly `w × h` as a CGImage: on white for a JPEG,
+/// on clear for a PNG.
+fn draw(source: CFTypeRef, w: u32, h: u32, format: Format) -> Option<Owned> {
     let side = number_i64(i64::from(w.max(h)))?;
     // SAFETY: the keys and kCFBooleanTrue are immutable statics; `side` lives
     // until the dictionary has retained it.
@@ -402,11 +450,14 @@ fn draw(source: CFTypeRef, w: u32, h: u32) -> Option<Owned> {
     // HDR source is converted, and a grey or CMYK one too.
     // SAFETY: kCGColorSpaceSRGB is an immutable static; the space is +1.
     let srgb = Owned::new(unsafe { CGColorSpaceCreateWithName(kCGColorSpaceSRGB) })?;
-    let context = bitmap(w, h, srgb.get())?;
+    let context = bitmap(w, h, srgb.get(), format == Format::Png)?;
     // SAFETY: `context` and `thumbnail` are live; drawing scales into `rect`.
+    // A new bitmap context's pixels are zero, which is clear for a PNG.
     unsafe {
-        CGContextSetRGBFillColor(context.get(), 1.0, 1.0, 1.0, 1.0);
-        CGContextFillRect(context.get(), rect);
+        if format == Format::Jpeg {
+            CGContextSetRGBFillColor(context.get(), 1.0, 1.0, 1.0, 1.0);
+            CGContextFillRect(context.get(), rect);
+        }
         CGContextSetInterpolationQuality(context.get(), INTERPOLATION_HIGH);
         CGContextDrawImage(context.get(), rect, thumbnail.get());
     }
@@ -415,8 +466,70 @@ fn draw(source: CFTypeRef, w: u32, h: u32) -> Option<Owned> {
     Owned::new(unsafe { CGBitmapContextCreateImage(context.get()) })
 }
 
-/// An opaque 8-bit RGB bitmap context in `space`.
-fn bitmap(w: u32, h: u32, space: CFTypeRef) -> Option<Owned> {
+/// The thumbnail's long side for an edited output of `out`, cropped from a
+/// `crop` of the `upright` picture: the scale the output needs, never above
+/// the source's own.
+fn thumbnail_side(upright: (u32, u32), crop: (u32, u32), out: (u32, u32)) -> u32 {
+    let long = upright.0.max(upright.1);
+    let scale = (f64::from(out.0) / f64::from(crop.0)).max(f64::from(out.1) / f64::from(crop.1));
+    ((f64::from(long) * scale).ceil() as u32).clamp(1, long)
+}
+
+/// `geometry`'s picture of the oriented image at exactly `out`, as [`draw`]
+/// makes it: the thumbnail decode at the output's scale, then one draw
+/// through the edit's map.
+fn draw_edited(
+    source: CFTypeRef,
+    geometry: &Geometry,
+    upright: (u32, u32),
+    out: (u32, u32),
+    format: Format,
+) -> Option<Owned> {
+    let side = number_i64(i64::from(thumbnail_side(upright, geometry.size(), out)))?;
+    // SAFETY: as in `draw`.
+    let options = dictionary(unsafe {
+        &[
+            (kCGImageSourceCreateThumbnailFromImageAlways, kCFBooleanTrue),
+            (kCGImageSourceCreateThumbnailWithTransform, kCFBooleanTrue),
+            (kCGImageSourceShouldCache, kCFBooleanFalse),
+            (kCGImageSourceDecodeRequest, kCGImageSourceDecodeToSDR),
+            (kCGImageSourceThumbnailMaxPixelSize, side.get()),
+        ]
+    })?;
+    // SAFETY: `source` and `options` are live; the thumbnail is +1.
+    let thumbnail =
+        Owned::new(unsafe { CGImageSourceCreateThumbnailAtIndex(source, 0, options.get()) })?;
+    let (tw, th) = transform::size(thumbnail.get());
+    let map = Affine::scale(f64::from(upright.0) / tw, f64::from(upright.1) / th)
+        .then(geometry.to_output(out));
+    // SAFETY: the name is an immutable static; the space is +1.
+    let srgb = Owned::new(unsafe { CGColorSpaceCreateWithName(kCGColorSpaceSRGB) })?;
+    transform::render(
+        thumbnail.get(),
+        map,
+        out,
+        srgb.get(),
+        transform::Surface::Eight,
+        format == Format::Png,
+        ResizeQuality::High,
+    )
+}
+
+/// `transformImage` on ImageIO: `apple_transform.rs`.
+pub(super) fn transform(
+    source: &[u8],
+    options: &Transform,
+    max_bytes: u64,
+    deadline: Deadline<'_>,
+) -> Result<Transformed, String> {
+    transform::transform(source, options, max_bytes, deadline)
+}
+
+#[path = "apple_transform.rs"]
+mod transform;
+
+/// An 8-bit bitmap context in `space`: opaque RGB, or premultiplied RGBA.
+fn bitmap(w: u32, h: u32, space: CFTypeRef, alpha: bool) -> Option<Owned> {
     // SAFETY: Core Graphics allocates the backing; `space` is live.
     Owned::new(unsafe {
         CGBitmapContextCreate(
@@ -426,7 +539,11 @@ fn bitmap(w: u32, h: u32, space: CFTypeRef) -> Option<Owned> {
             8,
             0,
             space,
-            ALPHA_NONE_SKIP_LAST,
+            if alpha {
+                ALPHA_PREMULTIPLIED_LAST
+            } else {
+                ALPHA_NONE_SKIP_LAST
+            },
         )
     })
 }
@@ -458,9 +575,10 @@ unsafe extern "C" fn put_bytes(info: *mut c_void, bytes: *const c_void, len: usi
     }
 }
 
-/// Keep at most `cap + 1` bytes. The extra byte tells the quality search to
-/// lower its next trial without retaining the remainder of an oversized JPEG.
-fn encode(image: CFTypeRef, quality: u32, cap: usize) -> Option<Vec<u8>> {
+/// Keep at most `cap + 1` bytes. The extra byte tells the search to lower
+/// its next trial without retaining the remainder of an oversized image.
+/// A quality is a JPEG's; none is a PNG.
+fn encode(image: CFTypeRef, quality: Option<u32>, cap: usize) -> Option<Vec<u8>> {
     let limit = cap.checked_add(1)?;
     let mut out = Encoded {
         bytes: Vec::with_capacity(limit),
@@ -475,24 +593,37 @@ fn encode(image: CFTypeRef, quality: u32, cap: usize) -> Option<Vec<u8>> {
     // writes synchronously during add/finalize and never retains this stack.
     let consumer =
         Owned::new(unsafe { CGDataConsumerCreate((&mut out as *mut Encoded).cast(), &callbacks) })?;
-    let jpeg = b"public.jpeg";
+    let uti: &[u8] = if quality.is_some() {
+        b"public.jpeg"
+    } else {
+        b"public.png"
+    };
     // SAFETY: the bytes are UTF-8 and copied.
     let kind = Owned::new(unsafe {
-        CFStringCreateWithBytes(ptr::null(), jpeg.as_ptr(), jpeg.len() as CFIndex, UTF8, 0)
+        CFStringCreateWithBytes(ptr::null(), uti.as_ptr(), uti.len() as CFIndex, UTF8, 0)
     })?;
     // SAFETY: the consumer and kind remain live through finalization.
     let destination = Owned::new(unsafe {
         CGImageDestinationCreateWithDataConsumer(consumer.get(), kind.get(), 1, ptr::null())
     })?;
-    let quality = number_f64(f64::from(quality) / 100.0)?;
-    let props = dictionary(&[(
-        // SAFETY: the key is an immutable static.
-        unsafe { kCGImageDestinationLossyCompressionQuality },
-        quality.get(),
-    )])?;
+    let props = match quality {
+        Some(quality) => {
+            let quality = number_f64(f64::from(quality) / 100.0)?;
+            Some(dictionary(&[(
+                // SAFETY: the key is an immutable static.
+                unsafe { kCGImageDestinationLossyCompressionQuality },
+                quality.get(),
+            )])?)
+        }
+        None => None,
+    };
     // SAFETY: all references remain live until the encoder returns.
     let finished = unsafe {
-        CGImageDestinationAddImage(destination.get(), image, props.get());
+        CGImageDestinationAddImage(
+            destination.get(),
+            image,
+            props.as_ref().map_or(ptr::null(), Owned::get),
+        );
         CGImageDestinationFinalize(destination.get())
     };
     drop(destination);
@@ -646,6 +777,13 @@ pub(super) fn png(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 /// For tests: the first pixel of a JPEG, decoded, as RGB.
 #[cfg(test)]
 pub(super) fn first_pixel(bytes: &[u8]) -> [u8; 3] {
+    let [r, g, b, _] = first_rgba(bytes);
+    [r, g, b]
+}
+
+/// For tests: the first pixel of an image, decoded, as premultiplied RGBA.
+#[cfg(test)]
+pub(super) fn first_rgba(bytes: &[u8]) -> [u8; 4] {
     // SAFETY: as in `compress`; the context's backing is ours.
     unsafe {
         let data = Owned::new(CFDataCreate(
@@ -675,7 +813,7 @@ pub(super) fn first_pixel(bytes: &[u8]) -> [u8; 3] {
             8,
             4,
             space.get(),
-            ALPHA_NONE_SKIP_LAST,
+            ALPHA_PREMULTIPLIED_LAST,
         ))
         .unwrap();
         // Draw the whole image into one pixel is an average; draw it at its
@@ -694,7 +832,7 @@ pub(super) fn first_pixel(bytes: &[u8]) -> [u8; 3] {
             },
             image.get(),
         );
-        [pixel[0], pixel[1], pixel[2]]
+        pixel
     }
 }
 

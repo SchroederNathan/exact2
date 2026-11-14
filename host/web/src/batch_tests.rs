@@ -74,8 +74,13 @@ fn cases() -> Vec<(&'static str, String)> {
                 b.router(&exact_runner::RouterChange {
                     top: 5,
                     url: "/tag/\"x\"?q=1".into(),
+                    fragment: "moves".into(),
+                    scroll: true,
+                    activation: 3,
                     removed: vec![],
                     visits: vec![(1, "/".into()), (5, "/tag/\"x\"?q=1".into())],
+                    pattern: String::new(),
+                    params: vec![],
                 })
             }),
         ),
@@ -85,13 +90,19 @@ fn cases() -> Vec<(&'static str, String)> {
                 b.router(&exact_runner::RouterChange {
                     top: 18_446_744_073_709_551_615,
                     url: "/".into(),
+                    fragment: String::new(),
+                    scroll: false,
+                    activation: 0,
                     removed: vec![1, 22, 333],
                     visits: vec![(18_446_744_073_709_551_615, "/".into())],
+                    pattern: String::new(),
+                    params: vec![],
                 })
             }),
         ),
         ("collections", one(|b| b.collections("[{\"view\":1}]"))),
         ("refuse", one(|b| b.refuse(9, "no \"way\"\n"))),
+        ("abort", one(|b| b.abort(7))),
         (
             "grants",
             one(|b| {
@@ -214,6 +225,19 @@ fn cases() -> Vec<(&'static str, String)> {
             }),
         ),
         (
+            "request-long-poll",
+            one(|b| {
+                let exact_runner::Answer::Later(poll) = exact_runner::Answer::stream(
+                    Request::get("https://api.example/changes?since=0")
+                        .independent_http(4096)
+                        .long_poll("since", "meta.seq"),
+                ) else {
+                    unreachable!()
+                };
+                b.request(&request(50, poll, false))
+            }),
+        ),
+        (
             "request-continue",
             one(|b| {
                 b.request(&request(
@@ -289,11 +313,11 @@ fn cases() -> Vec<(&'static str, String)> {
 const GOLDEN: &[(&str, &str)] = &[
     (
         "router",
-        r#"{"ops":[{"op":"router","top":5,"url":"/tag/\"x\"?q=1","removed":[],"visits":[[1,"/"],[5,"/tag/\"x\"?q=1"]]}],"timers":false,"clock":0,"error":null}"#,
+        r#"{"ops":[{"op":"router","top":5,"url":"/tag/\"x\"?q=1#moves","fragment":"moves","scroll":true,"activation":3,"removed":[],"visits":[[1,"/"],[5,"/tag/\"x\"?q=1"]]}],"timers":false,"clock":0,"error":null}"#,
     ),
     (
         "router-removed",
-        r#"{"ops":[{"op":"router","top":18446744073709551615,"url":"/","removed":[1,22,333],"visits":[[18446744073709551615,"/"]]}],"timers":false,"clock":0,"error":null}"#,
+        r#"{"ops":[{"op":"router","top":18446744073709551615,"url":"/","fragment":"","scroll":false,"activation":0,"removed":[1,22,333],"visits":[[18446744073709551615,"/"]]}],"timers":false,"clock":0,"error":null}"#,
     ),
     (
         "collections",
@@ -302,6 +326,10 @@ const GOLDEN: &[(&str, &str)] = &[
     (
         "refuse",
         r#"{"ops":[{"op":"refuse","ticket":9,"message":"no \"way\"\n"}],"timers":false,"clock":0,"error":null}"#,
+    ),
+    (
+        "abort",
+        r#"{"ops":[{"op":"abort","ticket":7}],"timers":false,"clock":0,"error":null}"#,
     ),
     (
         "grants",
@@ -396,6 +424,10 @@ const GOLDEN: &[(&str, &str)] = &[
         r#"{"ops":[{"op":"request","ticket":49,"target":"feed \"home\"","scope":null,"method":"GET","url":"https://api.example/authorize","headers":[],"redirect":"manual","body":"","cache":"default"}],"timers":false,"clock":0,"error":null}"#,
     ),
     (
+        "request-long-poll",
+        r#"{"ops":[{"op":"request","ticket":50,"target":"feed \"home\"","scope":null,"nativeHttp":"independent","maxResponseBytes":4096,"method":"GET","url":"https://api.example/changes?since=0","headers":[],"body":"","cache":"default","stream":true,"longPoll":{"cursor":"since","from":"meta.seq","sameCursorEvent":false}}],"timers":false,"clock":0,"error":null}"#,
+    ),
+    (
         "request-continue",
         r#"{"ops":[{"op":"continue","ticket":43,"token":9007199254740993}],"timers":false,"clock":0,"error":null}"#,
     ),
@@ -452,5 +484,76 @@ fn every_op_writes_the_json_it_always_wrote() {
     for ((name, text), (golden_name, golden)) in cases.iter().zip(GOLDEN) {
         assert_eq!(name, golden_name);
         assert_eq!(text, golden, "{name}");
+    }
+}
+
+/// LLP 1016.000 D8 on the web page: a long poll attached to work that is no
+/// HTTP request is refused in the batch, before `emit_request` dispatches any
+/// continuation, auth or storage work (host.rs `emit_request`, first line).
+#[test]
+fn a_long_poll_on_other_work_is_refused_before_dispatch() {
+    for request in [
+        Request::continuation(7).long_poll("since", "seq"),
+        Request::storage(b"{}".to_vec()).long_poll("since", "seq"),
+        Request::native(b"x".to_vec()).long_poll("since", "seq"),
+    ] {
+        let why = crate::batch::request_refusal(&request);
+        assert!(
+            why.is_some_and(|w| w.starts_with("exactLongPoll")),
+            "{why:?}"
+        );
+    }
+}
+
+/// LLP 1016.000 D10 on the web page: an upload's op says so (the page sends
+/// it with XMLHttpRequest, http-body.js `upload`), and the batch refuses, in
+/// the words of the native hosts, an upload they refuse.
+#[test]
+fn an_upload_is_marked_and_refused_where_the_native_hosts_refuse_it() {
+    let mut upload = Request::get("https://api.example/upload")
+        .independent_http(4096)
+        .upload_progress();
+    upload.method = "POST".into();
+    upload.body = vec![7; 3];
+    let exact_runner::Answer::Later(upload) = exact_runner::Answer::stream(upload) else {
+        unreachable!()
+    };
+    let text = one(|b| b.request(&request(1, upload.clone(), false)));
+    assert!(text.contains(r#","stream":true,"upload":true"#), "{text}");
+    let mut get = upload.clone();
+    get.method = "GET".into();
+    let mut manual = upload.clone();
+    manual.redirect = exact_runner::Redirect::Manual;
+    let mut socket = upload.clone();
+    socket.url = "wss://api.example/upload".into();
+    let mut native = upload.clone();
+    native.url = "exact-native:".into();
+    let mut plain = upload.clone();
+    plain.stream = false;
+    for (refused, why) in [
+        (
+            get,
+            "exactUploadProgress: a GET or HEAD request sends no body",
+        ),
+        (
+            manual,
+            "exactUploadProgress: an upload follows its redirects",
+        ),
+        (socket, "exactUploadProgress: a WebSocket sends no body"),
+        (
+            native,
+            "exactUploadProgress: an upload is an http: or https: request",
+        ),
+        (
+            plain,
+            "exactUploadProgress reports an upload's progress to its stream: give exactStream too",
+        ),
+    ] {
+        assert_eq!(crate::batch::request_refusal(&refused), Some(why));
+        let text = one(|b| b.request(&request(2, refused, false)));
+        assert!(
+            text.contains(r#""op":"refuse""#) && !text.contains("\"upload\""),
+            "{text}"
+        );
     }
 }

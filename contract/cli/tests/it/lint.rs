@@ -25,6 +25,261 @@ fn an_old_spelling_is_refused_with_the_css_name() {
     assert!(e.message.contains("`aria-label`"), "{e}");
 }
 
+/// A state part on an element (LLP 1121 D8, `:hover` then its rows) is linted
+/// as lowering folds it: a row its state takes passes, checked as the row it
+/// lowers to (`:active`'s colour as the press's, which inherits nothing); a
+/// row it takes none of, or a name that is no row, is refused (Excord's
+/// emoji button, f8b012ef1e).
+#[test]
+fn an_elements_state_part_is_linted_as_lowering_folds_it() {
+    let src = |state: &str, row: &str| {
+        format!("component A\n  state n = 0\n  action go\n    n = 1\n  view\n    button appearance=\"none\" press=go aria-label=\"Go\" opacity=0.6\n      :{state}\n        {row}\n      text \"a\"\n")
+    };
+    let lint = |state: &str, row: &str| {
+        contract_lower::lint(&contract_syntax::parse(&src(state, row)).unwrap())
+            .iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>()
+    };
+    for (state, row) in [
+        ("hover", "opacity=1"),
+        ("hover", "opacity = 1"),
+        ("active", "opacity=0.5"),
+        ("active", "color=\"#000000\""),
+    ] {
+        assert!(
+            lint(state, row).is_empty(),
+            "{state} {row}: {:?}",
+            lint(state, row)
+        );
+        contract::compile(&src(state, row)).unwrap_or_else(|e| panic!("{state} {row}: {e}"));
+    }
+    // A prop put in before the fold: a row that reads one is the fold's to judge, not the lint's (Astra's re-check).
+    let param = "component App\n  view\n    Dim(level=0.8)\ncomponent Dim\n  props\n    level: number\n  view\n    column opacity=0.6\n      :hover\n        opacity=level\n      text \"a\"\n";
+    let found = contract_lower::lint(&contract_syntax::parse(param).unwrap());
+    assert!(found.is_empty(), "{found:?}");
+    contract::compile(param).unwrap_or_else(|e| panic!("{e}"));
+    for (state, row, id) in [
+        ("hover", "opacty=1", "lower-state-row"),
+        ("hover", "width=10", "lower-state-row"),
+        ("hover", "color=\"#000000\"", "lower-state-row"),
+        ("active", "-exact-press-opacity-to=0.5", "lower-state-row"),
+        ("active", "color=\"inherit\"", "lower-attr-value"),
+    ] {
+        let found = lint(state, row);
+        assert_eq!(found.first().copied(), Some(id), "{state} {row}: {found:?}");
+        assert!(
+            contract::compile(&src(state, row)).is_err(),
+            "{state} {row} compiles"
+        );
+    }
+}
+
+/// The lint runs on the unexpanded file when an earlier pass refuses. A
+/// shorthand arm that is a child's prop is lowering's to judge once
+/// expansion puts the caller's value in; the lint judges the other arms, a
+/// derive by its body, and `font`'s type tokens across them as lowering does.
+#[test]
+fn a_shorthand_read_from_a_name_is_left_to_lowering() {
+    let src = |extra: &str| {
+        format!(
+            "component App\n  state kind = \"heading\"\n  view\n    column\n      Runs(kind=kind)\n{extra}\
+             component Runs\n  props\n    kind: string\n  derive face = kind == \"heading\" ? \"-exact-title2\" : \"-exact-body\"\n  view\n    \
+             Run(face=face, edge=\"1px solid red\")\n\
+             component Run\n  props\n    face: string\n    edge: string\n  derive own = face == \"-exact-body\" ? \"-exact-footnote\" : \"-exact-body\"\n  view\n    \
+             text \"a\" font=face border=edge\n    text \"b\" font=own\n    text \"c\" font=(WHICH ? \"-exact-caption1\" : \"-exact-caption2\")\n    \
+             text \"d\" font=(WHICH ? \"-exact-body\" : \"twelve\")\n    text \"e\" border=`${{edge}} red`\n"
+        )
+        .replace("WHICH", "face == \"x\"")
+    };
+    let lint = |source: &str| {
+        contract_lower::lint(&contract_syntax::parse(source).unwrap())
+            .into_iter()
+            .map(|e| (e.id, e.span.line))
+            .collect::<Vec<_>>()
+    };
+    // Only the literal that is no shorthand, and the computed string, which
+    // no expansion makes literal.
+    let refused = [("lower-css-shorthand", 21), ("lower-css-shorthand", 22)];
+    assert_eq!(lint(&src("")), refused);
+    // With an unrelated type error: that error and the same two.
+    let found = compile_all("shorthand-name", &src("      text missingName\n"));
+    let ids: Vec<(&str, u32)> = found
+        .iter()
+        .map(|(id, line, _)| (id.as_str(), *line))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            ("type-unknown-name", 6),
+            ("lower-css-shorthand", 22),
+            ("lower-css-shorthand", 23)
+        ],
+        "{found:#?}"
+    );
+    // Without the two, it compiles.
+    let fine = src("")
+        .replace(
+            "    text \"d\" font=(face == \"x\" ? \"-exact-body\" : \"twelve\")\n",
+            "",
+        )
+        .replace("    text \"e\" border=`${edge} red`\n", "");
+    contract::compile(&fine).unwrap_or_else(|e| panic!("{e}"));
+    // Type tokens across the known arms, a prop's arm left out and a
+    // derive's body in its place.
+    let design =
+        "tamber t\n\ntheme\n  type.a = 700 1rem Georgia\n  type.b: type = 1rem\n  space.md = 8px\n";
+    let lint_designed = |view: &str| {
+        let source = format!(
+            "component App\n  view\n    Run(face=\"type.a\", on=true)\ncomponent Run\n  props\n    face: string\n    on: bool\n  state title = \"-exact-body\"\n  derive good = on ? face : \"-exact-body\"\n  derive bad = on ? \"twelve\" : good\n  view\n    {view}\n"
+        );
+        let mut file = contract_syntax::parse(&source).unwrap();
+        file.design = Some(contract_syntax::DesignSource {
+            path: "app.tamber".into(),
+            home: "app.tamber".into(),
+            text: design.into(),
+            source_id: 1,
+            bindable: false,
+            package: None,
+            root: None,
+        });
+        contract_lower::lint(&file)
+            .into_iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>()
+    };
+    let font = |value: &str| format!("text \"x\" font={value}");
+    for (view, refused) in [
+        (font("(on ? face : \"type.a\")"), None),
+        (font("good"), None),
+        (font("bad"), Some("lower-css-shorthand")),
+        // A name no expansion replaces (a state's, a binder's, though it
+        // shadows a prop) is no literal at any stage.
+        (
+            font("(on ? \"-exact-body\" : title)"),
+            Some("lower-css-shorthand"),
+        ),
+        (
+            font("(match pick { case some(face) => face, case none => \"-exact-body\" })"),
+            Some("lower-css-shorthand"),
+        ),
+        (
+            format!("for face in faces key=face\n      {}", font("face")),
+            Some("lower-css-shorthand"),
+        ),
+        (
+            font("(on ? \"type.a\" : \"type.b\")"),
+            Some("tamber-type-longhands"),
+        ),
+        (
+            font("(on ? \"type.a\" : \"bold 12px serif\")"),
+            Some("tamber-kind"),
+        ),
+        (
+            font("(on ? \"-exact-body\" : \"space.md\")"),
+            Some("lower-css-shorthand"),
+        ),
+    ] {
+        assert_eq!(lint_designed(&view), Vec::from_iter(refused), "{view}");
+    }
+    // A chain of derives each reading the last twice is read within a budget,
+    // and a derive read in its own body is the type pass's to refuse.
+    let chain: String = (1..40)
+        .map(|i| format!("  derive d{i} = on ? d{} : d{}\n", i - 1, i - 1))
+        .collect();
+    let source = format!(
+        "component App\n  view\n    Run(on=true)\ncomponent Run\n  props\n    on: bool\n  derive d0 = on ? \"-exact-body\" : d0\n{chain}  view\n    text \"x\" font=d39\n"
+    );
+    let found = contract_lower::lint(&contract_syntax::parse(&source).unwrap());
+    assert!(found.is_empty(), "{found:?}");
+    // A platform token written unquoted reads as a minus and a name: said so.
+    let unknown = |value: &str| {
+        contract::compile(&format!(
+            "component A\n  view\n    text \"a\" color={value}\n"
+        ))
+        .unwrap_err()
+    };
+    let e = unknown("-exact-label");
+    assert_eq!(e.id, "type-unknown-name");
+    assert!(e.message.contains("write `\"-exact-label\"`"), "{e}");
+    // From the minus through the name.
+    assert_eq!((e.span.col, e.span.end_col), (20, 32), "{e:?}");
+    // Not where a shorter name is in scope: a subtraction missing its spaces.
+    let e = contract::compile(
+        "component A\n  state exact-a = 1\n  view\n    text \"a\" opacity=-exact-a-exact-b\n",
+    )
+    .unwrap_err();
+    assert!(e.message.contains("subtraction"), "{e}");
+}
+
+/// What a React Native port writes first is refused with what to write
+/// (the euxy port, 2026-10-17: 19 of 50 compiles refused).
+#[test]
+fn a_react_native_habit_is_refused_with_what_to_write() {
+    for (line, id, needle) in [
+        (
+            "text \"a\" numberOfLines=2",
+            "lower-unknown-attr",
+            "`line-clamp`",
+        ),
+        (
+            "text \"a\" ellipsizeMode=\"tail\"",
+            "lower-unknown-attr",
+            "`text-overflow`",
+        ),
+        (
+            "image \"a.png\" resizeMode=\"cover\"",
+            "lower-unknown-attr",
+            "`object-fit`",
+        ),
+        (
+            "text \"a\" textTransform=\"uppercase\"",
+            "lower-unknown-attr",
+            "`text-transform`",
+        ),
+        (
+            "view paddingHorizontal=16",
+            "lower-unknown-attr",
+            "`padding-left` and `padding-right`",
+        ),
+        (
+            "view marginVertical=8",
+            "lower-unknown-attr",
+            "`margin-top` and `margin-bottom`",
+        ),
+        ("view shadowRadius=4", "lower-unknown-attr", "`box-shadow="),
+        ("view elevation=4", "lower-attr-tag", "`box-shadow="),
+        (
+            "text \"a\" selectable=true",
+            "lower-unknown-attr",
+            "`user-select=\"text\"`",
+        ),
+        (
+            "text \"a\" font-weight=\"bold\"",
+            "lower-attr-value",
+            "write `font-weight=700`",
+        ),
+        (
+            "text \"a\" font-weight=\"normal\"",
+            "lower-attr-value",
+            "write `font-weight=400`",
+        ),
+    ] {
+        let src = format!("component A\n  view\n    column\n      {line}\n");
+        let e = contract::compile(&src).unwrap_err();
+        assert_eq!(e.id, id, "{line}: {e}");
+        assert!(e.message.contains(needle), "{line}: {e}");
+    }
+    // A keyframe's unit needs quotes, as an element's does; and a keyframe is one line.
+    let src = "keyframes W\n  from rotate=-2deg\n  to rotate=2deg\ncomponent A\n  view\n    text \"a\" animation=\"W 1s\"\n";
+    let e = contract::compile(src).unwrap_err();
+    assert_eq!(e.id, "syntax-unquoted-length", "{e}");
+    assert!(e.message.contains("`rotate=\"-2deg\"`"), "{e}");
+    let src = "keyframes W\n  from\n    opacity=0\ncomponent A\n  view\n    text \"a\" animation=\"W 1s\"\n";
+    let e = contract::compile(src).unwrap_err();
+    assert!(e.message.contains("a keyframe is one line"), "{e}");
+}
+
 #[test]
 fn a_literal_value_is_checked_against_its_row_at_compile_time() {
     for (src, id, needle) in [
@@ -441,6 +696,193 @@ fn number_only_style_choices_accept_valid_css_wide_keywords() {
     }
 }
 
+/// The `style=` hint's suggestion is read back as a node's attributes and
+/// compiled: what it suggests must compile (the euxy port, review round 2).
+#[test]
+fn the_style_hint_suggests_only_what_compiles() {
+    let hint = |style: &str| {
+        let src = format!("component A\n  view\n    text \"a\" style={style:?}\n");
+        let e = contract::compile(&src).expect_err("`style=` is refused");
+        let message = e.to_string();
+        assert!(message.contains("has no attribute `style`"), "{message}");
+        message
+    };
+    let compiles = |node: &str| {
+        let src = format!("style Title\n  font-weight=600\n\ncomponent A\n  view\n    {node}\n");
+        contract::compile(&src).unwrap_or_else(|e| panic!("{node}: {e}"));
+    };
+    let suggested = |message: &str, lead: &str| -> String {
+        let at = message
+            .find(lead)
+            .unwrap_or_else(|| panic!("{lead:?} in {message}"))
+            + lead.len();
+        message[at..].split('`').next().unwrap().to_string()
+    };
+    for (style, attrs) in [
+        // Split at `;` outside quotes and parentheses (a string attribute
+        // keeps CSS's quotes, as a quoted family name does).
+        (
+            "font-family: \"Helvetica Neue\", Arial; color: red",
+            "font-family=\"\\\"Helvetica Neue\\\", Arial\" color=\"red\"",
+        ),
+        (
+            "aria-label: \"Save; later\"; color: red",
+            "aria-label=\"\\\"Save; later\\\"\" color=\"red\"",
+        ),
+        (
+            "aria-label: f(a; b); width: calc(100% - 16px)",
+            "aria-label=\"f(a; b)\" width=\"calc(100% - 16px)\"",
+        ),
+        // `!important` is dropped from a property written once.
+        (
+            "color: red !important; padding: 8px ! important",
+            "color=\"red\" padding=\"8px\"",
+        ),
+        (
+            "font-size: 14px; font-weight: 600; line-height: 1.4",
+            "font-size=\"14px\" font-weight=600 line-height=1.4",
+        ),
+        // String shorthands keep quotes even when their CSS value is a number.
+        ("border: 0", "border=\"0\""),
+        ("border-top: 0", "border-top=\"0\""),
+        ("border-right: 0", "border-right=\"0\""),
+        ("border-bottom: 0", "border-bottom=\"0\""),
+        ("border-left: 0", "border-left=\"0\""),
+        ("columns: 2", "columns=\"2\""),
+        ("columns: 1", "columns=\"1\""),
+        ("columns: 65535", "columns=\"65535\""),
+        ("columns: 02", "columns=\"02\""),
+        ("columns: 12px", "columns=\"12px\""),
+        ("column-rule: 0", "column-rule=\"0\""),
+        (
+            "column-count: 2; column-rule-width: 0; padding: 8",
+            "column-count=2 column-rule-width=0 padding=8",
+        ),
+        // A custom property is not an attribute; the others are.
+        ("--gap: 8px; padding: 8px", "padding=\"8px\""),
+        // A plain number is unquoted, as the lexer wants it.
+        (
+            "-exact-press-scale: 0.97; opacity: 0.5; flex: 1; color: red",
+            "-exact-press-scale=0.97 opacity=0.5 flex=1 color=\"red\"",
+        ),
+    ] {
+        let message = hint(style);
+        assert_eq!(
+            suggested(&message, "write the declarations as attributes, `"),
+            attrs,
+            "{style}: {message}"
+        );
+        compiles(&format!("text \"a\" {attrs}"));
+    }
+    let message = hint("Title");
+    assert_eq!(suggested(&message, "write `"), "class=Title");
+    compiles("text \"a\" class=Title");
+    // No rewrite for properties that may overlap, which CSS resolves by
+    // importance and order and attributes do not: one written twice, a
+    // shorthand beside a longhand of its own, by prefix or by family.
+    for style in [
+        "padding: 8px !important; padding: 0",
+        "padding: 8px; padding: 0",
+        "padding-left: 16px !important; padding: 0",
+        "flex-direction: column; flex: 1 !important",
+        "border-top: 1px solid red; border-top-left-radius: 8px",
+        "border-radius: 8px; border-top-left-radius: 0",
+        "font: 14px Inter; line-height: 1.4",
+        "top: 4px; inset: 0",
+        "row-gap: 4px; gap: 8px",
+    ] {
+        let message = hint(style);
+        assert!(!message.contains("write "), "{style}: {message}");
+        assert!(
+            message.contains("a look nodes share is a `style Name` block"),
+            "{style}: {message}"
+        );
+    }
+    // Nothing to suggest: a custom property alone, a name with a quote or
+    // brace, a reserved word.
+    for style in [
+        "--gap: 8px",
+        "a\"b: 1",
+        "a{b}: 1",
+        "none",
+        "if",
+        "true",
+        "8px",
+    ] {
+        let message = hint(style);
+        assert!(!message.contains("write "), "{style}: {message}");
+        assert!(
+            message.contains("a look nodes share is a `style Name` block"),
+            "{style}: {message}"
+        );
+    }
+}
+
+#[test]
+fn the_style_hint_keeps_importance_for_properties_with_shared_rows() {
+    for (a, b) in [
+        ("border-color: red", "border-bottom-color: blue"),
+        ("border-width: 2px", "border-top: 1px solid red"),
+        ("border-top: 1px solid red", "border-color: blue"),
+        ("animation: pulse 1s", "animation-duration: 2s"),
+        ("animation-duration: 1s", "animation-duration: 2s"),
+    ] {
+        for (first, last) in [(a, b), (b, a)] {
+            let style = format!("{first} !important; {last}");
+            let src = format!("component A\n  view\n    text \"a\" style={style:?}\n");
+            let e = contract::compile(&src).unwrap_err();
+            assert_eq!(e.id, "lower-unknown-attr");
+            assert!(!e.message.contains("write "), "{style}: {e}");
+            assert!(e
+                .message
+                .contains("a look nodes share is a `style Name` block"));
+        }
+    }
+    // Distinct animation longhands compose into parts of one row without competing.
+    let app = |attrs: &str| {
+        format!("keyframes pulse\n  to opacity=0\ncomponent A\n  view\n    text \"a\" {attrs}\n")
+    };
+    let longhands: Vec<_> = exact_motion::animation::LONGHANDS
+        .into_iter()
+        .zip([
+            "pulse", "1s", "linear", "0s", "infinite", "reverse", "both", "paused",
+        ])
+        .collect();
+    for (i, a) in longhands.iter().enumerate() {
+        for b in &longhands[i + 1..] {
+            for ((first, x), (last, y)) in [(a, b), (b, a)] {
+                for importance in ["", " !important"] {
+                    let style = format!("{first}: {x}{importance}; {last}: {y}");
+                    let e = contract::compile(&app(&format!("style={style:?}"))).unwrap_err();
+                    let attrs = format!("{first}=\"{x}\" {last}=\"{y}\"");
+                    assert!(
+                        e.message
+                            .contains(&format!("write the declarations as attributes, `{attrs}`")),
+                        "{style}: {e}"
+                    );
+                    contract::compile(&app(&attrs)).unwrap_or_else(|e| panic!("{attrs}: {e}"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_style_hint_does_not_turn_invalid_column_counts_into_widths() {
+    let app = |attrs: &str| format!("component A\n  view\n    text \"a\" {attrs}\n");
+    for value in ["2.0", "2.5", "2.", "0.5", "0", "65536"] {
+        let style = format!("columns: {value}");
+        let e = contract::compile(&app(&format!("style={style:?}"))).unwrap_err();
+        let attrs = format!("columns={value}");
+        assert!(
+            e.message
+                .contains(&format!("write the declarations as attributes, `{attrs}`")),
+            "{style}: {e}"
+        );
+        contract::compile(&app(&attrs)).expect_err("invalid counts must remain refused");
+    }
+}
+
 #[test]
 fn refusals_name_what_the_author_wrote_and_suggest_one_repair() {
     let app = |state: &str, node: &str| {
@@ -467,6 +909,9 @@ fn refusals_name_what_the_author_wrote_and_suggest_one_repair() {
         (app("", "text \"a\" font-size=\"-2px\""), "lower-attr-value", "`font-size=\"-2px\"` is not a valid `font-size`: expected a nonnegative length"),
         (app("", "text \"a\" width=10px"), "syntax-unquoted-length", "`width=10px` needs quotes: a value with a unit is a string, `width=\"10px\"` (a bare number is pixels)"),
         (app("", "text \"a\" className=\"x\""), "lower-unknown-attr", "`text` has no attribute `className`; `class` names a `style` declared in this file, as in `class=Card`"),
+        // The euxy port's `style=`: the word is `class=`, or the declarations are attributes.
+        (app("", "text \"a\" style=\"title\""), "lower-unknown-attr", "`text` has no attribute `style`; write `class=title`: a look nodes share is a `style Name` block in the file, named with `class=Name`, and a node's own look is its attributes"),
+        (app("", "text \"a\" style=\"padding: 8px; color: red;\""), "lower-unknown-attr", "`text` has no attribute `style`; write the declarations as attributes, `padding=\"8px\" color=\"red\"`: a node's look is its attributes, and a look nodes share is a `style Name` block in the file, named with `class=Name`"),
         (
             app("  state n = 0\n", "text n"),
             "lower-attr-type",
@@ -477,6 +922,12 @@ fn refusals_name_what_the_author_wrote_and_suggest_one_repair() {
             "syntax-expected-newline",
             "expected end of line, found `=`; `==` compares, and only a statement assigns",
         ),
+        // The euxy port's `after(0, …)`: 0 would be due in the commit that armed it.
+        (
+            app("  task t mount\n    after(0, tick)\n  action tick\n    draft = \"x\"\n", "text draft"),
+            "lower-timer-interval",
+            "`after` needs a whole number of milliseconds, at least 1; given 0: write `after(1, …)`, the soonest, which runs a commit after the one that armed it, as the web's `setTimeout(f, 0)` runs after the current task",
+        ),
         (
             app("", "button press={add}"),
             "syntax-expected-expression",
@@ -484,7 +935,7 @@ fn refusals_name_what_the_author_wrote_and_suggest_one_repair() {
         ),
         // The app farm's guesses (round 1): a tag, a count, a placeholder.
         (app("", "heading \"T\""), "lower-unknown-tag", "unknown tag `heading`; a heading is `h1` (to `h6` for the level)"),
-        (app("", "table"), "lower-unknown-tag", "unknown tag `table`; a table or grid is `view display=\"grid\"` with `grid-template-columns`, or a `column` of `row`s"),
+        (app("", "grid"), "lower-unknown-tag", "unknown tag `grid`; a grid is `view display=\"grid\"` with `grid-template-columns`, or a `column` of `row`s"),
         (app("  state xs = [1]\n", "text count(xs).toString()"), "type-refused-idiom", "write `x.length`, of text or of a list"),
         (app("  state xs = [1]\n", "text xs.size.toString()"), "type-not-a-record", "`number[]` has no fields: write `x.length`, of text or of a list"),
         (
@@ -500,6 +951,58 @@ fn refusals_name_what_the_author_wrote_and_suggest_one_repair() {
     ] {
         let e = contract::compile(&src).unwrap_err();
         assert_eq!((e.id.as_str(), e.message.as_str()), (id, message), "{src}");
+    }
+}
+
+/// A prop written with a default (the euxy port's) is told props have none,
+/// and the `option` form the refusal names compiles.
+#[test]
+fn a_prop_default_is_refused_naming_the_option_form() {
+    let app = |props: &str, read: &str, pass: &str| {
+        format!("component A\n  view\n    Toggle({pass})\ncomponent Toggle\n  props\n    {props}\n  view\n    button \"x\" disabled={read}\n")
+    };
+    let e =
+        contract::compile(&app("disabled: bool = false", "disabled", "disabled=true")).unwrap_err();
+    assert_eq!(
+        (e.id.as_str(), e.message.as_str()),
+        ("syntax-expected-newline", "a prop has no default: pass `disabled=<value>` at every use, or declare `disabled: option<bool>`, pass `disabled=none` where it is unset, and read it as `match disabled { case some(v) => v, case none => <default> }`"),
+    );
+    contract::compile(&app(
+        "disabled: option<bool>",
+        "(match disabled { case some(v) => v, case none => false })",
+        "disabled=none",
+    ))
+    .unwrap();
+    // The other form it names, `disabled=<value>` with a value, compiles too.
+    contract::compile(&app("disabled: bool", "disabled", "disabled=true")).unwrap();
+}
+
+/// `style=`'s declarations come back as attributes that compile: a quote, a
+/// backslash or another control character in a value escaped as a string
+/// literal takes it, and a run of whitespace (a newline) one space, as CSS
+/// reads it.
+#[test]
+fn style_declarations_are_suggested_as_attributes_that_compile() {
+    let app = |attrs: &str| format!("component A\n  view\n    text \"a\" {attrs}\n");
+    for (written, suggested) in [
+        (
+            r#"style="font-family: \"Times New Roman\", serif; color: red""#,
+            r#"font-family="\"Times New Roman\", serif" color="red""#,
+        ),
+        (
+            r#"style="padding: 8px\n 16px;\tmargin:\u{d}\n4px""#,
+            r#"padding="8px 16px" margin="4px""#,
+        ),
+        (r#"style="aria-label: a\u{1}b""#, r#"aria-label="a\u{1}b""#),
+    ] {
+        let e = contract::compile(&app(written)).unwrap_err();
+        let edit = e
+            .message
+            .split('`')
+            .nth(5)
+            .unwrap_or_else(|| panic!("{}", e.message));
+        assert_eq!(edit, suggested, "{written}");
+        contract::compile(&app(edit)).unwrap_or_else(|e| panic!("{edit}: {e}"));
     }
 }
 
@@ -520,9 +1023,12 @@ fn the_element_lint_finds_nothing_in_any_app() {
                 .ok()
                 .map(|text| contract_syntax::DesignSource {
                     path: design.display().to_string(),
+                    home: "app.tamber".into(),
                     text,
                     source_id: 1,
                     bindable: false,
+                    package: None,
+                    root: None,
                 });
         let found = contract_lower::lint(&file);
         assert!(found.is_empty(), "{}: {found:?}", path.display());
@@ -545,6 +1051,48 @@ fn compile_all(name: &str, source: &str) -> Vec<(String, u32, String)> {
         .into_iter()
         .map(|e| (e.id, e.span.line, e.message))
         .collect()
+}
+
+#[test]
+fn focus_state_lint_keeps_an_independent_analyze_error() {
+    let source = r##"component App
+  mutation saved as shape string
+  action go
+    send saved = command("one")
+  view
+    button press=go background-color="#fcfcfc" border-width=1 border-style="solid" border-color="#e4e4e7"
+      :focus-visible
+        box-shadow="inset 0 0 0 2px light-dark(#1b4ed8b3, #346bf1b3)"
+      text "Open"
+"##;
+    contract::compile(source).unwrap_or_else(|e| panic!("{e}"));
+    let broken = source.replace(
+        "    send saved = command(\"one\")",
+        "    send saved = command(\"one\")\n    send saved = command(\"two\")",
+    );
+    let errors = compile_all("focus-analyze", &broken);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].0, "analyze-send-twice", "{errors:?}");
+    let invalid = broken.replace(
+        "inset 0 0 0 2px light-dark(#1b4ed8b3, #346bf1b3)",
+        "invalid",
+    );
+    let errors = compile_all("focus-value", &invalid);
+    assert_eq!(
+        errors
+            .iter()
+            .map(|e| (e.0.as_str(), e.1))
+            .collect::<Vec<_>>(),
+        [("analyze-send-twice", 5), ("lower-attr-value", 9)],
+        "{errors:?}"
+    );
+    let error = contract::compile(&source.replace(":focus-visible", ":active")).unwrap_err();
+    assert_eq!(error.id, "lower-state-row", "{error}");
+    let native = source
+        .replace("button press=go background-color=\"#fcfcfc\" border-width=1 border-style=\"solid\" border-color=\"#e4e4e7\"", "input type=\"checkbox\" checked=true")
+        .replace("      text \"Open\"\n", "");
+    let error = contract::compile(&native).unwrap_err();
+    assert_eq!(error.id, "lower-state-target", "{error}");
 }
 
 const TODOS: &str = r#"shape Todo
@@ -631,6 +1179,54 @@ fn one_run_reports_every_independent_mistake_call_sites_first() {
             .collect::<String>()
     );
     assert_eq!(compile_all("cap", &many).len(), contract::MAX_DIAGNOSTICS);
+}
+
+/// A refused member is skipped and the passes after the syntax check the
+/// rest; what they say about a refused name is left out, since it may only
+/// be that the name is missing.
+#[test]
+fn a_refused_member_does_not_hide_the_other_passes_refusals() {
+    let source = "component App\n  state n = 0\n  action pick\n    match none\n      case some(r) => n = r\n      case none => n = 0\n  action bump\n    n = n + \"x\"\n  view\n    button \"go\" press=pick color=missingName\n";
+    let found = compile_all("member", source);
+    let ids: Vec<(&str, u32)> = found
+        .iter()
+        .map(|(id, line, _)| (id.as_str(), *line))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            ("syntax-case-arrow", 5),
+            ("type-operand", 8),
+            ("type-unknown-name", 10)
+        ],
+        "{found:#?}"
+    );
+    assert!(
+        found[0].2.contains("end the line at `case some(r)`"),
+        "{}",
+        found[0].2
+    );
+    // A refused member's name is still its own: a call of it is no method's free form.
+    let named = "component App\n  state n = \"\"\n  action trim(s: string)\n    n =\n  view\n    button \"go\" press=trim(\"x\")\n";
+    let ids: Vec<String> = compile_all("named", named)
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(ids, ["syntax-expected-expression"]);
+    // A state only a refused action wrote cannot be inferred now: that is not said.
+    let written = "component App\n  state selected = none\n  action pick\n    selected = some(1) +\n  view\n    button \"go\" press=pick color=missingName\n";
+    let ids: Vec<String> = compile_all("written", written)
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(ids, ["syntax-expected-expression", "type-unknown-name"]);
+    // A refused first component would make another the app: nothing else is checked.
+    let first = "component App\n  props\n    x number\n  view\n    Card()\ncomponent Card\n  view\n    text \"a\" color=missingName\n";
+    let ids: Vec<String> = compile_all("first", first)
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(ids, ["syntax-expected"]);
 }
 
 #[test]

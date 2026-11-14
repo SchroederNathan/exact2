@@ -9,11 +9,14 @@ use crate::cull::{
 impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
     /// Resolve this frame's draw groups (one per batch and winding) and upload a
     /// new setup only when they or the retained structure changed.
+    /// `hooked`: render hooks draw in the frame, which may read the sun's
+    /// shadows anywhere, as a custom material's shader may.
     pub(super) fn prepare_cull(
         &mut self,
         frame: &FrameInput<'_>,
         cascades: Option<&Cascades>,
         custom: &[crate::hooks::CustomMaterial],
+        hooked: bool,
         size: (u32, u32),
     ) {
         self.cull_groups(frame, cascades.map_or(0, |c| c.count), custom);
@@ -81,7 +84,8 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 .filter(|_| self.occluding)
                 .and_then(|o| o.pyramid()),
         );
-        if self.culled_key.0 != self.cull.compacted.raw || self.culled_key.1 != self.cull.window {
+        if self.culled_key.0 != self.cull.compacted.raw || self.culled_key.1 != self.cull.binding()
+        {
             self.rebind_culled();
         }
         let mut views = [frame.proj * frame.view; 1 + crate::shadows::MAX_CASCADES];
@@ -89,9 +93,22 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         if let Some(c) = cascades {
             views[1..1 + count].copy_from_slice(&c.matrices[..count]);
         }
+        // Only the engine's own receivers keep a cascade's casters within its
+        // outline: each shades on its pixel's ray, in its cascade's slice. Not
+        // quite under MSAA, which shades a pixel whose centre a triangle misses
+        // at the centre: a sliver's position there, extrapolated from snapped
+        // vertices, can lie off the ray and outside the slice, and read a
+        // texel only a culled caster wrote. Such samples are shaded off their
+        // triangle already; the owner accepts that they, and what bloom then
+        // spreads from them, may differ.
+        let outlines = cascades.filter(|_| custom.is_empty() && !hooked).map_or(
+            [[crate::shadows::PASS_ALL; 6]; crate::shadows::MAX_CASCADES],
+            |c| c.outlines,
+        );
         self.cull.write_views(
             &self.queue,
             &views[..1 + count],
+            &outlines,
             self.slot_list.len() as u32,
             self.occluding,
         );
@@ -107,7 +124,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         let casters = ((1u32 << cascades) - 1) << 1;
         let mut groups = std::mem::take(&mut self.cull.groups);
         groups.clear();
-        self.viewmodels = false;
+        self.viewmodels = self.quads.order.iter().any(|o| o.viewmodel);
         for (index, batch) in self.batches.iter().enumerate() {
             if batch.slots.is_empty() {
                 continue;
@@ -161,7 +178,12 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             chunk += head[3];
             let flags = group.flags
                 | if mesh.capsule { CAPSULE } else { 0 }
-                | if mesh.plain { PLAIN } else { 0 };
+                | if mesh.plain { PLAIN } else { 0 }
+                | if mesh.outline.is_some() {
+                    crate::cull::OUTLINE
+                } else {
+                    0
+                };
             let histogram = if head[3] >= SORTED_CHUNKS {
                 self.cull.sorted += 1;
                 self.cull.sorted - 1
@@ -178,8 +200,14 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 mesh.base_vertex as u32,
                 flags,
                 self.cull.region(index),
-                mesh.reach.x.to_bits(),
-                mesh.reach.y.to_bits(),
+                mesh.outline
+                    .as_ref()
+                    .map_or(mesh.reach.x, |h| h.width)
+                    .to_bits(),
+                mesh.outline
+                    .as_ref()
+                    .map_or(mesh.reach.y, |h| h.min_pixels)
+                    .to_bits(),
                 mesh.reach.z.to_bits(),
                 mesh.cap.to_bits(),
                 histogram,
@@ -212,7 +240,22 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                     skin,
                     // Not this frame's level of detail: drawn in no view.
                     u32::from(self.levels.hidden.get(index).copied().unwrap_or(false)),
-                    0,
+                    mesh.outline
+                        .as_ref()
+                        .map_or(0., |h| {
+                            if record.skin.is_some() {
+                                h.reach
+                            } else {
+                                h.reach
+                                    * glam::Mat3::from_mat4(record.local)
+                                        .to_cols_array()
+                                        .iter()
+                                        .map(|x| x * x)
+                                        .sum::<f32>()
+                                        .sqrt()
+                            }
+                        })
+                        .to_bits(),
                     center.x.to_bits(),
                     center.y.to_bits(),
                     center.z.to_bits(),

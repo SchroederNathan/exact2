@@ -18,6 +18,7 @@ import { jsTargetBuild } from '../serve.mjs';
 import { need, notApplicable } from '../../../scripts/coverage.mjs';
 
 const ROOT = resolve(new URL('../../..', import.meta.url).pathname);
+const compiler = resolve(process.env.CARGO_TARGET_DIR ?? resolve(ROOT, 'target'), 'debug', process.platform === 'win32' ? 'contract.exe' : 'contract');
 const app = resolveApp('caltrain');
 const wasmDist = resolve(process.env.EXACT_WEB_DIST ?? resolve(ROOT, 'host/web/dist'));
 const jsDist = process.env.EXACT_WEB_JS_DIST ? resolve(process.env.EXACT_WEB_JS_DIST) : null;
@@ -42,7 +43,7 @@ function fixture() {
   if (plan) return plan;
   tmp = mkdtempSync(resolve(tmpdir(), 'exact-ax-'));
   plan = resolve(tmp, 'accessibility.plan');
-  const c = spawnSync('cargo', ['run', '-q', '-p', 'contract', '--', 'build', resolve(ROOT, 'contract/corpus/accessibility.contract'), '-o', plan], { cwd: ROOT, encoding: 'utf8' });
+  const c = spawnSync(compiler, ['build', resolve(ROOT, 'contract/corpus/accessibility.contract'), '-o', plan], { cwd: ROOT, encoding: 'utf8' });
   if (c.status !== 0) throw new Error('the accessibility fixture does not compile: ' + c.stderr);
   return plan;
 }
@@ -67,6 +68,11 @@ async function fixtureControls(s) {
   // Coverage: one element per unignored node Chrome reported, the dropped kinds aside.
   const { nodes } = await s.carrier.call('Accessibility.getFullAXTree');
   expect(r.ax.elements.length).toBe(nodes.filter(n => !n.ignored && !['InlineTextBox', 'RootWebArea'].includes(n.role?.value)).length);
+  const byId = new Map(nodes.map(n => [n.nodeId, n]));
+  const destinations = nodes.find(n => !n.ignored && n.role?.value === 'list' && n.name?.value === 'Destinations');
+  const rows = destinations.childIds.map(id => byId.get(id)).filter(n => !n.ignored);
+  expect(rows.map(n => n.role.value)).toEqual(['listitem', 'listitem', 'listitem']);
+  expect(rows.map(n => n.childIds.map(id => byId.get(id)).find(c => !c.ignored && c.role?.value === 'link')?.name.value)).toEqual(['Orchard', 'Harbor', 'Meadow']);
   // The decoration is aria-hidden, the inert box is inert: neither is exposed.
   for (const t of ['decoration', 'inert-box', 'inert-button']) expect(find(r, t)).toBeUndefined();
   // A focusable button inside an image role: present exactly when Chrome exposes it.

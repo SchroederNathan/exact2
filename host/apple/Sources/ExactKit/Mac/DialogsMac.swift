@@ -11,7 +11,7 @@ import AppKit
 final class DialogHost {
     private(set) weak var presenter: Presenter?
     final class Entry {
-        let dialog: NodeView
+        var dialog: NodeView
         weak var parent: NSView?
         weak var previous: NSView?
         let index: Int
@@ -23,6 +23,7 @@ final class DialogHost {
         /// A modal route in its sheet, not a `dialog`: what its sheet shows
         /// of its header, and the header's nodes hidden while it does.
         let route: Bool
+        var routeBase: NodeView?
         var header: SheetHeader?
         var stoodFor: [NodeView] = []
         init(_ dialog: NodeView, previous: NSView?, route: Bool = false) {
@@ -35,6 +36,7 @@ final class DialogHost {
         }
     }
     private(set) var entries: [Entry] = []
+    var onCancel: ((UInt32) -> Void)?
     /// Painted in the page, not AppKit's sheet: the driver's own chrome
     /// (`--chrome agent`), as it paints the header and the tablist. A test
     /// of the painted presentation says so.
@@ -58,6 +60,10 @@ final class DialogHost {
     /// its sheet; nil for any other node. A modal route's is navigation's.
     func authoredParent(of node: NodeView) -> NSView? { entries.first { $0.dialog === node && !$0.route }?.parent }
     func presentsRoute(_ node: NodeView) -> Bool { entries.contains { $0.dialog === node && $0.route } }
+    func isBehindModal(_ source: NSView) -> Bool {
+        guard let active else { return false }
+        return presenter?.menus.contains(active, source) != true
+    }
     func blocks(_ node: NSView) -> Bool {
         guard let active else { return false }
         // An alert over the dialog is the top modal: its rows are its own.
@@ -86,12 +92,15 @@ final class DialogHost {
     }
     /// What activating `source` does to a dialog once its own handler has
     /// run: the surviving button's invocation then (`Invocation`).
-    func command(_ source: NodeView, fromNativeMenu: Bool = false) -> (() -> Void)? {
-        guard !source.disabled, !source.inert, (fromNativeMenu || !source.isHiddenOrHasHiddenAncestor || presenter?.toolbar.contains(source) == true),
+    func command(_ source: NodeView, fromNativeMenu: Bool = false, bubbled: Bool = false) -> (() -> Void)? {
+        guard !source.disabled, !(bubbled ? source.authoredInert : source.inert), (fromNativeMenu || !source.isHiddenOrHasHiddenAncestor || presenter?.toolbar.contains(source) == true),
               source.isButton, dialogInvocation(source) != nil || source.handlers.contains("press") else { return nil }
         return { [weak self, weak source] in
-            guard let self, let source, self.live(source), !source.disabled, !source.inert,
-                  let invocation = self.dialogInvocation(source), self.live(invocation.target) else { return }
+            guard let self, let source else { return }
+            let bubbled = bubbled && self.isBehindModal(source)
+            guard self.live(source), !source.disabled, !(bubbled ? source.authoredInert : source.inert),
+                  let invocation = self.dialogInvocation(source), self.live(invocation.target),
+                  !bubbled || !invocation.target.inert else { return }
             if invocation.action == .showModal { self.show(invocation.target) }
             // HTML's `close` does nothing to a dialog showing as a popover.
             else if self.presenter?.menus.showsAsPopover(invocation.target) == false {
@@ -151,6 +160,7 @@ final class DialogHost {
     func close(_ dialog: NodeView, restoreFocus: Bool = true, notify: Bool = true) {
         if presenter?.alerts.close(dialog) == true { return }
         guard entries.contains(where: { $0.dialog === dialog }) else { return }
+        presenter?.mouseChain.bubbledPress?.cancel(in: dialog)
         // What stands on its sheet leaves first: an alert, a dialog opened over it.
         clear(above: dialog)
         guard let i = entries.firstIndex(where: { $0.dialog === dialog }) else { return }
@@ -192,6 +202,7 @@ final class DialogHost {
         presenter?.syncAccessibility()
         presenter?.shortcuts.sync()
         if notify, !entry.route { dialog.queueDialogClose() }
+        presenter?.afterBatch { [weak presenter] in presenter?.toolbar.sync() }
     }
     func reset() {
         presenter?.alerts.reset()
@@ -239,7 +250,7 @@ final class DialogHost {
         if let window, active != nil,
            ownsFocus(window), focusOwner(window).map({ blocks($0) }) ?? true { enterFocus() }
     }
-    private func refreshInputGates() {
+    func refreshInputGates() {
         guard let presenter else { return }
         accessibilityBlocker = accessibleActive.map(ObjectIdentifier.init)
         presenter.navigation.refreshInputGates(Array(presenter.views.values))
@@ -250,6 +261,7 @@ final class DialogHost {
         fitSheets()
         for entry in entries where entry.sheet == nil {
             entry.backdrop.frame = presenter.viewport.bounds
+            presenter.zoomOverPage(entry.backdrop)
             var frame = entry.frame
             // Without authored insets the HTML modal is centred in its viewport.
             let style = entry.dialog.style
@@ -312,6 +324,9 @@ final class DialogHost {
         if entries.contains(where: { $0.sheet?.window === window }) { return true }
         return owner === viewport || owner.isDescendant(of: viewport) || owner === presenter?.session?.view
     }
+    /// Dismissal belongs to the sheet's modal segment; its title-row Back belongs to the pushed route.
+    func dismissalOwner(of dialog: NodeView) -> NodeView { entry(ofRoute: dialog)?.routeBase ?? dialog }
+
     /// Shared by real key delivery and the agent's direct NSWindow delivery.
     func key(_ event: NSEvent) -> Bool {
         guard let dialog = active, event.window === dialog.window else { return false }
@@ -322,7 +337,7 @@ final class DialogHost {
         let period = event.type == .keyDown && event.keyCode == 47
             && event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command
         if event.keyCode == 53 || period {
-            if event.type == .keyDown, !event.isARepeat, dialog.props["closedby"] != "none" { dismiss(dialog) }
+            if event.type == .keyDown, !event.isARepeat, dismissalOwner(of: dialog).props["closedby"] != "none" { dismiss(dialog) }
             return true
         }
         // Return is the default button's, when the dialog has one (LLP 1115.000 D7.3).
@@ -360,13 +375,20 @@ final class DialogHost {
         return false
     }
     func outside() {
-        if let dialog = active, dialog.props["closedby"] == "any" { dismiss(dialog) }
+        if let dialog = active, dismissalOwner(of: dialog).props["closedby"] == "any" { dismiss(dialog) }
     }
     /// The platform's dismissal (Escape, Command-period, a click behind a
     /// `closedby="any"` sheet): a dialog closes; a modal route goes back as
     /// its stack goes, which the app decides (BackMac.swift).
     private func dismiss(_ dialog: NodeView) {
-        guard entry(ofRoute: dialog) != nil else { return close(dialog) }
+        guard entry(ofRoute: dialog) != nil else {
+            close(dialog)
+            if live(dialog), dialog.handlers.contains("cancel") {
+                if let onCancel { onCancel(dialog.id) }
+                else if let session = presenter?.session { session.apply(session.runtime.pickerCancel(dialog.id, now: session.now())) }
+            }
+            return
+        }
         if let refused = presenter?.navigation.dismiss(dialog) { presenter?.session?.log("modal dismissal refused: \(refused)") }
     }
     var observation: [String: Any]? {

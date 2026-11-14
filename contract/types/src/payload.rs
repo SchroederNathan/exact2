@@ -26,6 +26,11 @@ fn payload(event: &str, control: Option<&str>) -> Vec<(&'static str, &'static st
         ("key" | "keycapture" | "keyup", _) => one("key", "string", "the key's name, `key`"),
         ("message", _) => one("data", "string", "the message's `data`"),
         ("error", _) => one("message", "string", "the error's `message`"),
+        ("pictureinpictureerror", _) => one(
+            "message",
+            "string",
+            "why the platform's window did not open or ended",
+        ),
         ("hover", _) => one("hovered", "bool", "whether the pointer is over, `hovered`"),
         ("timeupdate", _) => one("currentTime", "number", "the media's `currentTime`"),
         ("durationchange", _) => one("duration", "number", "the media's `duration`"),
@@ -34,6 +39,7 @@ fn payload(event: &str, control: Option<&str>) -> Vec<(&'static str, &'static st
             one("fullscreen", "bool", "whether the media is now full screen")
         }
         ("select", _) => one("selection", "MarkdownSelection", "the editor's `selection`"),
+        ("navigate", Some("iframe")) => Vec::new(),
         ("navigate", _) => one("location", "string", "the location"),
         ("scroll", _) => numbers(&["scrollLeft", "scrollTop"]),
         ("resize", _) => numbers(&["width", "height"]),
@@ -45,6 +51,17 @@ fn payload(event: &str, control: Option<&str>) -> Vec<(&'static str, &'static st
         ("reorderdrop", _) => vec![("item", "string", ""), ("before", "option<string>", "")],
         _ => Vec::new(),
     }
+}
+
+/// What `event` appends on an element whose payload control is `control`
+/// ([`contract_syntax::payload_control`]), as `(name, type)`, before the
+/// event's record: the parameters an action given to it declares (the
+/// variant gallery's inert one, LLP 1139 §9 Q2).
+pub fn handler_parameters(event: &str, control: Option<&str>) -> Vec<(&'static str, &'static str)> {
+    payload(event, control)
+        .into_iter()
+        .map(|(name, ty, _)| (name, ty))
+        .collect()
 }
 
 /// An argument as written, when it is short enough to quote.
@@ -93,11 +110,7 @@ pub fn handler_arity_message(
     };
     // The event's record, the action's to take or leave
     // (`event_record`).
-    let record = if event == "selectionchange" && control == Some("field") {
-        Some("InputEvent")
-    } else {
-        crate::event_record(event)
-    };
+    let record = crate::event_record(contract_syntax::typed_event(event, control));
     let calls = match (quoted.is_empty(), &then) {
         (true, None) => format!("{site} calls `{name}` with nothing"),
         (true, Some(then)) => format!("{site} calls `{name}` with {then}"),
@@ -145,10 +158,38 @@ pub fn handler_arity_message(
             declare(&declared)
         );
     }
-    if event == "navigate" {
+    if event == "navigate" && control != Some("iframe") {
         return format!(
             "`navigate={name}` passes no arguments of its own, then the location (string) when the action takes one; declare `action {name}` or `action {name}(location: string)`"
         );
     }
     format!("{calls}; declare {declaration}")
+}
+
+/// The action `event=act` calls, for `contract vocab`: what the event
+/// appends, then optionally its record. `None` where the payload or record
+/// depends on the element (`change`, `input`, `select`, `selectionchange`)
+/// or the payload is optional (`navigate`): the refusal of a wrong arity
+/// spells the one that fits there.
+pub fn handler_signature(event: &str) -> Option<String> {
+    if matches!(
+        event,
+        "change" | "input" | "select" | "selectionchange" | "navigate"
+    ) {
+        return None;
+    }
+    let mut params: Vec<String> = payload(event, None)
+        .iter()
+        .map(|(n, ty, _)| format!("{n}: {ty}"))
+        .collect();
+    let declare = |params: &[String]| match params {
+        [] => "`action act`".to_string(),
+        _ => format!("`action act({})`", params.join(", ")),
+    };
+    let mut signature = format!("`{event}=act` calls {}", declare(&params));
+    if let Some(record) = crate::event_record(event) {
+        params.push(format!("event: {record}"));
+        signature += &format!(", or {} for its `{record}`", declare(&params));
+    }
+    Some(signature)
 }

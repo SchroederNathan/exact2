@@ -408,6 +408,61 @@ final class TextGeometryTests: XCTestCase {
         XCTAssertEqual(ellipses(engine.paragraph(narrow, width: 6).lines[0]), 0)
     }
 
+    func testClampTokenUsesTheBlockStyleBesideABoldRedRun() throws {
+        var value = spec("First\n")
+        value.strut = value.runs[0]
+        var red = value.runs[0]
+        red.text = "Second colored link with more words to hide"
+        red.color = [255, 0, 0, 255]; red.weight = 700; red.href = "example.md"
+        value.runs.append(red)
+        value.lineClamp = 2
+        let paragraph = engine.paragraph(value, width: 145)
+        let line = try XCTUnwrap(paragraph.lines.last)
+        let token = try XCTUnwrap((CTLineGetGlyphRuns(line) as! [CTRun]).first {
+            (CTRunGetAttributes($0) as NSDictionary)[NSAttributedString.Key.exactTruncation] != nil
+        })
+        let actual = CTRunGetAttributes(token) as NSDictionary
+        let block = engine.attributed(Spec(runs: [value.strut!], align: 0, lineClamp: 0, color: value.color)).attributes(at: 0, effectiveRange: nil)
+        XCTAssertTrue((actual[NSAttributedString.Key.font] as AnyObject).isEqual(block[.font]))
+        XCTAssertTrue((actual[NSAttributedString.Key.foregroundColor] as AnyObject).isEqual(block[.foregroundColor]))
+        XCTAssertLessThanOrEqual(CTLineGetTypographicBounds(line, nil, nil, nil), 145)
+    }
+
+    func testClampTokenKeepsTheBlocksShadowWithoutDoublingASharedShadow() throws {
+        let blue: [Double] = [0, 2, 3, 0, 0, 255, 255]
+        let red: [Double] = [0, 2, 3, 255, 0, 0, 255]
+        #if os(macOS)
+        _ = NSApplication.shared
+        #endif
+        let presenter = Presenter()
+        presenter.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "text", "props": ["text": "A clamped paragraph"],
+             "style": ["line_clamp": 1, "text_shadow": ["o": [0, 2], "b": 3, "c": [0, 0, 255, 255]]]],
+            ["op": "roots", "ids": [1]],
+        ]))
+        let captured = try XCTUnwrap(presenter.views[1]).paragraphSpec()
+        XCTAssertEqual(captured.strut?.shadow, blue, "the view supplies block paint, not just metrics")
+        XCTAssertEqual(captured.shadow, blue, "uniform shadow still belongs to the paragraph layer")
+        for inline in [blue, red] {
+            var value = spec("Words that need more than one line to fit")
+            var block = value.runs[0]; block.shadow = blue
+            value.strut = block; value.lineClamp = 1
+            value.runs[0].shadow = inline
+            value.gatherShadows()
+            let line = try XCTUnwrap(engine.paragraph(value, width: 145).lines.last)
+            let token = try XCTUnwrap((CTLineGetGlyphRuns(line) as! [CTRun]).first {
+                (CTRunGetAttributes($0) as NSDictionary)[NSAttributedString.Key.exactTruncation] != nil
+            })
+            if inline == blue {
+                XCTAssertEqual(value.shadow, blue, "one shadow around the paragraph")
+                XCTAssertNil(TextRunShadow.of(token), "the token does not cast that shadow a second time")
+            } else {
+                XCTAssertNil(value.shadow, "the token and inline text have different shadows")
+                XCTAssertEqual(TextRunShadow.of(token), TextRunShadow(blue), "the block styles the token")
+            }
+        }
+    }
+
     func testClampedInlineRunsKeepOriginalIndicesAndRecomputeAfterWidening() {
         var value = spec("First\nSecond colored link with more words to hide")
         let first = value.runs[0]
@@ -603,13 +658,18 @@ extension TextGeometryTests {
                                CTLineGetStringIndexForPosition(b, CGPoint(x: offset, y: 0)))
             }
         }
+        #else
+        let original = p
+        #endif
         if p.height.isFinite && p.baselines.allSatisfy({ $0.isFinite }) {
             let box = CGRect(x: 12, y: 9, width: width, height: p.height)
             let clip = CGRect(x: 0, y: 0, width: 360, height: 180)
-            XCTAssertEqual(inkBitmap(p, spec: input, bounds: box, clip: clip, exhaustive: false),
-                           inkBitmap(original, spec: input, bounds: box, clip: clip, exhaustive: true))
+            let expected = inkBitmap(original, spec: input, bounds: box, clip: clip, exhaustive: true)
+            if input.runs.contains(where: { !$0.text.isEmpty && $0.size > 0 }) {
+                XCTAssertTrue(CapturePixels.hasPaint(expected), "the visible strut reference draws")
+            }
+            XCTAssertEqual(inkBitmap(p, spec: input, bounds: box, clip: clip, exhaustive: false), expected)
         }
-        #endif
         return (p, calls)
     }
 
@@ -777,7 +837,13 @@ extension TextGeometryTests {
                 // CSS Text 3 §7.1: a line wider than its box is start-aligned (left to right, here).
                 let x = max(0, CGFloat(CTLineGetPenOffsetForFlush(line, flush, Double(bounds.width))))
                 context.saveGState()
-                context.translateBy(x: bounds.minX + x, y: bounds.minY + baseline.rounded())
+                // On the Mac a baseline rounds at its place in the view, on iOS below the box's top (`TextEngine.paintedLine`).
+                #if os(macOS)
+                let y = (bounds.minY + baseline).rounded()
+                #else
+                let y = bounds.minY + baseline.rounded()
+                #endif
+                context.translateBy(x: bounds.minX + x, y: y)
                 context.scaleBy(x: 1, y: -1)
                 context.textPosition = .zero
                 CTLineDraw(line, context)
@@ -792,7 +858,7 @@ extension TextGeometryTests {
     func assertInkMatches(_ paragraph: Paragraph, spec: Spec, bounds: CGRect,
                                   clip: CGRect, file: StaticString = #filePath, line: UInt = #line) {
         let expected = inkBitmap(paragraph, spec: spec, bounds: bounds, clip: clip, exhaustive: true)
-        XCTAssertTrue(expected.contains { $0 != 0 }, "Oracle clip must contain ink", file: file, line: line)
+        XCTAssertTrue(CapturePixels.hasPaint(expected), "the reference clip contains ink", file: file, line: line)
         let actual = inkBitmap(paragraph, spec: spec, bounds: bounds, clip: clip, exhaustive: false)
         XCTAssertTrue(actual == expected, "Viewport differs from exhaustive paint: \(clip)", file: file, line: line)
     }
@@ -1037,7 +1103,7 @@ extension TextGeometryTests {
         bytes.withUnsafeBufferPointer { bytes in
             var run = ExactTextRun()
             run.text = bytes.baseAddress; run.len = bytes.count
-            run.font_size = 13.25; run.font_weight = 400
+            run.font_size = 13.25; run.font_weight = 400; run.font_stretch = 100
             run.has_line_height = 1; run.line_height = 18.125
             withUnsafePointer(to: &run) { pointer in
                 var request = ExactMeasureRequest()
@@ -1067,7 +1133,7 @@ extension TextGeometryTests {
         bytes.withUnsafeBufferPointer { bytes in
             var run = ExactTextRun()
             run.text = bytes.baseAddress; run.len = bytes.count
-            run.font_size = 13.25; run.font_weight = 400
+            run.font_size = 13.25; run.font_weight = 400; run.font_stretch = 100
             run.has_line_height = 1; run.line_height = 18.125
             withUnsafePointer(to: &run) { pointer in
                 var request = ExactMeasureRequest()

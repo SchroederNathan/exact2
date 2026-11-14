@@ -65,11 +65,10 @@ pub trait MessageSender: Send + Sync {
     fn send_binary(&self, bytes: &[u8]) -> Result<(), HostError>;
     fn close(&self, code: Option<u16>, reason: &str) -> Result<(), HostError>;
     fn buffered_amount(&self) -> usize;
-    /// Messages admitted and not yet handed to the network. A transport
-    /// whose outbound queue also bounds messages closes the connection when
-    /// a send would pass that bound (WHATWG's "full"); a caller that must
-    /// refuse instead checks this first. Zero for a transport with no such
-    /// bound.
+    /// An observational snapshot of the transport's outbound message count.
+    /// This does not reserve admission: a concurrent or subsequent send may
+    /// change the count before a caller acts on it. Zero is the default for
+    /// transports without a message count.
     fn buffered_messages(&self) -> usize {
         0
     }
@@ -245,6 +244,25 @@ pub fn open(
     signal: &AbortSignal,
 ) -> Result<Box<dyn MessageSource>, HostError> {
     open_with_protocols(transport, grants, url, max_message, signal, &[])
+}
+
+/// [`open`], with the host's `gate` checked after the grant and before the
+/// transport connects (Exact patch, LLP 1133.036 D6). A handshake follows no
+/// redirect, so the open is the one hop.
+pub fn open_gated(
+    transport: &dyn SocketTransport,
+    grants: &GrantSet,
+    gate: Option<&dyn crate::boundary::HopGate>,
+    url: &str,
+    max_message: usize,
+    signal: &AbortSignal,
+) -> Result<Box<dyn MessageSource>, HostError> {
+    signal.check()?;
+    let parsed = parse_and_admit(grants, url)?;
+    if let Some(gate) = gate {
+        gate.admit(&parsed)?;
+    }
+    transport.connect_with_protocols(&parsed, max_message, signal, &[])
 }
 
 /// Protocol-aware spelling used by the event and JavaScript projections.
@@ -778,6 +796,14 @@ mod tests {
         );
         assert_eq!(
             opened("net.websocket ws://127.0.0.1:4350", "ws://127.0.0.1:4351/x"),
+            "denied: net.websocket"
+        );
+        assert_eq!(
+            opened("net.websocket ws:", "ws://127.0.0.1:4351/x"),
+            "reached the transport"
+        );
+        assert_eq!(
+            opened("net.websocket wss:", "ws://127.0.0.1:4351/x"),
             "denied: net.websocket"
         );
         assert!(opened(socket, "https://jetstream2.us-east.bsky.network/").contains("ws: or wss:"));

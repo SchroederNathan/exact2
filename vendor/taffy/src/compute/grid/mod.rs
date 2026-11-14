@@ -12,8 +12,10 @@ use crate::{
     style_helpers::*, AlignContent, BoxGenerationMode, BoxSizing, CoreStyle, Direction, GridContainerStyle,
     GridItemStyle, JustifyContent, LayoutGridContainer, RequestedAxis,
 };
-use crate::compute::ratio::sizes_through_ratio;
+use crate::compute::ratio::container_sizes_through_ratio;
 use crate::compute::common::absolute::AbsolutePass;
+#[cfg(feature = "content_size")]
+use crate::compute::common::scrollable_overflow::with_end_padding;
 use alignment::{align_and_position_item, align_tracks, static_position};
 use explicit_grid::{compute_explicit_grid_size_in_axis, initialize_grid_tracks, AutoRepeatStrategy};
 use implicit_grid::compute_grid_size_estimate;
@@ -69,19 +71,24 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
     let box_sizing_adjustment =
         if style.box_sizing() == BoxSizing::ContentBox { padding_border_size } else { Size::ZERO };
 
+    // EXACT PATCH 56: in ContentSize, omit preferred sizes before ratio
+    // resolution so an incoming dimension can transfer into the other axis.
+    let preferred_size = if inputs.sizing_mode == SizingMode::InherentSize {
+        style.size().maybe_resolve(parent_size, |val, basis| tree.calc(val, basis)).maybe_add(box_sizing_adjustment)
+    } else {
+        Size::NONE
+    };
     // EXACT PATCH 12: the container's own size styles through the ratio (`compute::ratio`).
     // A definite width assigned by the parent (including grid-item stretch during track
     // measurement) supplies the ratio's automatic height floor just as an authored width does.
-    let (style_size, min_size, max_size) = sizes_through_ratio(
+    let (preferred_size, min_size, max_size) = container_sizes_through_ratio(
         &style,
         padding_border_size,
-        known_dimensions.or(
-            style.size().maybe_resolve(parent_size, |val, basis| tree.calc(val, basis)).maybe_add(box_sizing_adjustment),
-        ),
+        known_dimensions.or(preferred_size),
         style.min_size().maybe_resolve(parent_size, |val, basis| tree.calc(val, basis)).maybe_add(box_sizing_adjustment),
         style.max_size().maybe_resolve(parent_size, |val, basis| tree.calc(val, basis)).maybe_add(box_sizing_adjustment),
+        inputs.sizing_mode,
     );
-    let preferred_size = if inputs.sizing_mode == SizingMode::InherentSize { style_size } else { Size::NONE };
 
     // Scrollbar gutters are reserved when the `overflow` property is set to `Overflow::Scroll`.
     // However, the axis are switched (transposed) because a node that scrolls vertically needs
@@ -603,6 +610,8 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
     #[cfg_attr(not(feature = "content_size"), allow(unused_mut))]
     let mut item_overflow_rect = Rect::ZERO;
     #[cfg_attr(not(feature = "content_size"), allow(unused_mut, unused))]
+    let mut margin_box_rect = Rect::ZERO;
+    #[cfg_attr(not(feature = "content_size"), allow(unused_mut, unused))]
     let mut absolute_overflow_rect = Rect::ZERO;
 
     // Sort items back into original order to allow them to be matched up with styles
@@ -630,7 +639,7 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
             },
         };
         #[cfg_attr(not(feature = "content_size"), allow(unused_variables))]
-        let (overflow_contribution, y_position, height) = align_and_position_item(
+        let (overflow_contribution, margin_box, y_position, height) = align_and_position_item(
             tree,
             item.node,
             index as u32,
@@ -649,8 +658,12 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
         #[cfg(feature = "content_size")]
         {
             item_overflow_rect = item_overflow_rect.union(overflow_contribution);
+            margin_box_rect = margin_box_rect.union(margin_box);
         }
     }
+    #[cfg(feature = "content_size")]
+    let end_padding =
+        Size { width: if direction.is_rtl() { padding.left } else { padding.right }, height: padding.bottom };
 
     // Position hidden and absolutely positioned children
     let contains_absolutes = tree.get_core_container_style(node).position() != Position::Static;
@@ -800,6 +813,9 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
             };
             let position = static_position(&child_style, container_alignment_styles, direction, static_rect, order);
             drop(child_style);
+            // EXACT PATCH 69: the area, for a caller that places what the child holds outside it,
+            // whichever box contains the child.
+            tree.set_grid_origin(child, Point { x: grid_area.left, y: grid_area.top });
 
             if contains_absolutes {
                 let area = (
@@ -860,8 +876,7 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
         {
             let mut overflow_rect = item_overflow_rect;
             if is_scroll_container {
-                overflow_rect.right += if direction.is_rtl() { padding.left } else { padding.right };
-                overflow_rect.bottom += padding.bottom;
+                overflow_rect = with_end_padding(overflow_rect, margin_box_rect, end_padding);
             }
             return LayoutOutput::from_sizes(container_border_box, overflow_rect.union(absolute_overflow_rect));
         }
@@ -893,15 +908,14 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
         Some(item.y_position + item.baseline.unwrap_or(item.height))
     };
 
-    // A scroll container's own padding at the end of the content is part of its scrollable
-    // overflow region, so it is included in the in-flow overflow rect. Boxes that are not
-    // scroll containers do not extend their overflow region by their own padding.
+    // A scroll container's own padding at the end of its items is part of its scrollable
+    // overflow region. Boxes that are not scroll containers do not extend their overflow region
+    // by their own padding.
     #[cfg(feature = "content_size")]
     let scrollable_overflow_rect = {
         let mut overflow_rect = item_overflow_rect;
         if is_scroll_container {
-            overflow_rect.right += if direction.is_rtl() { padding.left } else { padding.right };
-            overflow_rect.bottom += padding.bottom;
+            overflow_rect = with_end_padding(overflow_rect, margin_box_rect, end_padding);
         }
         overflow_rect.union(absolute_overflow_rect)
     };

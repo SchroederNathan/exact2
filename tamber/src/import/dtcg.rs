@@ -32,15 +32,24 @@
 //! there. A token is a colour in every tuple or makes no token; its default
 //! is the default tuple's (a `light-dark()` of the scheme's sides), and each
 //! other tuple Tamber would not otherwise select its value in is a `when`
-//! line. Other `$type`s are `kind pending (stage 6)` with the token each
-//! would become; borders, transitions, gradients and stroke styles are
-//! reported, as are strings and booleans. Names come from group paths, each
+//! line. A dimension, a number, a family, a duration, a curve, a shadow or
+//! a typography is its kind's token alike, written out (`kinds`), with one
+//! value on both sides of the scheme; borders, transitions, gradients and
+//! stroke styles are reported, as are strings and booleans. Names come from group paths, each
 //! segment made an identifier (`$root` is `root`); collisions are reported.
 
-use super::{colour_literal, counted, reconcile, Import, Mapped, Unmapped};
+use super::{counted, reconcile, Import, Mapped, Unmapped};
+use crate::import::kinds as other;
 use crate::{Design, Diagnostic};
 use serde_json::{Map, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+mod kinds;
+pub mod pen;
+mod resolve;
+pub(crate) use kinds::colour;
+use resolve::{Colour, Resolve};
 
 /// Where a layer applies.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,6 +59,8 @@ enum Scope {
     Scheme(bool),
     /// One value of a proposed axis.
     Axis(String, String),
+    /// Every one of these at once (a Pencil entry's theme of several axes).
+    All(Vec<Scope>),
 }
 
 /// One token as a source declares it.
@@ -84,6 +95,8 @@ struct Read {
     /// theme group's, a collection's modes by name, a modifier's default
     /// first): the first value the default.
     dims: Vec<(String, Vec<String>)>,
+    /// Names are flat (Pencil's): `a` and `a.b` are two tokens, no group.
+    flat: bool,
 }
 
 impl Read {
@@ -220,6 +233,7 @@ fn extended(
     stack: &mut Vec<String>,
 ) -> Result<Map<String, Value>, String> {
     let mut merged = Map::new();
+    crate::budget::spend(1)?;
     for key in ["$extends", "$ref"] {
         let Some(name) = node.get(key).and_then(Value::as_str) else {
             continue;
@@ -233,51 +247,60 @@ fn extended(
         let Some(inherited) = target(root, name).and_then(Value::as_object) else {
             return Err(format!("`{key}` names `{name}`, which is not there"));
         };
+        crate::budget::members(inherited)?;
         if token_like(root, &Value::Object(inherited.clone())) {
             return Err(format!("`{key}` names `{name}`, a token, not a group"));
         }
         stack.push(name.to_string());
         let base = extended(root, inherited, stack)?;
         stack.pop();
-        deep(root, &mut merged, &base);
+        deep(root, &mut merged, &base)?;
         if merged.get("$type").is_none() {
             if let Some(t) = inherited.get("$type") {
                 merged.insert("$type".into(), t.clone());
             }
         }
     }
+    crate::budget::members(node)?;
     let own: Map<String, Value> = node
         .iter()
         .filter(|(k, _)| *k != "$extends" && *k != "$ref")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    deep(root, &mut merged, &own);
+    deep(root, &mut merged, &own)?;
     Ok(merged)
 }
 
 /// `over` merged into `into`: groups into groups, anything else (a token,
-/// a whole-token alias, a value) replacing.
-fn deep(root: &Value, into: &mut Map<String, Value>, over: &Map<String, Value>) {
+/// a whole-token alias, a value) replacing; each copy charged first.
+fn deep(
+    root: &Value,
+    into: &mut Map<String, Value>,
+    over: &Map<String, Value>,
+) -> Result<(), String> {
     for (k, v) in over {
+        crate::budget::copy(v)?;
         match (into.get_mut(k), v) {
             (Some(Value::Object(a)), Value::Object(b))
                 if !token_like(root, &Value::Object(a.clone())) && !token_like(root, v) =>
             {
+                crate::budget::members(a)?;
                 let b = b.clone();
-                deep(root, a, &b);
+                deep(root, a, &b)?;
             }
             _ => {
                 into.insert(k.clone(), v.clone());
             }
         }
     }
+    Ok(())
 }
 
 /// Every token in a tree: its dotted path and definition, `$type` (or a
 /// legacy group `type`) inherited from groups, `$root` a token of its group,
 /// `$extends` and a group's `$ref` merged under it; a token that is a whole
-/// `$ref` an alias. An error for a cycle, a missing target, or nesting past
-/// 64.
+/// `$ref` an alias. An error for a cycle, a missing target, nesting past
+/// 64, or more work than one import may do (`crate::budget`).
 fn tokens(file: &str, tree: &Value) -> Result<Vec<Def>, String> {
     fn walk(
         file: &str,
@@ -293,8 +316,8 @@ fn tokens(file: &str, tree: &Value) -> Result<Vec<Def>, String> {
         if path.len() > 64 {
             return Err(format!("`{}` nests deeper than 64", path.join(".")));
         }
-        // A whole-token `$ref`: to a token, a `$value` or anything not a
-        // group, it is an alias.
+        crate::budget::spend(1)?;
+        // A whole-token `$ref`: to a token, a `$value` or anything not a group, it is an alias.
         if let Some(r) = map.get("$ref").and_then(Value::as_str) {
             let to_group = target(root, r).is_some_and(|t| t.is_object() && !token_like(root, t));
             if !map.contains_key("$value") && !to_group {
@@ -322,11 +345,9 @@ fn tokens(file: &str, tree: &Value) -> Result<Vec<Def>, String> {
                         .and_then(Value::as_str)
                 })
                 .map(str::to_string);
-            let value = map
-                .get("$value")
-                .or_else(|| map.get("value"))
-                .cloned()
-                .unwrap_or(Value::Null);
+            let value = map.get("$value").or_else(|| map.get("value"));
+            crate::budget::copy(value.unwrap_or(&Value::Null))?;
+            let value = value.cloned().unwrap_or(Value::Null);
             let refused = map
                 .get("$extensions")
                 .and_then(|e| e.get("studio.tokens"))
@@ -460,8 +481,7 @@ fn read(files: &[(String, String)]) -> Result<Read, String> {
     {
         return resolver(name, doc, &parsed);
     }
-    // Figma's `<Collection>.<Mode>.json`, each file on its own; any other
-    // file is the base.
+    // Figma's `<Collection>.<Mode>.json`, each file on its own; any other file is the base.
     let mut out = Read::default();
     let mut collections: BTreeMap<String, Vec<(String, &Value, String)>> = BTreeMap::new();
     let mut plain: Vec<(&String, &Value)> = Vec::new();
@@ -518,17 +538,23 @@ fn studio(
     // A set's place: its exact id in `tokenSetOrder`, else its last segment
     // when that names one set only; sets it does not name after the ones it
     // does, in the files' order.
+    // (each id's first place, and how many sets end in each last segment,
+    // counted once: round 3 of the checker sweep)
+    let mut place: HashMap<&str, usize> = HashMap::new();
+    for (i, o) in order.iter().enumerate() {
+        place.entry(o.as_str()).or_insert(i);
+    }
+    let mut ending: HashMap<&str, usize> = HashMap::new();
+    for (n, _) in sets {
+        *ending.entry(n.rsplit('/').next().unwrap_or(n)).or_insert(0) += 1;
+    }
     let rank = |set: &str, at: usize| {
-        if let Some(i) = order.iter().position(|o| o == set) {
+        if let Some(&i) = place.get(set) {
             return (i, at);
         }
         let last = set.rsplit('/').next().unwrap_or(set);
-        let alike = sets
-            .iter()
-            .filter(|(n, _)| n.rsplit('/').next() == Some(last))
-            .count();
-        match (alike, order.iter().position(|o| o == last)) {
-            (1, Some(i)) => (i, at),
+        match (ending.get(last).copied().unwrap_or(0), place.get(last)) {
+            (1, Some(&i)) => (i, at),
             _ => (order.len(), at),
         }
     };
@@ -545,12 +571,16 @@ fn studio(
         }
     }
     let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
     for t in list {
         // Ungrouped themes are one group.
         let group = t["group"].as_str().unwrap_or("").to_string();
-        match groups.iter_mut().find(|(g, _)| *g == group) {
-            Some((_, members)) => members.push(t),
-            None => groups.push((group, vec![t])),
+        match seen.get(&group) {
+            Some(&g) => groups[g].1.push(t),
+            None => {
+                seen.insert(group.clone(), groups.len());
+                groups.push((group, vec![t]));
+            }
         }
     }
     for (group, members) in &groups {
@@ -565,6 +595,16 @@ fn studio(
         } else {
             format!("the theme group `{group}`")
         };
+        // A group's themes are an axis's values: past the tuples a design
+        // may have, refused before anything compares them (round 2 of the
+        // checker sweep).
+        if members.len() > crate::MAX_TUPLES {
+            return Err(format!(
+                "{shown} has {} themes; a design has at most {} tuples",
+                members.len(),
+                crate::MAX_TUPLES
+            ));
+        }
         if members.len() > 1 {
             if names.iter().any(|n| n.trim().is_empty()) {
                 return Err(format!("{shown} has a theme with no name"));
@@ -577,8 +617,9 @@ fn studio(
                 return Err(format!("{shown} names two themes `{n}`"));
             }
         }
+        let by_scheme = scheme(&names);
         for (t, theme) in members.iter().zip(&names) {
-            let scope = match (members.len(), scheme(&names)) {
+            let scope = match (members.len(), by_scheme) {
                 (1, _) => Scope::Base,
                 (_, true) => Scope::Scheme(is_dark(theme)),
                 _ => out.axis(group, theme),
@@ -648,7 +689,9 @@ fn deref<'a>(
     if depth > 16 {
         return Err("references nest too deep".into());
     }
+    crate::budget::spend(1)?;
     let Some(r) = node.get("$ref").and_then(Value::as_str) else {
+        crate::budget::copy(node)?;
         return Ok((doc, node.clone()));
     };
     // Sibling keys written here keep this document: a `sources` among them
@@ -720,6 +763,7 @@ fn resolver(name: &str, doc: &Value, files: &[(String, Value)]) -> Result<Read, 
         if depth > 16 {
             return Err("sets nest too deep".into());
         }
+        crate::budget::spend(1)?;
         let mut pushed = false;
         if let Some(r) = src.get("$ref").and_then(Value::as_str) {
             let key = format!("{}{r}", doc.name);
@@ -847,7 +891,8 @@ fn resolver(name: &str, doc: &Value, files: &[(String, Value)]) -> Result<Read, 
 /// What Tamber makes of a `$type`.
 enum Kind {
     Colour,
-    Pending(&'static str),
+    /// Another kind, by the name `add-token` writes.
+    Other(&'static str),
     Reported(&'static str),
 }
 
@@ -855,15 +900,15 @@ fn kind(ty: Option<&str>) -> Kind {
     match ty.unwrap_or("") {
         "color" => Kind::Colour,
         "dimension" | "borderRadius" | "spacing" | "sizing" | "borderWidth" | "fontSizes"
-        | "letterSpacing" | "paragraphSpacing" => Kind::Pending("length"),
-        "fontFamily" | "fontFamilies" => Kind::Pending("family"),
+        | "letterSpacing" | "paragraphSpacing" => Kind::Other("length"),
+        "fontFamily" | "fontFamilies" => Kind::Other("family"),
         "fontWeight" | "fontWeights" | "number" | "lineHeights" | "opacity" => {
-            Kind::Pending("number")
+            Kind::Other("number")
         }
-        "duration" => Kind::Pending("duration"),
-        "cubicBezier" => Kind::Pending("easing"),
-        "shadow" | "boxShadow" => Kind::Pending("box-shadow"),
-        "typography" => Kind::Pending("type"),
+        "duration" => Kind::Other("duration"),
+        "cubicBezier" => Kind::Other("easing"),
+        "shadow" | "boxShadow" => Kind::Other("box-shadow"),
+        "typography" => Kind::Other("type"),
         "border" => Kind::Reported("no Tamber kind: a border"),
         "transition" => Kind::Reported("no Tamber kind: a transition"),
         "gradient" => Kind::Reported("no Tamber kind: a gradient (its stops stay where they are)"),
@@ -872,51 +917,6 @@ fn kind(ty: Option<&str>) -> Kind {
         "" => Kind::Reported("no `$type`, on it, a group around it, or the token it aliases"),
         _ => Kind::Reported("a `$type` Tamber's DTCG mapping does not name"),
     }
-}
-
-/// A colour value as Tamber writes it: a string, or 2025.10's object form
-/// (its colour space first; `hex` only without one).
-pub(crate) fn colour(value: &Value) -> Option<String> {
-    if let Some(s) = value.as_str() {
-        return colour_literal(s);
-    }
-    let obj = value.as_object()?;
-    let alpha = obj
-        .get("alpha")
-        .and_then(Value::as_f64)
-        .filter(|a| *a < 1.0);
-    let space = obj.get("colorSpace").and_then(Value::as_str);
-    let components = obj.get("components").and_then(Value::as_array);
-    if let (Some(space), Some(components)) = (space, components) {
-        let parts: Option<Vec<String>> = components
-            .iter()
-            .map(|c| match c {
-                Value::String(s) if s == "none" => Some("none".to_string()),
-                c => c.as_f64().map(|n| format!("{n}")),
-            })
-            .collect();
-        if let Some(parts) = parts {
-            let a = alpha.map_or(String::new(), |a| format!(" / {a}"));
-            let text = match space {
-                "oklch" | "oklab" | "lab" | "lch" | "hsl" | "hwb" => {
-                    Some(format!("{space}({}{a})", parts.join(" ")))
-                }
-                "srgb" | "srgb-linear" | "display-p3" | "a98-rgb" | "prophoto-rgb" | "rec2020"
-                | "xyz-d50" | "xyz-d65" => Some(format!("color({space} {}{a})", parts.join(" "))),
-                _ => None,
-            };
-            if let Some(c) = text.and_then(|t| colour_literal(&t)) {
-                return Some(c);
-            }
-        }
-    }
-    let hex = obj.get("hex").and_then(Value::as_str)?;
-    let full = match (hex.len(), alpha) {
-        (_, None) => hex.to_string(),
-        (7, Some(a)) => format!("{hex}{:02x}", (a * 255.0).round() as u8),
-        _ => return None,
-    };
-    colour_literal(&full)
 }
 
 /// An alias's target path: `{a.b}`, or `{"$ref": "#/a/b/$value"}`;
@@ -945,88 +945,6 @@ fn alias(value: &Value) -> Option<Result<String, String>> {
 /// One mode tuple: the scheme's side and a value of each axis.
 type Tuple = (bool, Vec<String>);
 
-/// A path's colour in one tuple: as written (a reference a token's name),
-/// resolved, and the path it references.
-type Colour = (String, String, Option<String>);
-
-/// A path's colour in one tuple, or why not.
-type Seen = Result<Colour, String>;
-
-/// A path's type in a tuple: its own, else the type of what it aliases,
-/// however long the chain (a cycle has none).
-fn type_of(defs: &[Def], w: &BTreeMap<&str, usize>, path: &str) -> Option<String> {
-    let mut seen = BTreeSet::new();
-    let mut at = path.to_string();
-    loop {
-        let d = &defs[*w.get(at.as_str())?];
-        if d.ty.is_some() {
-            return d.ty.clone();
-        }
-        match alias(&d.value) {
-            Some(Ok(target)) if seen.insert(target.clone()) => at = target,
-            _ => return None,
-        }
-    }
-}
-
-/// A tuple's resolution: its winners, the token names, and each path's
-/// colour once found.
-struct Resolve<'a> {
-    defs: &'a [Def],
-    w: &'a BTreeMap<&'a str, usize>,
-    names: &'a BTreeMap<String, String>,
-    memo: HashMap<String, Seen>,
-}
-
-impl Resolve<'_> {
-    /// A path's colour, aliases followed (a cycle is none).
-    fn seen(&mut self, path: &str, visiting: &mut BTreeSet<String>) -> Seen {
-        if let Some(found) = self.memo.get(path) {
-            return found.clone();
-        }
-        let Some(&i) = self.w.get(path) else {
-            return Err(format!("`{{{path}}}` is no token in this mode"));
-        };
-        let d = &self.defs[i];
-        let found = if let Some(why) = &d.refused {
-            Err(why.clone())
-        } else {
-            match alias(&d.value) {
-                Some(Ok(target)) if visiting.contains(&target) => {
-                    Err(format!("a cycle of aliases through `{{{target}}}`"))
-                }
-                Some(Ok(_)) if visiting.len() > 256 => {
-                    Err("an alias chain longer than 256".to_string())
-                }
-                Some(Ok(target)) => {
-                    visiting.insert(target.clone());
-                    let inner = self.seen(&target, visiting);
-                    visiting.remove(&target);
-                    inner.map(|(_, resolved, _)| match self.names.get(&target) {
-                        Some(n) => (n.clone(), resolved, Some(target)),
-                        None => (resolved.clone(), resolved, None),
-                    })
-                }
-                Some(Err(why)) => Err(why),
-                None => colour(&d.value)
-                    .map(|c| (c.clone(), c, None))
-                    .ok_or_else(|| match d.value.as_str() {
-                        Some(s) if exact_color::parse(s).is_some() => {
-                            "a colour Tamber does not fold yet".to_string()
-                        }
-                        _ => "not a colour Tamber reads".to_string(),
-                    }),
-            }
-        };
-        // A colour found holds; a failure may be a cycle in progress, kept
-        // only from the top.
-        if found.is_ok() || visiting.len() <= 1 {
-            self.memo.insert(path.to_string(), found.clone());
-        }
-        found
-    }
-}
-
 /// A tuple as a report names it: `dark, brand=loud`.
 fn tuple_name(t: &Tuple, scheme: bool, axes: &[(String, Vec<String>)]) -> String {
     let mut parts = Vec::new();
@@ -1049,8 +967,44 @@ pub fn import(
     prefix: &str,
     design: &Design,
 ) -> Result<Import, Vec<Diagnostic>> {
+    import_with(files, prefix, design, &crate::Vocab::default())
+}
+
+/// [`import`], the design checked against `vocab` where the import lands.
+pub fn import_with(
+    files: &[(String, String)],
+    prefix: &str,
+    design: &Design,
+    vocab: &crate::Vocab,
+) -> Result<Import, Vec<Diagnostic>> {
+    let _work = crate::budget::Work::begin(crate::budget::IMPORT);
+    let read = read(files).map_err(|m| vec![Diagnostic::new("tamber-import-source", m, 1, 1)])?;
+    planned(read, prefix, design, vocab)
+}
+
+/// The import a source's layers make (DTCG's, or another format read into
+/// them: `pen`), planned against `design`; inside the caller's budget.
+fn planned(
+    read: Read,
+    prefix: &str,
+    design: &Design,
+    vocab: &crate::Vocab,
+) -> Result<Import, Vec<Diagnostic>> {
+    super::bounded(planned_unbounded(read, prefix, design, vocab))
+}
+
+fn planned_unbounded(
+    read: Read,
+    prefix: &str,
+    design: &Design,
+    vocab: &crate::Vocab,
+) -> Result<Import, Vec<Diagnostic>> {
+    for d in &read.defs {
+        let mut strings = Vec::new();
+        super::json_strings(&d.value, &mut strings);
+        super::source_bound(strings.into_iter().map(|v| (d.path.as_str(), v)))?;
+    }
     let refuse = |id: &'static str, m: String| vec![Diagnostic::new(id, m, 1, 1)];
-    let read = read(files).map_err(|m| refuse("tamber-import-source", m))?;
     let defs = &read.defs;
     // The dimensions: the scheme, and each axis with its values in order.
     // Two axes, or two values of one, written differently but one
@@ -1071,13 +1025,15 @@ pub fn import(
             ));
         }
     }
-    let has_scheme = read
-        .layers
-        .iter()
-        .any(|l| l.scopes.iter().any(|s| matches!(s, Scope::Scheme(_))));
+    let has_scheme = read.layers.iter().any(|l| {
+        l.scopes
+            .iter()
+            .flat_map(Scope::flat)
+            .any(|s| matches!(s, Scope::Scheme(_)))
+    });
     let mut axes: Vec<(String, Vec<String>)> = read.dims.clone();
     for l in &read.layers {
-        for scope in &l.scopes {
+        for scope in l.scopes.iter().flat_map(Scope::flat) {
             if let Scope::Axis(a, v) = scope {
                 match axes.iter_mut().find(|(n, _)| n == a) {
                     Some((_, vs)) if !vs.contains(v) => vs.push(v.clone()),
@@ -1158,10 +1114,14 @@ pub fn import(
     let mut names: BTreeMap<String, String> = BTreeMap::new();
     let mut taken: BTreeMap<String, String> = BTreeMap::new();
     let mut collided: BTreeMap<String, String> = BTreeMap::new();
-    for d in defs {
-        if names.contains_key(&d.path) || collided.contains_key(&d.path) {
+    // (a def no layer uses makes no name, nor takes one; each name made charged)
+    let unused: BTreeSet<usize> = read.unused.iter().map(|(i, _)| *i).collect();
+    for (i, d) in defs.iter().enumerate() {
+        if unused.contains(&i) || names.contains_key(&d.path) || collided.contains_key(&d.path) {
             continue;
         }
+        crate::budget::spend(2 * (prefix.len() + d.path.len()) as u64)
+            .map_err(|m| refuse("tamber-import-source", m))?;
         let name = std::iter::once(prefix.to_string())
             .chain(d.path.split('.').map(segment))
             .collect::<Vec<_>>()
@@ -1178,48 +1138,49 @@ pub fn import(
     }
     // Each tuple's winners: its layers merged in order, a later one winning
     // whatever its kind.
-    let active = |t: &Tuple, scopes: &[Scope]| {
-        scopes.iter().any(|scope| match scope {
-            Scope::Base => true,
-            Scope::Scheme(dark) => *dark == t.0,
-            Scope::Axis(a, v) => axes
-                .iter()
-                .position(|(n, _)| n == a)
-                .is_some_and(|i| t.1[i] == *v),
-        })
-    };
-    let unused: BTreeSet<usize> = read.unused.iter().map(|(i, _)| *i).collect();
-    let winners: Vec<BTreeMap<&str, usize>> = tuples
-        .iter()
-        .map(|t| {
-            let mut w = BTreeMap::new();
-            // A colliding path still resolves; only its name is not made.
-            for l in read.layers.iter().filter(|l| active(t, &l.scopes)) {
-                for &i in l.defs.iter().filter(|i| !unused.contains(i)) {
-                    w.insert(defs[i].path.as_str(), i);
-                }
+    let active = |t: &Tuple, scopes: &[Scope]| scopes.iter().any(|scope| scope.holds(t, &axes));
+    // (each entry charged: a tuple holds every path, so tuples times paths are kept)
+    let mut winners: Vec<BTreeMap<&str, usize>> = Vec::with_capacity(tuples.len());
+    for t in &tuples {
+        let mut w = BTreeMap::new();
+        // A colliding path still resolves; only its name is not made.
+        for l in read.layers.iter().filter(|l| active(t, &l.scopes)) {
+            for &i in l.defs.iter().filter(|i| !unused.contains(i)) {
+                crate::budget::spend(1).map_err(|m| refuse("tamber-import-source", m))?;
+                w.insert(defs[i].path.as_str(), i);
             }
+        }
+        winners.push({
             // A token and a group at one path: the later layer's stands,
             // the other's tokens go (a token replaces a group, a group a
             // token).
-            let paths: Vec<(&str, usize)> = w.iter().map(|(p, i)| (*p, *i)).collect();
-            for (p, i) in &paths {
-                for (q, j) in &paths {
-                    let under =
-                        q.len() > p.len() && q.starts_with(p) && q.as_bytes()[p.len()] == b'.';
-                    if under && j < i {
-                        w.remove(q);
-                    } else if under && i < j {
-                        w.remove(p);
+            // (each path against its own dotted ancestors, not every other path)
+            let paths: BTreeMap<&str, usize> = if read.flat {
+                BTreeMap::new()
+            } else {
+                w.clone()
+            };
+            for (q, j) in &paths {
+                for (at, _) in q.match_indices('.') {
+                    match paths.get(&q[..at]) {
+                        Some(i) if j < i => {
+                            w.remove(q);
+                        }
+                        Some(i) if i < j => {
+                            w.remove(&q[..at]);
+                        }
+                        _ => {}
                     }
                 }
             }
             w
-        })
-        .collect();
+        });
+    }
     // Every path's colour in every tuple, or why it makes no token.
     let paths: Vec<&str> = names.keys().map(String::as_str).collect();
     let mut values: BTreeMap<&str, Vec<Colour>> = BTreeMap::new();
+    // Each path's kind besides colour.
+    let mut kinds_of: BTreeMap<&str, &'static str> = BTreeMap::new();
     let mut fates: BTreeMap<&str, String> = BTreeMap::new();
     let mut resolvers: Vec<Resolve> = winners
         .iter()
@@ -1228,29 +1189,78 @@ pub fn import(
             w,
             names: &names,
             memo: HashMap::new(),
+            types: RefCell::new(HashMap::new()),
         })
         .collect();
     for &path in &paths {
         let mut per = Vec::new();
         let mut failure: Option<String> = None;
+        let mut first: Option<&'static str> = None;
         for ((t, w), r) in tuples.iter().zip(&winners).zip(resolvers.iter_mut()) {
-            let label = tuple_name(t, has_scheme, &axes);
+            // (named only for a failure's words: not made for every path in every tuple)
+            let label = || tuple_name(t, has_scheme, &axes);
             if !w.contains_key(path) {
                 failure.get_or_insert(format!(
-                    "not set in {label}, and no value of it is invented"
+                    "not set in {}, and no value of it is invented",
+                    label()
                 ));
                 continue;
             }
-            match kind(type_of(defs, w, path).as_deref()) {
+            let ty = r.type_of(path);
+            let k = match kind(ty.as_deref()) {
+                Kind::Colour => "colour",
+                Kind::Other(k) => k,
+                Kind::Reported(_) => "",
+            };
+            if let Some(f) = first.replace(k).filter(|f| *f != k) {
+                let one = match (f, k) {
+                    ("colour", _) | (_, "colour") => "colour",
+                    ("", k) => k,
+                    (f, _) => f,
+                };
+                failure.get_or_insert(format!("a {one} in some modes, another kind in others"));
+            }
+            match kind(ty.as_deref()) {
                 Kind::Colour => match r.seen(path, &mut BTreeSet::from([path.to_string()])) {
                     Ok(v) => per.push(v),
                     Err(why) => {
-                        failure.get_or_insert(format!("{why} ({label})"));
+                        failure.get_or_insert(format!("{why} ({})", label()));
                     }
                 },
+                Kind::Other(k) => {
+                    let found = r
+                        .raw(path, &mut BTreeSet::from([path.to_string()]))
+                        .and_then(|v| kinds::text(ty.as_deref().unwrap_or_default(), &v));
+                    match found {
+                        Ok(v) => {
+                            // (kept twice a tuple, as a colour's names are: charged)
+                            crate::budget::spend(2 * v.len() as u64)
+                                .map_err(|m| refuse("tamber-import-source", m))?;
+                            per.push((v.clone(), v, None))
+                        }
+                        Err(why) => {
+                            failure.get_or_insert(format!("{why} ({})", label()));
+                        }
+                    }
+                    kinds_of.insert(path, k);
+                }
                 _ => {
                     failure.get_or_insert(String::new());
                 }
+            }
+        }
+        // One value on both sides of the scheme, but for a colour.
+        // (each tuple's value beside its axis values' other side: one pass, not every pair)
+        if failure.is_none() && kinds_of.contains_key(path) {
+            let mut side: HashMap<&[String], (bool, &str)> = HashMap::new();
+            let sided = tuples.iter().zip(&per).any(|(t, v)| {
+                match side.insert(&t.1, (t.0, v.0.as_str())) {
+                    Some((dark, x)) => dark != t.0 && x != v.0,
+                    None => false,
+                }
+            });
+            if sided {
+                failure = Some(other::SIDED.to_string());
             }
         }
         match failure {
@@ -1258,12 +1268,16 @@ pub fn import(
                 values.insert(path, per);
             }
             Some(why) => {
+                // (a why names a tuple: kept, so charged)
+                crate::budget::spend(why.len() as u64)
+                    .map_err(|m| refuse("tamber-import-source", m))?;
                 fates.insert(path, why);
             }
         }
     }
-    // A reference to a token not made is written as its colour; one round a
-    // cycle of tokens too.
+    // A walk the budget ran out in is the import's refusal, not a value's. A reference to a token
+    // not made is written as its colour; one round a cycle of tokens too.
+    crate::budget::spend(1).map_err(|m| refuse("tamber-import-source", m))?;
     let made: BTreeSet<&str> = values.keys().copied().collect();
     let mut graph: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (path, per) in values.iter_mut() {
@@ -1277,22 +1291,29 @@ pub fn import(
             }
         }
     }
-    let reaches = |from: &str| {
+    // (each step charged: a long chain walked from every link is a square of it)
+    let reaches = |from: &str| -> Result<bool, String> {
         let mut stack: Vec<String> = graph
             .get(from)
             .map_or(Vec::new(), |s| s.iter().cloned().collect());
         let mut visited = BTreeSet::new();
         while let Some(n) = stack.pop() {
+            crate::budget::spend(1)?;
             if n == from {
-                return true;
+                return Ok(true);
             }
             if visited.insert(n.clone()) {
                 stack.extend(graph.get(n.as_str()).into_iter().flatten().cloned());
             }
         }
-        false
+        Ok(false)
     };
-    let cyclic: BTreeSet<&str> = graph.keys().copied().filter(|p| reaches(p)).collect();
+    let mut cyclic: BTreeSet<&str> = BTreeSet::new();
+    for p in graph.keys().copied() {
+        if reaches(p).map_err(|m| refuse("tamber-import-source", m))? {
+            cyclic.insert(p);
+        }
+    }
     for (path, per) in values.iter_mut() {
         if cyclic.contains(path) {
             for v in per.iter_mut() {
@@ -1306,12 +1327,17 @@ pub fn import(
         true => l.to_string(),
         false => format!("light-dark({l}, {d})"),
     };
+    // (each tuple's place found once: a path's lines ask it for every combination)
+    let place: HashMap<(bool, &[String]), usize> = tuples
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ((t.0, t.1.as_slice()), i))
+        .collect();
     let value_at = |per: &Vec<Colour>, combo: &Vec<String>| {
         let at = |dark: bool| {
-            tuples
-                .iter()
-                .position(|t| t.0 == dark && t.1 == *combo)
-                .map(|i| per[i].0.clone())
+            place
+                .get(&(dark, combo.as_slice()))
+                .map(|&i| per[i].0.clone())
                 .unwrap_or_default()
         };
         match has_scheme {
@@ -1329,10 +1355,14 @@ pub fn import(
     // ones naming fewer leave the value wrong or ambiguous.
     combos.sort_by_key(|c| c.iter().zip(&default_combo).filter(|(a, b)| a != b).count());
     let mut tokens = Vec::new();
+    let mut made: Vec<&str> = Vec::new();
     for (path, per) in &values {
         let value = value_at(per, &default_combo);
         let mut whens: Vec<(Vec<(String, String)>, String)> = Vec::new();
         for combo in &combos {
+            // (each combination's lines weighed against those made so far: charged)
+            crate::budget::spend(1 + whens.len() as u64)
+                .map_err(|m| refuse("tamber-import-source", m))?;
             let conds: Vec<(String, String)> = axes
                 .iter()
                 .zip(combo.iter())
@@ -1363,12 +1393,34 @@ pub fn import(
             name: names[*path].clone(),
             value,
             whens,
+            kind: kinds_of.get(path).map(|k| other::written(k)),
         });
+        made.push(path);
     }
+    // Each of another kind that does not fold, and each colour that would not
+    // hold where it lands, makes no token.
+    let owned: Vec<&str> = axes.iter().map(|(a, _)| a.as_str()).collect();
+    let why = other::refused(&tokens, (&axes, &owned), design, vocab).map_err(|d| vec![d])?;
+    for (path, why) in made.iter().zip(&why) {
+        if let Some(why) = why {
+            let why = kinds_of
+                .get(path)
+                .map_or(why.clone(), |k| format!("not a {k} Tamber folds: {why}"));
+            fates.insert(path, why);
+            values.remove(path);
+        }
+    }
+    let mut at = 0;
+    tokens.retain(|_| {
+        at += 1;
+        why[at - 1].is_none()
+    });
     // Each def: mapped when it wins a tuple of a token made, else reported.
     let wins: BTreeSet<usize> = winners.iter().flat_map(|w| w.values().copied()).collect();
     let mut unmapped = Vec::new();
     let mut mapped = 0;
+    // (indexed: a source of many unused defs is no square of them)
+    let unused_why: HashMap<usize, &String> = read.unused.iter().map(|(i, w)| (*i, w)).collect();
     for (i, d) in defs.iter().enumerate() {
         let report = |why: String, token: Option<String>| Unmapped {
             block: d.file.clone(),
@@ -1380,8 +1432,8 @@ pub fn import(
             why,
             token,
         };
-        if let Some((_, why)) = read.unused.iter().find(|(j, _)| *j == i) {
-            unmapped.push(report(why.clone(), None));
+        if let Some(why) = unused_why.get(&i) {
+            unmapped.push(report((*why).clone(), None));
             continue;
         }
         if let Some(first) = collided.get(&d.path) {
@@ -1405,15 +1457,14 @@ pub fn import(
         let token = names.get(&d.path).cloned();
         let ty =
             d.ty.clone()
-                .or_else(|| winners.iter().find_map(|w| type_of(defs, w, &d.path)));
+                .or_else(|| resolvers.iter().find_map(|r| r.type_of(&d.path)));
         let why = match (&d.refused, kind(ty.as_deref())) {
             (Some(why), _) => why.clone(),
-            (None, Kind::Pending(k)) => format!("kind pending (stage 6): {k}"),
             (None, Kind::Reported(why)) => {
                 unmapped.push(report(why.to_string(), None));
                 continue;
             }
-            (None, Kind::Colour) => fates
+            (None, Kind::Colour | Kind::Other(_)) => fates
                 .get(d.path.as_str())
                 .cloned()
                 .filter(|w| !w.is_empty())
@@ -1421,7 +1472,6 @@ pub fn import(
         };
         unmapped.push(report(why, token));
     }
-    let owned: Vec<&str> = axes.iter().map(|(a, _)| a.as_str()).collect();
     let ops = reconcile(design, &axes, &owned, &tokens);
     let reported = unmapped.len();
     let counted = counted(defs.len(), mapped, reported)?;
@@ -1430,5 +1480,8 @@ pub fn import(
         offers: Vec::new(),
         unmapped,
         counted,
+        dials: Vec::new(),
+        pins: Vec::new(),
+        notes: Vec::new(),
     })
 }

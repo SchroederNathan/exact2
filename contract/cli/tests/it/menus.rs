@@ -277,6 +277,11 @@ fn a_confirmation_or_chooser_shape_compiles() {
         "dialog id=\"c\" role=\"dialog\" aria-modal=true closedby=\"any\"\n  column gap=12\n    text \"Delete account?\"\n    row\n      button commandfor=\"c\" command=\"close\"\n        text \"Cancel\"\n      button press=go commandfor=\"c\" command=\"close\"\n        text \"Delete\"".into(),
         // Not an alertdialog: a menu takes any rows, `hr` among them.
         format!("column id=\"c\" popover=\"auto\" role=\"menu\"\n  button press=go popovertarget=\"c\" popovertargetaction=\"hide\"\n    text \"Go\"\n  hr\n{CANCEL}"),
+        // Text and one closing button: the platform's one-button alert,
+        // which tells ("Couldn't save.") and has nothing to choose
+        // (Charlie, 2026-10-18), as a `dialog` and as a popover.
+        "dialog id=\"c\" role=\"alertdialog\" aria-label=\"Couldn't save\"\n  text \"The disk is full.\"\n  button commandfor=\"c\" command=\"close\"\n    text \"OK\"".into(),
+        format!("column id=\"c\" popover=\"auto\" role=\"alertdialog\"\n  text \"Saved.\"\n{CANCEL}"),
     ] {
         if let Err(e) = contract::compile(&app(&body)) {
             panic!("{body}\n{e}");
@@ -315,7 +320,10 @@ fn a_shape_the_native_sheet_cannot_present_is_refused_naming_the_row() {
             format!("{open}\n{action}\n  for s in items key=s\n    button popovertarget=\"c\" popovertargetaction=\"hide\"\n      text s"),
             "inside `for`",
         ),
-        (format!("{open}\n  text \"Sure?\"\n{CANCEL}"), "has no action"),
+        // With no action and not an alert, there is nothing to present.
+        (format!("{open}\n{CANCEL}"), "has no action"),
+        (format!("{open}\n  text \"Sure?\""), "has no action"),
+        (format!("{open}\n  input placeholder=\"Name\"\n{CANCEL}"), "has no action"),
         (
             "dialog id=\"c\" role=\"alertdialog\" closedby=\"none\"\n  button press=go commandfor=\"c\" command=\"close\"\n    text \"Go\"".into(),
             "closedby=\"any\"",
@@ -353,6 +361,11 @@ fn an_alert_shaped_dialog_implies_closerequest_and_a_chooser_any() {
             vec![text, &delete, &keep, cancel],
             "closerequest",
             "three buttons are still an alert's",
+        ),
+        (
+            vec![text, cancel],
+            "closerequest",
+            "text and its one button",
         ),
         (vec![&delete, cancel], "any", "no text: a chooser"),
         (vec![text, &delete], "any", "no cancel"),
@@ -546,7 +559,9 @@ fn one_cancel_component_on_both_arms_of_a_when_is_one_cancel() {
 
 #[test]
 fn menu_bar_placement_is_a_button_hint_with_fixed_literal_destinations() {
-    for menu in ["app", "file", "edit", "view", "go", "window", "help"] {
+    for menu in [
+        "about", "app", "file", "edit", "view", "go", "window", "help", "none",
+    ] {
         let r = boot(&app(&format!(
             "button \"Check for Updates…\" -exact-menu=\"{menu}\" press=go testId=\"updates\""
         )));
@@ -562,9 +577,46 @@ fn menu_bar_placement_is_a_button_hint_with_fixed_literal_destinations() {
     }
 }
 
+/// LLP 1133.025 D4, D5: `status` stands alone; `dock` joins at most one
+/// menu-bar menu, in either order.
+#[test]
+fn a_status_item_stands_alone_and_a_dock_item_joins_one_menu() {
+    for menu in ["status", "dock", "file dock", "dock file", "none dock"] {
+        let r = boot(&app(&format!(
+            "button \"New\" -exact-menu=\"{menu}\" press=go testId=\"new\""
+        )));
+        let prop = PropId::from_name("menuPlacement").expect("menu placement prop");
+        assert_eq!(node(&r, "new").props.str(prop), Some(menu));
+    }
+    for (body, id) in [
+        (
+            "button \"New\" -exact-menu=\"status dock\" press=go",
+            "lower-menu-status",
+        ),
+        (
+            "button \"New\" -exact-menu=\"file status\" press=go",
+            "lower-menu-status",
+        ),
+        (
+            "button \"New\" -exact-menu=\"file edit\" press=go",
+            "lower-menu-placement",
+        ),
+        (
+            "button \"New\" -exact-menu=\"dock dock\" press=go",
+            "lower-menu-placement",
+        ),
+        (
+            "button \"New\" -exact-menu=\"tray\" press=go",
+            "lower-menu-placement",
+        ),
+    ] {
+        assert_eq!(refused(body).0, id, "{body}");
+    }
+}
+
 #[test]
 fn menu_bar_removal_accepts_only_root_literal_standard_ids() {
-    let ids = "close-all autofill show-tab-bar show-all-tabs enter-full-screen minimize zoom bring-all-to-front show-previous-tab show-next-tab move-tab-to-new-window merge-all-windows";
+    let ids = "close-all autofill show-tab-bar show-all-tabs enter-full-screen minimize zoom bring-all-to-front show-previous-tab show-next-tab move-tab-to-new-window merge-all-windows back forward develop paste-and-match-style find spelling-and-grammar substitutions transformations app-help actual-size zoom-in zoom-out";
     for value in [ids, "", "show-tab-bar show-tab-bar"] {
         let source = format!(
             "component App\n  view\n    column -exact-menu-remove=\"{value}\" testId=\"root\"\n"
@@ -574,7 +626,7 @@ fn menu_bar_removal_accepts_only_root_literal_standard_ids() {
         assert_eq!(node(&r, "root").props.str(prop), Some(value));
     }
     for source in [
-        "component App\n  view\n    column -exact-menu-remove=\"develop\"\n".to_owned(),
+        "component App\n  view\n    column -exact-menu-remove=\"format\"\n".to_owned(),
         "component App\n  state removal = \"show-tab-bar\"\n  view\n    column -exact-menu-remove=removal\n".to_owned(),
         app("column -exact-menu-remove=\"show-tab-bar\""),
         app("if busy\n  column -exact-menu-remove=\"autofill\""),
@@ -582,6 +634,69 @@ fn menu_bar_removal_accepts_only_root_literal_standard_ids() {
         let e = contract::compile(&source).unwrap_err();
         assert_eq!(e.id, "lower-menu-remove", "{source}: {e}");
         for id in ids.split_whitespace() { assert!(e.message.contains(id), "{e}"); }
+    }
+}
+
+#[test]
+fn menu_bar_keys_accept_only_close_window_and_a_free_chord() {
+    for value in [
+        "close-window=none",
+        "close-window=Meta+Shift+W",
+        "close-window=Meta+Shift+1",
+        "close-window=Meta+Meta+Shift+W",
+        "close-window=Meta+F1",
+        "close-window=Meta+Alt++",
+        "",
+    ] {
+        let source = format!(
+            "component App\n  view\n    column -exact-menu-keys=\"{value}\" testId=\"root\"\n"
+        );
+        let r = boot(&source);
+        let prop = PropId::from_name("menuKeys").expect("menu keys prop");
+        assert_eq!(node(&r, "root").props.str(prop), Some(value));
+    }
+    let keys =
+        |value: &str| format!("component App\n  view\n    column -exact-menu-keys=\"{value}\"\n");
+    let mut refused: Vec<String> = [
+        "minimize=none",
+        "close-all=none",
+        "close-window",
+        "close-window=Control+W",
+        "close-window=Meta+Hyper+W",
+        "close-window=Meta+WW",
+        "close-window=Meta+F01",
+        "close-window=Meta+F36",
+        "close-window=none close-window=Meta+Shift+W",
+        // The host's and the system's own chords.
+        "close-window=Meta+W",
+        "close-window=Meta+Q",
+        "close-window=Meta+H",
+        "close-window=Meta+M",
+        "close-window=Meta+,",
+        "close-window=Meta+Alt+W",
+        "close-window=Meta+Shift+Z",
+        "close-window=Meta+Tab",
+        "close-window=Meta+Space",
+        "close-window=Meta++",
+        // The same keystrokes spelled with Shift, and the system's own.
+        "close-window=Meta+Shift+;",
+        "close-window=Meta+Shift+=",
+        "close-window=Meta+Shift+Q",
+        "close-window=Meta+Alt+Shift+Q",
+        "close-window=Meta+Shift+`",
+        "close-window=Meta+Control+Shift+3",
+        "close-window=Meta+Control+Shift+4",
+        "close-window=Meta+Alt+D",
+    ]
+    .iter()
+    .map(|value| keys(value))
+    .collect();
+    refused.push("component App\n  state keys = \"close-window=none\"\n  view\n    column -exact-menu-keys=keys\n".to_owned());
+    refused.push(app("column -exact-menu-keys=\"close-window=none\""));
+    for source in refused {
+        let e = contract::compile(&source).unwrap_err();
+        assert_eq!(e.id, "lower-menu-keys", "{source}: {e}");
+        assert!(e.message.contains("close-window"), "{e}");
     }
 }
 
@@ -661,5 +776,84 @@ fn popover_commands_check_their_id_and_source() {
     ] {
         let e = contract::compile(&format!("component App\n  action go\n    {command}\n  view\n    button press=go\n      text \"Menu\"\n")).unwrap_err();
         assert_eq!(e.id, "type-popover-command", "{command}: {e}");
+    }
+}
+
+/// HTML honours `popovertarget` and `commandfor` on a button only; on any
+/// other node (a composite `row` the euxy port tried) they are refused,
+/// naming `button appearance="none"`.
+#[test]
+fn an_invoker_off_a_button_is_refused_naming_the_button() {
+    const MENU: &str = "\ncolumn id=\"m\" popover=\"auto\"\n  button press=go\n    text \"New\"";
+    const DIALOG: &str =
+        "\ndialog id=\"d\"\n  button commandfor=\"d\" command=\"close\"\n    text \"Close\"";
+    for (body, attr) in [
+        (
+            format!("row popovertarget=\"m\" role=\"button\"\n  text \"Name\"{MENU}"),
+            "popovertarget",
+        ),
+        (
+            format!("text \"Name\" popovertarget=\"m\"{MENU}"),
+            "popovertarget",
+        ),
+        (
+            format!("row commandfor=\"d\" command=\"show-modal\"\n  text \"Open\"{DIALOG}"),
+            "commandfor",
+        ),
+    ] {
+        let (id, message) = refused(&body);
+        assert_eq!(id, "lower-invoker-tag", "{body}: {message}");
+        assert!(
+            message.contains(&format!("`{attr}`"))
+                && message.contains("button appearance=\"none\""),
+            "{message}"
+        );
+    }
+    boot(&app(&format!(
+        "button appearance=\"none\" popovertarget=\"m\"\n  row\n    text \"Name\"{MENU}"
+    )));
+    boot(&app(&format!(
+        "button commandfor=\"d\" command=\"show-modal\"\n  text \"Open\"{DIALOG}"
+    )));
+}
+
+#[test]
+fn optional_popover_preserves_the_node_and_clears_without_a_journal_refusal() {
+    let mut r = boot(
+        r#"component App
+  state full = false
+  action flip
+    full = not full
+  view
+    column
+      button testId="flip" press=flip
+        text "Flip"
+      column testId="resident" popover=(full ? some("manual") : none)
+        iframe testId="guest" src="about:blank" width=200 height=100
+"#,
+    );
+    let resident = node(&r, "resident").id;
+    let guest = node(&r, "guest").id;
+    let flip = node(&r, "flip").id;
+    assert_eq!(node(&r, "resident").props.str(PropId::Popover), None);
+    for expected in [Some("manual"), None, Some("manual"), None] {
+        r.dispatch(flip, exact_runner::Event::Press).unwrap();
+        assert_eq!(node(&r, "resident").id, resident);
+        assert_eq!(node(&r, "guest").id, guest);
+        assert_eq!(node(&r, "resident").props.str(PropId::Popover), expected);
+    }
+    assert!(!r.journal().any(|line| line.contains("invalid")));
+    for value in ["true", "5", "some(true)", "some(5)"] {
+        let source =
+            format!("component App\n  view\n    column popover={value}\n      text \"x\"\n");
+        assert_eq!(
+            contract::compile(&source).unwrap_err().id,
+            "lower-attr-type"
+        );
+    }
+    for value in ["\"manual\"", "\"auto\"", "none", "some(\"manual\")"] {
+        let source =
+            format!("component App\n  view\n    column popover={value}\n      text \"x\"\n");
+        assert!(contract::compile(&source).is_ok(), "{source}");
     }
 }

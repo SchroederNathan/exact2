@@ -1,12 +1,18 @@
 import Foundation
 import CoreGraphics
+import CExact
 import ImageIO
 import ObjectiveC
+#if os(iOS)
+import UIKit
+#endif
 
-enum RasterFailure: Error, CustomStringConvertible {
+enum RasterFailure: Error, CustomStringConvertible, Equatable {
     case encodedLimit, headerLimit, dimensions, sourcePixels, overflow, tooLarge, decode, reservation
-    /// Bytes no decoder here reads (an SVG, text served as `image/png`).
+    /// Bytes no decoder here reads (text served as `image/png`).
     case format
+    /// An SVG the parser refused, with its reason and line (LLP 1011.001 D2).
+    case svg(String)
     /// A source that names nothing: another scheme, an asset that is not there.
     case unresolved
     /// What the image's `error` says (LLP 1011 §4) and the agent's `state` shows.
@@ -20,6 +26,7 @@ enum RasterFailure: Error, CustomStringConvertible {
         case .tooLarge: return "too large"
         case .decode: return "decode failed"
         case .reservation: return "actual exceeds reservation"
+        case .svg(let why): return "not an SVG this host reads: \(why)"
         case .format: return "not an image format this host decodes"
         case .unresolved: return "the source names no file this host loads"
         }
@@ -64,6 +71,9 @@ struct RasterMetadata: Equatable, Sendable {
     var deep = false
     /// A PQ or HLG transfer, or a gain map, as the header says (LLP 1100 D4).
     var hdr = false
+    /// An SVG document (LLP 1011.001): its size is the file's natural size
+    /// in CSS pixels, and it is drawn at any size the plan asks.
+    var svg = false
     /// The variant when nothing limits it. For an HDR source's SDR rendition
     /// the header's depth is a guess at ImageIO's, which it can't say.
     var variant: UInt32 { deep ? RasterVariant.deep : RasterVariant.own8 }
@@ -87,6 +97,18 @@ struct RasterMetadata: Equatable, Sendable {
     static func read(prefix: Data, encodedBytes: Int) throws -> Self {
         guard encodedBytes > 0, encodedBytes <= encodedLimit else { throw RasterFailure.encodedLimit }
         guard !prefix.isEmpty, prefix.count <= headerLimit, prefix.count <= encodedBytes else { throw RasterFailure.headerLimit }
+        // An SVG, by its bytes (LLP 1011.001 D4): its root tag's size is the
+        // natural size, rounded to the pixel counts the seam carries.
+        var size = [Double](repeating: 0, count: 2)
+        let isSVG = prefix.withUnsafeBytes { raw in
+            exact_svg_image_header(raw.baseAddress?.assumingMemoryBound(to: UInt8.self), prefix.count, &size) == 1
+        }
+        if isSVG {
+            var metadata = try validated(width: max(1, Int(size[0].rounded())), height: max(1, Int(size[1].rounded())), orientation: 1,
+                                         encodedBytes: encodedBytes, headerBytes: prefix.count)
+            metadata.svg = true
+            return metadata
+        }
         // ImageIO reads WebP only whole; its size is in the first chunk, so a
         // prefix of a large WebP (the Bluesky CDN serves every image as one)
         // answers from the header itself.
@@ -233,6 +255,31 @@ func webpSize(_ data: Data) -> (Int, Int)? {
     }
 }
 
+extension RasterMetadata {
+    /// An 8-bit PNG's metadata from its header, as ImageIO reads it, where
+    /// nothing before its pixels can change that: no ICC profile or cICP
+    /// (either can name an HDR transfer), EXIF (an orientation) or animation.
+    /// Nil for anything else, left to ImageIO.
+    static func plainPNG(prefix: Data, encodedBytes: Int) -> Self? {
+        let b = [UInt8](prefix)
+        guard b.count >= 33, b.starts(with: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+              Array(b[12..<16]) == Array("IHDR".utf8), b[24] <= 8 else { return nil }
+        let u32 = { (i: Int) in Int(b[i]) << 24 | Int(b[i + 1]) << 16 | Int(b[i + 2]) << 8 | Int(b[i + 3]) }
+        let plain: Set<String> = ["PLTE", "tRNS", "sRGB", "gAMA", "cHRM", "pHYs", "bKGD", "tEXt", "zTXt", "iTXt", "tIME", "sBIT", "sPLT", "hIST"]
+        var at = 33
+        while at + 8 <= b.count {
+            let type = String(decoding: b[at + 4..<at + 8], as: UTF8.self)
+            if type == "IDAT" {
+                return try? validated(width: u32(16), height: u32(20), orientation: 1,
+                                      encodedBytes: encodedBytes, headerBytes: prefix.count)
+            }
+            guard plain.contains(type) else { return nil }
+            at += 12 + u32(at)
+        }
+        return nil
+    }
+}
+
 struct RasterDecodePlan: Sendable {
     let width: Int
     let height: Int
@@ -248,19 +295,29 @@ struct RasterDecodePlan: Sendable {
     /// provider storage is exact; no app-owned full-source bitmap is created.
     let scratchBytes: Int
     var peakBytes: Int { outputBytes + scratchBytes }
+    /// An SVG's device pixels per CSS pixel: the scene is resolved at the
+    /// plan's size over this (LLP 1011.001 D3), so a 3× screen gets a 3×
+    /// drawing. A bitmap's plan ignores it.
+    var scale: Double = 1
 
-    init(metadata: RasterMetadata, maxPixel: Int, variant: UInt32? = nil) throws {
+    /// `aspect`: for an SVG under `object-fit: fill`, the box's pixel size,
+    /// whose ratio the plan takes in place of the natural size's (LLP
+    /// 1011.001 D1: the concrete object size is the box itself).
+    init(metadata: RasterMetadata, maxPixel: Int, variant: UInt32? = nil, aspect: (Int, Int)? = nil) throws {
         guard maxPixel > 0 else { throw RasterFailure.dimensions }
         self.variant = variant ?? metadata.variant
         guard let bytes = RasterVariant.bytesPerPixel(self.variant) else { throw RasterFailure.reservation }
         bytesPerPixel = bytes
         let natural = metadata.naturalSize
-        let longest = Int(max(natural.width, natural.height))
-        self.maxPixel = min(maxPixel, longest)
+        let (axisW, axisH): (Int, Int) = metadata.svg ? aspect.map { (max(1, $0.0), max(1, $0.1)) } ?? (Int(natural.width), Int(natural.height)) : (Int(natural.width), Int(natural.height))
+        let longest = max(axisW, axisH)
+        // A bitmap is never enlarged (its pixels are what it has); an SVG is
+        // drawn at any size, up to the pipeline's cap on an axis.
+        self.maxPixel = metadata.svg ? min(maxPixel, 4096) : min(maxPixel, longest)
         // Keep the longest axis exact: floating ceil can add one pixel and
         // make a worker reconstruct a different reservation from this size.
-        width = try Self.scaled(Int(natural.width), pixel: self.maxPixel, longest: longest)
-        height = try Self.scaled(Int(natural.height), pixel: self.maxPixel, longest: longest)
+        width = try Self.scaled(axisW, pixel: self.maxPixel, longest: longest)
+        height = try Self.scaled(axisH, pixel: self.maxPixel, longest: longest)
         stride = try Self.aligned(try Self.product(width, bytes), to: 64)
         outputBytes = try Self.product(stride, height)
         // Allow up to 128-bit staging pixels and page-aligned scanlines. ImageIO
@@ -318,6 +375,33 @@ final class RasterImage: @unchecked Sendable {
     let animation: RasterAnimation?
     /// An HDR bitmap's headroom over SDR white, else 0.
     let headroom: Float
+
+    /// The launch image as the asset catalog holds it, already at the
+    /// screen's scale (`RasterInput.catalog`): drawn into the planned storage
+    /// when the plan is that size, so the picture is the launch screen's, and
+    /// no ImageIO decode runs, whose first use loads every reader plug-in
+    /// (RawCamera's 450 KB of data among them). Nil leaves it to ImageIO.
+    static func catalog(_ name: String, metadata: RasterMetadata, plan: RasterDecodePlan,
+                        charge: any RasterBackingCharge, sourceOwner: (any RasterSourceOwner)?) -> RasterImage? {
+        #if os(iOS)
+        guard plan.variant != RasterVariant.hdr, !plan.deep,
+              let image = UIImage(named: name)?.cgImage, image.width == plan.width, image.height == plan.height,
+              // Drawn, never adopted: the catalog's image is UIKit's to keep.
+              let drawn = normalized(image, plan: plan, adopt: false) else { return nil }
+        let owner = RasterOwner(charge: charge, sourceOwner: sourceOwner)
+        return RasterImage(image: owner.own(drawn), natural: metadata.naturalSize, bytes: plan.outputBytes, animation: nil)
+        #else
+        return nil
+        #endif
+    }
+    /// A package's decoded picture (LLP 1133.019 D11 item 1), drawn into the
+    /// plan's storage, which the budget charges as any decode's.
+    static func picture(_ image: CGImage, metadata: RasterMetadata, plan: RasterDecodePlan,
+                        charge: any RasterBackingCharge, sourceOwner: (any RasterSourceOwner)?) throws -> RasterImage {
+        guard let drawn = normalized(image, plan: plan, adopt: false) else { throw RasterFailure.decode }
+        let owner = RasterOwner(charge: charge, sourceOwner: sourceOwner)
+        return RasterImage(image: owner.own(drawn), natural: metadata.naturalSize, bytes: plan.outputBytes, animation: nil)
+    }
     private init(image: CGImage, natural: CGSize, bytes: Int, animation: RasterAnimation?, headroom: Float = 0) {
         self.image = image; naturalSize = natural; residentBytes = bytes; self.animation = animation; self.headroom = headroom
     }
@@ -332,6 +416,7 @@ final class RasterImage: @unchecked Sendable {
         let actual = try RasterMetadata.read(prefix: bytes.prefix(RasterMetadata.headerLimit), encodedBytes: bytes.count)
         guard actual == metadata else { throw RasterFailure.reservation }
         let owner = RasterOwner(charge: charge, sourceOwner: sourceOwner)
+        if metadata.svg { return try decodeSVG(bytes, metadata: metadata, plan: plan, owner: owner) }
         // This pool ends before the caller publishes the payload/completes its
         // permit. No ImageIO source, thumbnail, or CGContext enters the mailbox.
         return try autoreleasepool {
@@ -362,6 +447,42 @@ final class RasterImage: @unchecked Sendable {
             return RasterImage(image: owner.own(image), natural: metadata.naturalSize, bytes: plan.outputBytes,
                                animation: animation, headroom: headroom)
         }
+    }
+
+    /// An SVG drawn at the plan's size (LLP 1011.001 D3, D4): the file
+    /// parsed and resolved in Rust at the plan's size in CSS pixels, its scene
+    /// rendered as an island is (`SvgIsland.render`), on the main thread when
+    /// it has text (where the session's fonts are) and here otherwise, into
+    /// the plan's storage. Animation is ignored and nothing is dark: a
+    /// picture does not follow the page's scheme, as a browser's `<img>`
+    /// does not.
+    fileprivate static func decodeSVG(_ bytes: Data, metadata: RasterMetadata, plan: RasterDecodePlan, owner: RasterOwner) throws -> RasterImage {
+        let css = CGSize(width: Double(plan.width) / plan.scale, height: Double(plan.height) / plan.scale)
+        var length = 0, flags: UInt32 = 0
+        let buffer = bytes.withUnsafeBytes { raw in
+            exact_svg_image_scene(raw.baseAddress?.assumingMemoryBound(to: UInt8.self), bytes.count, css.width, css.height, &length, &flags)
+        }
+        guard let buffer else { throw RasterFailure.svg("the scene was not made") }
+        defer { exact_svg_image_free(buffer, length) }
+        let data = Data(bytes: buffer, count: length)
+        if flags & 2 != 0 { throw RasterFailure.svg(String(decoding: data, as: UTF8.self)) }
+        guard let spec = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw RasterFailure.svg("the scene is not JSON") }
+        let els = spec["els"] as? [Any] ?? []
+        let numbers = (spec["t"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue } ?? []
+        // No view box area: an empty picture, as the browser's.
+        let transform = numbers.count == 6 ? CGAffineTransform(a: numbers[0], b: numbers[1], c: numbers[2], d: numbers[3], tx: numbers[4], ty: numbers[5]) : nil
+        let render = { () -> CGContext? in
+            guard let transform else {
+                return CGContext(data: nil, width: plan.width, height: plan.height, bitsPerComponent: 8, bytesPerRow: plan.width * 4,
+                                 space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            }
+            return SvgIsland.render(els, rect: CGRect(origin: .zero, size: css), w: plan.width, h: plan.height, k: plan.scale,
+                                    transform: transform, flip: true, dark: false, fonts: nil)
+        }
+        let context = flags & 1 != 0 && !Thread.isMainThread ? DispatchQueue.main.sync(execute: render) : render()
+        guard let context else { throw RasterFailure.svg("the picture did not render at \(plan.width)×\(plan.height)") }
+        guard let drawn = context.makeImage(), let image = normalized(drawn, plan: plan) else { throw RasterFailure.svg("the picture's storage was not made") }
+        return RasterImage(image: owner.own(image), natural: metadata.naturalSize, bytes: plan.outputBytes, animation: nil)
     }
 
     /// An image's headroom, where the system says one (iOS 18 / macOS 15);
@@ -403,7 +524,7 @@ final class RasterImage: @unchecked Sendable {
     /// where a bitmap of ours would be copied again at each first commit.
     /// BGRA8 or RGBA16F premultiplied: Core Animation's own layouts, which it
     /// shares without converting.
-    static func normalized(_ thumbnail: CGImage, plan: RasterDecodePlan) -> CGImage? {
+    static func normalized(_ thumbnail: CGImage, plan: RasterDecodePlan, adopt: Bool = true) -> CGImage? {
         // An HDR decode in a BT.2100 space is kept as ImageIO made it: Core
         // Animation tone-maps that to the layer's range, which it doesn't do
         // for extended linear content (LLP 1100 D5, D8).
@@ -413,7 +534,7 @@ final class RasterImage: @unchecked Sendable {
            thumbnail.width <= plan.width + 1, thumbnail.height <= plan.height + 1,
            thumbnail.bytesPerRow * thumbnail.height <= plan.outputBytes { return thumbnail }
         let space = storageSpace(thumbnail.colorSpace, plan: plan)
-        if isAdoptable(thumbnail, plan: plan, space: space) { return thumbnail }
+        if adopt, isAdoptable(thumbnail, plan: plan, space: space) { return thumbnail }
         let bitmap = plan.deep
             ? CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.floatComponents.rawValue | CGBitmapInfo.byteOrder16Little.rawValue
             : CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
@@ -451,15 +572,16 @@ final class RasterImage: @unchecked Sendable {
     }
 }
 
-/// Whether drawing the thumbnail into the planned bitmap would change
-/// nothing but its bytes' layout: the planned size (no resample), 8-bit
-/// opaque pixels already in the storage space (no conversion; the skipped
-/// alpha byte reads as opaque), rows no wider than the plan's. A deep plan
+/// Keep ImageIO's one-pixel rounding within the reservation. Object fit
+/// uses the source's natural size, so the layer scales these pixels to the
+/// same rectangle without an intermediate resample. Only opaque 8-bit
+/// pixels in the storage space qualify. A deep plan
 /// always draws: ImageIO hands back 16-bit integers, and Core Animation
 /// shares half floats. Otherwise the caller draws.
 private func isAdoptable(_ thumbnail: CGImage, plan: RasterDecodePlan, space: CGColorSpace) -> Bool {
     !plan.deep
-        && thumbnail.width == plan.width && thumbnail.height == plan.height
+        && (plan.width - 1...plan.width).contains(thumbnail.width)
+        && (plan.height - 1...plan.height).contains(thumbnail.height)
         && thumbnail.bitsPerComponent == 8 && thumbnail.bitsPerPixel == 32
         && thumbnail.bytesPerRow <= plan.stride
         && thumbnail.bitmapInfo.subtracting(.alphaInfoMask).subtracting(.byteOrderMask).isEmpty

@@ -19,17 +19,68 @@ impl<D: DataSource> Presenter<D> {
         self.module = module;
     }
 
+    /// A dev loop's status the boot already said: the poll says it again
+    /// only once it changes.
+    pub fn said_at_boot(&mut self, said: Option<String>) {
+        if let (Some(dev), Some(said)) = (self.dev.as_mut(), said) {
+            dev.says(&said);
+        }
+    }
+
     /// Connect the existing development URL loop; polling starts after first pixel.
     pub fn set_development(&mut self, url: Option<String>, identity: Option<String>) {
         self.dev = url.map(|url| crate::fetch::Poller::new(url, self.compat.clone(), identity));
+        // Its answers wake the executor's fd, so a host that turns only when
+        // woken (the Android reader's canvas host) takes them at once.
+        let waker = self.executor.waker();
+        if let Some(dev) = self.dev.as_mut() {
+            *dev.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
+        }
         // What the build channel's registration names (LLP 1122 D4).
         if let Some(link) = self.dev.as_mut().and_then(|dev| dev.link.as_mut()) {
             link.design = Some(self.host.runner().design());
+            link.plan_digest = Some(self.host.runner().inspection_digest().to_string());
+        }
+    }
+
+    /// Milliseconds from `now` until a turn is owed: a timer, sampled motion
+    /// edge, or development poll (attached, and the first
+    /// pixel out: it polls after). A host that turns only when woken asks
+    /// this (the Android reader's canvas host).
+    pub fn turn_due_ms(&self, now: f64) -> Option<f64> {
+        let timer = self.wake_due_ms().map(|due| (due - now).max(0.0));
+        // (A load to send, or a picture asking again for a failed download, as soon.)
+        let timer = timer
+            .into_iter()
+            .chain(self.image_turn_due_in_ms())
+            .reduce(f64::min);
+        let dev = self.dev.as_ref().filter(|_| self.painted);
+        let poll = dev
+            .and_then(|d| d.due_in())
+            .map(|d| d.as_secs_f64() * 1000.0);
+        match (timer, poll) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
     /// Apply a finished URL generation without blocking the presentation thread.
     pub fn poll_development(&mut self, data: impl FnOnce() -> D) {
+        if !self.painted {
+            return;
+        }
+        self.tick_development();
+        // The build channel (LLP 1122 D4): the frames its tick took, the
+        // commands dispatched before any generation is handled.
+        self.serve_build_channel();
+        self.apply_development(data);
+    }
+
+    /// The development poll's tick alone: its workers started when due, an
+    /// answer taken (a generation kept for [`Self::poll_development`] to
+    /// apply). A frame that must stay quick (a scroll step on the Android
+    /// reader) still ticks, so a due poll is never left waiting on it.
+    pub fn tick_development(&mut self) {
         if !self.painted {
             return;
         }
@@ -45,12 +96,14 @@ impl<D: DataSource> Presenter<D> {
                 }
                 self.pending_dev = Some(generation);
             }
-            Some(Err(error)) => eprintln!("exact url: {error}; keeping the running app"),
+            // A dev loop's status (its producers starting) once, not each tick.
+            Some(Err(error)) => self.dev.as_mut().unwrap().say(&error),
             _ => {}
         }
-        // The build channel (LLP 1122 D4): the frames its tick took, the
-        // commands dispatched before any generation is handled.
-        self.serve_build_channel();
+    }
+
+    /// Install the generation a tick kept, when it may go.
+    fn apply_development(&mut self, data: impl FnOnce() -> D) {
         if let Some(generation) = self.pending_dev.take() {
             let let_go = self
                 .dev
@@ -59,8 +112,12 @@ impl<D: DataSource> Presenter<D> {
                 .is_some_and(|t| t.elapsed() >= LET_GO_AFTER);
             match self.reload_module(&generation.plan, data(), generation.module.clone(), let_go) {
                 Ok(_) => {
+                    let waker = self.executor.waker();
                     let dev = self.dev.as_mut().unwrap();
                     dev.identity = Some(generation.identity);
+                    // A new executor, so its waker (and a new wake
+                    // descriptor, which the Android reader watches again).
+                    *dev.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
                     // The generation runs the design it was built with; one
                     // applied live while it downloaded is newer. The next
                     // tick's snapshot (or 204, the plan's own) converges.
@@ -68,6 +125,7 @@ impl<D: DataSource> Presenter<D> {
                         link.snapshot = true;
                     }
                     self.repin();
+                    self.rehold();
                     self.report_status();
                 }
                 Err(HostError::PreparingModule) => self.pending_dev = Some(generation),
@@ -124,14 +182,23 @@ impl<D: DataSource> Presenter<D> {
             validation
                 .activate_for_validation()
                 .map_err(|e| HostError::Asset(format!("candidate module: {e:?}")))?;
-            let (mut host, error) = Host::boot_with(
-                plan,
-                validation,
-                Box::new(Measurer(text.clone())),
-                self.viewport.0,
-                self.viewport.1,
-                Some(carried),
-                Some(delivery.clone()),
+            let (mut host, error) = exact_runner::time::launching_with(
+                exact_runner::time::Launch {
+                    time: Some(self.host.runner().wall_time()),
+                    place: Some(self.host.runner().place().clone()),
+                    ..exact_runner::time::Launch::NONE
+                },
+                || {
+                    Host::boot_with(
+                        plan,
+                        validation,
+                        Box::new(Measurer(text.clone())),
+                        self.viewport.0,
+                        self.viewport.1,
+                        Some(carried),
+                        Some(delivery.clone()),
+                    )
+                },
             )?;
             if let Some(error) = error {
                 return Err(HostError::Layout(error));
@@ -247,14 +314,23 @@ impl<D: DataSource> Presenter<D> {
             &delivery,
             false,
         )?;
-        let (mut host, error) = Host::boot_with(
-            &candidate.plan,
-            data,
-            Box::new(Measurer(text.clone())),
-            self.viewport.0,
-            self.viewport.1,
-            Some(&carried),
-            Some(delivery),
+        let (mut host, error) = exact_runner::time::launching_with(
+            exact_runner::time::Launch {
+                time: Some(self.host.runner().wall_time()),
+                place: Some(self.host.runner().place().clone()),
+                ..exact_runner::time::Launch::NONE
+            },
+            || {
+                Host::boot_with(
+                    &candidate.plan,
+                    data,
+                    Box::new(Measurer(text.clone())),
+                    self.viewport.0,
+                    self.viewport.1,
+                    Some(&carried),
+                    Some(delivery),
+                )
+            },
         )?;
         if let Some(error) = error {
             return Err(HostError::Layout(error));
@@ -293,7 +369,12 @@ impl<D: DataSource> Presenter<D> {
         images.enable_decode();
         images.fit(self.viewport, self.brush.scale);
         self.images = images;
+        // The old executor lets go of everything, then says which uploads had
+        // begun to go out; the rest never left (LLP 1016.000 D10).
+        self.executor.forget(|_| false);
+        let started = self.executor.let_go_started(|_| false);
         self.executor = self.host.executor();
+        self.host.runner_mut().uploads_started(&started);
         self.parked.clear();
         self.scroll.clear();
         self.collection = collection::State::default();
@@ -336,6 +417,123 @@ impl<D: DataSource> Presenter<D> {
 mod tests {
     use super::*;
     use crate::delivery::{Selection, Store};
+    use exact_runner::{DataError, Value};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct FirstFacts(Arc<Mutex<Option<Vec<Value>>>>);
+
+    impl DataSource for FirstFacts {
+        fn query(&mut self, name: &str, args: &[Value]) -> Result<Value, DataError> {
+            assert_eq!(name, "record");
+            self.0.lock().unwrap().get_or_insert_with(|| args.to_vec());
+            Ok(Value::Number(1.0))
+        }
+
+        fn replacement(&self, _: &[u8], _: &str, _: Vec<u8>) -> Result<Self, DataError> {
+            Ok(self.clone())
+        }
+    }
+
+    fn candidate_plan() -> Vec<u8> {
+        crate::test_plan(
+            r#"shape Time
+  epochAtZero: number
+  utcOffset: number
+  locale: string
+  formatLocale: string
+  timeZone: string
+  seed: number
+component App
+  resource time = exactTime() as shape Time
+  resource first = record(time.epochAtZero, time.utcOffset, time.locale, time.formatLocale, time.timeZone, time.seed, performanceNow()) as shape number
+  view
+    text `${first}`
+"#,
+        )
+    }
+
+    fn dated_presenter() -> (Presenter<FirstFacts>, FirstFacts) {
+        let facts = FirstFacts::default();
+        let (mut p, error) = Presenter::boot_with(
+            &crate::test_plan("component App\n  view\n    text \"old\"\n"),
+            facts.clone(),
+            (100., 100.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        assert!(p.set_time(1_790_000_000_000.0, -240.0).is_none());
+        assert!(p
+            .set_place(&exact_runner::time::Place {
+                locale: "fr-CA".into(),
+                format_locale: "en-GB".into(),
+                time_zone: "America/Toronto".into(),
+                seed: 123_456_789.0,
+            })
+            .is_none());
+        assert!(p.clock(1250.0).1.is_none());
+        (p, facts)
+    }
+
+    fn assert_first_facts(facts: &FirstFacts) {
+        assert_eq!(
+            facts.0.lock().unwrap().as_deref(),
+            Some(
+                [
+                    Value::Number(1_790_000_000_000.0),
+                    Value::Number(-240.0),
+                    Value::str("fr-CA"),
+                    Value::str("en-GB"),
+                    Value::str("America/Toronto"),
+                    Value::Number(123_456_789.0),
+                    Value::Number(1250.0),
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn development_candidate_first_settle_reads_launch_facts() {
+        let (mut p, facts) = dated_presenter();
+        assert!(p
+            .reload(&candidate_plan(), facts.clone())
+            .unwrap()
+            .is_none());
+        assert_first_facts(&facts);
+    }
+
+    #[test]
+    fn validation_candidate_first_settle_reads_launch_facts() {
+        let (mut p, facts) = dated_presenter();
+        p.painted = true;
+        let mut carried = p.host.carry();
+        p.prepare_logic(
+            &candidate_plan(),
+            facts.clone(),
+            Some(&crate::delivery::Module {
+                receipt: String::new(),
+                bytes: Vec::new(),
+            }),
+            &p.text,
+            &mut carried,
+            p.host.runner().delivery(),
+            false,
+        )
+        .unwrap();
+        assert_first_facts(&facts);
+    }
+
+    #[test]
+    fn update_candidate_first_settle_reads_launch_facts() {
+        let (mut p, facts) = dated_presenter();
+        p.set_updates(Some(Box::new(StagedPlan(candidate_plan().into()))));
+        assert!(p.activate_update(facts.clone()).unwrap());
+        assert_first_facts(&facts);
+    }
 
     struct StagedPlan(Arc<[u8]>);
 

@@ -17,6 +17,16 @@ struct MissingPrerequisite: Error, CustomStringConvertible {
     var description: String { "\(message) (EXACT_REQUIRED=1)" }
 }
 
+/// For a test that needs Caltrain's archive: its plan calls Caltrain's data
+/// functions (`stations`, `nextTrains`) or it drives Caltrain's own plan.
+/// `build.mjs --test` links Caltrain's archive by default; with another app's,
+/// the test does not apply, so it skips even under EXACT_REQUIRED.
+func caltrainArchive() throws {
+    #if !EXACT_LINKS_CALTRAIN
+    throw XCTSkip("n/a: needs Caltrain's archive, and this run links another app's (`bun host/apple/build.mjs --test caltrain-apple` links it)")
+    #endif
+}
+
 /// A fixture's plan, compiled from `scripts/fixtures/<name>.contract` at this commit by
 /// `build.mjs --test` and named in `EXACT_<KEY>_PLAN`.
 func fixturePlan(_ key: String) throws -> Data {
@@ -25,3 +35,27 @@ func fixturePlan(_ key: String) throws -> Data {
     }
     return try Data(contentsOf: URL(fileURLWithPath: path))
 }
+
+#if os(iOS)
+@testable import ExactKit
+import UIKit
+
+/// Require the same foreground eligibility as a real touch's aim.
+func requireFront(_ window: UIWindow?) throws {
+    if let refusal = Agent.frontRefusal(window) { throw missing("foreground", refusal) }
+}
+
+extension XCTestCase {
+    /// Wait for the hosted test app's scene to connect before checking its prerequisites.
+    func hostedWindowScene() -> UIWindowScene? {
+        MainActor.assumeIsolated {
+            func connected() -> UIWindowScene? {
+                UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+            }
+            guard Bundle.main.object(forInfoDictionaryKey: "UIApplicationSceneManifest") != nil else { return connected() }
+            waitFor("the hosted test app's scene to connect", cap: 5, onFailure: { print($0) }) { connected() != nil }
+            return connected()
+        }
+    }
+}
+#endif

@@ -15,7 +15,7 @@
 //   184  app(module, event, application, json, len)
 //          event 0 built, 1 changed, 2 ended; json {"facts": {…}, "data": {…}, "processOwner"}
 //   192  window(module, event, window, scene, json, len)
-//          event 0 built, 1 changed, 2 ended; json {"frame", "safeArea", "exclusive"}
+//          event 0 built, 1 changed, 2 ended; json {"frame", "safeArea", "exclusive", "angle"}
 //
 // Built runs as the hatches connect, after first pixel; changed and ended
 // never inside a batch.
@@ -64,10 +64,17 @@ extension NativeViews {
         // The scene's, as the session tells Contract (Session.swift `preferenceBits`).
         let dark = session?.view?.window?.windowScene?.traitCollection.userInterfaceStyle == .dark
         #endif
-        return ["visibilityState": PageFacts.hidden ? "hidden" : "visible", "onLine": PageFacts.onLine,
+        return ["visibilityState": PageFacts.hidden ? "hidden" : "visible", "onLine": Self.appOnLine(moduleAsks: moduleAsksOnLine),
                 "prefersColorScheme": dark ? "dark" : "light", "prefersContrast": DisplayPreferences.contrast,
                 "prefersReducedMotion": DisplayPreferences.reducedMotion, "prefersReducedTransparency": DisplayPreferences.reducedTransparency]
     }
+
+    /// `onLine` as the app hatch is told it. A module that asks the host
+    /// for it (`app.onLine` calls the host table's `on_line`) is told it as
+    /// last read, so nothing starts the path monitor until something reads
+    /// it; an older module reads it only from these facts, so it is read,
+    /// which starts the monitor, and its changes are told.
+    static func appOnLine(moduleAsks: Bool) -> Bool { moduleAsks ? PageFacts.lastOnLine : PageFacts.onLine }
 
     /// The first root node's `data-*` words (§2.5): how Contract tells the
     /// app hatch what it should know.
@@ -111,7 +118,23 @@ extension NativeViews {
         let frame = view.convert(view.bounds, to: nil)
         let r = { (x: CGFloat) in (Double(x) * 100).rounded() / 100 }
         let insets = view.safeAreaInsets, safe = [r(insets.top), r(insets.right), r(insets.bottom), r(insets.left)]
-        return encoded(["frame": [r(frame.minX), r(frame.minY), r(frame.width), r(frame.height)], "safeArea": safe, "exclusive": scopes.windowExclusive])
+        return encoded(["frame": [r(frame.minX), r(frame.minY), r(frame.width), r(frame.height)], "safeArea": safe, "exclusive": scopes.windowExclusive,
+                        "angle": Self.angle(window)])
+    }
+
+    /// The window's angle as the web's `screen.orientation.angle` (LLP
+    /// 1133.013 D12 item 4): its scene's interface orientation; 0 on the Mac.
+    static func angle(_ window: FocusWindow) -> Int {
+        #if os(iOS)
+        switch window.windowScene?.effectiveGeometry.interfaceOrientation {
+        case .landscapeRight: return 90
+        case .portraitUpsideDown: return 180
+        case .landscapeLeft: return 270
+        default: return 0
+        }
+        #else
+        return 0
+        #endif
     }
 
     /// `window` for the surface the session presents into: built (0), a

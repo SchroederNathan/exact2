@@ -852,9 +852,10 @@ lifecycle and docs. Where the build differs from the text above, it says so.
   answer, fulfil, release and commit; the module's journal lines are taken
   there too, and after each round.
 - **The rejection tracker.** Hermes's tracker schedules its report with the
-  global `setTimeout`, which the prelude refuses; the prelude's `setTimeout`
-  runs the tracker's own callback (`bound onUnhandled`) at the next
-  checkpoint and refuses every other. The test proves it in the lean VM.
+  global `setTimeout`; the prelude's `setTimeout` runs the tracker's own
+  callback (`bound onUnhandled`, armed from inside the tracker's rejection
+  hook) at the next checkpoint. Every other was refused; since 2026-10-28 it
+  is an answer's own timer (LLP 1027.000 D1). The test proves it in the lean VM.
 - **Journal lines** go through a host op (13) natively and in the wasm
   realm; `console` lines are `console: …`. Every failed storage operation is
   journaled, so an app's expected first-launch `ENOENT` is a line too.
@@ -869,14 +870,19 @@ lifecycle and docs. Where the build differs from the text above, it says so.
   journal. The JS target journals every unhandled rejection on the page (the
   runtime handles its own), without reading stacks.
 - **Teardown.** `Module::unload` finishes the module's storage within a second,
-  so a dev restart, a reload and a drop all do. Linux's `teardown.rs` waits
-  five seconds at an agent's quit and a headless exit (the display loop has no
-  orderly exit). macOS (both delegates) and the agent's stdio end hold the quit
-  through `StorageHold` (`ExactKit/StorageHold.swift`): five seconds, and 1.5
-  for the driver, which kills at two. iOS and tvOS hold a background task from
-  `sceneDidEnterBackground` (both delegates). The XCTest is the platform-
-  neutral rule (`StorageHoldTests`: begin, end, bound, expiration), run by
-  `build.mjs --test`.
+  so a dev restart, a reload and a drop all do. The other holds wait while the
+  app must finish work an answer started (`Runner::must_finish`: the storage,
+  or a request with effects, LLP 1146 D2). Linux's `teardown.rs` waits five
+  seconds at a headless exit and one at an agent's quit (the display loop has
+  no orderly exit). macOS (both delegates) and the Apple agent's stdio end hold
+  the quit through `QuitHold` (`ExactKit/Holds.swift`): five seconds, and 1.5
+  for the driver, which kills at two. iOS and tvOS hold a background task
+  from the batch that says the app must finish to the one that says it is done
+  (`FinishHold`), begun again on the app's return to the foreground if the
+  system took it back. The XCTests are the platform-neutral rules
+  (`QuitHoldTests`: the hold, its end and bound; `FinishHoldTests`: the task
+  begun at the word, ended at the next, taken back by the system and begun
+  again), run by `build.mjs --test`.
 - **The driver's `reload`** lands the storage with `clock data`, which fires
   no timer; a full `clock settle` would. There is no interactive restart in
   `agent.mjs`, so only the test step does it.

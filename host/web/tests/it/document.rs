@@ -29,10 +29,61 @@ fn document(src: &str) -> String {
 }
 
 #[test]
+fn ordinary_lists_wrap_their_rows_without_replacing_link_roles() {
+    let source = include_str!("../../../web-js/conformance/list-items.contract");
+    for source in [
+        source.to_owned(),
+        source
+            .replace("listitem note", "LISTITEM note")
+            .replace("list group", "LIST group"),
+    ] {
+        let root = document(&source);
+        assert_eq!(root.matches("data-exact-list-item").count(), 20, "{root}");
+        assert_eq!(root.matches("role=\"listitem\"").count(), 18, "{root}");
+        assert_eq!(root.matches("<a ").count(), 13, "{root}");
+        assert!(!root.contains("<a role=\"listitem\""), "{root}");
+        for (id, role) in [
+            ("dpub-owner", "presentation"),
+            ("graphics-owner", "presentation"),
+            ("comment-owner", "presentation"),
+            ("dpub-row", "listitem"),
+            ("graphics-row", "listitem"),
+            ("mark-row", "listitem"),
+            ("unknown-owner", "listitem"),
+        ] {
+            let marker = format!("data-testid=\"{id}\"");
+            let tail = root
+                .split_once(&marker)
+                .unwrap()
+                .1
+                .split_once('>')
+                .unwrap()
+                .1;
+            assert!(
+                tail.starts_with(&format!("<div role=\"{role}\" data-exact-list-item")),
+                "{id}: {tail}"
+            );
+        }
+    }
+}
+
+#[test]
 fn app_file_frames_prerender_without_a_false_blank_source() {
     let doc = document("component App\n  view\n    iframe src=\"app:/data/doc.pdf\"\n");
     assert!(doc.contains("data-app-src=\"app:/data/doc.pdf\""), "{doc}");
     assert!(!doc.contains("about:blank"), "{doc}");
+}
+
+#[test]
+fn a_page_given_app_files_prerenders_with_no_source_the_browser_would_load() {
+    let doc = document(
+        "component App\n  view\n    iframe src=\"assets/viewer.html?file=app:/cache/a.pdf\"\n",
+    );
+    assert!(
+        doc.contains("data-app-src=\"assets/viewer.html?file=app:/cache/a.pdf\""),
+        "{doc}"
+    );
+    assert!(!doc.contains(" src=\"assets/viewer.html"), "{doc}");
 }
 
 #[test]
@@ -43,6 +94,7 @@ fn raw_symbols_prerender_as_nonfetching_decorative_images() {
     row font-size=28
       image "symbol:sf/airpodsmax" testId="raw"
       image "symbol:sf/" width=40 testId="empty"
+      image "symbol:" width=40 testId="none"
 "#,
     );
     assert!(
@@ -50,11 +102,22 @@ fn raw_symbols_prerender_as_nonfetching_decorative_images() {
         "{doc}"
     );
     assert!(doc.contains("data-symbol-source=\"symbol:sf/\""), "{doc}");
-    assert_eq!(doc.matches("src=\"data:image/svg+xml,").count(), 2, "{doc}");
+    // An empty name, as an empty `sf/` one (stage 9 H).
+    assert!(doc.contains("data-symbol-source=\"symbol:\""), "{doc}");
+    assert_eq!(doc.matches("src=\"data:image/svg+xml,").count(), 3, "{doc}");
     assert!(!doc.contains("src=\"symbol:"), "{doc}");
-    assert_eq!(doc.matches("width='28' height='28'").count(), 2, "{doc}");
-    assert_eq!(doc.matches("data-symbol-path=\"\"").count(), 2, "{doc}");
-    assert_eq!(doc.matches("alt=\"\"").count(), 2, "{doc}");
+    assert_eq!(doc.matches("width='28' height='28'").count(), 3, "{doc}");
+    assert_eq!(doc.matches("data-symbol-path=\"\"").count(), 3, "{doc}");
+    assert_eq!(doc.matches("alt=\"\"").count(), 3, "{doc}");
+}
+
+/// A role's natural size is the neutral look's `symbol-scale` ems, as the
+/// live renderer gives it, so the page does not move when it paints.
+#[test]
+fn a_role_prerenders_at_the_size_it_paints() {
+    let doc =
+        document("component App\n  view\n    row font-size=20\n      image \"symbol:circle\"\n");
+    assert!(doc.contains("width='24' height='24'"), "{doc}");
 }
 
 fn caltrain() -> (Host<caltrain_data::Caltrain>, String) {
@@ -478,6 +541,129 @@ component App
     );
 }
 
+// LLP 1115.000 D4.15 — a route's header iOS makes its bar of is marked as
+// navigation.js marks it (`appBarBack`), by the kernel's rule
+// (`exact_kernel::bars::header_bar`): its first child, holding one heading
+// text, on a route that does not say `navigationBar="none"`, unless its
+// author wrote `appearance: none`. A row whose role is `heading` is no
+// heading text. So a page built ahead of time sizes its bar's symbols as
+// the glue will.
+#[test]
+fn a_header_that_is_its_routes_bar_is_marked() {
+    let src = r#"
+routes nav
+  tab home "/"
+    full "/full"
+    bare "/bare"
+    row "/row"
+    own "/own"
+component App
+  action back
+    nav = back(nav)
+  view
+    main navigationKey=`${top(nav).id}` navigationBack="back" width="100%" height="100%"
+      for e in stack(nav) key=e.id
+        column navigationKey=`${e.id}` navigationBar=(e.name == "full" ? "none" : "auto")
+          header testId=`header-${e.name}` appearance=(e.name == "own" ? "none" : "auto")
+            if e.name == "row"
+              row role="heading" aria-level=1
+                text "Row"
+            else
+              if e.name != "bare"
+                text e.name role="heading" aria-level=1
+"#;
+    let tag = |launch: &str, test_id: &str| {
+        let doc = host(src, Says(""), launch).document().unwrap().root;
+        let at = doc.find(&format!("data-testid=\"{test_id}\"")).unwrap();
+        let start = doc[..at].rfind('<').unwrap();
+        doc[start..at + doc[at..].find('>').unwrap() + 1].to_owned()
+    };
+    for (launch, header, bar) in [
+        ("/", "header-home", true),
+        ("/full", "header-full", false),
+        ("/bare", "header-bare", false),
+        ("/row", "header-row", false),
+        ("/own", "header-own", false),
+    ] {
+        let tag = tag(launch, header);
+        assert_eq!(tag.contains("data-exact-bar"), bar, "{tag}");
+    }
+}
+
+// LLP 1153 D8 — a route's header that holds a `nav`, a popover's too, or
+// more than one link, is a site's: marked `data-exact-site`, which the shell
+// draws as written, and no bar, though iOS would make one of its one heading.
+// The header iOS makes its bar of (one heading, its buttons) stays the bar,
+// and so does one whose second link is in a menu that is no `nav`: a menu's
+// links are its button's. A header whose author wrote `appearance: none` is
+// drawn as written by its own mark.
+#[test]
+fn a_site_header_is_marked_and_is_no_bar() {
+    let src = r#"
+routes nav
+  tab home "/"
+    navs "/navs"
+    links "/links"
+    menu "/menu"
+    navmenu "/navmenu"
+    own "/own"
+component App
+  action back
+    nav = back(nav)
+  view
+    main navigationKey=`${top(nav).id}` navigationBack="back" width="100%" height="100%"
+      for e in stack(nav) key=e.id
+        column navigationKey=`${e.id}`
+          header testId=`header-${e.name}` appearance=(e.name == "own" ? "none" : "auto")
+            text "Pokédex" role="heading" aria-level=1
+            if e.name == "navs"
+              nav aria-label="Sections"
+                link href=path("home")
+                  text "All"
+            if e.name == "links"
+              link href=path("home")
+                text "All"
+              link href=path("menu")
+                text "Types"
+            if e.name == "navmenu"
+              link href=path("home")
+                text "All"
+              button popovertarget="sections" aria-label="Sections"
+                text "Sections"
+              nav popover="auto" id="sections"
+                link href=path("links")
+                  text "Links"
+            if e.name == "menu"
+              link href=path("home")
+                text "All"
+              button popovertarget="more" aria-label="More"
+                text "More"
+              column popover="auto" id="more"
+                link href=path("links")
+                  text "Links"
+            button press=back aria-label="Back"
+              text "Back"
+"#;
+    let tag = |launch: &str, test_id: &str| {
+        let doc = host(src, Says(""), launch).document().unwrap().root;
+        let at = doc.find(&format!("data-testid=\"{test_id}\"")).unwrap();
+        let start = doc[..at].rfind('<').unwrap();
+        doc[start..at + doc[at..].find('>').unwrap() + 1].to_owned()
+    };
+    for (launch, header, site, bar) in [
+        ("/", "header-home", false, true),
+        ("/navs", "header-navs", true, false),
+        ("/links", "header-links", true, false),
+        ("/menu", "header-menu", false, true),
+        ("/navmenu", "header-navmenu", true, false),
+        ("/own", "header-own", false, false),
+    ] {
+        let tag = tag(launch, header);
+        assert_eq!(tag.contains("data-exact-site"), site, "{tag}");
+        assert_eq!(tag.contains("data-exact-bar"), bar, "{tag}");
+    }
+}
+
 // @ref LLP 1075.003 §3.3, §3.7 — with tabs, each tab's panel holds its own
 // stack, built when the tab is first selected: the unselected panel is
 // hidden and inert; an app's data-* words are attributes of their own. Both are linked
@@ -674,7 +860,7 @@ component App
     let mut host = host(source, Says(""), "/");
     for role in ["list", "presentation", "list"] {
         let doc = host.document().unwrap();
-        let tree = host.runner().document_tree().unwrap();
+        let tree = host.runner_mut().document_tree().unwrap();
         let (detached, _) =
             exact_web::document::project_tree(&tree, host.runner(), Default::default()).unwrap();
         assert_eq!(detached.root, doc.root);
@@ -722,4 +908,72 @@ component App
             "retained nodes: {batch}"
         );
     }
+}
+
+/// A JS document uses the same conditional fills as its template, so an
+/// ancestor's bound row can arrive or disappear after adoption.
+#[test]
+fn bare_text_styles_fill_unsaid_rows_in_the_js_document() {
+    let h = host(
+        r#"component App
+  view
+    column
+      text font-size="-exact-headline" "Bare"
+      text font="-exact-headline" "Shorthand"
+      text font-size="-exact-headline" font-weight="unset" line-height="unset" "Clear"
+      column font-weight=700 line-height="40px"
+        text font-size="-exact-headline" "Inherited"
+      column font-size="-exact-headline"
+        text font-size="-exact-body" "Nested"
+      text role="heading" aria-level=1
+        text font-size="-exact-headline" "Heading"
+      button
+        text font-size="-exact-headline" "Control"
+"#,
+        Says(""),
+        "/",
+    );
+    let style = |doc: &str, text: &str| {
+        let at = doc.find(&format!(">{text}<")).expect(text);
+        let open = doc[..at].rfind('<').unwrap();
+        doc[open..at].to_string()
+    };
+    let wasm = h.document().unwrap().root;
+    let js = exact_web::document::project_for_js(h.runner())
+        .unwrap()
+        .root;
+    assert!(style(&wasm, "Bare").contains("font-weight:600"), "{wasm}");
+    for text in ["Bare", "Inherited", "Heading", "Control"] {
+        let tag = style(&js, text);
+        assert!(
+            tag.contains("font-weight:var(--exact-said-font-weight,600)"),
+            "{tag}"
+        );
+        assert!(
+            tag.contains("line-height:var(--exact-said-line-height,normal)"),
+            "{tag}"
+        );
+    }
+    assert!(
+        style(&js, "Nested").contains("font-weight:var(--exact-said-font-weight,400)"),
+        "{js}"
+    );
+    let clear = style(&js, "Clear");
+    assert!(
+        clear.contains("font-weight:unset") && clear.contains("line-height:unset"),
+        "{clear}"
+    );
+    assert!(!clear.contains("var(--exact-said-"), "{clear}");
+    let shorthand = style(&js, "Shorthand");
+    assert!(shorthand.contains("font-weight:600"), "{shorthand}");
+    assert!(
+        shorthand.contains("--exact-said-font-weight: ;"),
+        "{shorthand}"
+    );
+    assert!(
+        shorthand.contains("--exact-said-line-height: ;"),
+        "{shorthand}"
+    );
+    assert!(js.contains("font-weight:700"), "{js}");
+    assert!(js.contains("line-height:40px"), "{js}");
 }

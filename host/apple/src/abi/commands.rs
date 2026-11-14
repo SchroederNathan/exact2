@@ -5,7 +5,8 @@
 //! builds (LLP 1069.001 D5), a radio's group (x2apps survey #2), a
 //! grouped list's sections (LLP 1084), and
 //! whether a followed link names one of the app's routes (LLP 1038 §7),
-//! and where the host's own Back goes (LLP 1115 D5).
+//! where the host's own Back goes (LLP 1115 D5), and a package's call of
+//! the app's handler (LLP 1133.016 D15 item 1).
 use super::Bridge;
 use exact_runner::auth::{self, Arm, Browser};
 use exact_runner::DataSource;
@@ -26,6 +27,7 @@ pub fn measure_work_later() {
 pub fn measure_at_boot<D: DataSource>(runner: &mut exact_runner::Runner<D>, compat: Option<&str>) {
     if WORK_FROM_BOOT.load(Ordering::Relaxed) {
         runner.measure_unless_production(compat, true);
+        runner.measure_kernel_layouts();
     } else {
         runner.measure_later(compat);
     }
@@ -46,6 +48,7 @@ impl<D: DataSource> Bridge<D> {
         WORK_FROM_BOOT.store(true, Ordering::Relaxed);
         if let Some(host) = self.host.as_mut() {
             host.runner_mut().measure_from_now(self.compat, true);
+            host.runner_mut().measure_kernel_layouts();
         }
         0
     }
@@ -54,10 +57,11 @@ impl<D: DataSource> Bridge<D> {
     pub fn set_inline_geometry(
         &mut self,
         read: Option<crate::geometry::InlineFrameFn>,
+        range: Option<crate::geometry::RangeFrameFn>,
         ctx: *mut std::ffi::c_void,
     ) {
         self.inline_geometry = read.map(|read| {
-            std::rc::Rc::new(crate::geometry::InlineGeometry { read, ctx })
+            std::rc::Rc::new(crate::geometry::InlineGeometry { read, range, ctx })
                 as std::rc::Rc<dyn exact_runner::geometry::InlineGeometry>
         });
         if let Some(host) = self.host.as_mut() {
@@ -79,6 +83,31 @@ impl<D: DataSource> Bridge<D> {
         )
     }
 
+    /// `exact_module_invoke`: a package's call of the app's handler,
+    /// `{"extension", "handle", "handler", "args"}` in the input buffer.
+    /// `reply(ctx, answer, len)` is called once with the runner's JSON, now
+    /// or when the handler's own work lands. Not a batch.
+    pub fn module_invoke(&mut self, len: usize, reply: InvokeReply, ctx: *mut std::ffi::c_void) {
+        let body = String::from_utf8_lossy(&self.input[..len.min(self.input.len())]).into_owned();
+        // The context crosses threads as an address: the host's, which `reply` frees.
+        let ctx = ctx as usize;
+        let answer: Box<dyn FnOnce(String) + Send> = Box::new(move |text: String| {
+            reply(
+                ctx as *mut std::ffi::c_void,
+                text.as_ptr(),
+                text.len() as u32,
+            )
+        });
+        match self.host.as_mut() {
+            Some(h) => h.runner_mut().invoke_module(&body, answer),
+            None => answer(r#"{"error":"InvalidStateError","message":"no session runs"}"#.into()),
+        }
+        // The handler's requests, for the host to run.
+        if let Some(executor) = self.executor.as_deref() {
+            executor.notify();
+        }
+    }
+
     /// `exact_location_beneath`: the location of the visit beneath visit
     /// `id` on its stack, UTF-8 in the output buffer, empty when there is
     /// none — where the host's own Back goes for a route with no authored
@@ -90,6 +119,41 @@ impl<D: DataSource> Bridge<D> {
             .and_then(|h| h.runner().location_beneath(id))
             .unwrap_or_default();
         self.output = location.into_bytes();
+        self.output.len() as u32
+    }
+
+    /// Where the platform's Back goes from the selected visit, UTF-8;
+    /// empty at the stack's root. @ref LLP 1115.000 D5.5
+    pub fn location_behind(&mut self) -> u32 {
+        self.output = self
+            .host
+            .as_ref()
+            .and_then(|h| h.runner().location_behind())
+            .unwrap_or_default()
+            .into_bytes();
+        self.output.len() as u32
+    }
+
+    /// Where the platform's Forward goes, UTF-8; empty with nothing ahead.
+    /// @ref LLP 1115.000 D5.5
+    pub fn location_ahead(&mut self) -> u32 {
+        self.output = self
+            .host
+            .as_ref()
+            .and_then(|h| h.runner().location_ahead())
+            .unwrap_or_default()
+            .into_bytes();
+        self.output.len() as u32
+    }
+
+    /// A retained visit's canonical location, UTF-8; empty when absent.
+    pub fn visit_location(&mut self, id: u64) -> u32 {
+        self.output = self
+            .host
+            .as_ref()
+            .and_then(|h| h.runner().visit_location(id))
+            .unwrap_or_default()
+            .into_bytes();
         self.output.len() as u32
     }
 
@@ -108,7 +172,11 @@ impl<D: DataSource> Bridge<D> {
 
     /// `exact_top_layer`: the presenter's open top-layer boxes, and where
     /// the frontmost modal presentation begins among them.
-    pub fn top_layer(&mut self, frames: &[(u32, [f64; 4])], modal: Option<usize>) {
+    pub fn top_layer(
+        &mut self,
+        frames: &[exact_runner::geometry::TopLayerFrame],
+        modal: Option<usize>,
+    ) {
         if let Some(h) = self.host.as_mut() {
             h.runner_mut().top_layer_frames(frames, modal);
         }
@@ -130,6 +198,9 @@ impl<D: DataSource> Bridge<D> {
             host.set_canvas_text(f, hooks.ctx);
         }
         host.set_canvas_deferred(self.canvas_deferred);
+        host.runner_mut().use_native_timers(self.native_timers);
+        host.runner_mut()
+            .hold_waits(exact_runner::WaitKinds::from_bits(self.wait_kinds));
         host.runner_mut()
             .set_live_clock(self.live_clock.map(super::preferences::sampler));
     }
@@ -230,12 +301,26 @@ impl<D: DataSource> Bridge<D> {
         0
     }
 
+    /// How a presence check the host made ended (`exact_presence`, LLP
+    /// 1133.010 D13): the value goes to the waiting call alone.
+    pub fn presence(&mut self, len: usize) -> u32 {
+        if let Some(h) = self.host.as_mut() {
+            h.runner_mut()
+                .presence_reply(&self.input[..len.min(self.input.len())]);
+        }
+        if let Some(x) = self.executor.as_deref() {
+            x.notify();
+        }
+        0
+    }
+
     /// A button's face (`exact_press_face`, LLP 1069.011.000 D1; LLP 1069.011
     /// D2, D5), custom or native, as JSON in the output buffer:
     /// `{"button","title","symbol","raster","leading","label","fits","style",
     /// "ios","iosBefore26","macos","known"}` — `button` false (and the rest
     /// empty) for a node that is not a button, the symbol as the platform
-    /// names it, the style's row of the `buttonStyles` table (`bordered` for a
+    /// names it (an svg-only icon's "", its `symbolPath` and `symbolViewBox`
+    /// beside it, and `symbolIcon`, its token's name, for the agent), the style's row of the `buttonStyles` table (`bordered` for a
     /// name not in it); with no `buttonStyle` written, `"style":null` and no
     /// platform column (`button::face_json`). Not a batch: nothing changes.
     pub fn press_face(&mut self, view: u32) -> u32 {
@@ -248,7 +333,11 @@ impl<D: DataSource> Bridge<D> {
                 let style = kernel
                     .node(view)
                     .and_then(|n| n.props.str(exact_kernel::PropId::ButtonStyle));
-                crate::button::face_json(face.as_ref(), rows.as_ref(), style)
+                let icon = face
+                    .as_ref()
+                    .and_then(|f| f.symbol.as_deref())
+                    .and_then(|s| crate::icon_path::icon_name(h.runner().plan(), s));
+                crate::button::face_json_named(face.as_ref(), rows.as_ref(), style, icon)
             },
         );
         self.output = json.into_bytes();
@@ -318,14 +407,16 @@ impl<D: DataSource> Bridge<D> {
 
     /// A navigation root's tabs (`exact_root_tabs`; `Kernel::root_tabs`, LLP
     /// 1115.001 D11), as JSON in the output buffer: `{"tablist":view,
-    /// "tabs":[view...],"panels":[view...],"unsaid":bool}`, the tabs that
+    /// "tabs":[view...],"panels":[view...],"unsaid":bool,"covered":bool}`, the tabs that
     /// name a panel and those panels in tab order, or `null` for a root with
     /// one stack. `unsaid`: the app left the bar's placement unsaid, by the
     /// web's rule for its own sidebar (`host/web/navigation.js` `unsaidBar`,
     /// LLP 1116.004 D1.1): the tablist is a direct child of the root, not
     /// vertical, in flow in the root's flex column, and itself a row. It is
     /// read here because the layout rows it asks of never cross to the
-    /// presenter (`style::presenter_ignores`). Not a batch: nothing changes.
+    /// presenter (`style::presenter_ignores`). `covered`: the tablist is
+    /// covered whole, as the boot covers one a tab bar replaces
+    /// (`closed.rs`). Not a batch: nothing changes.
     pub fn root_tabs(&mut self, view: u32) -> u32 {
         use exact_kernel::{Display, FlexDirection, PositionType, PropId};
         let list = |ids: &[u32]| ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
@@ -339,12 +430,15 @@ impl<D: DataSource> Bridge<D> {
                 && root.style.display == Display::Flex
                 && column(root.style.flex_direction)
                 && matches!(
-                    bar.style.position_type,
+                    bar.layout_position(),
                     PositionType::Static | PositionType::Relative
                 )
                 && !column(bar.style.flex_direction);
+            let arena = kernel.arena();
+            let covered = arena.slot_of(tabs.tablist).and_then(|s| arena.cover(s))
+                == Some(exact_kernel::HostCover::Whole);
             Some(format!(
-                "{{\"tablist\":{},\"tabs\":[{}],\"panels\":[{}],\"unsaid\":{unsaid}}}",
+                "{{\"tablist\":{},\"tabs\":[{}],\"panels\":[{}],\"unsaid\":{unsaid},\"covered\":{covered}}}",
                 tabs.tablist,
                 list(&tabs.tabs),
                 list(&tabs.panels)
@@ -356,29 +450,46 @@ impl<D: DataSource> Bridge<D> {
 
     /// Whether the stack whose root route is `view` splits (`exact_stack_split`;
     /// `Runner::stack_split`, LLP 1115.002 D4), as JSON in the output buffer:
-    /// `{"list":view|null,"width":number|null,"rows":[[route,row]...]}`, the
-    /// list whose row pushes, the list column's width where `navigationSplit`
-    /// names one, and each route above the root that is a row's detail with
-    /// that row; `null` for a stack that pushes. Not a batch: nothing changes.
-    pub fn stack_split(&mut self, view: u32, retained: u32) -> u32 {
+    /// `{"list":view|null,"width":number|null,"rows":[[route,row]...],
+    /// "locations":[[route,url]...],"pressWrites":bool|null}`, the list whose
+    /// row pushes, the list column's width where `navigationSplit` names one,
+    /// each route above the root that is a row's detail with that row, each
+    /// route above the root with its location, and whether the press of
+    /// `pressed` (a view being pressed, or 0) writes the router; `null` for a
+    /// stack that pushes. Not a batch: nothing changes.
+    pub fn stack_split(&mut self, view: u32, retained: u32, pressed: u32) -> u32 {
         let json = self
             .host
             .as_ref()
             .and_then(|h| {
-                h.runner()
+                let runner = h.runner();
+                let writes = (pressed != 0)
+                    .then(|| runner.press_writes_router(pressed))
+                    .flatten();
+                runner
                     .stack_split(view, (retained != 0).then_some(retained))
+                    .map(|split| (split, writes))
             })
-            .map(|split| {
+            .map(|(split, writes)| {
                 let rows: Vec<String> = split
                     .rows
                     .iter()
                     .map(|(route, row)| format!("[{route},{row}]"))
                     .collect();
+                let locations: Vec<String> = split
+                    .locations
+                    .iter()
+                    .map(|(route, url)| {
+                        format!("[{route},{}]", serde_json::Value::from(url.as_str()))
+                    })
+                    .collect();
                 format!(
-                    "{{\"list\":{},\"width\":{},\"rows\":[{}]}}",
+                    "{{\"list\":{},\"width\":{},\"rows\":[{}],\"locations\":[{}],\"pressWrites\":{}}}",
                     split.list.map_or("null".into(), |v| v.to_string()),
                     split.width.map_or("null".into(), |w| w.to_string()),
-                    rows.join(",")
+                    rows.join(","),
+                    locations.join(","),
+                    writes.map_or("null".into(), |w| w.to_string())
                 )
             });
         self.output = json.unwrap_or_else(|| "null".into()).into_bytes();
@@ -387,9 +498,10 @@ impl<D: DataSource> Bridge<D> {
 
     /// A grouped list's sections and rows (`exact_grouped_list`, LLP 1084
     /// D4), as JSON in the output buffer: `{"style","sections":[{"view",
-    /// "header","footer","headerLook","footerLook","card","spaceAbove","rows":[{"view","custom","symbol","title",
+    /// "header","footer","headerLook","footerLook","card","spaceAbove","rows":[{"view","custom","symbol",("symbolPath","symbolViewBox": an
+    /// svg-only icon's, `icon_path::push_json`),"title",
     /// "secondary","subtitle","accessory","target","pressable","action",
-    /// "checked","destructive","disabled","titleLook","secondaryLook"}]}],"spaceBelow"}`,
+    /// "checked","destructive","disabled","authoredEdge","nextAuthoredTop","titleLook","secondaryLook"}]}],"spaceBelow"}`,
     /// `null` for a node that is not one. A look is `{"lines","ellipsis",
     /// "color","font"}`: a colour row's wire form and `{"size","weight",
     /// "italic","family","numeric"}`, each `null` where the author said nothing.
@@ -417,10 +529,24 @@ impl<D: DataSource> Bridge<D> {
             }
             json.push_str(",\"font\":");
             match l.font {
-                Some(f) => json.push_str(&format!(
-                    "{{\"size\":{},\"weight\":{},\"italic\":{},\"family\":{},\"numeric\":{}}}",
-                    f.size, f.weight, f.italic, f.family, f.numeric
-                )),
+                Some(f) => {
+                    let [size, weight, italic, family, numeric] = exact_kernel::TextFont::SAID;
+                    let part = |bit: u8, value: String| {
+                        if f.said & bit != 0 {
+                            value
+                        } else {
+                            "null".into()
+                        }
+                    };
+                    json.push_str(&format!(
+                        "{{\"size\":{},\"weight\":{},\"italic\":{},\"family\":{},\"numeric\":{}}}",
+                        part(size, f.size.to_string()),
+                        part(weight, f.weight.to_string()),
+                        part(italic, f.italic.to_string()),
+                        part(family, f.family.to_string()),
+                        part(numeric, f.numeric.to_string())
+                    ));
+                }
                 None => json.push_str("null"),
             }
             json.push('}');
@@ -457,6 +583,8 @@ impl<D: DataSource> Bridge<D> {
                             r.view, r.custom
                         ));
                         opt(&r.symbol, &mut json);
+                        // An svg-only icon's path (LLP 1121 D10, stage 9 A2).
+                        crate::icon_path::push_json(r.icon.as_deref(), &mut json);
                         json.push_str(",\"title\":");
                         opt(&r.title, &mut json);
                         json.push_str(",\"secondary\":");
@@ -470,13 +598,15 @@ impl<D: DataSource> Bridge<D> {
                             Accessory::Radio(id, on) => ("radio", Some(id), on),
                         };
                         json.push_str(&format!(
-                            ",\"subtitle\":{},\"accessory\":\"{accessory}\",\"target\":{},\"checked\":{checked},\"pressable\":{},\"action\":{},\"destructive\":{},\"disabled\":{}",
+                            ",\"subtitle\":{},\"accessory\":\"{accessory}\",\"target\":{},\"checked\":{checked},\"pressable\":{},\"action\":{},\"destructive\":{},\"disabled\":{},\"authoredEdge\":{},\"nextAuthoredTop\":{}",
                             r.subtitle,
                             target.map_or("null".into(), |t| t.to_string()),
                             r.pressable,
                             r.action,
                             r.destructive,
-                            r.disabled
+                            r.disabled,
+                            r.authored_edge,
+                            r.next_authored_top
                         ));
                         look(",\"titleLook\":", &r.title_look, &mut json);
                         look(",\"secondaryLook\":", &r.secondary_look, &mut json);
@@ -502,4 +632,17 @@ impl<D: DataSource> Bridge<D> {
         }
         0
     }
+
+    /// What the presenter applied of the orientation lock (`exact_orientation_applied`).
+    pub fn orientation_applied(&mut self, len: usize, conflict: bool) -> u32 {
+        let applied =
+            String::from_utf8_lossy(&self.input[..len.min(self.input.len())]).into_owned();
+        if let Some(h) = self.host.as_mut() {
+            h.runner_mut().set_orientation_applied(applied, conflict);
+        }
+        0
+    }
 }
+
+/// The host's answer to a package's call back: `reply(ctx, answer, len)`.
+pub type InvokeReply = extern "C" fn(*mut std::ffi::c_void, *const u8, u32);

@@ -5,8 +5,8 @@ import {tmpdir} from 'node:os';
 import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
-import {boundedHttpBody as readBody, request, waitForInflight} from './http-body.js';
-import {scopedGrantSet} from './grant-admission.js';
+import {boundedHttpBody as readBody, longPollTiming, request, waitForInflight} from './http-body.js';
+import {admittingGrant, scopedGrantSet} from './grant-admission.js';
 import {createRequestExecutor} from '../web-js/admission.js';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'../..'),sets=new Map();
@@ -112,6 +112,59 @@ test('a stream delivers each read as its newest event, then its end', async () =
   ]);
   assert.equal(end.kind, 1);
   assert.equal(new TextDecoder().decode(end.body), 'the event stream ended');
+});
+
+// LLP 1016.000's byte stream: reads that land before the page's next task
+// join into one ArrayBuffer; nothing is dropped; the end follows; a read past
+// the bound delivers what waits and refuses. Without `bytes` (a Rust
+// source) the body is the one answer.
+test('a TypeScript stream reads a body that is not events as joined bytes, then its end', async () => {
+  const { request } = await import('./http-body.js');
+  const open = (maxResponseBytes, protocol, sent) => {
+    let push;
+    const body = new ReadableStream({ start(c) { push = c; } });
+    const done = request({ method: 'GET', url: 'https://example.test/screen.avcc', headers: [], body: '', stream: true, maxResponseBytes }, {
+      grantSet: normalized('net.fetch https://example.test'), controllers: new Set(), protocol,
+      moduleLoader: { claim: () => Promise.resolve(new Response(body, { headers: { 'content-type': 'application/octet-stream' } })) },
+      message: (m) => sent.push([...new Uint8Array(m.data)]),
+    });
+    return { done, push: (bytes) => push.enqueue(new Uint8Array(bytes)), close: () => push.close() };
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  const sent = [], s = open(64, { bytes: true }, sent);
+  await tick();
+  s.push([0, 1]); s.push([2]); s.push([3, 4, 5]);
+  await tick();
+  s.push([6, 7]);
+  await tick();
+  s.close();
+  const end = await s.done;
+  assert.deepEqual(sent, [[0, 1, 2, 3, 4, 5], [6, 7]]);
+  assert.equal(new TextDecoder().decode(end.body), 'the byte stream ended');
+
+  const over = [], o = open(8, { bytes: true }, over);
+  await tick();
+  o.push([1, 1, 1, 1, 1]); o.push([2, 2, 2, 2, 2]);
+  const refused = await o.done;
+  assert.deepEqual(over, [[1, 1, 1, 1, 1]]);
+  assert.equal(refused.kind, 2);
+  assert.equal(new TextDecoder().decode(refused.body), 'byte stream receive queue exceeds the response ceiling');
+
+  // One browser read longer than the bound goes in pieces of it, at once.
+  const big = [], b = open(8, { bytes: true }, big);
+  await tick();
+  b.push([0]); b.push([...Array(20).keys()].map(n => n + 1));
+  await tick();
+  b.close();
+  const after = await b.done;
+  assert.deepEqual(big, [[0], [1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16], [17, 18, 19, 20]]);
+  assert.equal(new TextDecoder().decode(after.body), 'the byte stream ended');
+
+  const whole = [], w = open(64, undefined, whole);
+  await tick();
+  w.push([9]); w.close();
+  const answer = await w.done;
+  assert.deepEqual([whole, answer.status, [...answer.body]], [[], 200, [9]]);
 });
 
 // A local WebSocket peer (LLP 1069.004 slice 3): `/three` sends `a`, then at
@@ -224,4 +277,230 @@ test('the wasm early GET follows a return chain and is claimed at the granted fi
     const response = await request(op, { grantSet: app, controllers: new Set(), moduleLoader: { claim } });
     expect([response.kind, new TextDecoder().decode(response.body), middleHits, finalHits]).toEqual([0, 'accepted', 1, 1]);
   } finally { origin.stop(true); middle.stop(true); final.stop(true); }
+});
+
+test('a tool\'s request to the local network from a public page waits for the person, sent by neither path (LLP 1133.036 D6)', async () => {
+  globalThis.exact ??= {};
+  const { fetchEarly } = await import('./module-glue.js');
+  const was = globalThis.location, sent = [], real = globalThis.fetch;
+  let hits = 0;
+  const light = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch() { hits++; return new Response('{}'); } });
+  globalThis.location = { hostname: 'lights.example', origin: 'https://lights.example', href: 'https://lights.example/' };
+  globalThis.fetch = (url, init) => { sent.push(String(url)); return real(url, init); };
+  try {
+    const set = normalized('device.local-network lanPurpose\nnet.fetch local-network development');
+    const host = { grantSet: set, controllers: new Set(), moduleLoader: null };
+    const lan = { method: 'GET', url: 'http://192.168.1.40/json/si', headers: [], origin: 'tool', reachState: 'prompt' };
+    expect(fetchEarly(lan, set)).toBe(null);
+    const refused = await request(lan, host);
+    expect([refused.kind, new TextDecoder().decode(refused.body)]).toEqual([2, 'NotAllowedError: person-required']);
+    const denied = await request({ ...lan, url: `${light.url}json/si`, reachState: 'denied' }, host);
+    expect([denied.kind, new TextDecoder().decode(denied.body)]).toEqual([2, 'NotAllowedError: local network access is denied']);
+    const socket = await request({ ...lan, url: `ws://127.0.0.1:${light.port}/`, stream: true }, { ...host, grantSet: normalized('device.local-network lanPurpose\nnet.websocket local-network development') });
+    expect(new TextDecoder().decode(socket.body)).toBe('NotAllowedError: person-required');
+    expect([sent, hits]).toEqual([[], 0]);
+    // The app's own reach is the ask, and goes.
+    const own = await request({ method: 'GET', url: `${light.url}json/si`, headers: [] }, host);
+    expect([own.kind, own.status, hits]).toEqual([0, 200, 1]);
+  } finally { light.stop(true); globalThis.fetch = real; globalThis.location = was; }
+});
+
+test('a scheme line admits every origin of its scheme, and a request names the line that admitted it', async () => {
+  const set = normalized('net.fetch https://api.example\nnet.fetch http:\nnet.websocket wss://feed.example\nnet.websocket ws:');
+  expect([
+    admittingGrant(set, 'http://127.0.0.1:49152/x', 'fetch'), admittingGrant(set, 'https://api.example/x', 'fetch'),
+    admittingGrant(set, 'ws://laptop.tailnet.ts.net:3773/ws', 'websocket'), admittingGrant(set, 'wss://feed.example/s', 'websocket'),
+    admittingGrant(set, 'https://other.example/x', 'fetch'), admittingGrant(set, 'wss://other.example/s', 'websocket'),
+  ]).toEqual(['net.fetch http:', 'net.fetch https://api.example', 'net.websocket ws:', 'net.websocket wss://feed.example', null, null]);
+  const controller = new AbortController();
+  const refused = await request({ method: 'GET', url: 'wss://other.example/s', headers: [], stream: true }, { grantSet: set, controllers: new Set(), controller });
+  expect([refused.kind, new TextDecoder().decode(refused.body), controller.grant]).toEqual([2, "outside the app's grants (net.websocket)", undefined]);
+  const admitted = new AbortController();
+  const unreachable = await request({ method: 'GET', url: 'http://127.0.0.1:1/events', headers: [], stream: true }, { grantSet: set, controllers: new Set(), controller: admitted });
+  expect([unreachable.kind, admitted.grant]).toEqual([1, 'net.fetch http:']);
+});
+
+// LLP 1016.000 D8: a long poll against a stand-in. Each request takes the
+// next answer in the queue; `hold` keeps it open until the client lets go.
+function standIn(answers) {
+  const asked = [], held = [];
+  let open = 0, most = 0;
+  const server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
+    asked.push(new URL(req.url).search); open++; most = Math.max(most, open);
+    try {
+      const a = answers.shift() ?? 'hold';
+      if (a === 'hold') return await new Promise((resolve) => { held.push(req); req.signal.addEventListener('abort', () => resolve(new Response('', { status: 204 }))); });
+      return new Response(a.body ?? null, { status: a.status ?? 200, headers: a.headers ?? { 'content-type': 'application/json' } });
+    } finally { open--; }
+  } });
+  return { server, asked, held, most: () => most, origin: `http://127.0.0.1:${server.port}` };
+}
+function longPoll(s, controller, sent, poll = {}, extra = {}) {
+  const op = { method: 'GET', url: `${s.origin}/changes?since=0&wait=25`, headers: [], body: '', stream: true, maxResponseBytes: 64, longPoll: { cursor: 'since', from: 'seq', sameCursorEvent: false, ...poll }, ...extra };
+  // Each reply is counted (`replied`); one that is no event (`exact:reply`) is no message here.
+  controller.replies = 0; controller.replied = () => controller.replies++;
+  return request(op, { grantSet: normalized(`net.fetch ${s.origin}`), controllers: new Set(), controller, message: (m) => { if (m.event === 'exact:reply') controller.markers = (controller.markers ?? 0) + 1; else sent.push(m); } });
+}
+const until = async (ok) => { const end = performance.now() + 5000; while (!ok()) { if (performance.now() > end) throw new Error('timed out'); await new Promise((r) => setTimeout(r, 5)); } };
+
+test('a long poll delivers each reply with its cursor, asks again with it, and heartbeats deliver nothing', async () => {
+  const s = standIn([
+    { body: '{"seq":1,"c":["a"]}' }, { status: 204 }, { body: ' ' }, { body: '{"seq":1,"c":[]}' }, { status: 304 },
+    { body: '{"seq":2}' }, { body: '{"seq":"x3"}' },
+  ]);
+  const controller = new AbortController(), sent = [], started = performance.now();
+  longPollTiming.heartbeatMs = 40;
+  const done = longPoll(s, controller, sent);
+  await until(() => s.held.length === 1);
+  // Four heartbeats answered at once, each asked again no sooner than the floor.
+  assert.ok(performance.now() - started >= 4 * 40);
+  longPollTiming.heartbeatMs = 1000;
+  assert.deepEqual(sent.map((m) => m.id), ['1', '2', 'x3']);
+  assert.equal(sent[0].data, '{"seq":1,"c":["a"]}');
+  assert.deepEqual(s.asked, ['?since=0&wait=25', ...Array(5).fill('?since=1&wait=25'), '?since=2&wait=25', '?since=x3&wait=25']);
+  assert.equal(s.most(), 1, 'one request at a time');
+  assert.equal(controller.markers, 4, 'each heartbeat a reply that is no event');
+  assert.equal(controller.replies, 7, 'every reply counted');
+  controller.abort();
+  const end = await done;
+  assert.equal(end.kind, 4);
+  await until(() => s.held[0].signal.aborted);
+  s.server.stop(true);
+});
+
+test('under sameCursor "event" a reply with the cursor asked with is delivered', async () => {
+  const s = standIn([{ body: '{"seq":1,"n":1}' }, { body: '{"seq":1,"n":2}' }]);
+  const controller = new AbortController(), sent = [];
+  const done = longPoll(s, controller, sent, { sameCursorEvent: true });
+  await until(() => s.held.length === 1);
+  assert.deepEqual(sent.map((m) => m.data), ['{"seq":1,"n":1}', '{"seq":1,"n":2}']);
+  controller.abort(); await done; s.server.stop(true);
+});
+
+test('a long poll waits out Retry-After, shows retrying, and a drop ends the wait', async () => {
+  const s = standIn([{ status: 503, headers: { 'retry-after': '0' } }, { body: '{"seq":5}' }, { status: 429, headers: { 'retry-after': '30' } }]);
+  const controller = new AbortController(), sent = [];
+  const done = longPoll(s, controller, sent);
+  await until(() => controller.retrying?.error === 'HTTP 429');
+  assert.deepEqual(sent.map((m) => m.id), ['5']);
+  assert.equal(controller.retrying.attempt, 1, 'the 2xx reset the count');
+  assert.equal(controller.retrying.error, 'HTTP 429');
+  assert.ok(controller.retrying.at - performance.now() > 25000);
+  const dropped = performance.now();
+  controller.abort();
+  assert.equal((await done).kind, 4);
+  assert.ok(performance.now() - dropped < 1000, 'the wait ended with the drop');
+  assert.equal(controller.retrying, undefined);
+  assert.equal(s.asked.length, 3, 'not asked again');
+  s.server.stop(true);
+});
+
+test('what is not a poll reply ends a long poll, and only a bodiless GET is one', async () => {
+  const cases = [
+    [{ status: 404, body: 'gone', headers: {} }, (e) => e.kind === 0 && e.status === 404],
+    [{ body: 'not json', headers: {} }, (e) => e.kind === 0 && e.status === 200],
+    [{ body: '{"other":1}' }, (e) => e.kind === 0 && e.status === 200],
+    [{ body: '[1,2]' }, (e) => e.kind === 0 && e.status === 200],
+    [{ body: 'data: 1\n\n', headers: { 'content-type': 'text/event-stream' } }, (e) => e.kind === 2 && /event stream/.test(new TextDecoder().decode(e.body))],
+    [{ body: `{"seq":1,"pad":"${'.'.repeat(80)}"}` }, (e) => e.kind === 2],
+  ];
+  for (const [answer, ok] of cases) {
+    const s = standIn([answer]);
+    const end = await longPoll(s, new AbortController(), []);
+    assert.ok(ok(end), JSON.stringify({ answer, end: { ...end, body: new TextDecoder().decode(end.body) } }));
+    s.server.stop(true);
+  }
+  const s = standIn([]);
+  const post = await longPoll(s, new AbortController(), [], {}, { method: 'POST', body: btoa('x') });
+  assert.equal(post.kind, 2);
+  assert.match(new TextDecoder().decode(post.body), /a GET with no body/);
+  assert.equal(s.asked.length, 0);
+  s.server.stop(true);
+});
+
+test('a retry asks no sooner than the floor, a busy body is never read, and a cursor no host carries ends the poll', async () => {
+  longPollTiming.heartbeatMs = 40;
+  try {
+    const s = standIn([{ status: 503, headers: { 'retry-after': '0' }, body: 'x'.repeat(100000) }, { status: 429, headers: { 'retry-after': 'Sun, 06 Nov 1994 08:49:37 GMT' } }, { body: '{"seq":9}' }]);
+    const controller = new AbortController(), sent = [], started = performance.now();
+    const done = longPoll(s, controller, sent);
+    await until(() => sent.length === 1);
+    assert.ok(performance.now() - started >= 80);
+    assert.equal(controller.markers, 2);
+    controller.abort(); await done; s.server.stop(true);
+    for (const body of ['{"seq":9007199254740993}', '{"seq":"a\\nb"}', '{"seq":1.5}', '{"seq":"\\ud800"}']) {
+      const t = standIn([{ body }]);
+      const end = await longPoll(t, new AbortController(), []);
+      assert.equal(end.kind, 2, body);
+      t.server.stop(true);
+    }
+    // A long poll refused before anything is sent: a socket's URL, a bad `from`.
+    const r = standIn([]);
+    const ws = await request({ method: 'GET', url: r.origin.replace('http', 'ws'), headers: [], body: '', stream: true, longPoll: { cursor: 'since', from: 'seq', sameCursorEvent: false } }, { grantSet: normalized(`net.fetch ${r.origin}\nnet.websocket ${r.origin.replace('http', 'ws')}`), controllers: new Set(), controller: new AbortController() });
+    assert.match(new TextDecoder().decode(ws.body), /HTTP, not a WebSocket/);
+    // (an http URL with no `//` is refused, as natively)
+    const { longPollRefusal } = await import('./http-body.js');
+    assert.match(longPollRefusal({ url: 'https:example.test/changes', stream: true, longPoll: { cursor: 'since', from: 'seq', sameCursorEvent: false } }, 'GET', ''), /HTTP, not a WebSocket/);
+    const plain = await longPoll(r, new AbortController(), [], {}, { stream: false });
+    assert.match(new TextDecoder().decode(plain.body), /a stream's/);
+    const deep = await longPoll(r, new AbortController(), [], { from: 'a.b.c' });
+    assert.match(new TextDecoder().decode(deep.body), /exactLongPoll.from/);
+    assert.equal(r.asked.length, 0);
+    r.server.stop(true);
+  } finally { longPollTiming.heartbeatMs = 1000; }
+});
+
+// LLP 1016.000, an upload (D10): Fetch tells no bytes
+// sent, so the page sends it by XMLHttpRequest. Each `upload` progress event is
+// a message of the bytes sent; the reply, any status, read whole within the
+// ceiling, is the outcome; nothing asks for events. A redirect out of the
+// grants, an abort and the deadline end it as a fetch's would.
+test('an upload goes by XMLHttpRequest: its bytes sent are messages, its reply the outcome', async () => {
+  const made = [];
+  class Xhr {
+    constructor() { this.upload = {}; this.headers = []; made.push(this); }
+    open(method, url) { this.method = method; this.url = url; }
+    setRequestHeader(name, value) { this.headers.push([name, value]); }
+    send(body) { this.body = body; }
+    abort() { this.onabort?.(); }
+    getAllResponseHeaders() { return 'content-type: application/json\r\n'; }
+    answer(status, text, url = this.url) { this.status = status; this.response = new TextEncoder().encode(text).buffer; this.responseURL = url; this.onload(); }
+  }
+  const saved = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = Xhr;
+  try {
+    const tick = () => new Promise((r) => setTimeout(r, 5)), decode = (o) => new TextDecoder().decode(o.body);
+    const host = (sent, controller = new AbortController()) => ({ grantSet: normalized('net.fetch https://example.test'), controllers: new Set(), controller, message: (m) => sent.push([m.event, m.data]) });
+    const op = { method: 'POST', url: 'https://example.test/upload', headers: [['content-type', 'image/png']], body: btoa('12345678'), stream: true, upload: true, maxResponseBytes: 64 };
+    const sent = [], done = request(op, host(sent));
+    await tick();
+    const xhr = made[0];
+    assert.deepEqual([xhr.method, xhr.url, xhr.headers, [...xhr.body]], ['POST', op.url, [['content-type', 'image/png']], [...'12345678'].map((c) => c.charCodeAt(0))]);
+    xhr.upload.onprogress({ lengthComputable: true, loaded: 4, total: 8 });
+    xhr.upload.onprogress({ lengthComputable: true, loaded: 8, total: 8 });
+    xhr.answer(201, '{"id":"a1"}');
+    const end = await done;
+    // Its start, just before it went out, then its bytes sent (LLP 1016.000 D10).
+    assert.deepEqual(sent, [['exact:sending', ''], ['exact:progress', '{"loaded":4,"total":8}'], ['exact:progress', '{"loaded":8,"total":8}']]);
+    assert.deepEqual([end.kind, end.status, end.headers, decode(end)], [0, 201, 'content-type: application/json', '{"id":"a1"}']);
+
+    const away = request(op, host([]));
+    await tick();
+    made[1].answer(200, 'ok', 'https://other.example/landed');
+    const left = await away;
+    assert.deepEqual([left.kind, decode(left)], [2, "outside the app's grants (net.fetch): redirected to https://other.example"]);
+
+    const big = request(op, host([]));
+    await tick();
+    made[2].answer(200, 'x'.repeat(65));
+    assert.deepEqual([(await big).kind, decode(await big)], [2, 'HTTP response exceeds limit']);
+
+    const controller = new AbortController(), aborted = request(op, host([], controller));
+    await tick();
+    controller.abort();
+    assert.equal((await aborted).kind, 4);
+
+    const late = await request({ ...op, timeoutMs: 20 }, host([]));
+    assert.deepEqual([late.kind, decode(late)], [10, 'the request timed out after 20 ms']);
+  } finally { globalThis.XMLHttpRequest = saved; }
 });

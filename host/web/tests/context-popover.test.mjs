@@ -9,7 +9,7 @@
 // puts a popover). The page's stylesheet is a default build's (look.mjs).
 import { test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { chromium as browserPath } from '../../../scripts/agent-launch.mjs';
+import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
 
 const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
@@ -28,7 +28,7 @@ const page = `<style>${withLook(read('../index.html')).match(/<style>([\s\S]*?)<
 
 for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a right click opens the context menu's popover, once the press is over, and says where it was`, async () => {
   const playwright = await import('playwright-core');
-  const browser = await playwright[engine].launch({ headless: true, ...(engine === 'chromium' ? { executablePath: browserPath().executable } : {}) });
+  const browser = await suiteBrowser(engine);
   try {
     const tab = await browser.newPage({ viewport: { width: 600, height: 400 } });
     await tab.setContent(page);
@@ -51,5 +51,36 @@ for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a right
     await tab.mouse.click(120, 90, { button: 'right' });
     await tab.evaluate(() => new Promise((done) => setTimeout(done))); // a task after the one the release queued
     expect([engine, await open()]).toEqual([engine, false]);
+  } finally { await browser.close(); }
+}, 30000);
+
+// A context menu asked for inside an open popover nests in it (HTML, "topmost popover ancestor": the
+// source's nearest open popover), so the first stays open under it, and closing the menu leaves it open.
+const nested = `<style>${withLook(read('../index.html')).match(/<style>([\s\S]*?)<\/style>/)[1]}</style>
+<div id="exact-root"><button id="open" popovertarget="list">Open</button>
+  <div popover="auto" id="list"><div id="inner" style="height:60px;width:200px">A row in a popover</div></div>
+  <div popover="auto" role="menu" id="menu"><button type="button" id="item">Rename</button></div></div>
+<script type="module">${read('../navigation.js')}
+  const menu = document.getElementById('menu');
+  document.getElementById('inner').addEventListener('contextmenu', (event) => { event.preventDefault(); contextAt(event, () => [menu, event.currentTarget ?? document.getElementById('inner')]); });
+  window.ready = true;
+</script>`;
+
+for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a context menu inside an open popover leaves that popover open`, async () => {
+  const browser = await suiteBrowser(engine);
+  try {
+    const tab = await browser.newPage({ viewport: { width: 600, height: 400 } });
+    await tab.setContent(nested);
+    await tab.waitForFunction('window.ready === true');
+    const open = () => tab.evaluate(() => ['list', 'menu'].map((id) => document.getElementById(id).matches(':popover-open')));
+    await tab.click('#open');
+    expect([engine, await open()]).toEqual([engine, [true, false]]);
+    const box = await tab.locator('#inner').boundingBox();
+    await tab.mouse.click(box.x + 20, box.y + 20, { button: 'right' });
+    await tab.waitForFunction(() => document.getElementById('menu').matches(':popover-open'));
+    expect([engine, await open()]).toEqual([engine, [true, true]]);
+    await tab.keyboard.press('Escape');
+    await tab.waitForFunction(() => !document.getElementById('menu').matches(':popover-open'));
+    expect([engine, await open()]).toEqual([engine, [true, false]]);
   } finally { await browser.close(); }
 }, 30000);

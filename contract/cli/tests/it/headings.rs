@@ -1,10 +1,9 @@
 //! LLP 1115 D3: a heading is the platform's text style for its level (1
 //! `title1`, 2 `title2`, 3 `title3`, 4 and on `headline`), read from the
 //! schema's ramp at the root font size (the platform's body size), so it
-//! follows Dynamic Type as Apple's own ramp does, at the style's emphasized
-//! weight (LLP 1116 D7: bold for a title, `headline`'s semibold). A written `font-size` or
-//! `font-weight` wins; an inherited one does not. `font` takes a text style
-//! as WebKit's `font: -apple-system-headline` does.
+//! follows Dynamic Type as Apple's own ramp does. Native hosts keep the
+//! text style's weight; web, neutral and terminal looks emphasize titles.
+//! An authored `font`, `font-size` or `font-weight` wins over its defaults.
 use exact_kernel::{Kernel, RowValue, StyleId};
 use exact_runner::{DataError, DataSource, Runner, Value};
 
@@ -80,7 +79,12 @@ fn a_heading_is_its_levels_text_style_at_the_root_size_unless_written() {
         "a title's emphasized weight, not the parent's"
     );
     assert_eq!(weight(&r, "h2"), 700.0);
-    assert_eq!(weight(&r, "h3"), 700.0);
+    assert_eq!(
+        weight(&r, "h3"),
+        600.0,
+        "Apple's emphasized Title 3 is semibold"
+    );
+    assert_eq!(weight(&r, "chosen"), 600.0, "the chosen level's weight");
     assert_eq!(weight(&r, "h5"), 600.0, "headline is semibold");
     assert_eq!(size(&r, "sized"), 20.0, "the author's size wins");
     assert_eq!(weight(&r, "sized"), 700.0);
@@ -157,4 +161,85 @@ fn font_takes_only_a_text_style() {
             "{value}: {e}"
         );
     }
+}
+
+/// `font="inherit"`, the common reset's: every font longhand is a written
+/// clear, which takes the surrounding text's value past a platform control's
+/// start, as `color="inherit"` does.
+#[test]
+fn font_inherit_clears_every_font_longhand() {
+    let src = "component App\n  view\n    column font-size=20 font-weight=600\n      button testId=\"reset\" appearance=\"none\" font=\"inherit\" \"Sort\"\n";
+    let plan = contract::compile(src).unwrap_or_else(|e| panic!("{e}"));
+    let r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let node = r
+        .kernel()
+        .node_by_key(r.kernel().find_by_test_id("reset")[0])
+        .unwrap();
+    for row in [
+        StyleId::FontStyle,
+        StyleId::FontWeight,
+        StyleId::FontSize,
+        StyleId::LineHeight,
+        StyleId::FontFamily,
+    ] {
+        assert!(
+            node.style.written.has(row) && !node.style.mask.has(row),
+            "{row:?}"
+        );
+        assert!(!node.starts(row), "{row:?}");
+    }
+    assert_eq!(number(&r, "reset", StyleId::FontSize), 20.0);
+    assert_eq!(number(&r, "reset", StyleId::FontWeight), 600.0);
+    // The longhand alone, as a reset also writes it.
+    let src = "component App\n  view\n    column font-family=\"Georgia\"\n      button testId=\"field\" font-family=\"inherit\" \"Sort\"\n";
+    let plan = contract::compile(src).unwrap_or_else(|e| panic!("{e}"));
+    let r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let node = r
+        .kernel()
+        .node_by_key(r.kernel().find_by_test_id("field")[0])
+        .unwrap();
+    assert!(
+        node.style.written.has(StyleId::FontFamily) && !node.style.mask.has(StyleId::FontFamily)
+    );
+}
+
+/// Web headings retain their emphasized weights; an authored weight wins
+/// at every level.
+#[test]
+fn each_heading_level_has_its_emphasized_weight() {
+    let mut src = String::from("component App\n  view\n    column font-weight=300\n");
+    for level in 1..=6 {
+        src += &format!("      text testId=\"h{level}\" role=\"heading\" aria-level={level} \"x\"\n      text testId=\"w{level}\" role=\"heading\" aria-level={level} font-weight=400 \"x\"\n");
+    }
+    let plan = contract::compile(&src).unwrap_or_else(|e| panic!("{e}"));
+    let r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let weights: Vec<f64> = (1..=6)
+        .map(|l| number(&r, &format!("h{l}"), StyleId::FontWeight))
+        .collect();
+    assert_eq!(weights, [700.0, 700.0, 600.0, 600.0, 600.0, 600.0]);
+    let written: Vec<f64> = (1..=6)
+        .map(|l| number(&r, &format!("w{l}"), StyleId::FontWeight))
+        .collect();
+    assert_eq!(written, [400.0; 6], "a written weight wins");
 }

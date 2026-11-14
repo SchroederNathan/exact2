@@ -13,6 +13,8 @@ import type { Change, SqliteStorage } from './web.ts';
 import type { MutationOp, QueryOp } from './snapback.ts';
 
 const binary = process.env.SNAPBACK4_BIN ?? resolve(import.meta.dir, `../../node_modules/snapback4-${process.platform}-${process.arch}/snapback4${process.platform === 'win32' ? '.exe' : ''}`);
+// Since 0.4.33 dev refuses a persona the schema does not declare: these are every one the tests send.
+const PERSONAS = 'use personas alice, bob, carol, dave, erin, gina, hank, ivy, jo, jules, kim, lee, lou, max, ned, nell, olga, olive, pia, quin, rory, una';
 const SCHEMA = `
 use identity
 table messages:
@@ -158,7 +160,7 @@ const { commitChanges, readKept } = await import('./web.ts');
 beforeAll(async () => {
   const project = join(scratch, 'server');
   mkdirSync(join(project, 'snapback'), { recursive: true });
-  writeFileSync(join(project, 'snapback/schema.q'), SCHEMA);
+  writeFileSync(join(project, 'snapback/schema.q'), SCHEMA.replace('use identity', `use identity\n${PERSONAS}`));
   server = spawn(binary, ['dev', '--port', '0', '--memory', '--no-watch'], { cwd: project, stdio: ['ignore', 'pipe', 'pipe'] });
   origin = await new Promise<string>((done, fail) => {
     const lines = createInterface({ input: server.stdout! });
@@ -953,8 +955,14 @@ test('device guest sessions persist and bind a partition after public auth disco
     expect(sibling.session?.principal).toBe(db.session?.principal);
     await sibling.close();
     await expect(db.guest()).rejects.toMatchObject({code: 'E_AUTH'});
+    await expect(db.signup('guest-upgrade@example.com', 'correct-horse-battery-staple')).rejects.toMatchObject({code: 'E_AUTH'});
+    await expect(db.login('guest-upgrade@example.com', 'correct-horse-battery-staple')).rejects.toMatchObject({code: 'E_AUTH'});
     await db.logout();
     expect(store.get('session')).toBeNull();
+    expect(await db.signup('guest-upgrade@example.com', 'correct-horse-battery-staple')).toMatchObject({ok: true, session: {principal: expect.stringMatching(/^user:/)}});
+    await db.logout();
+    expect(await db.login('guest-upgrade@example.com', 'correct-horse-battery-staple')).toMatchObject({ok: true, session: {principal: expect.stringMatching(/^user:/)}});
+    await db.logout();
   } finally {await db.close();}
 });
 

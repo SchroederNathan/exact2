@@ -15,10 +15,15 @@
 //! in the box. Glyphs are rasterized by swash once per (glyph, color) into
 //! small premultiplied pixmaps.
 
+#[cfg(test)]
+mod background_tests;
+pub(crate) mod backgrounds;
 pub(crate) mod cache;
 mod catalog;
 mod catalog_recipe;
+pub(crate) mod decorations;
 mod fallback;
+pub(crate) mod field;
 mod flow;
 #[cfg(test)]
 mod flow_tests;
@@ -30,8 +35,11 @@ mod shaping;
 pub(crate) mod transfer;
 #[cfg(test)]
 mod transfer_tests;
+#[cfg(all(test, windows))]
+mod windows_audit;
 use shaping::ShapedSource;
 mod ink;
+mod inline;
 pub(crate) mod markup;
 pub use cache::{HandoffResidency, Residency, RetiringResidency};
 pub(crate) use catalog::scaler_id;
@@ -69,12 +77,20 @@ pub struct Run {
     pub family: u16,
     /// Italic.
     pub italic: bool,
+    /// CSS `font-stretch`, percent of normal width (LLP 1019 D8).
+    pub stretch: f32,
+    /// CSS `font-variation-settings` (LLP 1019 D9).
+    pub variations: exact_kernel::style::FontVariations,
+    /// CSS `font-optical-sizing: auto`: a face's `opsz` is the size.
+    pub optical_sizing: bool,
     /// Resolved logical length, or normal font metrics.
     pub line_height: Option<f32>,
     /// Points per glyph.
     pub letter_spacing: f32,
     /// CSS `font-variant-numeric` bits (LLP 1053 G4): 1 is `tabular-nums`.
     pub font_variant_numeric: u8,
+    /// CSS `font-variant-ligatures` as `FontVariantLigatures`' bits.
+    pub font_variant_ligatures: u8,
     /// A Markdown list item's head indent, points: where its paragraph's
     /// lines start (LLP 1045 D4).
     pub indent: f32,
@@ -85,6 +101,12 @@ pub struct Run {
     pub mark: u8,
     /// A Markdown link's target ([`markup::target`]); empty otherwise.
     pub href: String,
+    /// Bold Text weights this run (`TextStyle::bold_text`, LLP 1115.000
+    /// D12.3): a Markdown piece's own weight takes the step too.
+    pub bold_text: bool,
+    /// An image in the paragraph (LLP 1011.002): the box reserved in place of
+    /// this run's text, which is shaped as none.
+    pub inline: Option<exact_kernel::InlineBox>,
 }
 
 #[cfg(test)]
@@ -97,13 +119,19 @@ impl Clone for Run {
             weight: self.weight,
             family: self.family,
             italic: self.italic,
+            stretch: self.stretch,
+            variations: self.variations,
+            optical_sizing: self.optical_sizing,
             line_height: self.line_height,
             letter_spacing: self.letter_spacing,
             font_variant_numeric: self.font_variant_numeric,
+            font_variant_ligatures: self.font_variant_ligatures,
             indent: self.indent,
             hang: self.hang,
             mark: self.mark,
             href: self.href.clone(),
+            bold_text: self.bold_text,
+            inline: self.inline,
         }
     }
 }
@@ -119,13 +147,27 @@ impl Run {
             weight: style.font_weight,
             family: style.font_family,
             italic: style.font_style != exact_kernel::FontStyle::Normal,
+            stretch: style.font_stretch,
+            variations: style.font_variations,
+            optical_sizing: style.font_optical_sizing == exact_kernel::FontOpticalSizing::Auto,
             line_height: style.line_height,
             letter_spacing: style.letter_spacing,
             font_variant_numeric: style.font_variant_numeric,
+            font_variant_ligatures: style.font_variant_ligatures,
             indent: 0.0,
             hang: false,
             mark: 0,
             href: String::new(),
+            bold_text: style.bold_text,
+            inline: None,
+        }
+    }
+
+    /// A kernel run, its inline box included.
+    pub fn from_kernel(run: &exact_kernel::TextRun<'_>) -> Self {
+        Self {
+            inline: run.inline,
+            ..Self::from_style(&run.text, run.style)
         }
     }
 }
@@ -169,6 +211,11 @@ impl Spec {
                 run.text = text;
             }
         }
+        // An image's U+FFFC kept the spaces around it apart; shaped, its run
+        // is the box alone, so every source offset is a shaped one.
+        for run in self.runs.iter_mut().filter(|r| r.inline.is_some()) {
+            run.text.clear();
+        }
         self
     }
 
@@ -203,11 +250,7 @@ impl Spec {
         }
         let spec = Spec {
             strut: Run::from_style("", request.paragraph.strut),
-            runs: request
-                .runs
-                .iter()
-                .map(|r| Run::from_style(&r.text, r.style))
-                .collect(),
+            runs: request.runs.iter().map(Run::from_kernel).collect(),
             align: request.paragraph.text_align,
             line_clamp: request.paragraph.line_clamp,
             overflow_wrap: request.paragraph.overflow_wrap,
@@ -223,7 +266,9 @@ impl Spec {
 
     /// Whether there is nothing to shape.
     pub fn is_empty(&self) -> bool {
-        self.runs.iter().all(|r| r.text.is_empty())
+        self.runs
+            .iter()
+            .all(|r| r.text.is_empty() && r.inline.is_none())
     }
 }
 
@@ -504,7 +549,7 @@ pub struct GlyphRun {
     pub coords: std::sync::Arc<[i16]>,
     /// The face's file and collection index, when it was loaded from one.
     pub file: Option<(std::sync::Arc<str>, u32)>,
-    /// The weight shaped with (the `wght` a variable face is set to).
+    /// The requested CSS weight; a declared face may pin a different `wght`.
     pub weight: u16,
     /// Points.
     pub size: f32,
@@ -518,6 +563,11 @@ pub struct GlyphRun {
     /// chose them (`coords` normalized): `ital` 1 for an italic drawn from
     /// a face's axis rather than synthesized.
     pub synthesis: fontique::Synthesis,
+    /// The run's `font-variation-settings`, set after `synthesis` and
+    /// optical size, in the axes' own units (LLP 1019 D9).
+    pub variations: exact_kernel::style::FontVariations,
+    /// Whether `opsz` is the size (`font-optical-sizing: auto`).
+    pub optical_sizing: bool,
     /// (glyph id, x, y) — y is the baseline.
     pub glyphs: Vec<(u32, f32, f32)>,
 }
@@ -570,6 +620,11 @@ impl TextEngine {
     /// a browser gets from `fc-match sans-serif`.
     pub fn new() -> TextEngine {
         Self::with_catalog(catalog::Catalog::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_font_files(paths: &[&Path], sans: &str) -> Self {
+        Self::with_catalog(catalog::Catalog::from_files(paths, sans))
     }
 
     fn with_catalog(catalog: catalog::Catalog) -> Self {
@@ -776,6 +831,7 @@ impl TextEngine {
 
     fn source(&mut self, key: (u64, u64)) -> Rc<ShapedSource> {
         if let Some(source) = self.paragraphs.source(key) {
+            exact_ink::counters::add(exact_ink::counters::Counter::ShapeHits, 1);
             return source;
         }
         let spec = self.paragraphs.spec(key).expect("current identity");
@@ -785,6 +841,9 @@ impl TextEngine {
     }
 
     fn build_source(&mut self, spec: Arc<Spec>) -> Rc<ShapedSource> {
+        #[cfg(target_os = "macos")]
+        let _trace = exact_ink::device::apple::Trace::new(c"text shape");
+        exact_ink::counters::add(exact_ink::counters::Counter::ShapeMisses, 1);
         self.shape_calls += 1;
         #[cfg(test)]
         identified_tests::shaped(&spec);
@@ -825,6 +884,8 @@ impl TextEngine {
         width: Option<f32>,
         hold: bool,
     ) -> Paragraph {
+        #[cfg(target_os = "macos")]
+        let _trace = exact_ink::device::apple::Trace::new(c"text width layout");
         #[cfg(test)]
         if let Some(callback) = &mut self.before_layout {
             callback();
@@ -875,6 +936,33 @@ impl TextEngine {
         self.measure_for(spec, width, key)
     }
 
+    /// Each inline box's top left in `paragraph`, in run order (LLP
+    /// 1011.002 D2): its line's baseline less its height above it.
+    fn inline_box_origins(&mut self, paragraph: &Paragraph, origins: &mut Vec<(f32, f32)>) {
+        let lines = paragraph.lines();
+        let spec = &paragraph.source.spec;
+        let mut catalog = paragraph.source.catalog.borrow_mut();
+        // One pair per box in run order; a box on no line (a clamp cut it)
+        // is not a number.
+        for (run, _) in spec
+            .runs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.inline.is_some())
+        {
+            let placed = lines
+                .boxes
+                .iter()
+                .find(|b| b.run as usize == run)
+                .and_then(|b| {
+                    let baseline = *paragraph.baselines.get(b.line as usize)?;
+                    let (above, _) = shaping::box_extent(spec, &mut catalog, run);
+                    Some((b.x, baseline - above))
+                });
+            origins.push(placed.unwrap_or((f32::NAN, f32::NAN)));
+        }
+    }
+
     fn measure_for(&mut self, spec: &Spec, width: AxisOffer, key: (u64, u64)) -> TextMetrics {
         self.measures += 1;
         if spec.is_empty() {
@@ -895,7 +983,9 @@ impl TextEngine {
         };
         if self.layout_calls == before {
             self.hits += 1;
+            exact_ink::counters::add(exact_ink::counters::Counter::MeasureHits, 1);
         } else {
+            exact_ink::counters::add(exact_ink::counters::Counter::MeasureMisses, 1);
             self.shaping += started.elapsed();
         }
         metrics
@@ -1024,15 +1114,36 @@ impl TextEngine {
     /// points from the paragraph's top-left, the same numbers the raster
     /// path snaps to pixels.
     pub fn glyph_runs(&mut self, paragraph: &Paragraph, palette: &[RunPaint]) -> Vec<GlyphRun> {
+        self.glyph_runs_mapped(paragraph, palette, |g, baseline| (g.x, baseline + g.y))
+    }
+
+    pub(crate) fn physical_glyph_runs(
+        &mut self,
+        paragraph: &Paragraph,
+        palette: &[RunPaint],
+        origin: (f32, f32),
+        scale: f32,
+    ) -> Vec<GlyphRun> {
+        self.glyph_runs_mapped(paragraph, palette, |g, baseline| {
+            exact_ink::glyph::position(g.x, g.y, baseline, origin, scale)
+        })
+    }
+
+    fn glyph_runs_mapped(
+        &mut self,
+        paragraph: &Paragraph,
+        palette: &[RunPaint],
+        position: impl Fn(&LayoutGlyph, f32) -> (f32, f32),
+    ) -> Vec<GlyphRun> {
         type Key = (u16, u32, usize);
         type Runs = Vec<(Key, Vec<(u32, f32, f32)>)>;
         let mut runs: Runs = Vec::new();
         for (g, baseline, _) in paragraph.paint_glyphs(palette) {
             let key = (g.face, g.font_size.to_bits(), g.run());
-            let y = baseline + g.y;
+            let (x, y) = position(g, baseline);
             match runs.last_mut() {
-                Some((k, glyphs)) if *k == key => glyphs.push((g.glyph_id, g.x, y)),
-                _ => runs.push((key, vec![(g.glyph_id, g.x, y)])),
+                Some((k, glyphs)) if *k == key => glyphs.push((g.glyph_id, x, y)),
+                _ => runs.push((key, vec![(g.glyph_id, x, y)])),
             }
         }
         let catalog = paragraph.source.catalog.borrow();
@@ -1050,6 +1161,18 @@ impl TextEngine {
                     paint: palette[run_index],
                     synthetic_italic: face.skew,
                     synthesis: face.synthesis,
+                    variations: paragraph
+                        .source
+                        .spec
+                        .runs
+                        .get(run_index)
+                        .map_or_else(Default::default, |r| r.variations),
+                    optical_sizing: paragraph
+                        .source
+                        .spec
+                        .runs
+                        .get(run_index)
+                        .is_none_or(|r| r.optical_sizing),
                     glyphs,
                 })
             })
@@ -1074,6 +1197,18 @@ fn premultiply(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
 pub struct Measurer(pub Shared);
 
 impl TextMeasurer for Measurer {
+    fn format_time(&mut self, r: &exact_kernel::time::TimeRequest<'_>) -> Option<String> {
+        #[cfg(target_os = "android")]
+        if let Some(text) = crate::canvas::time::format(r) {
+            return Some(text);
+        }
+        let mut request = *r;
+        if r.format.starts_with("date-") || r.format.starts_with("time-") {
+            request.utc_offset = crate::zone::offset_minutes_at(r.time_zone, r.datetime);
+        }
+        exact_kernel::time::english(&request)
+    }
+
     fn button_measure(
         &mut self,
         request: &exact_kernel::ButtonMeasureRequest,
@@ -1150,6 +1285,28 @@ impl TextMeasurer for Measurer {
         let (key, spec) = engine.identified_spec(stamp, || Spec::from_request(request));
         if !spec.is_empty() {
             bottoms.extend_from_slice(engine.paragraph_for(&spec, Some(width), key).line_bottoms());
+        }
+    }
+
+    /// @ref LLP 1011.002 D2 — each image's box in the paragraph the
+    /// measure built.
+    fn inline_boxes(
+        &mut self,
+        stamp: &ParagraphStamp,
+        request: &TextMeasureRequest<'_>,
+        origins: &mut Vec<(f32, f32)>,
+    ) {
+        let AxisOffer::Definite(width) = request.width else {
+            return;
+        };
+        if !request.exclusions.is_empty() {
+            return;
+        }
+        let mut engine = self.0.borrow_mut();
+        let (key, spec) = engine.identified_spec(stamp, || Spec::from_request(request));
+        if spec.runs.iter().any(|r| r.inline.is_some()) {
+            let paragraph = engine.paragraph_for(&spec, Some(width), key);
+            engine.inline_box_origins(&paragraph, origins);
         }
     }
 
@@ -1251,3 +1408,10 @@ mod text_box_tests;
 #[cfg(test)]
 #[path = "text/balance_tests.rs"]
 mod balance_tests;
+
+#[cfg(test)]
+#[path = "text/live_time_tests.rs"]
+mod live_time_tests;
+
+#[cfg(test)]
+mod variable_face_tests;

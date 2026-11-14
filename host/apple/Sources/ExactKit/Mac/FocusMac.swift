@@ -16,10 +16,11 @@ extension NodeView {
     package override var acceptsFirstResponder: Bool {
         if formDisabled || inert || isHiddenOrHasHiddenAncestor || cssVisibilityHidden { return false }
         if field != nil || textArea != nil || isNativeButton || nativeValueControl != nil { return false }
-        return props["semanticTag"] == "dialog" || isParagraph || explicitTabIndex != nil || tabbable || isRadio
+        return props["semanticTag"] == "dialog" || isParagraph || explicitTabIndex != nil || tabbable || isRadio || ariaRadioGroup != nil
     }
     var tabbable: Bool {
         if let index = explicitTabIndex { return index >= 0 }
+        if ariaRadioGroup != nil { return ariaRadioTabStop } // an authored radio group is one stop too
         return kind == "button" || isNativeButton || isDateOrSelect || canvases?.wantsInput(id) == true || pressable || !handlers.isDisjoint(with: Self.focusEvents)
             || reorderKeys || radioTabStop // a grouped grip takes the keys (LLP 1094 D9); a radio group one stop (x2apps survey #2)
     }
@@ -43,6 +44,7 @@ extension NodeView {
         focusVisible = !isNativeButton && nativeValueControl == nil && presenter?.focusByPointer != true
         presenter?.collections.pinsChanged()
         presenter?.selection.focusEntered(self)
+        inputCanvas?.canvasInput?.focused()
         presenter?.focus(id)
         // A row of an open menu taking the focus is its highlight, which
         // AppKit's menu tells as its selected child changing (Accessibility.swift).
@@ -59,13 +61,19 @@ extension NodeView {
             presenter.shownMenus.remove(at: index)
             presenter.menuClosed(self)
         }
+        if newWindow !== window, BackdropCovers.nodes.contains(self) {
+            BackdropCovers.changed(in: window)
+            BackdropCovers.changed(in: newWindow)
+        }
         super.viewWillMove(toWindow: newWindow)
     }
     func focusLeft() {
+        releaseKeyboardPress()
         focusVisible = false
         presenter?.selection.focusLeft()
         presenter?.collections.pinsChanged()
         if !isSurfaceControl { inputCanvas?.canvasInput?.blur() }
+        inputCanvas?.canvasInput?.focusLeft()
         presenter?.blur(id)
     }
     /// Dates and selects have the same single native focus owner as a field.
@@ -112,7 +120,21 @@ extension NodeView {
     /// click gives it the focus. A paragraph that selects text, the one node
     /// that accepts and is asked here without taking keys, takes the focus
     /// itself as its selection begins (`mouseDown`).
-    package override var needsPanelToBecomeKey: Bool { takesClickFocus }
+    /// Not for a node whose press a `pointerdown` handler (its own or an
+    /// authored ancestor's) can prevent: AppKit would focus it before that
+    /// handler runs, so `mouseDown` gives the focus itself, after it, unless
+    /// it prevented the press (LLP 1005 §3).
+    package override var needsPanelToBecomeKey: Bool { takesClickFocus && !pointerdownHeard }
+    /// Whether a `pointerdown` handler hears a press here: this node's or an
+    /// enabled ancestor's up the authored tree.
+    var pointerdownHeard: Bool {
+        var at: NSView? = self
+        while let view = at {
+            if let node = view as? NodeView, !node.disabled, node.handlers.contains("pointerdown") { return true }
+            at = presenter?.eventParent(of: view)
+        }
+        return false
+    }
     /// Whether a click on this node in a window that is not key is also a
     /// press (LLP 1115.000 D7.9). Every node used to answer true, a
     /// browser's rule. AppKit's answer, measured on macOS 27.0
@@ -151,16 +173,17 @@ extension NodeView {
     /// A focused pressable's ring, AppKit's exterior one around its rounded
     /// box, as AppKit rings an `NSButton` the keyboard moved the focus to.
     /// AppKit draws no mask whose bounds are empty, which keeps it off a box
-    /// that is not pressable, a field (its own ring) and a focus that is not
-    /// visible.
+    /// that is not pressable, a field (its own ring), a focus that is not
+    /// visible, a box whose author wrote `outline: none` (LLP 1104 D6) and a
+    /// ring a later backdrop covers (`BackdropCoverMac.swift`).
     var bareFieldFocused: Bool {
         !isNativeTextControl && (field?.currentEditor() != nil || (textArea != nil && window?.firstResponder === textArea))
     }
     package override var focusRingMaskBounds: NSRect {
-        bareFieldFocused || (field == nil && ringsFocus && focusVisible) ? bounds : .zero
+        uncovered(!outlineNone && (bareFieldFocused || (field == nil && ringsFocus && focusVisible)) ? bounds : .zero)
     }
     package override func drawFocusRingMask() {
-        guard bareFieldFocused || (field == nil && ringsFocus) else { return }
+        guard !outlineNone, bareFieldFocused || (field == nil && ringsFocus) else { return }
         roundedPath(in: bounds).fill()
     }
 }
@@ -180,6 +203,33 @@ extension Presenter {
         if editor?.hasMarkedText() == true { return }
         guard let value = node.field?.stringValue ?? node.textArea?.string else { return }
         commitEdit(id, value, change: node.handlers.contains("change"))
+    }
+
+    /// The click being dispatched as a press, when `field` is an `autofocus`
+    /// text field or textarea that press's own work mounted in its window:
+    /// the field takes the focus from whatever holds it, and its caret goes
+    /// under the click, as AppKit's click-to-edit begins editing a cell
+    /// under the pointer (`NSCell.edit(withFrame:in:editor:delegate:event:)`).
+    /// Only the mouse paths give the click: a press from the keyboard, from
+    /// VoiceOver or from a hatch carries none, whatever the app's current event.
+    func pressMount(_ field: NodeView, in window: NSWindow) -> NSPoint? {
+        guard let click = pressClick, [.leftMouseDown, .leftMouseUp].contains(click.type), click.window === window,
+              field.field != nil || field.textArea != nil else { return nil }
+        return click.locationInWindow
+    }
+
+    /// Where a click at `point` (window coordinates) puts the caret in
+    /// `editor`: the end below the text or outside it, else the insertion
+    /// point nearest it, as a click in an `NSTextView` does.
+    static func caret(in editor: NSTextView, at point: NSPoint) -> Int {
+        let end = (editor.string as NSString).length
+        guard let manager = editor.layoutManager, let container = editor.textContainer else { return end }
+        let local = editor.convert(point, from: nil)
+        guard editor.visibleRect.contains(local) else { return end }
+        manager.ensureLayout(for: container)
+        let used = manager.usedRect(for: container).offsetBy(dx: editor.textContainerOrigin.x, dy: editor.textContainerOrigin.y)
+        if editor.isFlipped ? local.y >= used.maxY : local.y <= used.minY { return end }
+        return min(end, editor.characterIndexForInsertion(at: local))
     }
 
     /// A key that is not a shortcut chord (Tab and Shift-Tab included): the

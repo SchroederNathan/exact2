@@ -57,10 +57,10 @@ fn pointer_down_and_up_run_their_actions_beside_press() {
             EventKind::Press
         ]
     );
-    r.dispatch(mic, Event::Pointerdown(at("3,4,1,0.5,touch,7,13,14")))
+    r.dispatch(mic, Event::Pointerdown(at("3,4,0,1,0.5,touch,7,13,14")))
         .unwrap();
     assert_eq!(r.slot("recording"), Some(&Value::Bool(true)));
-    r.dispatch(mic, Event::Pointerup(at("3,4,0,0,touch,7,13,14")))
+    r.dispatch(mic, Event::Pointerup(at("3,4,0,0,0,touch,7,13,14")))
         .unwrap();
     r.dispatch(mic, Event::Press).unwrap();
     assert_eq!(r.slot("sent"), Some(&Value::Number(1.0)));
@@ -93,8 +93,8 @@ const PAD: &str = r#"component App
     pressing = e.pressure
   action move(e)
     points = `${points} ${e.offsetX},${e.offsetY}/${e.buttons}@${e.clientX},${e.clientY}`
-  action up
-    points = `${points} up`
+  action up(e: PointerEvent)
+    points = `${points} up${e.button}/${e.buttons}`
   view
     canvas pointerdown=down("pen") pointermove=move pointerup=up testId="pad" width=200 height=100
 "#;
@@ -115,17 +115,31 @@ fn pointer_events_hand_their_record_to_an_action_that_takes_it() {
         .node_by_key(r.kernel().find_by_test_id("pad")[0])
         .unwrap()
         .id;
-    r.dispatch(pad, Event::Pointerdown(at("10,20,1,0.75,pen,3,110,220")))
+    r.dispatch(pad, Event::Pointerdown(at("10,20,0,1,0.75,pen,3,110,220")))
         .unwrap();
-    r.dispatch(pad, Event::Pointermove(at("12.5,22,1,0.8,pen,3,112.5,222")))
-        .unwrap();
-    r.dispatch(pad, Event::Pointerup(at("13,23,0,0,pen,3,113,223")))
+    r.dispatch(
+        pad,
+        Event::Pointermove(at("12.5,22,-1,1,0.8,pen,3,112.5,222")),
+    )
+    .unwrap();
+    r.dispatch(pad, Event::Pointerup(at("13,23,0,0,0,pen,3,113,223")))
         .unwrap();
     assert_eq!(
         r.slot("points"),
-        Some(&Value::str("pen:pen#3@10,20 12.5,22/1@112.5,222 up"))
+        Some(&Value::str("pen:pen#3@10,20 12.5,22/1@112.5,222 up0/0"))
     );
     assert_eq!(r.slot("pressing"), Some(&Value::Number(0.75)));
+    // A mouse's back and forward buttons, by DOM's numbers (UI Events
+    // `button` 3 and 4, `buttons` bits 8 and 16), as Chrome reports them.
+    for (down, up, heard) in [
+        ("5,5,3,8,0.5,mouse,1,5,5", "5,5,3,0,0,mouse,1,5,5", "up3/0"),
+        ("5,5,4,16,0.5,mouse,1,5,5", "5,5,4,0,0,mouse,1,5,5", "up4/0"),
+    ] {
+        r.dispatch(pad, Event::Pointerdown(at(down))).unwrap();
+        r.dispatch(pad, Event::Pointerup(at(up))).unwrap();
+        let points = r.slot("points").unwrap().as_str().unwrap().to_string();
+        assert!(points.ends_with(heard), "{points}");
+    }
 }
 
 /// Gallery F20: a `press` action that takes one more parameter hears the
@@ -159,11 +173,49 @@ fn a_press_hears_the_modifiers_held() {
         .id;
     r.dispatch(a, Event::Press).unwrap();
     r.dispatch(a, Event::press("Shift+Meta+").unwrap()).unwrap();
-    r.dispatch(a, Event::Pointerdown(at("1,1,1,0.5,mouse,1,1,1,Alt")))
+    r.dispatch(a, Event::Pointerdown(at("1,1,0,1,0.5,mouse,1,1,1,Alt")))
         .unwrap();
     assert_eq!(r.slot("log"), Some(&Value::str("a;a+shift+meta;down+alt;")));
     assert!(Event::press("Hyper").is_none());
     assert_eq!(Event::press(""), Some(Event::Press));
+}
+
+/// LLP 1021 D2: a press's `MouseEvent` says where the pointer was, from the
+/// viewport, so a popover can open there; a keyboard's or assistive press is
+/// at 0, 0, as Chrome's synthetic `click` is.
+#[test]
+fn a_press_hears_where_the_pointer_was() {
+    let src = r#"component App
+  state log = ""
+  action pick(e: MouseEvent)
+    log = `${log}${e.clientX},${e.clientY}${e.shiftKey ? "+shift" : ""};`
+  view
+    button press=pick testId="a"
+      text log
+"#;
+    let plan = contract::compile(src).unwrap_or_else(|e| panic!("{e}"));
+    let mut r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let a = r
+        .kernel()
+        .node_by_key(r.kernel().find_by_test_id("a")[0])
+        .unwrap()
+        .id;
+    r.dispatch(a, Event::press("30.5,8").unwrap()).unwrap();
+    r.dispatch(a, Event::press("120,40,Shift+").unwrap())
+        .unwrap();
+    r.dispatch(a, Event::Press).unwrap();
+    assert_eq!(r.slot("log"), Some(&Value::str("30.5,8;120,40+shift;0,0;")));
+    assert_eq!(Event::press("0,0,"), Some(Event::Press));
+    for bad in ["1", "1,", "1,2,3", "NaN,1", "1,2,Hyper"] {
+        assert!(Event::press(bad).is_none(), "{bad}");
+    }
 }
 
 /// A board's input as a canvas editor hears it (studio diary R3, R17, R19,
@@ -207,7 +259,7 @@ fn a_board_hears_its_menu_point_its_wheel_its_drop_and_its_unload() {
         .unwrap()
         .id;
     let event = |kind: u32, payload: &str| Event::of_host_kind(kind, payload).unwrap();
-    r.dispatch(world, event(10, "40,8,2,0.5,mouse,1,40,8"))
+    r.dispatch(world, event(10, "40,8,2,2,0.5,mouse,1,40,8"))
         .unwrap();
     assert_eq!(r.slot("menu"), Some(&Value::str("40,8,2")));
     // A keyboard's menu key: no point, DOM's record at the origin.
@@ -235,10 +287,56 @@ fn a_board_hears_its_menu_point_its_wheel_its_drop_and_its_unload() {
         Event::of_host_kind(38, "12,30\n/etc/passwd").is_err(),
         "only minted handles drop"
     );
+    // A folder is a handle as a file is (`fs.stat` tells them apart).
+    r.dispatch(world, event(38, "0,0\ndoc:/5/photos")).unwrap();
+    assert_eq!(r.slot("dropped"), Some(&Value::str("1 doc:/5/photos 0")));
     r.take_commands();
     r.dispatch(world, event(36, "")).unwrap();
     assert!(
         r.take_commands().iter().any(|c| c.name == "preventDefault"),
         "unsaved: the window stays"
     );
+}
+
+/// A file drag over a column (the oracle's chat column, T3 Code
+/// `ChatView.tsx`): `dragenter` and `dragleave` bracket it so the app can
+/// draw a drop overlay; their `DragEvent` has the point and no files.
+#[test]
+fn a_column_hears_a_file_drag_enter_and_leave() {
+    const COLUMN: &str = r#"component App
+  state over = false
+  state at = ""
+  action entered(e: DragEvent)
+    over = true
+    at = `${e.offsetX},${e.offsetY},${e.files.length}`
+  action left
+    over = false
+  view
+    column testId="column" width=300 height=200 dragenter=entered dragleave=left
+"#;
+    let plan = contract::compile(COLUMN).unwrap_or_else(|e| panic!("{e}"));
+    let mut r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let column = r
+        .kernel()
+        .node_by_key(r.kernel().find_by_test_id("column")[0])
+        .unwrap()
+        .id;
+    assert_eq!(
+        r.handlers_of(column),
+        vec![EventKind::Dragenter, EventKind::Dragleave]
+    );
+    r.dispatch(column, Event::of_host_kind(55, "7,9").unwrap())
+        .unwrap();
+    assert_eq!(r.slot("over"), Some(&Value::Bool(true)));
+    assert_eq!(r.slot("at"), Some(&Value::str("7,9,0")));
+    r.dispatch(column, Event::of_host_kind(56, "0,0").unwrap())
+        .unwrap();
+    assert_eq!(r.slot("over"), Some(&Value::Bool(false)));
 }

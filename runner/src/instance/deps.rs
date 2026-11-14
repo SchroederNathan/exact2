@@ -57,6 +57,18 @@ impl Bits {
     }
 }
 
+/// Hashed as [`PartialEq`] compares: up to the last word with a bit set.
+impl std::hash::Hash for Bits {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let words = self
+            .0
+            .iter()
+            .rposition(|w| *w != 0)
+            .map_or(0, |last| last + 1);
+        self.0[..words].hash(state);
+    }
+}
+
 /// Equal when they hold the same bits, whatever words each holds.
 impl PartialEq for Bits {
     fn eq(&self, other: &Bits) -> bool {
@@ -102,7 +114,7 @@ impl Layout {
 }
 
 /// What one code body, or the union over a subtree, reads.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Reads {
     /// Inputs, by [`Layout`].
     pub(crate) bits: Bits,
@@ -112,6 +124,11 @@ pub struct Reads {
     /// `k`, bit 63 for 63 and past; every bit when read other than one
     /// field at a time): LLP 1017.003 D6. Meaningful with bit 0 of `frames`.
     pub(crate) fields: u64,
+    /// Enclosing frames whose POSITION is read (`each item, i in list`,
+    /// LoadIndex), by relative depth as `frames`: bit 0 says a row's body
+    /// reads its own position, at any depth, so a row that moved must
+    /// re-evaluate (LLP 1062 D8); one that reads none keeps its bindings.
+    pub(crate) positions: u64,
     /// Whether any row slot is among `bits`.
     pub(crate) row_slots: bool,
     /// Reads a parameter or has an effect: never skipped.
@@ -135,6 +152,7 @@ impl Reads {
             self.fields = !0;
         }
         self.frames |= frames;
+        self.positions |= out_of(other.positions, shift);
         self.row_slots |= other.row_slots;
         self.opaque |= other.opaque;
     }
@@ -142,6 +160,12 @@ impl Reads {
     #[cfg(test)]
     pub(crate) fn constant(&self) -> bool {
         self.bits.is_empty() && self.frames == 0 && !self.opaque
+    }
+    /// Whether these reads, a row's body's, read the row's own position:
+    /// opaque reads count, since a scan that stops at code it can't decode
+    /// knows no more of them.
+    pub(crate) fn reads_position(&self) -> bool {
+        self.positions & 1 != 0 || self.opaque
     }
     /// The same reads seen from `shift` scopes further out.
     pub(crate) fn frames_outside(&self, shift: u32) -> u64 {
@@ -170,8 +194,9 @@ pub(crate) fn into_scope(frames: u64, dirty: bool) -> u64 {
     (frames << 1) | (frames & (1 << 63)) | u64::from(dirty)
 }
 
-/// Read sets by index, those that read nothing one shared entry: most of a
-/// plan's bindings are literal rows.
+/// Read sets by index, each distinct set held once: most of a plan's
+/// bindings are literal rows, which read nothing, and most of the rest read
+/// what another reads (euxy: 5,651 bindings, 85 distinct sets).
 #[derive(Debug, Default)]
 pub(crate) struct ReadsTable {
     /// Each index's place in `reads`; 0 is the empty set.
@@ -181,22 +206,36 @@ pub(crate) struct ReadsTable {
 
 impl FromIterator<Reads> for ReadsTable {
     fn from_iter<I: IntoIterator<Item = Reads>>(all: I) -> Self {
-        let mut table = ReadsTable {
-            at: Vec::new(),
-            reads: vec![Reads::default()],
-        };
+        let all = all.into_iter();
+        let mut at = Vec::with_capacity(all.size_hint().0);
+        let mut places: std::collections::HashMap<Reads, u32> = Default::default();
         for reads in all {
-            let at = match reads == Reads::default() {
+            let place = match reads == Reads::default() {
                 true => 0,
                 false => {
-                    table.reads.push(reads);
-                    table.reads.len() - 1
+                    let next = places.len() as u32 + 1;
+                    *places.entry(reads).or_insert(next)
                 }
             };
-            table.at.push(at as u32);
+            at.push(place);
         }
-        table.reads.shrink_to_fit();
-        table
+        let mut reads = vec![Reads::default(); places.len() + 1];
+        for (set, place) in places {
+            reads[place as usize] = set;
+        }
+        ReadsTable { at, reads }
+    }
+}
+
+#[cfg(test)]
+impl ReadsTable {
+    /// Index `i`'s reads as a scan that stopped at undecodable code leaves
+    /// them (`opaque`), for a test of a body nothing more is known of.
+    pub(crate) fn set_opaque(&mut self, i: usize) {
+        let mut reads = self[i].clone();
+        reads.opaque = true;
+        self.reads.push(reads);
+        self.at[i] = (self.reads.len() - 1) as u32;
     }
 }
 
@@ -212,19 +251,19 @@ impl std::ops::Index<usize> for ReadsTable {
 pub struct Deps {
     layout: Option<Layout>,
     pub(crate) bindings: ReadsTable,
-    pub(crate) surface_args: Vec<Reads>,
+    pub(crate) surface_args: ReadsTable,
     /// A node's own reads and every descendant's, relative to the node.
-    pub(crate) nodes: Vec<Reads>,
+    pub(crate) nodes: ReadsTable,
     /// A region's subject, relative to the region.
-    pub(crate) subjects: Vec<Reads>,
+    pub(crate) subjects: ReadsTable,
     /// A region's key, relative to the row (bit 0 is the item).
-    pub(crate) keys: Vec<Reads>,
+    pub(crate) keys: ReadsTable,
     /// Exactly the innermost row's position; identities survive item changes.
     pub(crate) index_keys: Vec<bool>,
     /// A region's arms' sites, relative to the row or arm frame.
-    pub(crate) bodies: Vec<Reads>,
+    pub(crate) bodies: ReadsTable,
     /// Subject, key and body, relative to the region.
-    pub(crate) regions: Vec<Reads>,
+    pub(crate) regions: ReadsTable,
     /// Each derive's body.
     pub(crate) derives: Vec<Reads>,
     /// Each resource's arguments together.
@@ -233,17 +272,44 @@ pub struct Deps {
 
 /// One input a settlement body reads, decoded from [`Reads::bits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Input {
+pub enum Input {
+    /// A root or row-owned state slot.
     Slot(usize),
+    /// A settled derive value.
     Derive(usize),
+    /// A resource's settled value.
     Resource(usize),
+    /// A resource's pending flag.
     PendingResource(usize),
+    /// A mutation's pending flag and failure state.
     PendingMutation(usize),
+    /// A resource's failure state.
     FailedResource(usize),
+    /// The evaluation clock.
     Clock,
 }
 
+/// A region body's dependencies shared by the native and JavaScript list engines.
+#[derive(Debug)]
+pub struct RowDependencies {
+    /// Plan inputs read anywhere in the row's subtree.
+    pub inputs: Vec<Input>,
+    /// Enclosing frames, excluding the row itself (bit 63 includes every greater depth).
+    pub outer_frames: u64,
+    /// Reads whose inputs cannot be represented by the dependency table.
+    pub opaque: bool,
+}
+
 impl Deps {
+    pub(super) fn row_dependencies(&self, region: usize) -> RowDependencies {
+        let reads = &self.bodies[region];
+        RowDependencies {
+            inputs: self.inputs(reads).collect(),
+            outer_frames: reads.frames_outside(1),
+            opaque: reads.opaque,
+        }
+    }
+
     /// Scan every body once and fold sites bottom-up over `children`.
     pub(crate) fn new(plan: &Plan, children: &super::SiteIndex) -> Self {
         let layout = Layout {
@@ -257,7 +323,7 @@ impl Deps {
             layout: Some(layout),
             bindings: plan.bindings.iter().map(|b| scan(b.expr)).collect(),
             surface_args: plan.surface_args.iter().map(|a| scan(a.expr)).collect(),
-            nodes: vec![Reads::default(); plan.nodes.len()],
+            nodes: ReadsTable::default(),
             subjects: plan.regions.iter().map(|r| scan(r.subject)).collect(),
             keys: plan.regions.iter().map(|r| scan(r.key)).collect(),
             index_keys: plan
@@ -265,8 +331,8 @@ impl Deps {
                 .iter()
                 .map(|r| is_index_key(plan.code(r.key)))
                 .collect(),
-            bodies: vec![Reads::default(); plan.regions.len()],
-            regions: vec![Reads::default(); plan.regions.len()],
+            bodies: ReadsTable::default(),
+            regions: ReadsTable::default(),
             derives: plan.derives.iter().map(|d| scan(d.body)).collect(),
             resource_args: plan
                 .resources
@@ -280,7 +346,11 @@ impl Deps {
                 })
                 .collect(),
         };
-        // Post-order over the site tree without recursing to the plan's depth.
+        // Post-order over the site tree without recursing to the plan's depth;
+        // the sites' reads are tabled once every one is known.
+        let mut nodes = vec![Reads::default(); plan.nodes.len()];
+        let mut bodies = vec![Reads::default(); plan.regions.len()];
+        let mut regions = vec![Reads::default(); plan.regions.len()];
         let mut stack: Vec<(super::Site, bool)> = children
             .children(None, None)
             .iter()
@@ -301,6 +371,10 @@ impl Deps {
                 stack.extend(kids(site).into_iter().map(|(_, s)| (s, false)));
                 continue;
             }
+            let of = |site| match site {
+                super::Site::Node(n) => &nodes[n.0 as usize],
+                super::Site::Region(r) => &regions[r.0 as usize],
+            };
             match site {
                 super::Site::Node(n) => {
                     let node = plan.node(n);
@@ -314,24 +388,27 @@ impl Deps {
                         }
                     }
                     for (_, kid) in kids(site) {
-                        reads.union(deps.site(kid), 0);
+                        reads.union(of(kid), 0);
                     }
-                    deps.nodes[n.0 as usize] = reads;
+                    nodes[n.0 as usize] = reads;
                 }
                 super::Site::Region(r) => {
                     let i = r.0 as usize;
                     let mut body = Reads::default();
                     for (_, kid) in kids(site) {
-                        body.union(deps.site(kid), 0);
+                        body.union(of(kid), 0);
                     }
                     let mut all = deps.subjects[i].clone();
                     all.union(&deps.keys[i], 1);
                     all.union(&body, 1);
-                    deps.bodies[i] = body;
-                    deps.regions[i] = all;
+                    bodies[i] = body;
+                    regions[i] = all;
                 }
             }
         }
+        deps.nodes = nodes.into_iter().collect();
+        deps.bodies = bodies.into_iter().collect();
+        deps.regions = regions.into_iter().collect();
         deps
     }
 
@@ -357,13 +434,6 @@ impl Deps {
                 _ => Input::Clock,
             }
         })
-    }
-
-    fn site(&self, site: super::Site) -> &Reads {
-        match site {
-            super::Site::Node(n) => &self.nodes[n.0 as usize],
-            super::Site::Region(r) => &self.regions[r.0 as usize],
-        }
     }
 
     /// The inputs that differ between what the tree last showed and `env`.
@@ -466,8 +536,16 @@ fn scan(plan: &Plan, layout: Layout, code: Code) -> Reads {
             Opcode::Call if Stdlib::from_wire(index as u8) == Some(Stdlib::PerformanceNow) => {
                 reads.bits.set(layout.clock())
             }
+            // A share's files arrive by `set_shared`, after the location (LLP
+            // 1133.024 D3): no input the scan sees changes with them.
+            Opcode::Call if Stdlib::from_wire(index as u8) == Some(Stdlib::SharedFiles) => {
+                reads.opaque = true
+            }
             Opcode::LoadItem | Opcode::LoadBound | Opcode::LoadIndex => {
                 reads.frames |= 1 << index.min(63);
+                if i.op == Opcode::LoadIndex {
+                    reads.positions |= 1 << index.min(63);
+                }
                 if index == 0 {
                     // One field of the innermost frame's value, or all of it
                     // (its position, LLP 1062 D8, counts as all of it).
@@ -574,5 +652,38 @@ mod tests {
         assert_eq!(into_scope(0b1, false), 0b10);
         assert_eq!(into_scope(1 << 62, false), 1 << 63);
         assert_eq!(into_scope(1 << 63, false), 1 << 63);
+    }
+
+    #[test]
+    fn position_reads_shift_as_frames_do_with_the_same_sticky_far_bit() {
+        let at = |positions: u64| Reads {
+            frames: positions,
+            positions,
+            ..Reads::default()
+        };
+        // An inner body reading the position one scope out: the row's own, seen from the row.
+        let mut row = Reads::default();
+        row.union(&at(0b10), 1);
+        assert!(row.reads_position());
+        assert_eq!(row.positions, row.frames);
+        // Its own position read from one scope further in is not this row's.
+        let mut outer = Reads::default();
+        outer.union(&at(0b1), 1);
+        assert!(!outer.reads_position());
+        // Bit 63 is 63 scopes out or farther, as for frames: seen `shift` scopes out it spreads from 63 - shift up,
+        // so it reaches this row's bit 0 once 63 shifts have passed, and no shift drops it.
+        for shift in [1, 30, 62, 63, 64] {
+            let mut far = Reads::default();
+            far.union(&at(1 << 63), shift);
+            assert_eq!(far.positions, !0 << (63 - shift.min(63)), "shift {shift}");
+            assert_eq!(far.reads_position(), shift >= 63, "shift {shift}");
+            assert_eq!(far.positions, far.frames);
+        }
+        // An opaque body counts as reading it.
+        assert!(Reads {
+            opaque: true,
+            ..Reads::default()
+        }
+        .reads_position());
     }
 }

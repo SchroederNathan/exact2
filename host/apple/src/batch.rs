@@ -21,19 +21,35 @@ pub(crate) struct ContentBox {
 /// A JSON writer for one batch.
 #[derive(Debug, Default)]
 pub struct Batch {
+    /// Deferred store read and data activation still need a retry (LLP 1126.001 WP12).
+    pub store_status: Option<(bool, bool)>,
     ops: Vec<String>,
     /// The views this batch creates: each starts at its presentation's
     /// identity (`Host::present`).
     created: std::collections::HashSet<u32>,
+    /// The properties this batch presents of a view it creates: one
+    /// presented away from identity is no longer at it.
+    presented_new: std::collections::HashMap<u32, Vec<&'static str>>,
     /// What moves changes place or size (`Engine::spatial`): the display
     /// link asks for the panel's full rate (LLP 1061 D4).
     pub spatial: bool,
     /// A frame task wants each display frame (LLP 1073 D5): the display
     /// link runs and each tick is `exact_frame`.
     pub frames: bool,
+    /// Pending timer observation deadlines and held kinds (LLP 1147).
+    pub waits: Option<exact_runner::Waits>,
+    /// Independent platform timer instances, including an empty cancellation list.
+    pub native_timers: Option<Vec<exact_runner::NativeTimer>>,
     /// The kernel transactions this batch carries, `"seq":[first,last]`,
     /// when the runner measures (LLP 1079 D3): the frame sampler's join.
     pub seq: Option<(u64, u64)>,
+    /// Failure lines for the platform's log, `"alerts":[…]`, each carried
+    /// once (LLP 1142 D4: [`exact_runner::Runner::take_alerts`]).
+    pub alerts: Vec<String>,
+    /// The journal's other lines, `"journal":[…]`, for the platform's log at
+    /// a lower level (LLP 1143 open question 1:
+    /// [`exact_runner::Runner::take_journal`]).
+    pub journal: Vec<String>,
     /// A 2D canvas asked for another frame (LLP 1056 D5).
     canvas: bool,
     /// A canvas draw is owed to a turn of its own (LLP 1072 §8.5).
@@ -49,9 +65,18 @@ pub struct Batch {
     images: Vec<String>,
     /// The root font size or the window's modes moved (`Host::facts_moved`).
     pub facts: bool,
+    /// A timer's continuation an advance released is still out
+    /// (`Runner::data_timer_landing`): the agent's jump waits for its reply.
+    pub landing: bool,
     /// Whether a displayed element holds the wake lock, when that changed
     /// (`Host::wakelock_moved`, LLP 1125 D11).
     pub wakelock: Option<bool>,
+    /// The session's orientation lock, JSON, when it changed
+    /// (`Host::orientation_moved`, LLP 1133.029 D3).
+    pub orientationlock: Option<String>,
+    /// Whether the app must finish work an answer started, when that
+    /// changed (`Host::finish_moved`).
+    pub must_finish: Option<bool>,
 }
 
 pub use exact_runner::agent::quote;
@@ -163,7 +188,7 @@ impl Batch {
         out: &mut String,
         id: u32,
         parent: u32,
-        props: &exact_kernel::SortedMap<String, String>,
+        props: &exact_kernel::SortedMap<&'static str, String>,
         style: &str,
         handlers: &[&str],
         paints: bool,
@@ -175,7 +200,7 @@ impl Batch {
         string_map(
             &props
                 .iter()
-                .map(|(k, v)| (k.as_str(), v.clone()))
+                .map(|(k, v)| (*k, v.clone()))
                 .collect::<Vec<_>>(),
             out,
         );
@@ -281,10 +306,21 @@ impl Batch {
         Batch::default()
     }
 
-    /// @ref LLP 1038 D7 — one coalesced router change beside commands.
+    /// @ref LLP 1038 D7 — one coalesced router change beside commands; its
+    /// `url` carries the visit's fragment, and `scroll` asks for the scroll
+    /// to it (LLP 1153 D5).
     pub fn router(&mut self, change: &exact_runner::RouterChange) {
         let mut s = format!("{{\"op\":\"router\",\"top\":{},\"url\":", change.top);
-        quote(&change.url, &mut s);
+        quote(&change.location(), &mut s);
+        s.push_str(",\"fragment\":");
+        quote(&change.fragment, &mut s);
+        s.push_str(if change.scroll {
+            ",\"scroll\":true"
+        } else {
+            ",\"scroll\":false"
+        });
+        s.push_str(",\"activation\":");
+        s.push_str(&change.activation.to_string());
         s.push_str(",\"removed\":[");
         for (i, id) in change.removed.iter().enumerate() {
             if i > 0 {
@@ -292,7 +328,19 @@ impl Batch {
             }
             let _ = write!(s, "{id}");
         }
-        s.push_str("]}");
+        // The route pattern and params name the screen in navigation metrics.
+        s.push_str("],\"pattern\":");
+        quote(&change.pattern, &mut s);
+        s.push_str(",\"params\":{");
+        for (i, (k, v)) in change.params.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            quote(k, &mut s);
+            s.push(':');
+            quote(v, &mut s);
+        }
+        s.push_str("}}");
         self.ops.push(s);
     }
 
@@ -338,6 +386,28 @@ impl Batch {
     /// Whether this batch creates `id`.
     pub fn creates(&self, id: u32) -> bool {
         self.created.contains(&id)
+    }
+
+    /// Whether the presenter shows `id`'s `property` at its identity
+    /// unless this batch presents it: the batch creates the view and has
+    /// presented none of that property yet. A batch can present twice (a
+    /// commit, then a `resize` round's), and a view the first presented
+    /// away from identity stays there until a `present` says otherwise.
+    pub fn at_identity(&self, id: u32, property: &str) -> bool {
+        self.created.contains(&id)
+            && !self
+                .presented_new
+                .get(&id)
+                .is_some_and(|p| p.contains(&property))
+    }
+
+    fn note_present(&mut self, id: u32, property: &'static str) {
+        if self.created.contains(&id) {
+            let p = self.presented_new.entry(id).or_default();
+            if !p.contains(&property) {
+                p.push(property);
+            }
+        }
     }
 
     /// `{"op":"props","id":…,"set":{…},"clear":[…]}`.
@@ -438,11 +508,43 @@ impl Batch {
         quote(&session.url, &mut s);
         s.push_str(",\"callback\":");
         quote(&session.callback, &mut s);
+        // A loopback callback's receiver checks `state` itself (LLP 1133.005 D9).
+        if let Some((host, port, path)) = exact_runner::auth::loopback_callback(&session.callback) {
+            s.push_str(&format!(
+                ",\"loopback\":{{\"host\":\"{host}\",\"port\":{port},\"path\":"
+            ));
+            quote(&path, &mut s);
+            if let Some(message) = &session.message {
+                s.push_str(",\"message\":");
+                quote(message, &mut s);
+            }
+            s.push_str("},\"state\":");
+            quote(&session.state, &mut s);
+        }
         s.push_str(&format!(",\"ephemeral\":{}}}", session.ephemeral));
         self.ops.push(s);
     }
 
-    /// `{"op":"auth","ticket":N,"cancel":true}`: the runner let go of it.
+    /// `{"op":"presence","call":N,"name":…,"account":…,"service":…,"policy":…,
+    /// "reason":…,"origin":…}`: the platform's check for a presence call
+    /// (LLP 1133.010 D13), and, with a `service`, the item the host reads
+    /// after it, one op per ask. Nothing secret: the value comes back by
+    /// `exact_presence`.
+    pub fn presences(&mut self, asks: Vec<exact_runner::presence::PresenceAsk>) {
+        for ask in asks {
+            self.ops
+                .push(format!("{{\"op\":\"presence\",{}", &ask.json()[1..]));
+        }
+    }
+
+    /// A reserved activity send, dispatched to the demand-loaded arm.
+    pub fn activity(&mut self, ticket: u64, request: &str) {
+        self.ops.push(format!(
+            "{{\"op\":\"activity\",\"ticket\":{ticket},\"request\":{request}}}"
+        ));
+    }
+
+    /// Cancel the authentication session whose ticket the runner let go.
     pub fn auth_cancel(&mut self, ticket: u64) {
         self.ops.push(format!(
             "{{\"op\":\"auth\",\"ticket\":{ticket},\"cancel\":true}}"
@@ -601,6 +703,10 @@ impl Batch {
         runner: &mut exact_runner::Runner<D>,
         boot: bool,
     ) {
+        if runner.take_activities_demand() {
+            self.ops
+                .push("{\"op\":\"activity\",\"demand\":true}".into());
+        }
         self.sound(runner.take_sounds(), boot.then(|| runner.plan()));
         let uses = boot && exact_runner::uses::uses_midi(runner.plan());
         if let Some(op) = exact_runner::midi::batch_op(&runner.take_midi(), uses) {
@@ -724,14 +830,25 @@ impl Batch {
         self.ops.push(s);
     }
 
-    /// `{"op":"block","id":…,"w":…,"h":…}` — the used size of the containing
-    /// block a host gave this subtree (LLP 1115.002 D8.2).
-    pub fn block(&mut self, id: u32, w: f32, h: f32) {
+    /// `{"op":"block","id":…,"w":…,"h":…,"x":…,"y":…}` — the used size of
+    /// the containing block a host gave this subtree (LLP 1115.002 D8.2),
+    /// or the kernel did (a popover's, the viewport), and where the root
+    /// sits in it: a top-layer box is reported by its block's rectangle.
+    pub fn block(&mut self, id: u32, (w, h): (f32, f32), (x, y): (f32, f32)) {
+        let num = crate::style::num;
         self.ops.push(format!(
-            "{{\"op\":\"block\",\"id\":{id},\"w\":{},\"h\":{}}}",
-            crate::style::num(w),
-            crate::style::num(h)
+            "{{\"op\":\"block\",\"id\":{id},\"w\":{},\"h\":{},\"x\":{},\"y\":{}}}",
+            num(w),
+            num(h),
+            num(x),
+            num(y)
         ));
+    }
+
+    /// `{"op":"block","id":…}` — the subtree has no block any more (a
+    /// popover out of the top layer): its block's rectangle is forgotten.
+    pub fn unblock(&mut self, id: u32) {
+        self.ops.push(format!("{{\"op\":\"block\",\"id\":{id}}}"));
     }
 
     /// `{"op":"content","id":…,"w":…,"h":…}` — natural scrollable extent;
@@ -746,16 +863,18 @@ impl Batch {
 
     /// `{"op":"present","id":…,"property":…,"x":…,"y":…}` — a motion
     /// property's presentation value this frame (`y` only for `translate`).
-    pub fn present(&mut self, id: u32, property: &str, x: f64, y: f64) {
+    pub fn present(&mut self, id: u32, property: &'static str, x: f64, y: f64) {
+        self.note_present(id, property);
         self.ops.push(format!(
             "{{\"op\":\"present\",\"id\":{id},\"property\":\"{property}\",\"x\":{x},\"y\":{y}}}"
         ));
     }
 
     /// `{"op":"present","id":…,"property":"layout","x":…,"y":…,"w":…,"h":…}`
-    /// — a layout transition's offset and scale of the laid-out box (LLP
-    /// 1063).
-    pub fn present4(&mut self, id: u32, property: &str, [x, y, w, h]: [f64; 4]) {
+    /// — a layout transition's offset from the laid-out box and its size's
+    /// difference from it (LLP 1063).
+    pub fn present4(&mut self, id: u32, property: &'static str, [x, y, w, h]: [f64; 4]) {
+        self.note_present(id, property);
         self.ops.push(format!(
             "{{\"op\":\"present\",\"id\":{id},\"property\":\"{property}\",\"x\":{x},\"y\":{y},\"w\":{w},\"h\":{h}}}"
         ));
@@ -786,7 +905,11 @@ impl Batch {
         clock_ms: f64,
         error: Option<&str>,
     ) -> String {
-        let timers = timer_due_ms.is_some();
+        let timers = timer_due_ms.is_some()
+            || self
+                .native_timers
+                .as_ref()
+                .is_some_and(|timers| !timers.is_empty());
         // One allocation for the ops, which a list row's mount makes by the
         // hundred: growing the string as it went copied it a dozen times.
         let ops: usize = self.ops.iter().map(|op| op.len() + 1).sum();
@@ -803,6 +926,35 @@ impl Batch {
         s.push(']');
         if let Some(due) = timer_due_ms {
             let _ = write!(s, ",\"timer_due_ms\":{due}");
+        }
+        if let Some(timers) = self.native_timers {
+            s.push_str(",\"nativeTimers\":[");
+            for (i, timer) in timers.iter().enumerate() {
+                if i != 0 {
+                    s.push(',');
+                }
+                let _ = write!(s, "{{\"index\":{},\"generation\":\"{}\",\"due\":{},\"interval\":{},\"tolerance\":{},\"once\":{}}}",
+                    timer.index, timer.generation, timer.due_ms, timer.interval_ms, timer.tolerance_ms, timer.once);
+            }
+            s.push(']');
+        }
+        if let Some(waits) = self.waits {
+            s.push_str(",\"waits\":[");
+            for (i, wait) in [waits.frame, waits.update, waits.scrollend, waits.idle]
+                .iter()
+                .enumerate()
+            {
+                if i != 0 {
+                    s.push(',');
+                }
+                let value = if wait.held {
+                    -2.0
+                } else {
+                    wait.due_ms.unwrap_or(-1.0)
+                };
+                let _ = write!(s, "{value}");
+            }
+            s.push(']');
         }
         if self.spatial {
             s.push_str(",\"spatial\":true");
@@ -822,8 +974,17 @@ impl Batch {
         if self.facts {
             s.push_str(",\"facts\":true");
         }
+        if self.landing {
+            s.push_str(",\"landing\":true");
+        }
         if let Some(held) = self.wakelock {
             let _ = write!(s, ",\"wakelock\":{held}");
+        }
+        if let Some(lock) = &self.orientationlock {
+            let _ = write!(s, ",\"orientationlock\":{lock}");
+        }
+        if let Some(must) = self.must_finish {
+            let _ = write!(s, ",\"mustFinish\":{must}");
         }
         if !self.images.is_empty() {
             s.push_str(",\"canvasImages\":[");
@@ -835,8 +996,27 @@ impl Batch {
             }
             s.push(']');
         }
+        if let Some((read, activation)) = self.store_status {
+            let _ = write!(
+                s,
+                ",\"storeReadPending\":{read},\"storeActivationPending\":{activation}"
+            );
+        }
         if let Some((first, last)) = self.seq {
             let _ = write!(s, ",\"seq\":[{first},{last}]");
+        }
+        for (key, lines) in [("alerts", &self.alerts), ("journal", &self.journal)] {
+            if lines.is_empty() {
+                continue;
+            }
+            let _ = write!(s, ",\"{key}\":[");
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                quote(line, &mut s);
+            }
+            s.push(']');
         }
         let _ = write!(
             s,

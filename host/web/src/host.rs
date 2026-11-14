@@ -8,7 +8,6 @@
 //! only where the host's per-view cache says something changed. The kernel
 //! is the single source of truth; the cache is a memo of what the page has
 //! already been told.
-
 use crate::batch::Batch;
 use crate::css;
 use crate::motion::{Lowered, Motion, Still};
@@ -19,11 +18,13 @@ use exact_runner::{
     Carried, DataSource, Dispatch, Event, FailureKind, Outcome, RequestOut, Response, Runner,
     RunnerError, SurfaceOutcome, Timed, Work,
 };
+use mode::mirror::Mirror;
 
 #[path = "auth.rs"]
 mod auth;
 #[path = "canvas2d.rs"]
 mod canvas2d;
+mod complete;
 pub mod fonts;
 mod mode;
 mod scale;
@@ -33,6 +34,9 @@ use fonts::{font_catalog, font_faces, font_names, font_names_for_runner};
 pub mod document;
 #[path = "element.rs"]
 mod element;
+#[path = "roles.rs"]
+mod roles;
+pub use roles::implicit_role;
 #[path = "template.rs"]
 pub mod template;
 use element::{css_style, host_css, in_button, props_for, svg_props, tag_for};
@@ -81,11 +85,18 @@ pub fn outcome_from(kind: u32, status: u32, headers: &str, body: Vec<u8>) -> Out
         7 => Outcome::Surface(SurfaceOutcome::Restored),
         0 => Outcome::Response(Response {
             status: status as u16,
+            // A line that starts with a colon is a pseudo-header the page
+            // names (`:exact-body-to`, exactBodyTo's size): no browser header
+            // name has a colon, so it keeps its leading one.
             headers: headers
                 .lines()
                 .filter_map(|l| {
-                    l.split_once(':')
-                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    let (pseudo, l) = l.strip_prefix(':').map_or((false, l), |l| (true, l));
+                    l.split_once(':').map(|(k, v)| {
+                        let k = k.trim();
+                        let k = if pseudo { format!(":{k}") } else { k.into() };
+                        (k, v.trim().to_string())
+                    })
                 })
                 .collect(),
             body,
@@ -121,17 +132,6 @@ impl std::fmt::Display for HostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-struct Mirror {
-    props: SortedMap<String, String>,
-    css: String,
-    children: Vec<ViewId>,
-    /// Created inside a `<button>`, where a container is a `<span>`.
-    in_button: bool,
-    /// Created with handlers (a text that has some is never folded).
-    handled: bool,
 }
 
 /// What a host links that is generic over its data source (LLP 1047 D3):
@@ -654,12 +654,21 @@ impl<D: DataSource> Host<D> {
 
     /// The agent API's read operations (LLP 1012): `tree`, `state`, and
     /// `logs` from the runner; `settle` — the clock at which the last spring
-    /// in flight ends, milliseconds, `null` when none — from the engine here.
+    /// in flight ends, milliseconds, `null` when none — from the engine here,
+    /// and a resource's re-ask.
     /// CSS transitions are the browser's; the glue folds their end times in.
     pub fn agent(&self, request: &str) -> String {
         if exact_runner::agent::field_str(request, "op").as_deref() == Some("settle") {
-            return match self.springs.settle_time() {
-                Some(t) => format!("{{\"settle\":{}}}", exact_runner::agent::num(t * 1000.0)),
+            // A re-ask after a turn over its budget: no I/O to wait on, so the
+            // clock goes to it (exact-runner's `overrun.rs`).
+            return match (self.springs.settle_time().map(|t| t * 1000.0))
+                .into_iter()
+                .chain(self.runner.reask_due_ms())
+                // An answer waiting on its own timer (`data_timers.rs`): the clock goes to it too.
+                .chain(self.runner.data_timer_due_ms())
+                .reduce(f64::max)
+            {
+                Some(t) => format!("{{\"settle\":{}}}", exact_runner::agent::num(t)),
                 None => "{\"settle\":null}".to_string(),
             };
         }
@@ -754,74 +763,49 @@ impl<D: DataSource> Host<D> {
 
     /// The date (LLP 1027.000.000): re-answer `exactTime` in one batch.
     pub fn set_time(&mut self, epoch_at_zero: f64, utc_offset: f64) -> String {
-        let (receipts, error) = match self.runner.set_time(epoch_at_zero, utc_offset) {
-            Ok(Some(receipt)) => (
-                vec![Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => (vec![], None),
-            Err(e) => (vec![], Some(format!("time: {e:?}"))),
-        };
-        self.batch_for(&receipts, error.as_deref())
+        let answer = self.runner.set_time(epoch_at_zero, utc_offset);
+        self.told(answer, "time")
     }
 
     /// The page's visibility, connectivity or share sheet (LLP 1069.000 D2):
     /// the `exactPage()` readers, in one batch.
     pub fn set_page(&mut self, page: exact_runner::Page) -> String {
-        let (receipts, error) = match self.runner.set_page(page) {
-            Ok(Some(receipt)) => (
-                vec![Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => (vec![], None),
-            Err(e) => (vec![], Some(format!("page: {e:?}"))),
-        };
-        self.batch_for(&receipts, error.as_deref())
+        let answer = self.runner.set_page(page);
+        self.told(answer, "page")
     }
 
     /// The root font size `rem` follows (LLP 1069.000 D3): a relayout in one
     /// batch, no resource asked again.
     pub fn set_root_font_size(&mut self, px: f64) -> String {
-        let (receipts, error) = match self.runner.set_root_font_size(px) {
-            Ok(Some(receipt)) => (
-                vec![Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => (vec![], None),
-            Err(e) => (vec![], Some(format!("root font size: {e:?}"))),
-        };
-        self.batch_for(&receipts, error.as_deref())
+        let answer = self.runner.set_root_font_size(px);
+        self.told(answer, "root font size")
     }
 
     /// The page module says `topic` changed (LLP 1016.002): the resources
     /// watching it are asked again, in one batch.
     pub fn changed(&mut self, topic: &str) -> String {
-        let (receipts, error) = match self.runner.changed(topic) {
-            Ok(Some(receipt)) => (
-                vec![Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }],
-                None,
-            ),
-            Ok(None) => (vec![], None),
-            Err(e) => (vec![], Some(format!("changed: {e:?}"))),
-        };
-        self.batch_for(&receipts, error.as_deref())
+        let answer = self.runner.changed(topic);
+        self.told(answer, "changed")
     }
 
     /// The viewer's locale and zone, beside the date.
-    pub fn set_place(&mut self, locale: &str, time_zone: &str, seed: Option<f64>) -> String {
-        let (receipts, error) = match self.runner.set_place(locale, time_zone, seed) {
+    pub fn set_place(
+        &mut self,
+        locale: &str,
+        time_zone: &str,
+        seed: Option<f64>,
+        format_locale: Option<&str>,
+    ) -> String {
+        let answer = self
+            .runner
+            .set_place_formatted(locale, time_zone, seed, format_locale);
+        self.told(answer, "place")
+    }
+
+    /// A told fact's answer as one batch: its commit, nothing when the
+    /// fact is unchanged, or the refusal named by `what`.
+    fn told(&mut self, answer: Result<Option<CommitReceipt>, RunnerError>, what: &str) -> String {
+        let (receipts, error) = match answer {
             Ok(Some(receipt)) => (
                 vec![Timed {
                     at_ms: self.now_ms,
@@ -830,7 +814,7 @@ impl<D: DataSource> Host<D> {
                 None,
             ),
             Ok(None) => (vec![], None),
-            Err(e) => (vec![], Some(format!("place: {e:?}"))),
+            Err(e) => (vec![], Some(format!("{what}: {e:?}"))),
         };
         self.batch_for(&receipts, error.as_deref())
     }
@@ -933,7 +917,9 @@ impl<D: DataSource> Host<D> {
                         self.head_dirty = true;
                         continue;
                     }
-                    self.mirror.remove(&id);
+                    if self.mirror.remove(&id).is_some_and(|m| !m.looks.is_empty()) {
+                        batch.looks(id, "");
+                    }
                     self.layers.forget(id);
                     self.exclusions.remove(&id);
                     if let Some(drag) = self.drag {
@@ -1021,63 +1007,6 @@ impl<D: DataSource> Host<D> {
         for w in self.runner.take_store_writes() {
             batch.store(&w);
         }
-    }
-
-    /// Hand the last commit's requests to the page and finish the batch. A
-    /// continuation is dispatched here, on this thread, with the store as
-    /// committed (LLP 1027.002 D3); one a source holds is parked and
-    /// released after a later commit. Work a source answers at once — a
-    /// main member's turn in an ordered set — is fulfilled here, and the
-    /// commits it makes join the batch.
-    fn complete(&mut self, mut batch: Batch, error: Option<String>) -> String {
-        let mut error = error;
-        loop {
-            let mut immediate = Vec::new();
-            for r in self.runner.take_requests() {
-                self.emit_request(r, &mut batch, &mut immediate);
-            }
-            for (token, dispatch) in self.runner.release_work() {
-                if let Some(r) = self.parked.remove(&token) {
-                    self.emit_dispatch(r, dispatch, &mut batch, &mut immediate);
-                }
-            }
-            if immediate.is_empty() || error.is_some() {
-                break;
-            }
-            let mut receipts = Vec::new();
-            for (ticket, outcome) in immediate {
-                match self.runner.fulfill(ticket, outcome) {
-                    Ok(Some(receipt)) => receipts.push(Timed {
-                        at_ms: self.now_ms,
-                        receipt,
-                    }),
-                    Ok(None) => {}
-                    Err(e) => {
-                        error = Some(format!("{e:?}"));
-                        break;
-                    }
-                }
-            }
-            self.emit_receipts(&receipts, &mut batch);
-        }
-        let collections = self.runner.collections_json();
-        if collections != self.collections {
-            self.collections = collections;
-            batch.collections(&self.collections);
-        }
-        let language = self.runner.resolved_locale();
-        if self.language.as_deref() != Some(language) {
-            batch.language(language, self.runner.direction());
-            self.language = Some(language.into());
-        }
-        self.finish(batch, error.as_deref())
-    }
-
-    /// Close a batch: the runner's deadline, frames wanted (LLP 1073 D5), clock, `seq` (LLP 1079).
-    pub(crate) fn finish(&self, batch: Batch, error: Option<&str>) -> String {
-        let due = self.runner.timer_due_ms();
-        let batch = batch.seq(self.runner.seq_range());
-        batch.finish(due, self.runner.wants_frames(), self.runner.now_ms(), error)
     }
 
     fn emit_request(
@@ -1374,11 +1303,19 @@ impl<D: DataSource> Host<D> {
                 let kernel = self.runner.kernel();
                 let (css, _skipped) = css::css_text(&css_style(kernel, &node), &self.font_names);
                 let mut props = props_for(&node);
+                // A decoration's and an atom kind's paint rows as CSS text by name (LLP 1114.007, 1045.000 D3).
+                for name in ["data-decoration-styles", "data-atom-styles"] {
+                    if let Some(raw) = props.get(name) {
+                        let css = crate::css::decoration_styles(raw, &self.font_names);
+                        props.insert(name.into(), css);
+                    }
+                }
                 svg_props(self.runner.kernel(), &node, &mut props);
                 let css = host_css(kernel, &node, css, tag);
                 let css = element::folded_css(kernel, &node, css, !kinds.is_empty());
                 let handled = |c| self.mirror.get(&c).is_some_and(|m| m.handled);
-                let css = element::blocks(css, element::holds_folded(kernel, &node, &handled));
+                let holds = element::holds_folded(kernel, &node, &handled);
+                let css = element::blocks(css, holds, &node.facts());
                 (props, self.paint_css(&node, css))
             }
         };
@@ -1399,8 +1336,10 @@ impl<D: DataSource> Host<D> {
                 children: Vec::new(),
                 in_button,
                 handled: !kinds.is_empty(),
+                looks: String::new(),
             },
         );
+        self.emit_looks(id, batch);
         self.keys.insert(key, id);
     }
 
@@ -1433,6 +1372,13 @@ impl<D: DataSource> Host<D> {
             .zip(crate::link::linked().materials)
             .and_then(|(name, material)| (material.1)(name));
         let mut props = props_for(&node);
+        // A decoration's and an atom kind's paint rows as CSS text by name (LLP 1114.007, 1045.000 D3).
+        for name in ["data-decoration-styles", "data-atom-styles"] {
+            if let Some(raw) = props.get(name) {
+                let css = crate::css::decoration_styles(raw, &self.font_names);
+                props.insert(name.into(), css);
+            }
+        }
         element::router_press(&mut props, self.runner.press_writes_router(id));
         svg_props(self.runner.kernel(), &node, &mut props);
         let css = self.view_css(&node);
@@ -1456,6 +1402,7 @@ impl<D: DataSource> Host<D> {
             batch.style(id, &css);
             m.css = css;
         }
+        self.emit_looks(id, batch);
         if let Some(note) = note {
             self.runner.log(note);
         }

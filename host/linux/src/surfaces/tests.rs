@@ -1,6 +1,5 @@
 use super::*;
 use exact_runner::Request;
-use sha2::{Digest, Sha256};
 
 pub(super) fn compile_fixture(source: &std::path::Path, path: &std::path::Path) {
     #[cfg(not(windows))]
@@ -154,6 +153,10 @@ pub(super) fn fixture() -> (PathBuf, Value) {
 #include <stdio.h>
 #include <string.h>
 void gpu_load_headless(void) {}
+static uint32_t tier_code = 2, retiers;
+uint32_t gpu_tier(uint32_t code) { if (code < 3) tier_code = code; return tier_code; }
+void gpu_retier(void) { retiers++; }
+uint32_t test_retiers(void) { return retiers; }
 static uint32_t lifecycle_count, lifecycle_codes[32], lifecycle_ids[32];
 void gpu_lifecycle(uint32_t id, uint32_t code) {
   if (lifecycle_count < 32) { lifecycle_ids[lifecycle_count] = id; lifecycle_codes[lifecycle_count++] = code; }
@@ -179,7 +182,25 @@ uint32_t gpu_bind_at(uint32_t id, const unsigned char *text, size_t len, double 
 }
 const char *test_bound(void) { return bound; }
 static const char reply[] = "{\"hit\":{\"name\":\"cpu\"}}";
+static char journal_reply[256];
+static const char *output;
+static uint32_t journal_next;
+void test_journal_next(uint32_t next) { journal_next = next; }
 uint32_t gpu_agent(uint32_t id, const unsigned char *text, size_t len) {
+  output = reply;
+  char query[4096];
+  if(len>=sizeof(query)) return 268435457;
+  memcpy(query,text,len); query[len]=0;
+  if (strstr(query,"logs")) {
+    unsigned long since=0;
+    const char *cursor=strstr(query,"\"since\":");
+    if(cursor) sscanf(cursor+8,"%lu",&since);
+    unsigned long from=journal_next>4096 ? journal_next-4096 : 0;
+    if(since>from) from=since;
+    if(from>journal_next) from=journal_next;
+    snprintf(journal_reply,sizeof(journal_reply),"{\"from\":%lu,\"next\":%u,\"lines\":[]}",from,journal_next);
+    output=journal_reply; return strlen(output);
+  }
   for (size_t i=0; i+6<=len; ++i) if (!memcmp(text+i, "layout", 6)) return sizeof(reply)-1;
   return 268435457;
 }
@@ -201,6 +222,7 @@ uint32_t gpu_input(uint32_t id, const unsigned char *text, size_t len) {
   return strstr(event,"control") && !strstr(event,"jump") ? 1 : 0;
 }
 uint32_t gpu_wants_input(uint32_t id) { return id != 98; }
+uint32_t gpu_presentation_flags(uint32_t id) { return 0; }
 uint32_t gpu_assets(void) { return 0; }
 bool gpu_asset(void) { return true; }
 uint32_t gpu_published(void) { return 268435457; }
@@ -209,12 +231,12 @@ uint32_t gpu_carry(void) { return 268435457; }
 uint32_t gpu_restore(void) { return 1; }
 void gpu_destroy(void) {}
 uint32_t gpu_error(void) { return 0; }
-const unsigned char* gpu_out_ptr(void) { return (const unsigned char*)reply; }
+const unsigned char* gpu_out_ptr(void) { return (const unsigned char*)(output ? output : reply); }
 "#,
     )
     .unwrap();
     compile_fixture(&source, &path);
-    let digest = format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap()));
+    let digest = digest::file(&path, true).unwrap();
     let compat = json!({"id":"cohort", "inputs":{"app":"test.app"}, "embedded":{"gpu":{
             "name":path.file_name().unwrap().to_str().unwrap(),"sha256":digest,
             "app":"test.app","cohort":"cohort","trust":"production"}}});
@@ -240,6 +262,23 @@ fn module_identity_refuses_stale_foreign_and_missing_bakes_before_loading() {
     }
     assert!(Abi::open_path(&path, &Value::Null, "").is_err());
     drop(Abi::open_path(&path, &compat, "").unwrap());
+    let mut development = compat.clone();
+    development["embedded"]["gpu"]["trust"] = json!("development");
+    development["embedded"]["gpu"]["receipt"] = json!(true);
+    let receipt = format!("{}.proof.json", path.display());
+    std::fs::write(
+        &receipt,
+        json!({"inputs":"a".repeat(64),
+        "artifact":digest::bytes_digest(&std::fs::read(&path).unwrap(), false)})
+        .to_string(),
+    )
+    .unwrap();
+    verify_module(&path, &development, "").unwrap();
+    verify_module(&path, &compat, "").unwrap();
+    development["embedded"]["gpu"]["receipt"] = json!(false);
+    development["embedded"]["gpu"]["sha256"] = json!("wrong digest");
+    assert!(verify_module(&path, &development, "").is_err());
+
     // A digest-authenticated old child ABI must refuse before any call.
     let source = path.with_file_name("probe.c");
     let old = std::fs::read_to_string(&source)
@@ -249,7 +288,7 @@ fn module_identity_refuses_stale_foreign_and_missing_bakes_before_loading() {
     compile_fixture(&source, &path);
     let mut old_compat = compat.clone();
     old_compat["embedded"]["gpu"]["sha256"] =
-        format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap())).into();
+        digest::bytes_digest(&std::fs::read(&path).unwrap(), true).into();
     let error = Abi::open_path(&path, &old_compat, "")
         .err()
         .expect("old ABI refused");
@@ -467,9 +506,9 @@ fn e11_development_module_requires_its_own_completed_receipt() {
     std::fs::write(&product, b"changed").unwrap();
     assert!(verify_module(&product, &compat, "").is_err());
     std::fs::write(&product, b"module").unwrap();
-    compat["inputs"]["trust"] = json!("production");
+    compat["embedded"]["trust"] = json!("production");
     assert!(verify_module(&product, &compat, "").is_err());
-    compat["inputs"]["trust"] = Value::Null;
+    compat["embedded"]["trust"] = json!("development");
     compat["embedded"]["gpu"]["trust"] = json!("production");
     assert!(verify_module(&product, &compat, "").is_err());
     std::fs::remove_dir_all(dir).unwrap();
@@ -485,6 +524,19 @@ fn production_ignores_module_path_override() {
     compat["embedded"]["gpu"]["trust"] = "development".into();
     assert_eq!(
         module_path(default, &compat, Some("override".into())),
+        PathBuf::from("override")
+    );
+    // An updater-free (L=0) production build: no trust in its cohort, and
+    // still no override, whatever its card says.
+    let mut zero = json!({"inputs":{"store":{"L":"0"},"trust":null},
+        "embedded":{"trust":"production","gpu":{"trust":"development"}}});
+    assert_eq!(
+        module_path(default, &zero, Some("override".into())),
+        default
+    );
+    zero["embedded"]["trust"] = "development".into();
+    assert_eq!(
+        module_path(default, &zero, Some("override".into())),
         PathBuf::from("override")
     );
 }
@@ -627,4 +679,42 @@ fn a_module_is_absent_only_without_an_identity_or_a_file() {
         "an unknown directory is no absence"
     );
     let _ = std::fs::remove_file(here);
+}
+
+/// LLP 1139.003 D2: the module's tier (here its own choice, low) is the
+/// page's `gpuTier`; `prefer gpu-tier` tells every module and remakes its
+/// renderers, and the page follows the module's answer.
+#[test]
+fn the_page_fact_follows_the_modules_gpu_tier() {
+    let (path, compat) = fixture();
+    let plan = contract::compile("component App\n  view\n    text \"test\"\n").unwrap();
+    let (mut p, _) = Presenter::boot(
+        &plan.encode(),
+        (),
+        (100., 100.),
+        1.,
+        path.parent().unwrap().into(),
+    )
+    .unwrap();
+    let abi = Abi::open_path(&path, &compat, "").unwrap();
+    // SAFETY: the C fixture's own observer.
+    let retiers = unsafe {
+        *abi.library
+            .get::<unsafe extern "C" fn() -> u32>(b"test_retiers")
+            .unwrap()
+    };
+    p.surfaces.abis.insert(String::new(), abi);
+    assert_eq!(
+        p.host.runner().page().gpu_tier(),
+        "high",
+        "before the module speaks"
+    );
+    p.sync_surfaces();
+    assert_eq!(p.host.runner().page().gpu_tier(), "low");
+    p.retier_surfaces(1);
+    assert_eq!(unsafe { retiers() }, 1);
+    p.sync_surfaces();
+    assert_eq!(p.host.runner().page().gpu_tier(), "mid");
+    drop(p);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }

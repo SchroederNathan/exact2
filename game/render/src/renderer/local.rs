@@ -5,7 +5,7 @@ use crate::cull::{Cull, KEEP_ALL};
 /// A cull over up to four local shadow views and the scene groups over its lists.
 pub(crate) struct LocalCull {
     pub cull: Cull,
-    binds: Option<([wgpu::BindGroup; 2], (wgpu::Buffer, u64))>,
+    binds: Option<([wgpu::BindGroup; 2], ListsKey)>,
 }
 
 impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
@@ -32,13 +32,14 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             .write(&self.queue, &self.local_plan.views);
         while self.local_culls.len() < views.div_ceil(crate::cull::VIEWS) as usize {
             self.local_culls.push(LocalCull {
-                cull: Cull::new(&self.device),
+                cull: Cull::new(&self.device, self.pipelines.cache.handle.as_ref()),
                 binds: None,
             });
         }
     }
 
-    /// Group 1 of every forward pass: cascades, comparison sampler, local maps.
+    /// Group 1 of every forward pass: cascades, comparison sampler, local maps
+    /// and the gathering sampler.
     pub(super) fn refresh_shadow_sample(&mut self) {
         if !std::mem::take(&mut self.shadow_sample_stale) {
             return;
@@ -65,6 +66,10 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: view(self.local.as_ref().map(|l| &l.sample), placeholder),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.shadow_gather),
                 },
             ],
         });
@@ -109,7 +114,8 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             local.cull.words.extend_from_slice(words);
             for (index, group) in local.cull.groups.iter().enumerate() {
                 let at = index * crate::cull::GROUP_WORDS + 7;
-                local.cull.words[at] = (local.cull.words[at] & !15) | (group.flags & 15);
+                local.cull.words[at] =
+                    (local.cull.words[at] & !(15 | crate::cull::OUTLINE)) | (group.flags & 15);
             }
             local
                 .cull
@@ -133,7 +139,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 self.models.skinning.as_ref().map(|s| &s.palette.raw),
                 None,
             );
-            let key = (local.cull.compacted.raw.clone(), local.cull.window);
+            let key = (local.cull.compacted.raw.clone(), local.cull.binding());
             if local.binds.as_ref().is_none_or(|(_, old)| *old != key) {
                 let binds = scene_binds(
                     &self.device,
@@ -141,7 +147,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                     &self.uniform,
                     &self.transforms,
                     &self.materials,
-                    (&local.cull.compacted.raw, Some(local.cull.window)),
+                    (&local.cull.compacted.raw, local.cull.binding()),
                     &self.attachment_matrices,
                     &self.environment,
                     &self.lights,
@@ -149,7 +155,10 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 local.binds = Some((binds, key));
             }
             let views = &self.local_plan.views[i * 4..(i * 4 + 4).min(self.local_plan.views.len())];
-            local.cull.write_views(&self.queue, views, items, false);
+            let outlines = [[crate::shadows::PASS_ALL; 6]; crate::shadows::MAX_CASCADES];
+            local
+                .cull
+                .write_views(&self.queue, views, &outlines, items, false);
         }
     }
     /// The scene groups changed buffers: rebuild every local cull's on next use.
@@ -185,6 +194,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         for layer in 0..layers {
             let local = &self.local_culls[layer / 4];
             let view = (layer % 4) as u32;
+            self.probe_stage(super::probe::Stage::LocalShadow(layer as u8));
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("game local shadow"),
                 color_attachments: &[],
@@ -207,19 +217,26 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             });
             pass.set_vertex_buffer(0, self.vertices.raw.slice(..));
             pass.set_index_buffer(self.indices.raw.slice(..), wgpu::IndexFormat::Uint32);
+            let mut bound = super::passes::Bound::default();
             for (index, group) in local.cull.groups.iter().enumerate() {
                 if group.flags & (1 << view) == 0 {
                     continue;
                 }
-                self.set_depth_pipeline(&mut pass, group, &maps.cameras[layer], custom);
+                self.set_depth_pipeline(&mut pass, &mut bound, group, &maps.cameras[layer], custom);
+                let _ = self.probe_begin(&mut pass, || super::probe::Drew::Local {
+                    cull: layer / 4,
+                    group: index,
+                    view,
+                    variant: None,
+                });
                 if self.cull.direct {
                     let mesh = &self.meshes[self.batches[group.batch].mesh.0];
-                    pass.set_bind_group(0, &self.scene_binds[self.current], &[0]);
+                    bound.scene(&mut pass, &self.scene_binds[self.current], 0);
                     pass.draw_indexed(mesh.indices.clone(), mesh.base_vertex, group.range.clone());
                 } else {
-                    let (region, draw) = local.cull.offsets(view, index);
+                    let (offset, draw) = local.cull.draw(view, index);
                     let binds = &local.binds.as_ref().unwrap().0;
-                    pass.set_bind_group(0, &binds[self.current], &[region]);
+                    bound.scene(&mut pass, &binds[self.current], offset);
                     pass.draw_indexed_indirect(&local.cull.indirect.raw, draw);
                 }
                 draws += 1;

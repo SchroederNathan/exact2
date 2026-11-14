@@ -4,9 +4,14 @@
 //! means — parents before children, so an `em` font size builds on its
 //! parent's resolved one, as CSS computes it. A hairline row (LLP 1115.000
 //! D10.3) is resolved with them, against the display's scale as the host
-//! last set it.
+//! last set it. Hosts that snap borders resolve their used widths against
+//! that scale before layout too, without changing the authored rows. A
+//! `rem` inside a calculation or a grid track is no row of its own: it
+//! resolves at layout against the environment's root font size, which a
+//! change here writes, restyling the nodes that hold one.
 use super::*;
 use crate::generated::StyleProps;
+use crate::style::env::root_font_readers;
 use crate::style::relative::MEDIUM;
 use crate::StyleId;
 
@@ -46,10 +51,70 @@ pub(crate) fn resolve(
                     touched.push(arena.key(slot));
                 }
             }
+            // A `rem` in a calculation or a grid track resolves under the
+            // environment, by the handle it was given: a replayed layout
+            // would keep what the handle resolved to before
+            let mut env = arena.env().clone();
+            env.root_font_size = px;
+            arena.set_env(env);
+            let readers: Vec<(u32, StyleMask)> = (arena.iter_live())
+                .map(|slot| (slot, root_font_readers(arena.style(slot))))
+                .filter(|(_, rows)| !rows.is_empty())
+                .collect();
+            if !readers.is_empty() {
+                if let Some(tree) = layout.tree() {
+                    tree.forget_memo();
+                }
+            }
+            for (slot, rows) in readers {
+                style_changed(arena, layout, slot, rows, receipt);
+                if let Some(node) = arena.taffy(slot) {
+                    layout.mark_dirty(node);
+                }
+                touched.push(arena.key(slot));
+            }
         }
     }
     if let Some(scale) = arena.display_scale_next.take() {
         arena.display_scale = Some(scale);
+        if arena.env().border_scale.is_some_and(|old| old != scale) {
+            let mut env = arena.env().clone();
+            env.border_scale = Some(scale);
+            arena.set_env(env);
+            let slots: Vec<_> = arena
+                .iter_live()
+                .filter(|&slot| {
+                    arena
+                        .effective_style(slot)
+                        .border_widths()
+                        .iter()
+                        .any(|w| *w > 0.0)
+                })
+                .collect();
+            let rows = StyleMask::of(StyleId::BorderWidthTop)
+                .union(StyleMask::of(StyleId::BorderWidthRight))
+                .union(StyleMask::of(StyleId::BorderWidthBottom))
+                .union(StyleMask::of(StyleId::BorderWidthLeft));
+            for slot in slots {
+                style_changed(arena, layout, slot, rows, receipt);
+                touched.push(arena.key(slot));
+            }
+        }
+    }
+    // Bold Text (LLP 1115.000 D12.3): every text is measured and drawn again
+    // at the weight it now means.
+    if let Some(on) = arena
+        .bold_text_next
+        .take()
+        .filter(|on| *on != arena.bold_text)
+    {
+        arena.bold_text = on;
+        let rows = StyleMask::of(StyleId::FontWeight);
+        let slots: Vec<u32> = arena.iter_live().collect();
+        for slot in slots {
+            inherited_changed(arena, layout, slot, rows, receipt);
+            touched.push(arena.key(slot));
+        }
     }
     if arena.relative_slots.is_empty() {
         return;
@@ -91,7 +156,7 @@ pub(crate) fn resolve(
             if id != StyleId::FontSize {
                 continue;
             }
-            let px = n * unit.basis(root, parent, device);
+            let px = unit.px(n, root, parent, device);
             if next.set_resolved(id, px) {
                 changed.set(id);
             }
@@ -103,7 +168,7 @@ pub(crate) fn resolve(
             if id == StyleId::FontSize {
                 continue;
             }
-            let px = n * unit.basis(root, font, device);
+            let px = unit.px(n, root, font, device);
             if next.set_resolved(id, px) {
                 changed.set(id);
             }

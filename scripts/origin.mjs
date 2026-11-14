@@ -6,7 +6,11 @@
 // record of each publish). A client resolves the head's relative `url`s to
 // the immutable blob tree; no mutable payload copy lives under a stream.
 //
-// Two adapters. A **directory** is v1's writable origin: any directory a
+// Three adapters. An **AppDrop** origin (`https://appdrop.app/u/<key id>`,
+// which app.json spells `"appdrop"`) is the one that needs no account and no
+// server: every PUT is signed with the app's update key, and AppDrop keeps
+// blobs content-addressed, release records write-once and each head's seq
+// rising, with `If-Match` on the ETag as the conditional put. A **directory** is v1's writable origin: any directory a
 // supported serve.mjs origin handler serves. Every file lands whole or absent (a temp file beside
 // it, then a rename), blobs are immutable and skipped when present by
 // digest, and the head is a **conditional put**: one writer per stream at a
@@ -18,6 +22,7 @@
 // and Azure all have) is owed, and `--yes` against https refuses by name.
 import { createHash } from 'node:crypto';
 import { extname, resolve } from 'node:path';
+import { canonical, matchPattern } from '../host/web-js/route-pattern.js';
 import { filesystem, filesystemLock } from './filesystem.mjs';
 
 /** SHA-256, lowercase hex — the digest every card and blob name carries (LLP 1023 D2). */
@@ -27,6 +32,36 @@ export const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex'
  * this typed failure into an `unavailable` row; malformed heads and broken
  * invariants still fail closed. */
 export class OriginUnavailable extends Error {}
+
+/** A publisher never replays a signed write through a redirect. The timeout covers
+ * headers and the streamed body; every chunk is checked before retaining it. */
+async function publisherFetch(url, init = {}, cap = 64 << 10) {
+  let response;
+  try { response = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(30_000) }); }
+  catch (error) { throw new OriginUnavailable(`${url}: ${error.cause?.code ?? error.message}`); }
+  const reader = response.body?.getReader();
+  const chunks = [];
+  let length = 0;
+  try {
+    if (Number(response.headers.get('content-length')) > cap) throw new Error(`${url}: response exceeds ${cap} bytes`);
+    while (reader) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > cap - length) throw new Error(`${url}: response exceeds ${cap} bytes`);
+      length += value.byteLength;
+      chunks.push(value);
+    }
+    return { response, bytes: Buffer.concat(chunks, length) };
+  } finally { await reader?.cancel().catch(() => {}); reader?.releaseLock(); }
+}
+
+export function validateChannel(channel) {
+  if (typeof channel !== 'string' || !/^[A-Za-z0-9._-]+$/.test(channel)
+    || ['.', '..', 'blobs', 'root'].includes(channel.toLowerCase())) {
+    throw new Error(`the channel ${JSON.stringify(channel)} cannot name a directory under .exact/`);
+  }
+  return channel;
+}
 
 /** The stream's directory on the origin, relative to its root (LLP 1030.000 D7). */
 export const streamPath = ({ channel, compatibilityId }) => `.exact/${channel}/${compatibilityId}`;
@@ -59,15 +94,16 @@ export function webRequestURL(target) {
 
 /** Extensions a web build's files have (serve.mjs `webContentType` and the
  * game's `.hbc`, `.model`, `.tex`): a missing one stays a 404, a page or an
- * iframe's document (`/deck/missing.html`) included. A location whose last
- * label is one of them (`/profile/photos.zip`, `.zip` being a TLD) is taken
- * for a file too: telling the two apart needs the app's routes (QUEUE). */
+ * iframe's document (`/deck/missing.html`) included, unless a declared
+ * route matches the path on a navigation. */
 const FILE_EXTENSIONS = new Set(['.html', '.htm', '.css', '.js', '.mjs', '.json', '.wasm', '.plan', '.map', '.txt', '.xml', '.pdf', '.zip',
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.svg', '.ico', '.mp4', '.webm', '.vtt', '.wav', '.mp3', '.m4a', '.aac', '.ogg', '.oga',
   '.ttf', '.otf', '.woff', '.woff2', '.wgsl', '.hbc', '.model', '.tex']);
 /** Whether a request's `Accept` takes HTML (RFC 9110: the media type, any
- * case, at a quality above zero), as a browser's navigation does. */
-export function acceptsHTML(accept = '') {
+ * case, at a quality above zero), as a browser's navigation does. With
+ * `wildcard`, a range taking any type or any text type, or no header at
+ * all, does too (curl's request) unless it names `text/html` at quality zero. */
+export function acceptsHTML(accept = '', { wildcard = false } = {}) {
   // Split on commas and semicolons outside a quoted parameter value.
   const ranges = [[[]]];
   let quoted = false;
@@ -79,23 +115,26 @@ export function acceptsHTML(accept = '') {
     if (!quoted && c === ';') { range.push([]); continue; }
     param.push(c);
   }
-  return ranges.some(([type, ...params]) => {
+  const types = ranges.map(([type, ...params]) => {
     const q = params.map((p) => p.join('').trim().toLowerCase()).find((p) => p.startsWith('q='));
-    return type.join('').trim().toLowerCase() === 'text/html' && (q === undefined || Number(q.slice(2)) > 0);
+    return [type.join('').trim().toLowerCase(), q === undefined || Number(q.slice(2)) > 0];
   });
+  const html = types.filter(([type]) => type === 'text/html');
+  if (html.length || !wildcard) return html.some(([, taken]) => taken);
+  return !String(accept ?? '').trim() || types.some(([type, taken]) => taken && (type === '*/*' || type === 'text/*'));
 }
 /** Whether a path that names no file is the app's document. A navigation
  * (`acceptsHTML`) to one whose last segment has a dot is too, unless that
- * is a file's extension: a deep link like `/profile/jay.bsky.team` is a
- * location, not a missing file. */
-export function appDocumentPath(pathname, navigation = false) {
+ * is a file's extension and no declared route matches it. */
+export function appDocumentPath(pathname, navigation = false, routes = []) {
   if (!webRequestURL(pathname)) return false;
   let path;
   try { path = decodeURIComponent(pathname); } catch { return false; }
+  const extension = extname(path.replace(/\/+$/, '')).toLowerCase();
   return path.startsWith('/') && !path.includes('\\') && !path.includes('\0')
     && !path.split('/').some(part => part.startsWith('.'))
     && path !== '/__dev' && !path.startsWith('/__dev/')
-    && (extname(path.replace(/\/+$/, '')) === '' || (navigation && !FILE_EXTENSIONS.has(extname(path.replace(/\/+$/, '')).toLowerCase())));
+    && (extension === '' || (navigation && (!FILE_EXTENSIONS.has(extension) || matchPattern(routes, canonical(pathname)) >= 0)));
 }
 export function parseWebRoot(bytes) {
   const root = JSON.parse(bytes.toString('utf8'));
@@ -117,10 +156,34 @@ export function safeRelative(rel) {
   return rel;
 }
 
-/** The origin `spec` names: a directory (created on first write) or an https URL (read-only). */
+/** The origin `spec` names: an AppDrop origin, a directory (created on first write) or an https URL (read-only). */
 export function openOrigin(spec) {
+  if (APPDROP_PATH.test(spec)) return new AppDropOrigin(spec);
   if (/^https?:\/\//.test(spec)) return new HttpsOrigin(spec);
   return new DirectoryOrigin(spec);
+}
+
+const APPDROP_PATH = /^https?:\/\/[^/]+\/u\/[0-9a-f]{32}\/?$/;
+
+/** AppDrop's key id for a raw Ed25519 public key: the first 32 hex digits of its sha256. */
+export const appdropKeyId = (rawPublicKey) => sha256(rawPublicKey).slice(0, 32);
+
+/** AppDrop's origin for the app's update key (`deploy.signing.key`, or the
+ * only key): `<base>/u/<key id>`, the base `https://appdrop.app` unless
+ * `EXACT_APPDROP_ORIGIN` names another. Matches `Manifest::appdrop_origin`
+ * in contract/cli, which bakes the same URL into the binary. */
+export function appdropOrigin(manifest) {
+  const keys = manifest.deploy?.signing?.keys ?? {};
+  const id = manifest.deploy?.signing?.key ?? (Object.keys(keys).length === 1 ? Object.keys(keys)[0] : null);
+  if (!id || !keys[id]) throw new Error('the origin "appdrop" is named after the update key: set deploy.signing.key and deploy.signing.keys');
+  const base = (process.env.EXACT_APPDROP_ORIGIN ?? 'https://appdrop.app').replace(/\/+$/, '');
+  return `${base}/u/${appdropKeyId(Buffer.from(keys[id], 'base64'))}`;
+}
+
+/** The origin spec a channel names in app.json (`deploy.channels.<channel>`, else `app.origin`), with `"appdrop"` resolved. */
+export function channelOrigin(manifest, channel) {
+  const spec = manifest.deploy?.channels?.[channel] ?? manifest.app?.origin ?? null;
+  return spec === 'appdrop' ? appdropOrigin(manifest) : spec;
 }
 
 /** A directory served by host/web/serve.mjs --origin: the one writable origin in v1, one publisher per stream at a time. */
@@ -162,7 +225,9 @@ export class DirectoryOrigin {
 
   /** A complete sibling-temp rename, or an exclusive immutable link. */
   async put(rel, bytes, { immutable = false } = {}) {
-    return this.operation({ op: 'put', path: safeRelative(rel), bytes: Buffer.from(bytes).toString('base64'), immutable });
+    const parts = safeRelative(rel).toLowerCase().split('/');
+    if (parts.length === 4 && parts[0] === '.exact' && ['exact.json', '.lock'].includes(parts[3])) throw new Error('stream heads and locks require the held stream lock');
+    return this.operation({ op: 'put', path: rel, bytes: Buffer.from(bytes).toString('base64'), immutable });
   }
 
   /** The stream's current head: `{bytes, sha256, json}`, or null when the stream has none. A head that is not JSON is an error naming the path — a corrupt head is not a missing one. */
@@ -211,15 +276,10 @@ export class HttpsOrigin {
   /** The body at `rel`, or null on 404. Any other failure is an error naming the URL. */
   async get(rel) {
     const url = `${this.url}/${safeRelative(rel)}`;
-    let response;
-    try {
-      response = await fetch(url, { headers: { 'cache-control': 'no-cache' }, redirect: 'follow' });
-    } catch (error) {
-      throw new OriginUnavailable(`${url}: ${error.cause?.code ?? error.message}`);
-    }
+    const { response, bytes } = await publisherFetch(url, { headers: { 'cache-control': 'no-cache' } }, /(?:^|\/)exact\.json$/i.test(rel) ? 64 << 10 : 64 << 20);
     if (response.status === 404) return null;
     if (!response.ok) throw new OriginUnavailable(`${url}: HTTP ${response.status}`);
-    return Buffer.from(await response.arrayBuffer());
+    return bytes;
   }
 
   /** An https origin cannot be listed: null, and the caller says so. */
@@ -237,4 +297,72 @@ export class HttpsOrigin {
   async put() { this.readOnly(); }
   async withLock() { this.readOnly(); }
   async putHead() { this.readOnly(); }
+}
+
+/** An AppDrop origin: reads like any https origin, lists its directories,
+ * and writes with every request signed by the update key its URL is named
+ * after (`useSigner`). There is no lock to hold: AppDrop refuses a head that
+ * doesn't raise the stream's seq, and the head is put `If-Match` the ETag of
+ * the head whose digest the publisher read. */
+export class AppDropOrigin extends HttpsOrigin {
+  constructor(url) {
+    super(url);
+    this.kind = 'appdrop';
+    this.writable = true;
+    // AppDrop holds update streams, not a web app's root files.
+    this.servesWeb = false;
+    this.keyId = this.url.split('/').at(-1);
+  }
+
+  /** Sign writes with the deploy signer, refused when its key isn't the one this origin is named after. */
+  useSigner(signer) {
+    const raw = Buffer.from(signer.publicKey, 'base64');
+    if (appdropKeyId(raw) !== this.keyId) throw new Error(`${this.url} belongs to another update key; ${signer.keyId} publishes to ${this.url.replace(/[0-9a-f]{32}$/, appdropKeyId(raw))}`);
+    this.signer = signer;
+    return this;
+  }
+
+  async list(rel) {
+    const url = `${this.url}/${safeRelative(rel)}/`;
+    const { response, bytes: received } = await publisherFetch(url, { headers: { 'cache-control': 'no-cache' } });
+    if (!response.ok) throw new OriginUnavailable(`${url}: HTTP ${response.status}`);
+    return JSON.parse(received.toString('utf8')).names;
+  }
+
+  async send(rel, bytes, headers = {}) {
+    if (!this.signer) throw new Error(`${this.url}: writes are signed with the update key; no signer was given`);
+    const path = safeRelative(rel);
+    const body = Buffer.from(bytes);
+    const digest = path.startsWith('.exact/blobs/') ? path.slice('.exact/blobs/'.length) : sha256(body);
+    const message = Buffer.from(`appdrop-exact-put\n${this.keyId}\n${path}\n${digest}`);
+    const { response, bytes: received } = await publisherFetch(`${this.url}/${path}`, { method: 'PUT', body, headers: {
+      'x-exact-public-key': this.signer.publicKey,
+      'x-exact-signature': this.signer.signBytes(message).toString('base64'),
+      ...headers,
+    } });
+    let reply;
+    try { reply = JSON.parse(received.toString('utf8')); } catch { reply = {}; }
+    if (response.status >= 500) throw new OriginUnavailable(`${this.url}/${path}: HTTP ${response.status}`);
+    if (!response.ok) throw new Error(`${this.url}/${path}: ${reply.error ?? `HTTP ${response.status}`}`);
+    return reply;
+  }
+
+  /** A blob or release record: written once, `present` when it already is. */
+  async put(rel, bytes) {
+    return (await this.send(rel, bytes)).written ? 'written' : 'present';
+  }
+
+  async withLock(stream, fn) { return fn(); }
+
+  /** Replace the head only if it is still the one whose digest the publisher read (none, when `previousDigest` is null). */
+  async putHead(stream, bytes, { previousDigest = null } = {}) {
+    const rel = `${streamPath(stream)}/exact.json`;
+    if (previousDigest === null) return this.send(rel, bytes, { 'if-none-match': '*' });
+    const url = `${this.url}/${rel}`;
+    const { response, bytes: received } = await publisherFetch(url, { headers: { 'cache-control': 'no-cache' } });
+    if (!response.ok) throw new Error(`${url}: the head the publisher read is gone (HTTP ${response.status})`);
+    const etag = response.headers.get('etag');
+    if (sha256(received) !== previousDigest) throw new Error(`${url}: the head changed since it was read`);
+    return this.send(rel, bytes, { 'if-match': etag });
+  }
 }

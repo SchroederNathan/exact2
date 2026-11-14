@@ -51,8 +51,11 @@ async function reservePort() {
   const socket=createServer(); await new Promise((ok,fail)=>{socket.once('error',fail);socket.listen(0,'127.0.0.1',ok);});
   const port=socket.address().port;await new Promise(ok=>socket.close(ok));return port;
 }
-async function startServer(binary,port,cwd,env) {
-  const server=spawn(binary,['dev','--port',String(port),'--no-watch'],{cwd,env,stdio:['ignore','pipe','pipe']});
+// A password-only app's dev closes /dev/* (so `fresh`) unless asked, as its README section says.
+export const devArgs=(schema,port)=>['dev','--port',String(port),'--no-watch',
+  ...(/^use identity password\s*$/m.test(schema) && !/^use personas\b/m.test(schema)?['--unsafe-dev-doors']:[])];
+async function startServer(binary,args,cwd,env) {
+  const server=spawn(binary,args,{cwd,env,stdio:['ignore','pipe','pipe']});
   try {
     await new Promise((ok,fail)=>{
       let log='';const timer=setTimeout(()=>fail(new Error(`Snapback backend did not start: ${log}`)),30_000);
@@ -89,7 +92,7 @@ async function executeExample(example,base,version,registry,env,bun) {
     manifest.app.id=appId[1];writeFileSync(join(app,'app.json'),JSON.stringify(manifest,null,2)+'\n');
     exact(['snapback','--port',String(port)]);
     exact(['contract','types','app.contract','-o','app.contract.d.ts']);
-    server=await startServer(binary,port,project,localEnv);
+    server=await startServer(binary,devArgs(example.blocks[0],port),project,localEnv);
     const tests=[...example.blocks[3].matchAll(/^test /gm)].length;
     for(let round=0;round<2;round++) {
       const result=exact(['test','web','--backend',`http://127.0.0.1:${port}`]);
@@ -144,7 +147,7 @@ export async function retest({version,registry='https://registry.npmjs.org/',rev
       const text=refreshClaims(read(name).replaceAll(previous,version),version,date);
       changes.set(join(root,name),text);
     }
-    for(const name of ['AGENTS.md','README.md','docs/reference.md','docs/start-here.md'])
+    for(const name of ['AGENTS.md','README.md','docs/reference.md','docs/recipes/snapback-tests.md'])
       changes.set(join(root,name),read(name).replaceAll(previous,version).replaceAll(oldRevision,revision));
     const tested=Object.fromEntries(testedFiles.map(name=>[name,changes.get(join(root,name)) ?? read(name)]));
     const receipt={format:1,version,revision,registry:registryUrl.href,date,examples:results,

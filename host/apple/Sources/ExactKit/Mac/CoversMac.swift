@@ -34,10 +34,16 @@ final class HostCovers {
     }
 
     private func deliver() {
+        // A callback the runtime waits on can make no runtime call: deliver once it returns
+        if Owner.shared.isServingMain {
+            DispatchQueue.main.async { [weak self] in self?.deliver() }
+            return
+        }
         queued = false
         var wanted: [UInt32: HostCover] = [:]
-        // One box, two presentations: the first by name, every time.
-        for name in claims.keys.sorted() { wanted.merge(claims[name] ?? [:]) { first, _ in first } }
+        // A replaced box leaves layout, including any scrollbar gutter.
+        // Other competing claims keep their stable order by name.
+        for name in claims.keys.sorted() { wanted.merge(claims[name] ?? [:]) { first, next in next == .whole ? next : first } }
         wanted = wanted.filter { presenter.views[$0.key] != nil }
         var changes: [(UInt32, HostCover?)] = []
         for id in wanted.keys.sorted() where delivered[id] != wanted[id] { changes.append((id, wanted[id])) }

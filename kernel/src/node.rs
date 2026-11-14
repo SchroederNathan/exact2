@@ -22,6 +22,9 @@ pub struct NodeFacts<'a> {
     pub is_root: bool,
     /// A `Text` inside a `Text`: an inline run of its paragraph.
     pub inline_run: bool,
+    /// A symbol image whose `color` its author wrote, on it or on the
+    /// nearest ancestor that sets one ([`NodeRef::symbol_color_said`]).
+    pub symbol_color: bool,
 }
 
 impl NodeFacts<'_> {
@@ -41,7 +44,23 @@ impl<'a> NodeRef<'a> {
             props: self.props,
             is_root: self.is_root,
             inline_run: self.is_inline_run(),
+            symbol_color: self.symbol_color_said(),
         }
+    }
+
+    /// Whether this is a symbol image (`image "symbol:…"`) that draws in its
+    /// `color` when it has no `-exact-tint-color` (LLP 1121 stage 9 B, D10):
+    /// the author wrote `color` (a token or a role included) on it or on the
+    /// nearest ancestor that sets one ([`NodeRef::says`]), not the inherited
+    /// default label colour or a sheet's. A native control's face (a
+    /// `Control`'s image) keeps the control's tint (D9, LLP 1115 D4).
+    pub fn symbol_color_said(&self) -> bool {
+        self.node_type == NodeType::Image
+            && self
+                .props
+                .str(crate::PropId::ImageSource)
+                .is_some_and(|s| s.starts_with("symbol:"))
+            && self.arena.ink_said(self.slot)
     }
 }
 
@@ -80,6 +99,12 @@ impl NodeType {
                 | NodeType::SvgFilter
                 | NodeType::SvgFe
         )
+    }
+
+    /// Whether a `Text` may hold the node: a run, or an image in its text
+    /// (LLP 1011.002).
+    pub fn in_text(self) -> bool {
+        matches!(self, NodeType::Text | NodeType::Image)
     }
 
     /// Whether the node is measured by the text measurer.

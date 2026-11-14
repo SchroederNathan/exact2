@@ -13,6 +13,7 @@
 //! Each process interns what it parses itself, so no wide colour id
 //! crosses.
 
+use exact_kernel::style::theme::{typeface, Kind};
 use exact_plan::Plan;
 use sha2::{Digest, Sha256};
 
@@ -41,6 +42,43 @@ pub struct Edit {
     pub design: String,
     /// The tokens it sets.
     pub tokens: Vec<Token>,
+    /// The scrub frame it is, when it is one (*1.10*).
+    pub scrub: Option<Scrub>,
+}
+
+/// A scrub's frame (LLP 1121 D13): the scrub's id, the frame's revision,
+/// rising over every frame of every scrub the design server sends (an end's
+/// included), and that server's run. A build drops a frame or snapshot of
+/// the run it last applied one of (or, with no run, of the scrub) whose
+/// revision is not above that one's, and applies a scrub's frames with no
+/// transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scrub {
+    /// The scrub's id.
+    pub id: String,
+    /// The frame's revision.
+    pub rev: u64,
+    /// The design server's run, whose revisions rise across its scrubs.
+    pub run: Option<String>,
+}
+
+impl Scrub {
+    /// Whether this frame was sent before `last`, which was applied: of its
+    /// run and not above it (with no run on either, of its scrub), or of a
+    /// run a build has applied a later run's frame since (`retired`), as a
+    /// late fetch across a server restart arrives. A frame with a run after
+    /// a mark with none is a new run's.
+    pub fn older(&self, last: &Scrub, retired: &[String]) -> bool {
+        if self.run.as_ref().is_some_and(|r| retired.contains(r)) {
+            return true;
+        }
+        let same = match (&self.run, &last.run) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => self.id == last.id,
+            _ => false,
+        };
+        same && self.rev <= last.rev
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -56,7 +94,7 @@ pub fn structure(plan: &Plan) -> String {
     hex(&plan.structure())
 }
 
-/// The digest of `plan`'s design shape: its axes, and each theme row's name,
+/// The digest of `plan`'s design shape: its axes, its `@keyframes`, and each theme row's name,
 /// role and slice count: which tokens override which role, not with what
 /// (an override's value is a live edit, LLP 1121 stage 5). A batch is for one
 /// shape: the JS target's build and a wasm or native build of the same
@@ -77,6 +115,41 @@ pub fn shape(plan: &Plan) -> String {
         text(plan.str(row.name));
         text(plan.str(row.role));
         text(&row.slices.len.to_string());
+        // A kind is which rows may name the token: a change is structure.
+        text(&row.kind.to_string());
+        // A type token's longhands and family, a family token's stack, each
+        // tuple's (stage 6 C, the lead's ruling): which rows it writes and
+        // which stack it names are lowered, so a change is structure.
+        if let Some(k @ (Kind::Type | Kind::Family)) = Kind::of(row.kind) {
+            let values = std::iter::once(row.value).chain(
+                plan.theme_slices[row.slices.start as usize..][..row.slices.len as usize]
+                    .iter()
+                    .map(|s| s.value),
+            );
+            for value in values {
+                let value = plan.str(value);
+                text(&match k {
+                    Kind::Family => value.trim().to_string(),
+                    _ => typeface::parts(value).map_or_else(String::new, |p| {
+                        format!(
+                            "{} {} {} {:?}",
+                            p.style.is_some(),
+                            p.weight.is_some(),
+                            p.leading.is_some(),
+                            p.family
+                        )
+                    }),
+                });
+            }
+        }
+    }
+    // The `@keyframes` rules, which a token named in a colour keyframe is
+    // folded into when the app compiles: an edit to it changes a rule, so it
+    // is a rebuild, never a batch that would leave the rule's old colour.
+    text("");
+    for row in &plan.keyframes {
+        text(plan.str(row.name));
+        text(plan.str(row.css));
     }
     hex(&bytes)
 }
@@ -129,6 +202,7 @@ pub fn batch(structure: &str, from: &[Token], to: &[Token]) -> Option<Edit> {
             .filter(|(a, b)| a != b)
             .map(|(_, b)| b.clone())
             .collect(),
+        scrub: None,
     })
 }
 
@@ -142,6 +216,7 @@ pub fn notice(structure: &str, design: &str) -> Edit {
         base: Some(design.to_string()),
         design: design.to_string(),
         tokens: Vec::new(),
+        scrub: None,
     }
 }
 
@@ -152,6 +227,7 @@ pub fn snapshot(structure: &str, tokens: &[Token]) -> Edit {
         base: None,
         design: digest(tokens),
         tokens: tokens.to_vec(),
+        scrub: None,
     }
 }
 
@@ -164,14 +240,20 @@ impl Edit {
             .iter()
             .map(|t| serde_json::json!({"name": t.name, "value": t.value, "slices": t.slices}))
             .collect();
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "kind": if self.base.is_some() { "tamber-batch" } else { "tamber-snapshot" },
             "structure": self.structure,
             "base": self.base,
             "design": self.design,
             "tokens": tokens,
-        })
-        .to_string()
+        });
+        if let Some(s) = &self.scrub {
+            v["scrub"] = serde_json::json!({"id": s.id, "rev": s.rev});
+            if let Some(run) = &s.run {
+                v["scrub"]["run"] = run.as_str().into();
+            }
+        }
+        v.to_string()
     }
 
     /// One read off the dev stream; `None` when it is no batch or snapshot.
@@ -203,11 +285,20 @@ impl Edit {
             "tamber-batch" => Some(s("base")?),
             _ => None,
         };
+        // A scrub frame's mark is optional; one malformed is no mark.
+        let scrub = v.get("scrub").and_then(|m| {
+            Some(Scrub {
+                id: m.get("id")?.as_str()?.to_string(),
+                rev: m.get("rev")?.as_u64()?,
+                run: m.get("run").and_then(|r| r.as_str()).map(str::to_string),
+            })
+        });
         Some(Edit {
             structure: s("structure")?,
             base,
             design: s("design")?,
             tokens,
+            scrub,
         })
     }
 }

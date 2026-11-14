@@ -150,6 +150,11 @@ fn style_rows_lower_to_css_by_their_names() {
         .unwrap();
     s.set_dynamic(StyleId::TextWrapStyle, &StyleValue::Text("auto".into()))
         .unwrap();
+    s.set_dynamic(
+        StyleId::FontSmoothing,
+        &StyleValue::Text("antialiased".into()),
+    )
+    .unwrap();
     // LLP 1093: multi-column layout reaches CSS by its own names.
     for (row, value) in [
         (StyleId::ColumnCount, StyleValue::Number(3.0)),
@@ -225,6 +230,7 @@ fn style_rows_lower_to_css_by_their_names() {
         "text-indent:-24px;",
         "hyphens:auto;",
         "text-wrap-style:auto;",
+        "-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;",
         "column-count:3;",
         "column-width:120px;",
         "column-fill:auto;",
@@ -403,6 +409,7 @@ fn relative_lengths_are_pixels_live_and_units_ahead_of_time() {
         (StyleId::CornerShape, "-exact-continuous round round round"),
     ] {
         s.set_dynamic(id, &StyleValue::Text(value.into())).unwrap();
+        s.written.set(id);
     }
     let (live, skipped) = css_text(&s, &[]);
     assert!(skipped.is_empty(), "{skipped:?}");
@@ -493,6 +500,7 @@ fn a_negative_calculation_on_a_size_reaches_the_browser_clamped() {
     let text = || StyleValue::Text("calc(10px - 20px)".into());
     s.set_dynamic(StyleId::Width, &text()).unwrap();
     s.set_dynamic(StyleId::MarginLeft, &text()).unwrap();
+    s.written.set(StyleId::MarginLeft);
     let (css, _) = css_text(&s, &[]);
     assert!(css.contains("width:0px;"), "{css}");
     assert!(css.contains("margin-left:-10px;"), "{css}");
@@ -603,7 +611,7 @@ fn explicit_clears_preserve_special_host_row_contracts() {
             "accent-color:unset;--exact-accent:unset;",
             false,
         ),
-        (ControlSize, "--exact-control-font-size:medium;", false),
+        (ControlSize, "--exact-control-font-size:1rem;", false),
         (ExitAnimation, "", false),
         (RotateAxis, "", false),
         (SymbolRendering, "", true),
@@ -629,4 +637,111 @@ fn explicit_clears_preserve_special_host_row_contracts() {
     assert!(css.contains("--exact-scale:1;"), "{css}");
     assert!(css.contains("scale:calc("), "{css}");
     assert!(!css.contains("--exact-press:unset"), "{css}");
+}
+
+/// A node's rows as the host writes them.
+fn declared(rows: &[(exact_kernel::StyleId, exact_kernel::StyleValue)]) -> String {
+    let mut style = exact_kernel::StyleProps::default();
+    for (id, value) in rows {
+        style.set_dynamic(*id, value).unwrap();
+    }
+    css_text(&style, &[]).0
+}
+
+fn text(s: &str) -> exact_kernel::StyleValue<'_> {
+    exact_kernel::StyleValue::Text(s.into())
+}
+
+/// `-exact-press-haptic` is the custom property input-glue.js plays at the
+/// press (LLP 1077 D14, workout F4); `rotate`'s axis part is written
+/// with the angle and skips nothing (kanban F30).
+#[test]
+fn press_haptic_is_the_glues_property_and_a_rotation_skips_nothing() {
+    use exact_kernel::{StyleId, StyleProps};
+    let mut style = StyleProps::default();
+    style
+        .set_dynamic(StyleId::PressHaptic, &text("impact-medium"))
+        .unwrap();
+    for row in [StyleId::Rotate, StyleId::RotateAxis] {
+        style.set_dynamic(row, &text("3deg")).unwrap();
+    }
+    let (css, skipped) = css_text(&style, &[]);
+    assert_eq!(css, "rotate:3deg;--exact-press-haptic:impact-medium;");
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(declared(&[(StyleId::PressHaptic, text("none"))]), "");
+}
+
+/// The pressed paint is three custom properties input-glue.js reads from
+/// the pressed element's own style (LLP 1061 D7); a written 1 is still
+/// the author's, and a clear writes nothing.
+#[test]
+fn the_pressed_paint_is_the_glues_properties() {
+    use exact_kernel::{StyleId, StyleProps, StyleValue};
+    assert_eq!(
+        declared(&[
+            (StyleId::PressOpacity, StyleValue::Number(0.5)),
+            (StyleId::PressBackgroundColor, text("light-dark(#eeeeee, #333333)")),
+            (StyleId::PressColor, text("#ff0000")),
+        ]),
+        "--exact-press-opacity:0.5;--exact-press-background-color:light-dark(rgba(238,238,238,1), rgba(51,51,51,1));--exact-press-color:rgba(255,0,0,1);"
+    );
+    assert_eq!(
+        declared(&[(StyleId::PressOpacity, StyleValue::Number(1.0))]),
+        "--exact-press-opacity:1;"
+    );
+    let mut cleared = StyleProps::default();
+    cleared.written.set(StyleId::PressColor);
+    assert_eq!(css_text(&cleared, &[]).0, "");
+}
+
+/// `-exact-fit` is the custom property navigation.js `fitText` reads
+/// (LLP 1116.001 D1.4); its initial value writes nothing.
+#[test]
+fn fit_is_navigations_property() {
+    use exact_kernel::StyleId;
+    assert_eq!(
+        declared(&[(StyleId::Fit, text("shrink"))]),
+        "--exact-fit:shrink;"
+    );
+    assert_eq!(declared(&[(StyleId::Fit, text("none"))]), "");
+}
+
+/// LLP 1069.011.001 D8: a mini or small control is titled in the
+/// subheadline's `rem` and keeps no touch floor; medium in the body's, large
+/// in the body's × 18/16.
+#[test]
+fn a_control_size_writes_its_title_in_rem_and_its_touch_floor() {
+    use exact_kernel::StyleId;
+    let below = "--exact-control-font-size:0.875rem;--exact-touch-floor:0px;";
+    for (size, css) in [
+        ("mini", below),
+        ("small", below),
+        ("medium", "--exact-control-font-size:1rem;"),
+        ("large", "--exact-control-font-size:1.125rem;"),
+    ] {
+        assert_eq!(
+            declared(&[(StyleId::ControlSize, text(size))]),
+            css,
+            "{size}"
+        );
+    }
+}
+
+/// WebKit parses `user-select` but selects by `-webkit-user-select` alone
+/// (Playwright WebKit, measured), so the row writes both names (but for `auto`,
+/// which writes neither).
+#[test]
+fn user_select_writes_the_webkit_name_too() {
+    use exact_kernel::{StyleId, StyleProps, StyleValue};
+    for value in ["none", "text", "all"] {
+        let mut s = StyleProps::default();
+        s.set_dynamic(StyleId::UserSelect, &StyleValue::Text(value.into()))
+            .unwrap();
+        let (css, skipped) = css_text(&s, &[]);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(
+            css.contains(&format!("-webkit-user-select:{value};user-select:{value};")),
+            "{css}"
+        );
+    }
 }

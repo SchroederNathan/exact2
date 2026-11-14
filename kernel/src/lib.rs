@@ -61,11 +61,13 @@ pub mod sorted;
 pub mod style;
 pub mod svg;
 pub mod text;
+pub mod time;
 pub mod timeline;
 pub mod transform;
 pub mod txn;
 pub mod wire;
 
+pub use arena::text_style::bolder;
 pub use bars::{Bar, HeaderShape, RootTabs};
 pub use control::{Choice, ControlKind, PressFace, Progress, Range};
 pub use control_measurement::{
@@ -76,34 +78,41 @@ pub use error::{
     ApplyError, DecodeError, KernelError, LayoutError, StyleDomainError, StyleValueError,
 };
 pub use generated::*;
-pub use grouped::{Accessory, GroupedList, GroupedRow, GroupedSection, TextFont, TextLook};
+pub use grouped::{
+    Accessory, GroupedList, GroupedMargins, GroupedRow, GroupedSection, GroupedSeparator, TextFont,
+    TextLook,
+};
 pub use handoff::Handoff;
 pub use id::{AxisOffer, Frame, NodeFlags, NodeKey, Offer, ViewId};
 pub use invocation::Invocation;
 pub use kernel::{
-    BlockAxis, HostBlock, HostCover, Kernel, NodeRef, PresentedHeight, StickyConstraint,
+    BlockAxis, BlockMeasure, HostBlock, HostCover, Kernel, NodeRef, PresentedHeight,
+    StickyConstraint,
 };
 pub use layout::LayoutReceipt;
 pub use motion::{motion_node, MotionSync};
 pub use node::NodeFacts;
 pub use props::{PropList, PropValue};
-pub use replaced::apple_symbol_name;
+pub use replaced::{apple_symbol_name, symbol_path, symbol_path_in, Icon, SymbolPath, SymbolSet};
 pub use sorted::{SortedMap, SortedSet};
 pub use style::{
     link_segments, uses_env, BoxShadow, Color, ColorValue, Dimension, Edge, Env, EnvRefusal,
     GridFitContent, GridLine, GridPlacement, GridRepeat, GridRepeatCount, GridTrack,
     GridTrackComponent, GridTrackMax, GridTrackMin, GridTracks, LineHeight, Rect, Region, RowValue,
-    SegmentVar, StyleValue, Transitions, Vec2, ViewportUnit,
+    SegmentVar, StyleValue, TitleBarVar, Transitions, Vec2, ViewportUnit,
 };
 pub use text::case::link as link_text_transform;
-pub use text::case::{linked_lowercase, lowercase_bounded, Lowercase};
+pub use text::case::{
+    linked_lowercase, linked_uppercase, lowercase_bounded, uppercase_bounded, CaseMapping,
+};
+pub use text::inline_box::{FontEdges, InlineBox, INLINE_BOX_TEXT};
 pub use text::{
-    Markup, MonospaceMeasurer, OverEdge, ParagraphStamp, SymbolRequest, TextEdges,
+    Markup, MarkupAtoms, MonospaceMeasurer, OverEdge, ParagraphStamp, SymbolRequest, TextEdges,
     TextMeasureRequest, TextMeasurer, TextMetrics, TextRun, TextStyle, UnderEdge,
 };
 pub use transform::TransformDragBinding;
 pub use txn::{CommitReceipt, Exit, MAX_DEPTH};
-pub use wire::{FrameBuilder, Op};
+pub use wire::{look_rows, FrameBuilder, Op, LOOK_FOCUS_VISIBLE, LOOK_HOVER};
 
 pub use region::{
     ContentRegion, RegionArtifact, RegionFrame, RegionInputs, RegionLayoutReceipt,
@@ -113,3 +122,10 @@ pub use region::{
 /// CSS authored and resolved exclusion geometry (LLP 1043.000).
 pub use exact_textflow::{FlowShape, ShapeOutside};
 pub use flow::FlowRefusal;
+
+// A terminal host's stderr can share stdout's nonblocking open file description.
+// Drop diagnostics on write failure so stopped output cannot panic the host.
+fn diagnostic(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{args}");
+}

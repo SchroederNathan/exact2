@@ -12,20 +12,20 @@
 // with Control held and `deltaY` of -100 × the magnification, which is how
 // a browser on a Mac delivers one, so one handler zooms on both hosts.
 //
-// Files dragged in from Finder land on the innermost node that declares
-// `drop`: each a `doc:` handle minted for this session (LLP 1069.010 D1),
-// of the types the manifest's `file_handlers` declares — the bound the
-// pickers keep (D2) — and refused into the journal otherwise.
+// Files and folders dragged in from Finder land on the innermost node that
+// declares `drop`, a field under the pointer included: each a `doc:` handle
+// minted for this session (LLP 1069.010 D1), of any type (the 2026-10-11
+// any-file waiver, extended to `drop`). `dragenter` and `dragleave` bracket
+// the drag over each node that hears them (FileDragMac.swift).
 #if os(macOS)
 import AppKit
 import UniformTypeIdentifiers
 
 extension Presenter {
-    /// Chrome on macOS opens an unmodified ContextMenu keydown at the
-    /// current focus, after its key handlers; Shift+F10 has no such default.
+    /// Invoke the focused node's contextmenu or contextPopover after key handlers.
     func contextMenuKey(_ event: NSEvent, in owner: NSWindow? = nil) -> Bool {
-        guard event.type == .keyDown, NodeView.keyName(event) == "ContextMenu",
-              event.modifierFlags.intersection([.shift, .control, .option, .command]).isEmpty,
+        let name = NodeView.keyName(event), held = KeyCodes.held(event.modifierFlags)
+        guard event.type == .keyDown, (name == "ContextMenu" && held.isEmpty || name == "F10" && held == "Shift+"),
               let window = owner ?? event.window, hosts(window),
               (window.firstResponder as? NSTextInputClient)?.hasMarkedText() != true else { return false }
         if let run = window.firstResponder as? InlineKeyView, run.owner?.inlineContextMenu(run.id) == true { return true }
@@ -44,12 +44,97 @@ extension Presenter {
             guard responder == nil || responder === window || responder === viewport
                     || responder === root || responder === session?.view,
                   session?.view?.ownsShortcutFocus() ?? true else { return false }
-            let clip = viewport.contentView
-            point = clip.convert(NSPoint(x: clip.bounds.minX + 1, y: clip.bounds.minY + 1), to: nil)
-            start = viewport.hitTest(viewport.superview?.convert(point, from: nil) ?? point)
+            if let (node, at) = selection.keyboardMenuPoint(in: window) {
+                // Selected text: at its first line, as Blink's
+                // `ShowNonLocatedContextMenu` places a menu with no focus.
+                point = at
+                start = node
+            } else {
+                let clip = viewport.contentView
+                point = clip.convert(NSPoint(x: clip.bounds.minX + 1, y: clip.bounds.minY + 1), to: nil)
+                start = viewport.hitTest(viewport.superview?.convert(point, from: nil) ?? point)
+            }
         }
-        guard let node = contextTarget(start) else { return false }
+        guard let node = contextTarget(start) else { return unansweredContextMenu(at: point, from: start, in: window) }
         return contextMenu(node, at: point, from: start)
+    }
+
+    /// A request from the keyboard that no node answers (the ContextMenu
+    /// key, VoiceOver's show menu) gets the menu a right-click at `point`
+    /// would show, as Chrome's own menu follows a `contextmenu` no handler
+    /// prevented: the menu of the view drawn there or of the first view
+    /// above it that has one (selected text's), else the session's view and
+    /// the responders past it (an embedder's, an app's), which hear a
+    /// secondary click's press and release. No node hears it, since the
+    /// tree already declined, and selected text keeps its selection. It
+    /// goes on the next turn, as a context menu's popover does
+    /// (`MenuHost.context`), outside VoiceOver's request. False where the
+    /// walk from `start` stopped at a field, which keeps its own menu.
+    func unansweredContextMenu(at point: NSPoint, from start: NSView?, in window: NSWindow) -> Bool {
+        guard contextUnanswered(start), let down = Self.keyboardClick(.rightMouseDown, at: point, in: window),
+              let up = Self.keyboardClick(.rightMouseUp, at: point, in: window) else { return false }
+        let found = keyboardMenu(for: down, in: window)
+        RunLoop.main.perform(inModes: [.common]) { [weak self] in
+            guard let self else { return }
+            if let (view, menu) = found { return NSMenu.popUpContextMenu(menu, with: down, for: view) }
+            let past = self.session?.view ?? self.viewport
+            past.rightMouseDown(with: down)
+            past.rightMouseUp(with: up)
+        }
+        return true
+    }
+
+    /// Whether a request from the keyboard at `point` would get a menu,
+    /// judged without building one, since VoiceOver asks on every query:
+    /// the view drawn there or one above it holds selected text or has a
+    /// `menu`, below any native control (`keyboardMenu`). A responder past
+    /// the session's view is not counted.
+    func offersKeyboardMenu(at point: NSPoint, in window: NSWindow) -> Bool {
+        var next = hit(point, in: window)
+        while let view = next, view !== session?.view, !(view is NSControl) {
+            if let node = view as? NodeView, node.isParagraph, !ExactEnv.agentMode, (selection.range(node)?.length ?? 0) > 0 { return true }
+            if view.menu != nil { return true }
+            next = view.superview
+        }
+        return false
+    }
+
+    private static func keyboardClick(_ type: NSEvent.EventType, at point: NSPoint, in window: NSWindow) -> NSEvent? {
+        NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                           windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+    }
+
+    private func hit(_ point: NSPoint, in window: NSWindow) -> NSView? {
+        guard let content = window.contentView else { return nil }
+        return content.hitTest(content.superview?.convert(point, from: nil) ?? point)
+    }
+
+    /// The first view from the one drawn at `event`'s point up to the
+    /// session's view whose `menu(for:)` gives a request from the keyboard
+    /// a menu, as AppKit asks a right-click's view and then its superviews;
+    /// nil when none does. The walk stops at a native control: its own menu
+    /// (a `select`'s options, which its `NSPopUpButton` gives) is no context
+    /// menu, and Chrome shows its page menu over a `select` too.
+    private func keyboardMenu(for event: NSEvent, in window: NSWindow) -> (NSView, NSMenu)? {
+        NodeView.keyboardMenuRequest = true
+        defer { NodeView.keyboardMenuRequest = false }
+        var next = hit(event.locationInWindow, in: window)
+        while let view = next, view !== session?.view, !(view is NSControl) {
+            if let menu = view.menu(for: event) { return (view, menu) }
+            next = view.superview
+        }
+        return nil
+    }
+
+    /// Whether the walk `contextTarget` takes from `view` meets no field,
+    /// which keeps its own menu.
+    func contextUnanswered(_ view: NSView?) -> Bool {
+        var next = view
+        while let view = next {
+            if let node = view as? NodeView, node.field != nil || node.textArea != nil { return false }
+            next = eventParent(of: view)
+        }
+        return true
     }
 
     /// The node a request from the keyboard at `view` reaches (the
@@ -76,9 +161,15 @@ extension Presenter {
     func contextPoint(_ node: NodeView, rect: NSRect? = nil) -> NSPoint? {
         guard !node.formDisabled, !node.inert, !node.isHiddenOrHasHiddenAncestor,
               !dialogs.blocks(node), node.field == nil, node.textArea == nil else { return nil }
-        // AppKit's visibleRect clips the untransformed frame. Clip the
-        // drawn anchor instead, including a frame translated into view.
-        var drawn = node.drawnRect(rect ?? menus.anchor(node, in: node))
+        let drawn = visiblePart(of: node.drawnRect(rect ?? menus.anchor(node, in: node)), in: node)
+        return drawn.isEmpty ? nil : NSPoint(x: drawn.midX, y: drawn.midY)
+    }
+
+    /// `drawn`, a rect of `node` as drawn in its window, clipped by what
+    /// clips `node`. AppKit's visibleRect clips the untransformed frame; this
+    /// clips the drawn rect, including a frame translated into view.
+    func visiblePart(of drawn: NSRect, in node: NodeView) -> NSRect {
+        var drawn = drawn
         var ancestor = node.superview
         while let view = ancestor {
             if let node = view as? NodeView, node.overflowClips {
@@ -91,34 +182,176 @@ extension Presenter {
             }
             ancestor = view.superview
         }
-        return drawn.isEmpty ? nil : NSPoint(x: drawn.midX, y: drawn.midY)
+        return drawn
     }
 
     /// `node`'s `contextmenu` and `contextPopover` at `point` in the source's
     /// window (the node's when omitted), with no button held.
-    func contextMenu(_ node: NodeView, at point: NSPoint, from source: NSView? = nil) -> Bool {
+    func contextMenu(_ node: NodeView, at point: NSPoint, from source: NSView? = nil, click: NSEvent? = nil) -> Bool {
         func converted(to window: NSWindow?) -> NSPoint {
             guard let from = source?.window ?? node.window, let window, from !== window else { return point }
             return window.convertPoint(fromScreen: from.convertPoint(toScreen: point))
         }
         let windowPoint = converted(to: node.window)
         let local = node.local(windowPoint), box = node.contentBox(), client = self.client(converted(to: viewport.window))
+        // A secondary click's menu is that button's; a Control-click's and a key's, the primary's.
         let sample = PointerSample(x: Double(local.x - box.minX), y: Double(local.y - box.minY),
                                    buttons: 0, pressure: 0, type: "mouse", id: 1,
-                                   clientX: Double(client.x), clientY: Double(client.y))
+                                   clientX: Double(client.x), clientY: Double(client.y), button: click?.type == .rightMouseDown ? 2 : 0)
         return node.dispatchContextMenu(at: node.convert(windowPoint, from: nil), sample: sample,
-                                        bubbled: source.map { $0 !== node } ?? false)
+                                        bubbled: source.map { $0 !== node } ?? false, click: click)
     }
 }
 
 extension NodeView {
+    package override func mouseDown(with event: NSEvent) {
+        HeldState.input(at: self) // a press on a held node lets its hold go (HeldState.swift; the window's monitor, ExactViewMac)
+        let chain = holdPresenter?.mouseChain
+        chain?.receivedDown(self, event: event)
+        if let contact = chain?.bubbledPress {
+            if contact.cancelled { return }
+            if contact.reaches(self) { contact.down(on: self); return }
+        }
+        guard !inert else { return }
+        // A control-click focuses as it did before its menu, whatever its `pointerdown` says (its own way, LLP 1005).
+        if contextClick(event) { if pointerdownHeard, takesClickFocus, !focusInside(event) { takeClickFocus() }; return rightMouseDown(with: event) }
+        pointerPressed(event)
+        // A prevented `pointerdown` keeps the focus where it is and starts no selection; the press still goes on.
+        let keepsFocus = presenter?.mouseChain.prevented === event
+        let endKeeping = keepingFocus(for: event)
+        defer { endKeeping() }
+        // One AppKit did not focus before its `mouseDown` (a `pointerdown` handler hears it:
+        // `needsPanelToBecomeKey`) takes the click focus now, after that handler, unless it prevented it.
+        if pointerdownHeard, takesClickFocus, !keepsFocus, !focusInside(event) { takeClickFocus() }
+        if isSurfaceControl { _ = control("down", point: local(event.locationInWindow), timestamp: event.timestamp); return }
+        if canvasInput?.pointer(event, phase: "down") == true { return }
+        presenter?.leaves.pressed(self) // a held leaf's box was clicked: made now (LLP 1068 §5.1)
+        presenter?.collections.pointerDown(id, event: event)
+        presenter?.mouseChain.down(self, event: event)
+        guard !disabled else { pressed = false; return }
+        presenter?.interacting = id
+        if let target = presenter?.svg.target(id, at: local(event.locationInWindow)) { svgPressed = target; return }
+        if isParagraph, let run = inlineTarget(at: local(event.locationInWindow), handler: "press") {
+            inlinePressed = run.id
+            if !keepsFocus { window?.makeFirstResponder(self); presenter?.selection.begin(self, event: event) }
+            return
+        }
+        if selectsText { if !keepsFocus { presenter?.selection.press(self, event: event) }; return }
+        // A descendant that took focus keeps it (LLP 1088 D7.3). Forward
+        // through the responder chain: NSView's default retries covered siblings.
+        let inner = focusInside(event)
+        if takesClickFocus, !inner, !keepsFocus { window?.makeFirstResponder(self) }
+        if pressable { pressed = true } else { (chain?.responder(from: self, event: event) ?? (chain == nil ? nextResponder : nil))?.mouseDown(with: event) }
+    }
+    /// A descendant that took focus keeps it (LLP 1088 D7.3): the click is in it.
+    func focusInside(_ event: NSEvent) -> Bool {
+        (window?.firstResponder as? NodeView).map { $0 !== self && ($0.tabbable || $0.explicitTabIndex != nil) && (window?.contentView?.hitTest(event.locationInWindow)?.isDescendant(of: $0) ?? false) } ?? false
+    }
+    /// The click focus, as AppKit gives it before a `mouseDown`: first
+    /// responder, its window made key (a popover's, a panel that becomes key
+    /// only if needed).
+    func takeClickFocus() {
+        window?.makeFirstResponder(self)
+        if let window, !window.isKeyWindow, window.canBecomeKey { window.makeKey() }
+    }
+    /// A paragraph's drag selects its text unless a press takes it: its
+    /// own handler (a `<span onClick>`, spreadsheet F12) or an ancestor's.
+    var selectsText: Bool { isParagraph && !pressable && !hasPressableAncestor }
+    var hasPressableAncestor: Bool { hasPressableAncestor(crossingPresentations: true) }
+    func hasPressableAncestor(crossingPresentations: Bool) -> Bool {
+        var at: NSView = self, crossed = false
+        while let parent = (crossingPresentations ? presenter?.presentationParent(of: at) : nil) ?? at.superview {
+            crossed = crossed || parent !== at.superview
+            if let node = parent as? NodeView,
+               node.pressable || !crossed && (node.isSurfaceControl || node.isButton) { return true }
+            at = parent
+        }
+        return false
+    }
+    package override func mouseDragged(with event: NSEvent) {
+        if contextClicked { return rightMouseDragged(with: event) }
+        pointerDragged(event)
+        let chain = holdPresenter?.mouseChain
+        if let contact = chain?.bubbledPress {
+            contact.validate()
+            if contact.cancelled { _ = chain?.drag(event); return }
+            if contact.reaches(self) { contact.drag(on: self, event: event); return }
+        }
+        guard !inert else { return }
+        if isSurfaceControl || ownsSurfaceControl { _ = control("move", point: local(event.locationInWindow), timestamp: event.timestamp); return }
+        if canvasInput?.pointer(event, phase: "move") == true { return }
+        inlinePressed = nil
+        // A gesture that engages ends the press (the chain clears `pressed`).
+        if presenter?.mouseChain.drag(event) == true { return }
+        pressFollows(inside: pressInside(event.locationInWindow))
+        if selectsText, presenter?.mouseChain.preventedContact != true { presenter?.selection.drag(event) } // a prevented contact selects nothing
+        else { (chain?.responder(from: self, event: event) ?? (chain == nil ? nextResponder : nil))?.mouseDragged(with: event) }
+    }
+    package override func rightMouseUp(with event: NSEvent) {
+        pointerReleased(event)
+        if canvasInput?.pointer(event, phase: "up") != true { super.rightMouseUp(with: event) }
+    }
+    package override func mouseUp(with event: NSEvent) {
+        let chain = holdPresenter?.mouseChain, contact = chain?.bubbledPress
+        defer { chain?.completed(contact, at: self) }
+        if contextClicked { contextClicked = false; return rightMouseUp(with: event) }
+        pointerReleased(event)
+        contact?.validate()
+        if contact?.cancelled == true {
+            let taken = chain?.up(event) == true
+            chain?.presenter?.interacting = 0
+            if !taken, !inert { dispatchDblclick(dblclickTarget(event)) }
+            return
+        }
+        if let contact, contact.reaches(self) { contact.up(on: self, event: event); return }
+        guard !inert else { return }
+        if isSurfaceControl || ownsSurfaceControl { _ = control("up", point: local(event.locationInWindow), timestamp: event.timestamp); finishPointerPress(); return }
+        if canvasInput?.pointer(event, phase: "up") == true { return }
+        defer { holdPresenter?.interacting = 0 }
+        if presenter?.mouseChain.up(event) == true { return }
+        presenter?.collections.releaseInteractionLater()
+        let double = dblclickTarget(event)
+        defer { dispatchDblclick(double) }
+        if let target = svgPressed {
+            svgPressed = nil
+            // The element has no view of its own: the `svg`'s view stands for it.
+            if !inert, presenter?.svg.target(id, at: local(event.locationInWindow)) == target {
+                presenter?.menus.activating(from: self, pressing: nil) {
+                    presenter?.pressHeld = KeyCodes.held(event.modifierFlags); presenter?.pressClick = event
+                    presenter?.onPress?(target); presenter?.pressHeld = ""; presenter?.pressClick = nil
+                }
+            }
+            return
+        }
+        if let run = inlinePressed {
+            inlinePressed = nil
+            if inlineTarget(at: local(event.locationInWindow), handler: "press")?.id == run {
+                presenter?.pressClick = event
+                _ = activateInline(run)
+                presenter?.pressClick = nil
+            }
+            return
+        }
+        if selectsText { presenter?.selection.end(self, event: event); return }
+        guard !disabled else { pressed = false; return }
+        guard pressed else { (chain?.responder(from: self, event: event) ?? (chain == nil ? nextResponder : nil))?.mouseUp(with: event); return }
+        pressed = false
+        if pressInside(event.locationInWindow) {
+            let canvas = inputCanvas, ownerWindow = window
+            presenter?.menus.activating(from: presenter?.mouseChain.pressSource ?? self, pressing: self) {
+                presenter?.press(id, held: KeyCodes.held(event.modifierFlags), click: event)
+            }
+            finishPress(canvas: canvas, window: ownerWindow, pointer: true)
+        }
+    }
+
     /// Whether its own `contextmenu` or `contextPopover` answers a context request.
     var answersContextMenu: Bool { handlers.contains("contextmenu") || props["contextPopover"]?.isEmpty == false }
 
     /// The context action runs before the menu is read, for pointer and
     /// keyboard alike. A context action cannot leak its preventDefault to
     /// another input; keydown cancellation was handled before this default.
-    func dispatchContextMenu(at point: NSPoint, sample: PointerSample, bubbled: Bool = false) -> Bool {
+    func dispatchContextMenu(at point: NSPoint, sample: PointerSample, bubbled: Bool = false, click: NSEvent? = nil) -> Bool {
         guard let presenter, presenter.views[id] === self, !formDisabled, !(bubbled ? authoredInert : inert) else { return false }
         let action = handlers.contains("contextmenu"), menu = props["contextPopover"]?.isEmpty == false
         let outer = presenter.defaultPrevented
@@ -126,7 +359,7 @@ extension NodeView {
         defer { presenter.defaultPrevented = outer }
         if action { presenter.mouseEvent(id, 10, sample.line) }
         // In the browser this ancestor's popover opens behind the modal, inert.
-        if menu, !inert { presenter.menus.context(self, at: point) }
+        if menu, !inert { presenter.menus.context(self, at: point, click: click) }
         return action || menu
     }
 
@@ -138,7 +371,7 @@ extension NodeView {
         while let view = next {
             if let node = view as? NodeView,
                node.dispatchContextMenu(at: node.convert(Self.point(event, in: node.window), from: nil),
-                                        sample: node.pointerSample(event), bubbled: true) { return true }
+                                        sample: node.pointerSample(event), bubbled: true, click: event) { return true }
             next = presenter.eventParent(of: view)
         }
         return false
@@ -196,7 +429,7 @@ extension NodeView {
         guard let run = inlineContextTarget(at: point), let line = inlineRects(run).first else { return false }
         var sample = pointerSample(event)
         sample.x = Double(point.x - line.minX); sample.y = Double(point.y - line.minY)
-        return dispatchInlineContextMenu(run, at: convert(event.locationInWindow, from: nil), sample: sample)
+        return dispatchInlineContextMenu(run, at: convert(event.locationInWindow, from: nil), sample: sample, click: event)
     }
 
     /// A request from the keyboard at run `id` (VoiceOver's show menu, X84;
@@ -209,7 +442,8 @@ extension NodeView {
         guard let presenter, !presenter.inlineInert(id), let run = presenter.inlineText(id),
               let line = inlineRects(run).first, let point = presenter.contextPoint(self, rect: line) else { return false }
         guard let target = inlineContextTarget(from: run), let first = inlineRects(target).first else {
-            return presenter.contextTarget(self).map { presenter.contextMenu($0, at: point, from: self) } ?? false
+            if let node = presenter.contextTarget(self) { return presenter.contextMenu(node, at: point, from: self) }
+            return window.map { presenter.unansweredContextMenu(at: point, from: self, in: $0) } ?? false
         }
         let local = self.local(point), client = presenter.client(point)
         let sample = PointerSample(x: Double(local.x - first.minX), y: Double(local.y - first.minY),
@@ -219,23 +453,27 @@ extension NodeView {
     }
 
     /// Whether a request from the keyboard at run `id` reaches a run or
-    /// node from it up whose `contextmenu` or `contextPopover` runs.
+    /// node from it up whose `contextmenu` or `contextPopover` runs, or,
+    /// where none answers, a menu at the run's middle (`offersKeyboardMenu`).
     func inlineOffersContextMenu(_ id: UInt32) -> Bool {
         guard let presenter, presenter.views[self.id] === self, !formDisabled, !inert,
               !presenter.inlineInert(id), let run = presenter.inlineText(id) else { return false }
         if inlineContextTarget(from: run) != nil { return true }
-        return presenter.contextTarget(self).map { !$0.formDisabled && !$0.authoredInert } ?? false
+        if let node = presenter.contextTarget(self) { return !node.formDisabled && !node.authoredInert }
+        guard presenter.contextUnanswered(self), let line = inlineRects(run).first,
+              let point = presenter.contextPoint(self, rect: line), let window else { return false }
+        return presenter.offersKeyboardMenu(at: point, in: window)
     }
 
     /// `run`'s `contextmenu`, then its `contextPopover`'s menu at `point`
     /// (this view's space), as `dispatchContextMenu` sends a node's.
-    private func dispatchInlineContextMenu(_ run: InlineText, at point: NSPoint, sample: PointerSample) -> Bool {
+    private func dispatchInlineContextMenu(_ run: InlineText, at point: NSPoint, sample: PointerSample, click: NSEvent? = nil) -> Bool {
         guard let presenter, presenter.views[id] === self, inlineAnswersContextMenu(run.id) else { return false }
         let outer = presenter.defaultPrevented
         presenter.defaultPrevented = false
         defer { presenter.defaultPrevented = outer }
         if run.handlers.contains("contextmenu") { presenter.mouseEvent(run.id, 10, sample.line) }
-        if run.props["contextPopover"]?.isEmpty == false { presenter.menus.context(self, at: point, run: run.id) }
+        if run.props["contextPopover"]?.isEmpty == false { presenter.menus.context(self, at: point, run: run.id, click: click) }
         return true
     }
 
@@ -248,6 +486,8 @@ extension NodeView {
     }
     package override func otherMouseDown(with event: NSEvent) {
         pointerPressed(event)
+        let endKeeping = keepingFocus(for: event)
+        defer { endKeeping() }
         if canvasInput?.pointer(event, phase: "down") != true { super.otherMouseDown(with: event) }
     }
     package override func otherMouseDragged(with event: NSEvent) {
@@ -308,34 +548,21 @@ extension NodeView {
         return "\(Double(point.x - box.minX)),\(Double(point.y - box.minY)),\(dx),\(dy),0,\(KeyCodes.held(held))"
     }
 
-    /// A node that hears `drop` takes files dragged over it; one that no
-    /// longer does gives them back to whatever is under it.
+    /// A node that hears `drop`, `dragenter` or `dragleave` is a destination
+    /// for files dragged over it (FileDragMac.swift); one that no longer does
+    /// gives them back to whatever is under it.
     func syncDropTypes() {
-        if handlers.contains("drop") { registerForDraggedTypes([.fileURL]) } else { unregisterDraggedTypes() }
+        if !handlers.isDisjoint(with: FileDrag.events) { registerForDraggedTypes([.fileURL]) } else { unregisterDraggedTypes() }
     }
 
-    /// The dragged files this node would take: file URLs of a type the
-    /// manifest declares.
-    private func droppable(_ info: NSDraggingInfo) -> [URL] {
-        guard handlers.contains("drop"), !disabled, !inert else { return [] }
-        let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
-        return urls.filter(ExactDocuments.accepts)
-    }
-
-    package override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        droppable(sender).isEmpty ? [] : .copy
-    }
-
-    package override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        droppable(sender).isEmpty ? [] : .copy
-    }
-
-    package override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        drop(droppable(sender), at: sender.draggingLocation)
-    }
+    package override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { FileDrag.moved(self, sender) ?? [] }
+    package override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { FileDrag.moved(self, sender) ?? [] }
+    package override func draggingExited(_ sender: NSDraggingInfo?) { FileDrag.exited(self, sender) }
+    package override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { FileDrag.perform(self, sender) ?? false }
+    package override func draggingEnded(_ sender: NSDraggingInfo) { FileDrag.ended() }
 
     /// The innermost node from `view` up that hears `drop`: what a drag
-    /// over it lands on (the agent's `tap … drop`).
+    /// over it lands on, a field inside it included (the agent's `tap … drop`).
     static func dropTarget(_ view: NSView) -> NodeView? {
         var next: NSView? = view
         while let view = next {
@@ -345,19 +572,33 @@ extension NodeView {
         return nil
     }
 
-    /// Files dropped at a window point: each of a declared type minted for
-    /// this session and delivered with the `DragEvent`'s line.
+    /// Files and folders dropped at a window point, of any type: each minted
+    /// for this session and delivered with the `DragEvent`'s line.
     func drop(_ urls: [URL], at windowPoint: NSPoint) -> Bool {
         guard let presenter, let session = presenter.session else { return false }
-        let docs = urls.filter(ExactDocuments.accepts).compactMap { session.mintDocument($0) }
+        let docs = Self.droppedDocuments(urls, accepts: { ExactDocuments.accepts($0) },
+                                         keep: { session.keepDocument($0, noting: true) }, mint: session.mintDocument)
         guard !docs.isEmpty else {
-            session.log("drop: refused: no file of a type this app declares")
+            session.log("drop: refused: no file could be opened")
             return false
         }
-        let point = local(windowPoint), box = contentBox()
-        let held = KeyCodes.held(NSEvent.modifierFlags)
-        presenter.mouseEvent(id, 38, "\(Double(point.x - box.minX)),\(Double(point.y - box.minY)),\(held)\n" + docs.joined(separator: "\n"))
+        presenter.mouseEvent(id, 38, dragLine(windowPoint) + "\n" + docs.joined(separator: "\n"))
         return true
+    }
+
+    /// The handles of dropped `urls`. A file of a type the manifest declares
+    /// is a document the person chose (LLP 1069.010.000 D3): kept, it arrives
+    /// as the path it is kept by, and joins Open Recent. Any other file, and a
+    /// folder (a directory handle, its path undisclosed; `fs.stat` tells the
+    /// two apart), is content: minted for this session alone, as a paste's is.
+    static func droppedDocuments(_ urls: [URL], accepts: (URL) -> Bool, keep: (URL) -> String?, mint: (URL) -> String?) -> [String] {
+        urls.filter(\.isFileURL).compactMap { url in (accepts(url) ? keep(url) : nil) ?? mint(url) }
+    }
+
+    /// A `DragEvent`'s point line: from the content box, and the modifiers held.
+    func dragLine(_ windowPoint: NSPoint) -> String {
+        let point = local(windowPoint), box = contentBox()
+        return "\(Double(point.x - box.minX)),\(Double(point.y - box.minY)),\(KeyCodes.held(NSEvent.modifierFlags))"
     }
 }
 

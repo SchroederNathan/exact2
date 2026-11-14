@@ -241,6 +241,7 @@ dependencies = [
  "exact-motion",
  "exact-num",
  "exact-plan",
+ "exact-route",
  "exact-tamber",
  "icu_locale",
  "serde_json",
@@ -478,6 +479,7 @@ dependencies = [
  "exact-kernel",
  "exact-plan",
  "exact-runner",
+ "exact-svg-file",
  "exact-update",
  "serde_json",
  "sha2",
@@ -497,6 +499,7 @@ name = "exact-color"
 version = "0.1.0"
 dependencies = [
  "exact-num",
+ "libm",
 ]
 
 [[package]]
@@ -514,6 +517,7 @@ dependencies = [
 name = "exact-game"
 version = "0.1.0"
 dependencies = [
+ "exact-color",
  "exact-game-derive",
  "exact-motion",
  "exact-plan",
@@ -588,6 +592,7 @@ dependencies = [
  "exact-gpu-reflect",
  "flate2",
  "glam 0.33.7",
+ "naga",
  "serde_json",
  "sha2",
  "wasm-bindgen",
@@ -624,6 +629,15 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "url",
+]
+
+[[package]]
+name = "exact-js-value"
+version = "0.1.0"
+dependencies = [
+ "exact-num",
+ "exact-plan",
+ "serde_json",
 ]
 
 [[package]]
@@ -681,6 +695,7 @@ version = "0.1.0"
 dependencies = [
  "exact-canvas",
  "exact-grants",
+ "exact-js-value",
  "exact-kernel",
  "exact-motion",
  "exact-num",
@@ -688,6 +703,15 @@ dependencies = [
  "exact-route",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "exact-svg-file"
+version = "0.1.0"
+dependencies = [
+ "exact-kernel",
+ "exact-motion",
+ "exact-num",
 ]
 
 [[package]]
@@ -699,7 +723,9 @@ name = "exact-tamber"
 version = "0.1.0"
 dependencies = [
  "exact-color",
+ "exact-motion",
  "exact-num",
+ "serde",
  "serde_json",
 ]
 
@@ -2628,6 +2654,10 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "accesskit_windows"
+version = "0.35.2"
 
 [[patch.unused]]
 name = "fontique"

@@ -18,6 +18,7 @@ fn a_web_boot_uses_neutral_roles_and_marks_without_a_look_fact() {
     exact_web::link(exact_web_capabilities::ALL);
     let plan = contract::compile(
         r##"component App
+  state inset = 0
   view
     column border-color="-exact-separator"
       input type="checkbox" testId="check"
@@ -34,6 +35,12 @@ fn a_web_boot_uses_neutral_roles_and_marks_without_a_look_fact() {
       button width=84 height=24 testId="sized"
         text "Go"
       button height=28 testId="short"
+        text "Go"
+      button padding-top=0 padding-bottom=0 testId="padded"
+        text "Go"
+      button padding=8 testId="inset"
+        text "Go"
+      button padding=inset testId="bound"
         text "Go"
       list appearance="auto" testId="list"
         section
@@ -53,6 +60,10 @@ fn a_web_boot_uses_neutral_roles_and_marks_without_a_look_fact() {
         text "Off"
       button disabled=true testId="off"
         text "Off"
+      select value="a" aria-label="Kind" height=40 testId="sized-select"
+        option "A" value="a"
+      select value="a" aria-label="Kind" testId="bare-select"
+        option "A" value="a"
 "##,
     )
     .unwrap()
@@ -99,6 +110,13 @@ fn a_web_boot_uses_neutral_roles_and_marks_without_a_look_fact() {
         assert!(!op.contains("data-exact-control"), "{other}, {why}: {op}");
     }
     assert!(created(&neutral, "switch").contains("\"data-exact-switch\":\"\""));
+    // What its author wrote `appearance: none` on says so (a Back control
+    // so written in a route's header is the route's Back, navigation.js).
+    assert!(
+        created(&neutral, "own").contains("\"data-exact-said\":\"appearance\""),
+        "{}",
+        created(&neutral, "own")
+    );
     // The rows the author wrote where the sheet would draw over them.
     assert!(!created(&neutral, "spinner").contains("data-exact-said"));
     assert!(
@@ -110,8 +128,8 @@ fn a_web_boot_uses_neutral_roles_and_marks_without_a_look_fact() {
         !created(&neutral, "bar").contains("data-exact-said"),
         "a determinate bar's colour is no ring's"
     );
-    // A platform button's written size, which the look's floor yields to; an
-    // unsized button keeps the floor.
+    // A platform button's written size or padding, which the look's floor
+    // yields to on that axis; an unsized button keeps the floor.
     assert!(!created(&neutral, "unsized").contains("data-exact-said"));
     assert!(
         created(&neutral, "sized").contains("\"data-exact-said\":\"width height\""),
@@ -123,6 +141,22 @@ fn a_web_boot_uses_neutral_roles_and_marks_without_a_look_fact() {
         "{}",
         created(&neutral, "short")
     );
+    assert!(
+        created(&neutral, "padded").contains("\"data-exact-said\":\"padding-block\""),
+        "{}",
+        created(&neutral, "padded")
+    );
+    assert!(
+        created(&neutral, "inset").contains("\"data-exact-said\":\"padding-inline padding-block\""),
+        "{}",
+        created(&neutral, "inset")
+    );
+    assert!(
+        created(&neutral, "bound").contains("\"data-exact-said\":\"padding-inline padding-block\"")
+    );
+    // A select whose author wrote its height, which the sheet fills at the normal leading.
+    assert!(created(&neutral, "sized-select").contains("\"data-exact-said\":\"height\""));
+    assert!(!created(&neutral, "bare-select").contains("data-exact-said"));
     // LLP 1115.000 D16: a list whose rows are cells carries Contract's mark
     // on every boot, a list whose author opted out does not, and a row is
     // told which of its edges its author wrote (`none` is written too), so

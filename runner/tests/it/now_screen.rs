@@ -973,15 +973,16 @@ fn a_region_at_the_plan_root_is_refused() {
     plan.regions[0].parent = None;
     // Remove the root node so the site count stays one.
     let root_children: Vec<usize> = (0..plan.nodes.len())
-        .filter(|i| plan.nodes[*i].parent == Some(exact_plan::NodesId(0)))
+        .filter(|i| plan.nodes.get(*i).unwrap().parent == Some(exact_plan::NodesId(0)))
         .collect();
     for i in root_children {
-        plan.nodes[i].parent = None;
+        plan.nodes.to_mut()[i].parent = None;
     }
-    plan.nodes.remove(0);
+    plan.nodes.to_mut().remove(0);
     // Every surviving parent index moves down with the removal.
     for parent in plan
         .nodes
+        .to_mut()
         .iter_mut()
         .map(|n| &mut n.parent)
         .chain(plan.regions.iter_mut().map(|r| &mut r.parent))
@@ -1043,10 +1044,8 @@ fn the_journal_is_a_ring_and_logs_reports_where_its_window_starts() {
 }
 
 #[test]
-fn an_advance_stops_at_a_refusing_timer_with_the_refusal_and_the_clock() {
-    // A poisoned runner refuses every action: the first timer of a seek
-    // refuses, the advance stops at that timer's due time with no commits,
-    // and the refusal rides along — the kernel is exactly as it was.
+fn a_poisoned_runner_stops_without_attempting_another_timer() {
+    // Stop at poison without spending another firing or moving its clock
     let mut r = bad_data::fragile();
     // One timer fires cleanly first: its commit is kept and timed.
     let ok = r.advance_timed(1_500.0);
@@ -1056,16 +1055,15 @@ fn an_advance_stops_at_a_refusing_timer_with_the_refusal_and_the_clock() {
     assert!(ok.error.is_none());
     let _ = r.act("poke", vec![]);
     assert!(r.is_poisoned());
+    let scheduled = r.tasks();
     let a = r.advance_timed(5_000.0);
     assert!(a.receipts.is_empty());
-    assert_eq!(
-        a.now_ms, 2_000.0,
-        "the clock stays at the refusing timer's due time"
-    );
+    assert_eq!(a.now_ms, 1_500.0, "poison ends timer processing");
     assert!(matches!(a.error, Some(RunnerError::Poisoned)));
-    assert_eq!(r.now_ms(), 2_000.0);
+    assert_eq!(r.now_ms(), 1_500.0);
+    assert_eq!(r.tasks(), scheduled);
     let logs = exact_runner::agent::logs(&r, 0);
-    assert!(logs.contains("timer 0 (tick) refused: Poisoned"), "{logs}");
+    assert!(!logs.contains("timer 0 (tick) refused: Poisoned"), "{logs}");
 }
 
 #[test]

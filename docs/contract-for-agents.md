@@ -24,6 +24,8 @@ This guide is documentation, not an additional policy layer. Documents in
 - [Composition and lifetime](#composition-and-lifetime)
 - [Data requests and side effects](#data-requests-and-side-effects)
 - [Views, layout, and interaction](#views-layout-and-interaction)
+  - [Tabular numbers](#tabular-numbers)
+  - [Sound, MIDI and media](#sound-midi-and-media)
 - [Routes and web documents](#routes-and-web-documents)
 - [Tabs and stacks](#tabs-and-stacks)
 - [Time, motion, graphics, and platform facts](#time-motion-graphics-and-platform-facts)
@@ -47,14 +49,21 @@ This guide is documentation, not an additional policy layer. Documents in
 | Work | Normal home |
 | --- | --- |
 | View structure, UI state, event binding | `.contract` |
-| Derived labels, record copies, bounded list transforms | Contract expressions / `fn` |
-| Network, authentication, storage, sorting, domain algorithms | App TypeScript/Rust data module |
+| Derived labels, record copies, bounded list transforms, a presentation order by one key (`sortBy`) | Contract expressions / `fn` |
+| Network, authentication, storage, a stored or locale order, domain algorithms | App TypeScript/Rust data module |
 | Device facts | Reserved source with an admitted shape |
 | A system control (button, list, switch, picker, menu, tabs, bars) | Contract's native form ([below](#views-layout-and-interaction)); an app native module only where none exists |
 | What only the platform's own object can do (a gesture recognizer, a bar's look, drawing into a view) | An access hatch: `hatch="word"` on the node, native code handed its view ([reference](reference.md#access-hatches)); `bun exact.mjs hatch <word>` writes the stubs |
 | Canvas 2D drawing | Data module's canvas surface |
 | GPU scene or game | Optional GPU/game artifact |
 | App identity, grants/deploy selection, module placement | App manifest and data-module declarations |
+
+Windows apps default to ink, or CPU when the manifest declares `game`;
+`host.windows.painter: "ink"` or `"cpu"` selects either, and `EXACT_PAINTER`
+overrides both. Headless drives explicitly use CPU unless
+overridden, so inspect the desktop capture too. See the
+[Windows painter choices](reference.md#windows-painter) for device selection
+and the other platforms' defaults.
 
 For the implementation, the relevant authorities are:
 
@@ -83,7 +92,13 @@ In an app made by `exact new`, run its own `exact.mjs` from the app's directory.
 `bun exact.mjs update` regenerates that file, so the app's own verbs go in
 `app.json`'s `commands` (`"seed": ["bun", "seed.mjs"]` is `bun exact.mjs seed
 web`, run in the app's directory), which it reads and update leaves alone.
-Its `contract` verb is exact2's compiler, with paths relative to where you run it:
+A command that prepares files a build reads but the app's repository does not
+hold, such as a script that fetches photos into a folder Git ignores, goes in
+`app.json`'s `before_build` (`["bun", "scripts/fetch.mjs"]`, where `bun` is
+the Bun that runs `exact.mjs`, so it runs on every host): each verb that
+builds, runs, compiles or checks the app runs it first in the app's
+directory, and stops if it fails. Make it finish at once when the files are there.
+`exact.mjs`'s `contract` verb is exact2's compiler, with paths relative to where you run it:
 
 ```sh
 bun exact.mjs contract types app.contract -o app.contract.d.ts   # what app.ts imports
@@ -99,31 +114,45 @@ Inside the exact2 checkout, for its own apps, the same commands are
 `bun host/web/dev.mjs --app <name>`. Run `bun install --frozen-lockfile` there once.
 
 Use `build --json` before and after the edit. It returns one JSON array with all
-independent diagnostics it can collect, capped at 20; success is `[]`. Keep the
+independent diagnostics it can collect, capped at 20; success is `[]`. It is the
+whole output: stderr stays empty (but for a note while the compiler first
+builds), and `bun exact.mjs contract build`
+appends `app.ts`'s type errors (`typescript-TS2322`, …) to the same array. Keep the
 exit status: 0 success, 1 compilation/I/O failure, 2 invalid invocation. Read all
 diagnostics, including related locations, before making the next repair. Each has
 a `severity`: `"error"` refuses the build; `"warning"` (after the errors, also on a
 success) builds and runs but is not what you meant, such as a header node the iOS
 bar hides (`lower-header-unplaced`), a route's `header` a box below the route,
-which iOS leaves in the page (`lower-header-nested`), a content heading that says the bar's title
+which iOS leaves in the page (`lower-header-nested`), a heading header at the head of
+an app with no navigation route (`lower-header-routeless`: a lone `navigationKey`
+is only a root; add a navigation root holding
+a separately keyed screen whose first child is the header, or give the header
+`appearance="none"` to keep it drawn as written on iOS), a content heading that says the bar's title
 again (`lower-title-twice`), a tab bar of one tab (`lower-single-tab`), a
 `button` with no words and no `aria-label` (`lower-button-unlabelled`), a dialog's
 role on a box (`lower-dialog-role`), an `aria-level` with no `role="heading"`
 (`lower-level-without-heading`), a content-box `width="100%"` with padding, wider than
-its parent by the padding (`lower-width-padding`), an absolute width containing text that
-grows at accessibility sizes (`lower-text-px-width`; use `rem` for the width), a bare
+its parent by the padding (`lower-width-padding`), a box whose fixed width ceiling cannot grow
+with its text at accessibility sizes (`lower-text-px-width`; use `rem` for the width and its bounds), a bare
 `line-height=28`, which is 28 times the font size, not 28 points (`lower-line-height-multiplier`),
-screens swapped by an `if` in an app with no `routes` (`lower-screen-by-state`), a count before a plural noun, `${n} cards`
+screens swapped by an `if` over a state, at the top of the view or inside a route (`lower-screen-by-state`), a
+`replace` to another route, pressed on the screen a launch at `/` opens before
+anything else changes the router, which the router refuses (`lower-replace-root`), a count before a plural noun, `${n} cards`
 (`lower-count-plural`), a row of the app's records that searches another table of them,
 `users.filter(u => u.id == p.userId)` in `for p in posts` (`lower-row-lookup`), a
+row that walks its own list, `tokens.slice(0, i)` in `for t, i in tokens`
+(`lower-row-own-list`), a
 symbol by an alias, not its role (`lower-symbol-alias`), a
 `performanceNow()` time sent to a source (`type-performance-now-persisted`), the
-launch's `time.epochAtZero` or `time.seed` as a resource's identifying argument, which
-keeps its kept answer from ever showing at launch: pass it after `with`
+launch's `time.epochAtZero` or `time.seed` as a resource's identifying argument, or a
+value equal to one at launch (`time.epochAtZero + tick * 60000` while `tick` starts at
+0), which keeps its kept answer from ever showing at launch: pass it after `with`
 (`lower-resource-launch-identity`), a
 state read after its own action assigned it (`analyze-read-after-assign`), a
 literal colour that stays the same in dark mode (`lower-colour-one-scheme`, every
-site past the cap), and a name or key a host would refuse or ignore at run time: a
+site past the cap), a `list` holding a `section` with no `appearance`, which is neither
+a grouped list nor a list of cells (`lower-list-section`), and a
+name or key a host would refuse or ignore at run time: a
 swipe row's `swipeTrailing` naming a button outside its `scroll` (`lower-swipe-wiring`),
 a navigation root's `navigationKey` that never meets its routes' (`lower-navigation-key`),
 a `navigationSplit` off the root route (`lower-navigation-split`), an `image` source
@@ -140,7 +169,7 @@ by exact name with `symbols file.contract --name name`.
 After compiling, build and drive the actual app. From an `exact new` app:
 
 ```sh
-bun exact.mjs test web                          # app.test.contract; builds a stale web app first
+bun exact.mjs test web                          # the app's *.test.contract; builds a stale web app first
 bun exact.mjs agent web tree "tap add" state logs "screenshot out.png"
 bun exact.mjs agent web --size 390x844 "screenshot phone.png"   # a phone-sized viewport
 ```
@@ -149,7 +178,8 @@ The web carrier opens at 420×900; `--size <w>x<h>` (before the operations) open
 another viewport, and a test's first step `size <w>x<h>` does the same for that test.
 `resize <w>x<h>`, an operation and a test step, resizes it mid-drive as a person
 dragging the window's edge would: the browser's viewport, a macOS window, the
-Linux presenter. iOS refuses a mid-drive `resize`; a size given at launch (`--size`, a
+Linux presenter (the driver's op also takes `resize <w> <h>`; a test step takes only
+`<w>x<h>`). iOS refuses a mid-drive `resize`; a size given at launch (`--size`, a
 test's `size` line) is laid out at that viewport with no safe-area insets, scaled to fit
 the app's frame (the safe area, unless the root covers the whole screen).
 `close`, an operation and a test step, presses the window's close button as ⌘W
@@ -158,12 +188,18 @@ nothing): the window asks its `beforeunload` first, and the reply says
 `closed: true`, or `closed: false` for a window a handler kept (the web's
 "Leave site?" is answered "Stay"). macOS and the web; iOS and Linux refuse it.
 `--storage <name>` gives a drive a named scratch store, kept between drives on
-macOS, iOS, Linux and web Chrome (a kept browser profile served on one port per
+macOS, iOS and Linux until one passes `--reset-storage`, and on web Chrome when the
+next drive passes `--keep-storage` (a browser profile served on one port per
 name; a Firefox or WebKit drive starts fresh each time, so a name there lasts
-for the drive, including its `reload`). Without it a drive has no
-app storage: an `app:/` file or SQLite request is refused (`storage is unavailable
-in agent mode unless the drive names a scratch store (--storage <name>)`), so an
-app that keeps its data there does nothing on a write; a chosen document (`doc:/`)
+for the drive, including its `reload`). A native drive that names none uses the
+store `default`, kept the same way, as the app keeps its files from launch to
+launch. A drive that compares with a reference (`screenshot … compare`) starts
+empty on every host unless it passes `--keep-storage`, so a plain drive after
+one can show what an earlier plain drive stored. A web drive without one has no
+app storage: an `app:/` file read finds an empty store (code `ENOENT`, as a
+fresh install's first launch does), and a write or SQLite request is refused (`storage
+is unavailable in agent mode unless the drive names a scratch store (--storage
+<name>)`), so an app that keeps its data there does nothing on a write; a chosen document (`doc:/`)
 still opens under its grant. That store, and an authored test's own store, includes
 a data module's `secret.keep`: files in the named scratch tree on Apple and Linux,
 and the page's `localStorage` on the web. Apple native modules use that store's
@@ -174,11 +210,20 @@ To show what survives a restart on any host, use an authored test's `reload` ste
 The driver prints each reply in a short text form. A `tap` or `type` is one line
 (`tapped #15 "add" · delivery platform · epoch 2 · clock 0 ms`); a failed one starts
 with `ERROR`. `state` prints one line a section (`slots {"count":1}`) and leaves out
-the empty ones (null, `[]`, `{}`). `--json` prints every field of every reply.
+the empty ones (null, `[]`, `{}`); one over 8 KB prints its size, its small sections,
+the others' sizes, and how to read one (`state resources`, `state feed.0`) or all of it
+(`state --full`). `state <name>` reads a state, derive, resource or section of the
+record, even where a view carries the same name. Every other reply is one line too
+(`clock 600 ms · settled · epoch 5`, `screenshot out.png · 420×900 · …`).
+`--json` prints every field of every reply, one JSON object a line.
 `--scale <n>` shrinks each screenshot to n pixels a point: an iPhone's are
 1206×2622 at its own 3, 402×874 with `--scale 1`, one pixel a point as on the
 web, at about a ninth of the pixels. An app's `bun exact.mjs agent ios|macos`
 takes `--scale 1` unless told otherwise; ask for more only to check fine pixels.
+On a simulator a `window` screenshot's pixels are the display's (`pixels="display"`):
+glass, blur and the keyboard as the device draws them. So are a plain one's where glass
+or a blur lies in the page; where the display cannot be read (the app not in front, an
+overlay) the reply says its materials are approximate, and why.
 
 Inside the exact2 checkout, for Caltrain:
 
@@ -293,8 +338,8 @@ what to write. Nothing runs because a value changed (no `useEffect` or watch).
 | A stored number is finite: a commit that would put `NaN` or `Infinity` in a state or derive is refused, and the write that caused it does not land | every host can carry it |
 | `toFixed` and the format functions print `""` for a non-finite number | one rule for every format |
 | Names hold hyphens, so subtraction takes spaces (`a - b`) | CSS's names |
-| A binding's list work is bounded (65,536 steps); a row's own binding has its own bound, so a row that searches another table costs rows × items (`lower-row-lookup`) | determinism on every host |
-| Sorting, grouping, joining and aggregates are the data module's; the view names an order it relies on where it reads it (`loadTasksByDueDate()`) | a view computes what it shows |
+| A binding's list work is bounded (65,536 steps); a row's own binding has its own bound, so a row that searches another table costs rows × items (`lower-row-lookup`), and one that walks its own `for`'s list grows with it until the binding is unset (`lower-row-own-list`) | determinism on every host |
+| No comparator sort: `sortBy(xs, x => key)` orders by one number or string key, stably (`"desc"` third; a second key is an earlier `sortBy`). Grouping, joining, aggregates and a stored or locale order are the data module's; the view names an order it relies on where it reads it (`loadTasksByDueDate()`) | a view computes what it shows, the same on every host |
 
 - Types are `number`, `string`, `bool`, declared shapes, `option<T>`, `T[]`,
   and `action` for behavior interfaces. Do not emit authored `any` or object types.
@@ -310,8 +355,8 @@ what to write. Nothing runs because a value changed (no `useEffect` or watch).
   (recipient chips). A list the
   screen keeps for the session — a selection, open or collapsed ids, per-row
   offsets — is `state` built this way; a list the app keeps across launches, or
-  a server owns, belongs to the data module, and so do sorting, grouping and
-  aggregates:
+  a server owns, belongs to the data module, and so do grouping, aggregates
+  and a stored order (a view orders what it holds with `sortBy`):
 
   ```contract
   state collapsed = []
@@ -333,8 +378,12 @@ what to write. Nothing runs because a value changed (no `useEffect` or watch).
   `join` prints or `concat`/`slice`/`split` keep, each item `includes` or
   `indexOf` scans), builds strings of at most 64 MiB of UTF-8, and values of at
   most 2²⁴ values and 64 MiB of string bytes. Every target refuses the same
-  step with the same reason: an action is refused with nothing changed, a view
-  binding stops the runner (LLP 1090).
+  step with the same reason: an action is refused with nothing changed; a prop
+  or style binding's row is unset, with one journal line naming its site and
+  the trap until it evaluates to a value again, and the app goes on; an `if`,
+  `match` or `for` subject, a key, a row's state initializer, a surface
+  argument or a virtualized list's own options stops the runner (LLP 1090,
+  LLP 1017.003 D3).
 - A state's initializer runs before any resource answers and before any derive:
   it reads props, injects and the states declared above it, nothing else
   (`type-initializer-scope`). Derive a value from a resource instead, or keep
@@ -385,6 +434,8 @@ component Cart
 - Dates: `formatDate(ms, offset, "iso")` is `YYYY-MM-DD`, and `calendarDiff(from, to,
   "years")` (or `"months"`) is the whole periods between two such dates as an
   `option<number>`, counted as an age is (a Feb 29 birthday has its year on Mar 1).
+  `formatDay(then, now, offset, "day")` names a day from `now` (`Today`, `Yesterday`, else
+  the date; `"day-time"` adds the time, `"list"` is a list row's, as Mail's).
 - There is no general list append: add an item to
   resource-backed data in its source and answer the updated list (a mutation that
   `refreshes` the list's resource, or its own answer).
@@ -407,9 +458,9 @@ component Cart
   the file also declares is refused (`syntax-method-shadowed`).
 - Named arguments belong to component uses, record constructors,
   `t("key", placeholder=value)`, `empty(field=value)`, canvas `surface=` bindings,
-  and the commands `share(…)`, `showNotification(…)`, `scrollIntoView(…)`, `playSound(…)` and
-  `stopSounds(…)`. Every other function takes
-  positional arguments.
+  the commands `share(…)`, `scrollIntoView(…)`, `playSound(…)` and
+  `stopSounds(…)`, and a native module's sources and sends
+  (`showNotification(…)`). Every other function takes positional arguments.
 
 For the full roster and special calls, see
 [standard functions and intrinsics](contract-grammar.md#standard-functions-and-intrinsics).
@@ -437,7 +488,11 @@ component App
 The first press yields `1/2`. Writing `doubled = count * 2` instead would use the
 old count and yield `1/0`. The same snapshot rule applies inside nested branches
 and to locals declared after a state assignment. The compiler warns of such a read
-(`analyze-read-after-assign`), naming the line that assigned the slot.
+(`analyze-read-after-assign`), naming the line that assigned the slot, and of a
+send and an assignment of one nonqueued mutation on one path
+(`analyze-send-assigned`): the assignment forgets the request in flight and keeps
+its value, whichever comes first, so a retry hides the old result while
+`pending(m)` instead, and a logout sends through a mutation of its own.
 
 A local is immutable, block-scoped, and visible only after its declaration. It
 cannot shadow an in-scope name. Two disjoint arms may declare the same local name.
@@ -452,7 +507,8 @@ infers effects from the body, through its calls; `writes` is a refusal, not an
 optional annotation. Use `symbols` when you need the inferred write set.
 
 An action calls an action of its own component, an `action` prop or an injected
-action by name, as a statement, anywhere a statement goes (LLP 1089). The call is
+action by name with its parentheses (`play()`, `arrive(path)`; a bare `play` is not a
+statement), anywhere a statement goes (LLP 1089). The call is
 the callee's statements run where it stands, in the same commit: one rollback,
 and the callee reads the state the action started with, as every statement does.
 A name that is a host command stays the command. Never give an action, an `action`
@@ -483,12 +539,13 @@ component App
 ```
 
 Because the callee sees the starting state, a slot its caller assigned first
-would be stale behind the call, and the compiler refuses that read
-(`analyze-call-stale-read`): `sel = next` then `follow()`, where `follow` reads
-`sel`. Pass the value it should see instead: `follow(next)` for the new one, or
-a `let` bound before the assignment for the old one. Two calls that each read and
-write one slot (`move(1, 0)` then `move(0, 1)`) are refused the same way: both
-read the starting cell, and the last write wins. Calls in exclusive branches
+is stale behind the call, and the compiler warns of that read as it does in the
+action's own body (`analyze-read-after-assign`, naming both frames): `sel = next`
+then `follow()`, where `follow` reads `sel`. Pass the value it should see instead:
+`follow(next)` for the new one, or a `let` bound before the assignment for the
+old one. Two calls that each read and write one slot (`move(1, 0)` then
+`move(0, 1)`) are named the same way: both read the starting cell, and the last
+write wins. Calls in exclusive branches
 (`if k == "ArrowUp" …` then `if k == "ArrowDown" …`) are separate paths.
 
 A derive is not mutable storage, an async effect, or a timer. Derive cycles are
@@ -525,11 +582,17 @@ component App
   `type-persist-child`; a derive, `syntax-persist-derive`.
 - Each authored test starts from an empty store, and its `reload` reads back what
   it kept. A drive with `--storage <name>` keeps persisted state in that store
-  between drives; a drive without one starts from the declared values and keeps
+  between drives (on the web, the next one passes `--keep-storage`; on a native host
+  `--reset-storage` empties it); a drive without one starts from the declared values and keeps
   nothing past the drive. The recipe:
   [a remembered setting](recipes/persisted-setting.md).
 
 ### Editing a value: the field's contract
+
+An `input` handler should update raw draft state on every edit so live search,
+validation and button enablement follow typing. A text field fires `change` on
+Enter or blur; its handler should normalize the draft. Use `submit` for explicit
+submission.
 
 A text field is re-set only when what its `value` binding reads changes, never
 after each keystroke (React writes the bound value back; Exact does not, so a
@@ -542,6 +605,10 @@ half-typed `-` or `1.` survives). That makes the contract:
 - **on commit** (`change`, which a text field fires on Enter and on blur), the
   action writes the accepted value and writes the normalized text back into the
   draft, which changes the binding and redraws the field.
+  Since `change` also fires when an edited field loses focus, it is no
+  "submit on Return": a form submitting on it submits on a tap away from the
+  field (an eye, a "Forgot password?"). Submit on Return with `submit`, which
+  runs on Return alone, after the commit (and never for an IME's Return).
 
 A field bound straight to the accepted value breaks this: an action that
 normalizes `-2` to the `0` it already held leaves the binding unchanged, so the
@@ -583,6 +650,19 @@ Supply every declared prop exactly once; props have no defaults (pass `none` for
 an option). An `action` prop can receive a reference with
 captured arguments; the eventual event payload is appended at invocation.
 
+A prop or inject named like an app `fn` is refused when an expression in the
+component calls that name and inlining could substitute the prop into the call.
+Rename either declaration. Handler-only uses are allowed. An expression's
+`match` or arrow binder protects its bound name; a view's `for` or `match`
+binder does not protect call heads.
+
+A derive supplies a value, even when its expression is a function call.
+Beside `fn pick`, `derive pick = pick(1)` makes `${pick}` read that result;
+`pick(5)` still calls the function.
+States and device-fact resources also supply values only: beside `fn pick`,
+`state pick = 7` makes `${pick}` read `7`, while `pick(5)` calls the function.
+These names leave calls intact in derives, state initializers, actions and slot fills.
+
 A child's action may call its `action` props and injected actions, with the
 arguments after those captured where they were bound: the parent's action runs
 in the same commit, and the child never writes the parent's state itself. A
@@ -605,6 +685,13 @@ Children may hold state, derives, and actions. They cannot declare resources,
 mutations, or tasks. Lift shared data requests to the root and pass values and
 actions. A child used under `for` owns row state keyed to that row's identity.
 Stable keys matter when content is inserted, removed, filtered, or reordered.
+
+A root that has outgrown the 1,500-line cap keeps its members and moves them
+into files by feature: `members "./composer.contract"` in its body, and in that
+file a `members App` block of states, derives, resources, mutations, actions,
+tasks and sequences. The program is the one-file program, and every file sees
+every member; each file `use`s the shapes and `fn`s it calls
+(`docs/contract-grammar.md`, "Components and actions").
 
 A state cannot start from a resource, but a child's state can start from a prop.
 So a form that edits a saved record is a child made once the record is in: the
@@ -677,6 +764,58 @@ Imports resolve local `.contract` declarations, with cycle and app-boundary
 checks. Paths begin with `./` and cannot contain `..` segments. They do not load app logic or expand the available built-in function
 roster. Compiler-owned router names exist only with a `routes` declaration.
 
+### Tabular numbers
+
+Use `font-variant-numeric="tabular-nums"` for **numeric columns** and **values that
+change in place**: prices in a ledger, timetable times, timers, scores, counters,
+progress percentages and recalculated totals.
+
+Use default spacing for prose, ordinary labels, static standalone statistics,
+and fields merely accepting numbers. Choose by how the value is used, regardless
+of its size or currency symbol: static columns need alignment, and updating
+headlines need stable digits.
+
+```contract
+component App
+  state balance = "$1,234.50"
+  view
+    text balance font-variant-numeric="tabular-nums"
+```
+
+Apply it to numeric text, keeping the platform font. It makes digits equal-width
+without monospacing letters. Font support is required; unsupported fonts remain
+unchanged. The property inherits. `normal` restores the font's default, which may
+already be tabular; Exact does not accept `proportional-nums`.
+
+Equal-width digits do not fix the whole value's width: `99` → `100`, signs,
+precision, separators and units can still move content. Reserve space for the
+formatted range when layout must stay still. Align numeric columns to a common
+edge (usually right for left-to-right numbers), with consistent units and precision
+where appropriate. Digits alone do not align decimals; do not pad with spaces or
+misleading zeroes.
+
+Supported for ordinary text on macOS, iOS, tvOS, Linux, Windows, Android and both
+web targets, including prerendered pages. Exceptions:
+
+- **Terminal:** ordinary digits already occupy equal-width cells. Explicit
+  `font-variant-numeric` settings are currently rejected.
+- **Android editable fields:** unsupported on native `input` and `textarea`;
+  they keep their font's default digits.
+- **Native buttons:** unsupported. Keep their typography; use separate `text`
+  for a readout. This property also does not style Canvas/GPU drawing or native hatches.
+- **Text wrapping around shapes on web:** a paragraph using `tabular-nums` skips
+  Exact's wrapping along image or shape outlines and uses ordinary browser layout.
+  Keep readouts separate from prose that needs this wrapping.
+
+`exact:content` components set their own typography: `SummaryCard` uses tabular
+digits for `value` and `detail`. Use `text` for a static statistic needing default
+spacing.
+
+Check the actual font, locale and host, including fallback digits, `11` → `88`,
+`99` → `100` and large accessibility text. Widths can differ across hosts. Keep
+locale-aware formatting and accessible labels. See
+[numeric-readout](recipes/numeric-readout.md) for sizing.
+
 ### Content components: `exact:content`
 
 The platform answers the controls and the chrome; the app's own content is the
@@ -722,14 +861,14 @@ component Water
 | Component | Props | Draws |
 | --- | --- | --- |
 | `SummaryCard` | `label: string`, `value: string`, `detail: string`, `progress: option<number>`, `symbol: option<string>` | a card: the symbol and label, the value large in tabular figures, the detail beside it where the card is wide and under it where it is narrow, the fraction as `progress` |
-| `StatBar` | `label: string`, `value: string`, `fraction: number`, `tint: option<string>` | the label and value over a bar `fraction` (held to 0–1) of the width: the accent short of the goal, the system green at 1 or past it, `tint` (a colour role) when given; one `meter` to a reader |
-| `RingProgress` | `label: string`, `value: string`, `fraction: number`, `tint: option<string>` | a ring filled `fraction` of the way round from the top, in the bar's colours over a grey track, the value large in its centre and the label under it; 200 across, down to 120 in a narrower box; one `progressbar` to a reader |
+| `StatBar` | `label: string`, `value: string`, `fraction: number`, `tint: option<string>` | the label and value (the value under the label where both do not fit) over a bar `fraction` (held to 0–1) of the width: the accent short of the goal, the system green at 1 or past it, `tint` (a colour role) when given; one `meter` to a reader |
+| `RingProgress` | `label: string`, `value: string`, `fraction: number`, `tint: option<string>` | a ring filled `fraction` of the way round from the top, in the bar's colours over a grey track, the value large in its centre and the label under it, at the default body's sizes at every text size; 200 across, down to 120 in a narrower box; one `progressbar` to a reader |
 | `DoneMark` | `caption: string`, `done: bool` | a filled check in the system green, or an empty circle in grey, with `caption` (short: a weekday; `""` for none) under it; one image to a reader, named by its caption and state ("Mon, done") |
-| `EmptyState` | `symbol: string`, `title: string`, `message: string`; a slot | a centred symbol, the title as a heading, the message; the nodes indented under the use (your `button`) under them |
-| `RowText` | `title: string`, `detail: string`, `value: option<string>` | a title, a secondary line under it (`""` for none) and a trailing value in tabular figures: a grouped list `row`'s content, or any list's |
-| `Badge` | `label: string`, `tint: option<string>` | a status in a word ("Full", "Cancelled") in a capsule, the caption style semibold, keeping its own size beside a title; `none` the neutral grey, `some("AccentColor")`, or a system hue under dark ink (white on indigo); read as its text |
-| `RoundButton` | `label: string`, `tint: option<string>`, `press: action`, `disabled: bool`, `testId: string` | the platform's own button as an 80-point circle (the Clock's Start, Stop, Lap): filled with `tint` (a role: `"AccentColor"`, `"-exact-system-red"`), ink the host picks for contrast; a light hue (green, mint, teal, cyan, yellow, orange) is the platform's tinted style, the hue at low opacity under the label's ink; `none` is the neutral grey with the label's ink |
-| `AnswerTile` | `label: string`, `status: string`, `press: action`, `testId: string` | a full-width tile for one answer, the label in the headline style; `status` `"idle"` (a neutral fill), `"selected"` (the accent's outline and check), `"correct"` (the system green, dark ink, a check), `"wrong"` (the system red, white ink, a cross) or `"dimmed"`; told and dimmed tiles are disabled; a reader hears "Quito, correct" |
+| `EmptyState` | `symbol: string`, `title: string`, `message: string`; a slot | a centred symbol (none at the accessibility text sizes), the title as a heading, the message; the nodes indented under the use (your `button`) under them; a `scroll` where it is taller than its space (in a flex column, give the column `min-height=0`) |
+| `RowText` | `title: string`, `detail: string`, `value: option<string>` | a title, a secondary line under it (`""` for none) and a trailing value in tabular figures (under them where they do not fit on one line): a grouped list `row`'s content, or any list's |
+| `Badge` | `label: string`, `tint: option<string>` | a status in a word ("Full", "Cancelled") in a capsule, the caption style semibold, keeping its own size beside a title; `none` the neutral grey, `some("AccentColor")`, or a system hue under white ink (dark on the light hues: green, mint, teal, cyan, yellow, orange); Windows contrast themes use the system highlight/text pair for these tints; read as its text |
+| `RoundButton` | `label: string`, `tint: option<string>`, `press: action`, `disabled: bool`, `testId: string` | the platform's own button as an 80-point circle (the Clock's Start, Stop, Lap): filled with `tint` (a role: `"AccentColor"`, `"-exact-system-red"`), ink the host picks for contrast; a light hue (green, mint, teal, cyan, yellow, orange) is the platform's tinted style, the hue on the hue at low opacity; `none` is the neutral grey with the label's ink; the title stays the default body size at every text size |
+| `AnswerTile` | `label: string`, `status: string`, `press: action`, `testId: string` | a full-width tile for one answer, the label in the headline style; `status` `"idle"` (a neutral fill), `"selected"` (the accent's outline and checkmark), `"correct"` (the system green, dark ink, a check), `"wrong"` (the system red, white ink, a cross), `"dimmed"` (the rest, once told), or `"chosen"` (the person's own pick once told or closed: the selected look, disabled, so a closed poll still marks the vote while the rest dim); told, dimmed and chosen tiles are disabled; as a grouped list's row it is the list's cell on every host (`-exact-row-look`), the checkmark its accessory; a reader hears "Quito, correct" |
 
 - Props have no defaults: pass `none` for an option. A symbol is an `image` source:
   a role (`"symbol:calendar"`) draws on every host, `"symbol:sf/<name>"` on Apple only.
@@ -771,6 +910,13 @@ Choose the mechanism from its lifetime:
 | Resource request failed without an answer | `failed(resourceOrMutationName)` |
 | Why it failed, to branch on or show | `failure(resourceOrMutationName)`: `none`, or `some({ code, message, reason })`, `code` a domain refusal code when supplied, otherwise one of `offline`, `timeout`, `refused`, `shape`, `storage`, `error`; `reason` a Snapback refusal's code (`SLOT_FULL`), else `""` |
 | Initial resource fallback | `else empty(field=constant)`, or `else source(values)` answered once at build |
+
+A timer's step that reloads a resource runs the data module before the next frame, and
+the frame waits for it: a module that rebuilds every row each second drops a frame of a
+scrolling list each second, and `verify ios` says when the data module is in a late
+frame's time. Rebuild only what the tick changed (keep last tick's rows, remake those
+whose values moved), and leave out of the rows what the list does not show: a detail
+screen's chart points belong to a resource the detail reads.
 
 Resources read as their declared type. Mutations read as `option<T>` and start at
 `none`, so a mutation's `T` is not itself an option. Do not treat a resource as an optional wrapper unless its declared type
@@ -826,11 +972,52 @@ the seam, and use `refresh`/`refreshes` for counters whose only purpose is anoth
 ask. The default web JS target keeps no persisted resource answers
 ([LLP 1027.005](../llp/1027.005-resource-identity-and-request-context.rfc.md)).
 
+Resource inputs are not asynchronous prerequisites, and HTTP request lanes do
+not make resources depend on one another. A resource that reads another resource
+uses its current displayed value; it does not wait for the upstream request to
+succeed. While that request is pending, the value may be a retained answer, and
+`not pending(upstream)` does not prove the latest request succeeded.
+
+An authenticated source must await the app's shared current-session helper
+before issuing its protected request. It must verify that the session authorizes
+the principal named by the resource call. The helper and auth generation are app
+code, not Exact APIs. The app must advance its auth generation and clear its
+authorized principal whenever the principal changes or signs out. A request
+that must belong to that auth attempt should take the generation as a resource
+argument and return the principal and generation as fields in its answer. The
+view should show private data only when both fields match the currently
+authorized principal and generation. Checking only the owner cannot distinguish
+signing into A, then B, then A again. A pending session resource, or one that is
+merely not pending, does not prove authorization.
+
+Before committing a refreshed session or shared owner-sensitive cache write,
+recheck the generation at the commit point, including inside queued work. When
+possible, partition persistent caches by owner so one owner's valid result can
+still populate its cache after the view changes. If writes share a slot, guard
+the commit by owner and auth generation. Do not suppress a valid per-owner cache
+write only because another request became current. See the
+[fetch/loading/error recipe](recipes/fetch-loading-error.md) for retained-answer
+and owner-gating patterns. The [REST starter](patterns/rest/app.contract) uses
+public development identities and does not implement an authenticated session
+lifecycle.
+
 The current request owns its answer; older replies cannot overwrite a newer
-request. A newer send or an assignment forgets a mutation's in-flight reply, not
-its work: the source's storage steps for it still run to their end on every host,
-as a browser runs a promise nobody awaits. Because the reply is forgotten, an
-action that sends one mutation twice on one path is refused (`analyze-send-twice`), counting
+request. A newer send or an assignment drops a mutation's in-flight reply. It
+does not undo storage operations the source has already started; those
+operations and any serialized storage chain behind them run to completion.
+Other source work, such as a fetch, may be aborted when an answer is replaced
+(see the [runtime reference](reference.md#what-a-data-module-can-use)).
+
+The action sending a mutation without `queue` must not also assign its slot to
+`none`. Assignments commit after sends, so the reset can discard the new reply
+even when it appears first. Keep the mutation for its reply and hide an old error
+while `pending(added)`, as the [after-a-write recipe](recipes/after-a-write.md)
+does. `none` means the slot contains no reply, not that the write failed: use
+`failure(added)` for a request failure, and match a shaped reply's `ok` or error
+for a domain refusal.
+
+An action that sends one mutation twice on one path is refused
+(`analyze-send-twice`) because the second send would forget the first reply, counting
 the sends of the actions it calls. Every `if` is read as one that can run: two
 sends are separate paths only as arms of one `if … else if … else` or `match`,
 or in `if`s testing one unchanged name against different literals. Send one
@@ -856,18 +1043,50 @@ own mutation; to repeat, use a task (see "Repeating while a condition holds").
 Do not mistake the scheduling boundary
 for a general async workflow or a per-reply event log.
 
+A long poll (`/changes?since=…&wait=…`) is a stream too: add
+`exactLongPoll: { cursor: 'since', from: 'seq' }` beside `exactStream`, and the
+host asks again with each reply's cursor, skipping heartbeats and backing off
+on failures (`docs/reference.md`, LLP 1016.000 D8). Re-read on each event with
+`resource view = load() with live.seq`.
+
 A bidirectional WebSocket uses a resource's TypeScript
 `fetch(url, { exactStream(event, socket) { … } })` (LLP 1016.000 D7).
 Keep the handle in module state by resource identity; after its `open` event,
 a mutation source can call `socket.send(textOrBytes)` or `socket.close(code,
-reason)`. The mapper only reads frames and returns snapshots. Sends run after
-the mutation's commit stands, in order, and have bounded admission. The
-source must send and answer synchronously, and a mutation that sends cannot
-also `fetch` (whichever comes second refuses it). Refreshing or removing the
+reason)`. The mapper may also send and close on its own socket while it
+answers `open` or a `message` (a subscribe, an Ack per frame), with no
+`fetch`. Sends run after the commit that settles the mutation or the frame
+stands, in order, and have bounded admission. A mutation's source that
+sends answers now or with a promise, and cannot also `fetch` (whichever
+comes second refuses it). A resource's answer may send its own
+request on its module's socket and await the reply, with no timer, and so
+may a mutation whose source answers with a promise: what each turn of it
+sends goes out once the commit that ran that turn stands, and stays sent if
+it is let go (on the web build, only its source's synchronous call may
+send). Refreshing or removing the
 resource invalidates the old handle. **TypeScript on the web JS target,
 macOS, iOS and Linux**; the wasm target and Rust sources remain
 receive-only. See
 [the reference](reference.md#generate-typescript-data-source-types) for bounds and events.
+
+A large response needs a parse that yields. On native hosts each turn of an
+answer has 100 ms: from its call, or from the `fetch` or storage step it
+awaited, until it next awaits one. A turn over that is refused, so a parse
+that passes its tests on a 300 KB thread fails on a 1 MB one.
+`await scheduler.yield()` (the web's [Prioritized Task
+Scheduling](https://wicg.github.io/scheduling-apis/#dom-scheduler-yield)) ends
+the turn, and the answer goes on in a new one with its own 100 ms. Yield every
+few thousand items in a parse or tree walk:
+
+```ts
+for (let i = 0; i < nodes.length; i++) {
+  if (i % 2000 === 1999) await scheduler.yield();
+  comments.push(toComment(nodes[i]));
+}
+```
+
+The function that yields is `async`, and so is every caller that awaits it.
+On the web the page has no such budget, and a yield lets it paint mid-parse.
 
 ### Optimistic writes: the overlay
 
@@ -972,23 +1191,59 @@ makes the folders above it too), or the write fails with `ENOENT`.
 The [human guide's data-module section](contract-for-humans.md#writing-the-data-module)
 has a complete `app.ts`: synchronous, `fetch` and SQLite sources, the grants
 each needs (one per line: `['sqlite.open app:/data/books.db', 'net.fetch https://…'].join('\n')`;
-`net.fetch` takes an `http` or `https` origin, `http://127.0.0.1:8080` too; on iOS
+`net.fetch` takes an `http` or `https` origin, `http://127.0.0.1:8080` too, or a
+whole scheme, `net.fetch https:` (any host and port, for a server the person names
+at run time; `net.websocket` takes `wss:` or `ws:` the same way); on iOS
 cleartext `http` reaches only a local host, and only with `app.json`'s
-`host.ios.localNetworking` set; an `iframe` of `http://` from a named host needs
-`host.macos.appTransportSecurity` or `host.ios.appTransportSecurity` set to
-`{ "allowsArbitraryLoadsInWebContent": true }`, which relaxes web views only and
-not an `http:` sub-resource of the app's own `assets/` page),
-and how to drive it with storage. A path grant covers its path and what is below
+`host.ios.localNetworking` set, unless ATS is off (below); a device on the local
+network the person names or the app finds is `net.fetch local-network` with
+`device.local-network purpose.<key>`, whose text is the platform's prompt on macOS
+and iOS ([recipe](recipes/local-network.md)); the app's own `http` to any other
+host, such as a server the person types in, needs each Apple platform's
+`appTransportSecurity` (`host.macos`, `host.ios`) set to
+`{ "allowsArbitraryLoads": true }`, which turns ATS off for every connection the
+app makes, frames included, and which App Store review asks the app to justify;
+an `iframe` of `http://` from a named host, or such a sub-resource of the app's
+own `assets/` page, needs `host.macos.appTransportSecurity` or
+`host.ios.appTransportSecurity` set to `{ "allowsArbitraryLoadsInWebContent": true }`,
+which relaxes web views only (ATS lets an IP address or a `.local` name through
+without it, LLP 1020.001 §4 Q6, though on an iPhone those also ask for Local
+Network access), and how to drive it with storage. The macOS driver launches the assembled app
+bundle, so its ATS policy also applies during drives. A path grant covers its path and what is below
 it, by whole names: `sqlite.open app:/data` covers `app:/data/inbox-amy.sqlite`,
 `sqlite.open app:/data/inbox` does not. A refused open names the file it wanted
 and the grant line that would admit it.
+A line of `app.ts`'s grants that begins with the word `development` is a development
+build's only: a production bake (`EXACT_UPDATE_TRUST=production`, which an Apple
+`--archive` or `--release` and a deploy set) leaves it out, and any other keeps it
+without the word (`development device.calls purpose.calls`, Harmony's test call,
+LLP 1133.033 §13 question 4). Only the build's copy of `app.ts` changes, so the
+module's own `grants` constant is the build's, and the app can hide what the line
+serves (Harmony's `testCallBuild` source). A Rust data crate's `grants()` can't mark
+a line yet: the bake refuses one (`grant-development`). The bake's own trailing word
+on a development build's `local-network` line (LLP 1133.036 D5) is another thing.
 A token, a password or a key the module keeps is a secret, not a file: grant
 `secret.keep <name>` (one line per name, `secret.keep signal.token`) and use
 `store.set(name, value)`, `store.get(name)` (a string, or `null`) and
 `store.forget(name)` in an answer (LLP 1018). It is the Keychain on Apple; on the
 web, the page's `localStorage`, readable by any script on that origin; a Linux
 launch keeps it only until the app exits for now. A drive keeps it, by default,
-only in a named `--storage` store (`EXACT_STORE=real` gives an Apple drive the Keychain).
+only in a named `--storage` store (`EXACT_STORE=real` gives an Apple drive, on a Mac, a simulator or a phone, the Keychain a normal launch reads).
+A secret that only the person in front of the device may read (an account's token
+behind Face ID) carries a policy on its line, `secret.keep token user-presence`
+(`biometry-any`, `biometry-current-set`, `device-credential`), then `optional` when
+the person chooses whether it is locked; the app grants `device.local-auth <purposeKey>`
+and depends on `@exact/local-auth` (LLP 1133.010). Its value is never in the store:
+`store.get` throws `InvalidAccessError` while it is locked, `await store.unlock(name,
+{ reason })` shows the platform's sheet and answers the value, `store.has` and
+`store.locked` say what is kept, and `store.protect(name)` and `store.unprotect(name,
+{ reason })` turn an `optional` lock on and off. `store.set` keeps every write in the
+name's state, a rotated token's too. Keep the value out of every answer: an answer is
+kept and shown. `authenticate(reason=)` from the same package is the check alone: it
+gates a screen, never a secret. The web keeps no locked secret yet: a name that must
+be locked is refused there, and `localAuthStatus().presenceSecrets` is false. Under the
+agent the sheet is a `presence` ticket (`tap @presence allow`, `cancel`, `fail`,
+`lockout`, `invalidated`), after Face ID's `permission` ticket while it is `prompt`.
 The compiler accepting a source call does not provide its implementation. Check
 its arguments, declared result, grants, storage access, and bake-time behavior.
 Keep generated output out of version control. Use app-local sources for domain
@@ -998,11 +1253,125 @@ A bake runs initial data work and packages first-frame values. A first-frame
 value is not the answer: every host asks the TypeScript module again at launch,
 natively once it loads after first pixel, even a source with no arguments
 (`logs`: `<resource> shows its build-time answer until its source answers`, then
-`<resource> answered: …`). A `send` an action makes before the module loads (a
+`<resource> answered: …`). A resource with an argument (one after `with` too) made
+from `exactTime()`, through a derive, another resource or a state an action
+assigns it (or writes under a condition on the date), gets no first-frame value, since the bake's date is unknown: it shows
+its placeholder until the module answers with the launch's date, so a task waiting
+on `lib.loaded` never adopts an answer stamped at 1970. Don't pass the clock into a
+source whose answer doesn't depend on it, or its first frame waits for the module:
+format times in Contract (`formatTime(at, time.utcOffset, "short")`). A `send` an action makes before the module loads (a
 document opened at launch) waits for it, `pending` meanwhile (`logs`: `send <name>:
 waits until the data source is ready`). Live requests run after that under host scheduling. Do not assume a secret store, disk database,
 or authenticated network session is available while baking. See
 [the data-module reference](reference.md#generate-typescript-data-source-types).
+
+### Sign-in providers (`@exact/oauth`)
+
+The `oauth` recipe is the code; this is each provider's configuration, as its
+documentation requires (LLP 1146; the IDs are `packages/oauth/test/PROVIDERS.md`'s).
+
+| Provider | Configuration |
+|---|---|
+| Google | `issuer: 'https://accounts.google.com'`, `issuerAliases: ['accounts.google.com']` (GOOG-2), `authorizationParams: { access_type: 'offline', prompt: 'consent' }` for a refresh token (GOOG-8). Grant `net.fetch https://oauth2.googleapis.com`, its token endpoint's origin (GOOG-1). An iOS client's callback is its reversed client ID, `com.googleusercontent.apps.<id>:/oauth2redirect` (GOOG-5); a desktop or web client needs its `clientSecret`, which is not secret (GOOG-4) |
+| Microsoft Entra ID | `issuer: 'https://login.microsoftonline.com/common/v2.0'`, `issuerTemplate: true` (ENTRA-1), `offline_access` in `scopes`. Register the callback as "Mobile and desktop"; send no `clientSecret` (ENTRA-3). A web build's callback is registered as "Single-page application" (ENTRA-4) |
+| Auth0 | `issuer: 'https://<tenant>.auth0.com/'`, the tenant's domain with a trailing slash (AUTH0-1); `offline_access`, with "Allow Offline Access" on the API (AUTH0-3); `authorizationParams: { audience }` for an API's token. With rotation's overlap period on, `retryLostRefresh: true` |
+| Okta | `issuer`: the authorization server's issuer, `https://<org>.okta.com/oauth2/default` (OKTA-1); `offline_access` (OKTA-4); `retryLostRefresh: true` while refresh tokens rotate with a grace period (OKTA-6) |
+| OneLogin | `issuer: 'https://<subdomain>.onelogin.com/oidc/2'` (ONELOGIN-1); no `offline_access`, which it refuses (ONELOGIN-2); `endedErrors: [{ error: 'invalid_request', status: 401 }]` (ONELOGIN-4) |
+| GitHub | `endpoints: { authorization: 'https://github.com/login/oauth/authorize', token: 'https://github.com/login/oauth/access_token' }`, no `openid` (GH-1), `clientSecret` (GH-7), `commaScopes: true` (GH-5), `endedErrors: ['bad_refresh_token']` (GH-4). Its token endpoint does not answer a browser, so a web build needs a server (GH-8) |
+| Salesforce | `issuer: 'https://login.salesforce.com'`, the `refresh_token` scope (SF-14); it sends no `expires_in`, so the expiry is learned from a 401 (SF-1) |
+| Amazon Cognito | the endpoints are on the user pool's domain, not the issuer's: grant both origins (COGNITO-1) |
+| ForgeRock (PingAM) | `issuer`: the realm's, `…/oauth2/realms/root/realms/<realm>`, as its discovery document names it. An app with its own sign-in screens answers the authentication tree (FR-1), then passes `signIn` an `authorize` that POSTs the authorization request with the SSO token (FR-2; below), natively only. A gateway that answers 403 for an expired access token: `expiredStatus: [401, 403]` (FR-4) |
+| Sign in with Apple | not supported: its token exchange needs a server-signed client secret |
+
+Every option, with what it does, is in `@exact/oauth`'s `index.d.ts`.
+
+**An app's own sign-in screens.** A provider that lets an app sign the person
+in with its own screens (ForgeRock's authentication trees) still issues an
+authorization code. The app sends the authorization request as the provider
+documents and answers where it was redirected; the package checks it and does
+the rest. The source that answers the tree's last step keeps its SSO token in
+the module and answers only that the tree is done: an answer is kept and
+shown, and whoever holds the token can sign in as the person.
+
+```ts
+let sso = '';  // the tree's SSO token, set by the source that answers its last step
+const sources: Sources = {
+  signIn: (_a, store) => {
+    const token = sso;
+    sso = '';
+    return provider.signIn(store, {
+      authorize: async ({ endpoint, params, fetch }) => {
+        const reply = await fetch(endpoint, { method: 'POST', redirect: 'manual',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `iPlanetDirectoryPro=${token}` },
+          body: new URLSearchParams({ ...params, csrf: token, decision: 'allow' }).toString() });
+        return reply.headers.get('Location') ?? '';
+      },
+    });
+  },
+};
+```
+
+This sign-in runs natively. On the web, the browser answers `redirect:
+'manual'` with no status or headers (Fetch's opaque redirect) and drops a
+`Cookie` an app sets, so a web build needs a server to send the authorization
+request, as GitHub's needs one for its token exchange (GH-8). Grant no
+`auth.session` or `auth.callback`, and set `callback` to the redirect URI the
+provider registered. Send with the `fetch` that `authorize` is given, the
+package's transport, and throw an `OAuthError` to say why sign-in failed,
+giving it the failing reply's status. `claims(store)` reads the ID token's
+claims, for an API that wants one of them in a header; the `log` option hears
+what the session did, with no token in it, for a diagnostics screen; the
+`fetch` option carries every request the package makes, for a demo whose
+server is in the app.
+
+**Testing against a fake provider.** Name `<exact2>/packages/oauth/test/fixture.ts`
+as the app's server in `app.json` (`"commands": {"server": ["bun", "<exact2>/packages/oauth/test/fixture.ts", "--port", "4400"]}`,
+`"server": {"database": false}`). Its profiles (`spec`, `google`, `entra`, `auth0`,
+`okta`, `onelogin`, `github`, `salesforce`, `forgerock`) behave as those providers do. The
+issuer is `http://127.0.0.1:4400/p/<profile>`, except Entra's
+`…/p/entra/common/v2.0`, Auth0's `…/p/auth0/` and OneLogin's
+`…/p/onelogin/oidc/2`. Google's token endpoint is on the next port, `4401`:
+grant it too. GitHub has no discovery: its `endpoints` are `…/p/github/authorize`
+and `…/p/github/token`. `GET /p/<profile>/api/me` answers the person.
+ForgeRock's tree is `POST /p/forgerock/json/authenticate` (the person is
+`ada@example.com`, password `lovelace`), and its API answers 403 for an expired
+access token.
+`authorize` completes the held sign-in against the fixture;
+`authorize cancel` cancels it. `request POST "/control"` changes what the
+fixture does next: `{"action": "expire-access", "profile": "spec"}`, and
+`revoke`, `fail-token`, `hold-token` (then `{"action": "await", "held": 1}`
+returns once the app's token request is held, and `release-token` lets it
+go), `deny-authorize`; `fixture.ts`'s `control` lists them all.
+
+```contract-test
+test "signs in, shows the person, and is still signed in after a relaunch"
+  request POST "/control" {"action": "reset"}
+  tap "sign-in"
+  authorize
+  clock data
+  expect text "name" == "Ada Lovelace"
+  reload
+  clock data
+  expect text "status" == "Signed in"
+```
+
+### Child processes (`@exact/child-process`)
+
+A desktop app's data code starts a program with Node's names (LLP 1133.007).
+A resource answers `spawn(program, args, {exactStream})`: the child lives
+while the resource holds it, and its mapper hears `spawn`, `stdout`,
+`stderr`, `exit`, `close`, `drain`, `ready` and `ready-timeout`, with the
+incarnation's handle (`write`, `end`, `kill`). An answer awaits `execFile`
+for a one-shot run. Each program needs a grant line naming it
+(`process.spawn path:ssh`, `process.spawn /usr/bin/tar`); a call with none is
+`grant-missing`. Only a person's input or the app's own code starts or
+drives a child: a tool's call, a wake or a device event is refused
+`person-required`, and its commit lets no child go. Under the agent nothing
+runs unless the drive names it: `--process <program>=script:<file.json>`
+answers from a script on the agent's clock. macOS and Linux run it; every
+other target answers `NotSupportedError`, which `processStatus()` says
+ahead. The options, events and limits are `docs/reference.md`'s "Child
+processes".
 
 ## Views, layout, and interaction
 
@@ -1076,7 +1445,10 @@ backgrounds share the existing drawn-gradient limitation for
 
 For scrolling, provide a bound and inspect measured layout. For virtualized
 lists, use `list virtualized=true` (no other tag takes it), one direct keyed
-`for`, and one flow root per row. A vertical list needs `height`, `max-height`
+`for`, and one flow root per row. Its `reachstart` and `reachend` fire when the
+first or last row comes within `reach-margin` of the port (one port by default),
+and further ahead while a fling travels toward it; page from them rather than from
+`scroll` (`docs/reference.md`, "Intersection visibility"). A vertical list needs `height`, `max-height`
 or a growing `flex`, which may be computed (`max-height=(narrow ? "320px" : "640px")`).
 A percentage bounds it only against a definite containing-block height (a plain
 `column` is content-sized), and the bake refuses (`bake-scroll-unbounded`) only a
@@ -1097,7 +1469,8 @@ reach is past it, and on iOS the pull-to-refresh spinner draws below
 same forms) is where its `scrollIntoView` aligns a row, as CSS's snapport:
 with `scroll-padding-top` equal to a header's height, the first row's
 `block="start"` is `scrollTop` 0. Only a virtualized list takes it
-(`lower-scroll-padding` elsewhere: native hosts read it nowhere else). `reorderdrop` belongs only on a vertical `list virtualized=true`
+(`lower-scroll-padding` elsewhere: native hosts read it nowhere else).
+`reorderdrop` belongs only on a vertical `list virtualized=true`
 (each row's handle names it with `reorderFor`); the compiler refuses it on any
 other element, where no host could drag. Lists that share a `reorderGroup`
 (each with a `reorderdrop`, an `id` and string keys) exchange rows: the drop
@@ -1122,6 +1495,12 @@ stays there, so rows inserted on top show, and one following its end
 (`translate`, `rotate`, `scale`, a relative `top`/`left`, `z-index`: a lifted
 row being dragged) and keeps its place in the list.
 
+A virtualized list mounts only the rows near its port, and a screen reader
+moves only through mounted rows. `keep-mounted=[first(ids), ids.at(-1)]`
+names rows by key that stay mounted wherever the window is: a transcript's
+first and last message, so VoiceOver moves from one to the other, or a row that
+is playing. It takes up to 64 keys of the `for`'s key type (LLP 1010 §6.11).
+
 A `button` is the platform's own control by default. A background, border or
 radius, rich children, or a row/attribute/context the native control cannot
 support makes it your bare box instead. Classes count after merging, and a
@@ -1132,8 +1511,10 @@ UIKit can read the cell's face; explicit `appearance="auto"` carries a custom na
 asks for the platform's button and refuses unsupported rows or children. The
 switch must resolve to a literal after class merging; use `if` with two
 buttons to switch. Its first `text` is the title, its second is the subtitle, and
-its one `image "symbol:…"` is the symbol. These are semantic face data, not
-layout children. A symbol-only face needs a nonempty `aria-label`. With
+its one `image "symbol:…"` is the symbol. Raster faces need
+`appearance="none"`: the graphical plan is shared, and macOS and Linux do not
+paint a native raster face yet. These are semantic face data, not layout
+children. An image-only face needs a nonempty `aria-label`. With
 `flex-direction="row"` (or absent), an image before/after the texts is
 leading/trailing; with `flex-direction="column"` it is top/bottom.
 
@@ -1166,6 +1547,20 @@ dialog or popover with `commandfor` and `command="show-modal"`,
 bound, and an empty target is no target. `href`, `action` and swipe attributes
 remain refused. `-exact-enabled` transitions are not available.
 
+**Exact2's menu rule** (LLP 1021): a row of a menu (`popover role="menu"`)
+whose `popovertarget` (or `commandfor` with `command="show-popover"` or `"toggle-popover"`) names a
+popover that is no menu opens it as if by the menu's own invoker (the button
+that opened the menu, or the node its context menu opened on), as
+`showPopover(id, source=)` does: not nested in the menu, so it stays open as the
+menu closes on choose, beside where the menu came from. Write that popover
+outside the menu: one written inside it is nested by where it is. A row naming
+another menu opens its submenu, nested. The build notes each such row it can
+see (literal ids, roles and actions: `lower-menu-row-popover`). Every other
+row (a dialog's command, a custom one) keeps HTML's own activation. On the web
+the rule takes the row as it is at the click: a press that changes a row from
+naming a popover to naming something else still opens that popover, and one
+changing it the other way leaves the popover nested.
+
 On macOS, iOS and the web, an action can call `showModal(id)` or `close(id)`
 for a `dialog`. macOS and the web follow the invoker's modal focus path; iOS
 presents the dialog as an alert. Bare `close()` still closes the window.
@@ -1188,21 +1583,43 @@ the agent both paint in the page as before; `--chrome platform` on `macos`
 shows them, `tap`, `type` and `tree` reach what is in them, and `screenshot
 "file" window` draws them over the window.
 
+`popover` alone also accepts an optional string. For example,
+`popover=(expanded ? some("manual") : none)` keeps the same mounted box:
+`some("manual")` adds the property, and `none` removes it. An empty string
+still declares a popover; it does not restore inline layout. After setting
+`expanded = true`, call `showPopover(id)` in the same action. Setting it back
+to false closes the presentation and restores the box to its inline parent.
+An iframe kept in that box, with the same `src`, retains its mounted guest.
+Use explicit viewport bounds and admitted absolute positioning for an expanded
+box; this does not add `position="fixed"`. The
+[resident iframe fixture](../scripts/fixtures/iframe-resident-popover.contract)
+shows the complete enter/exit action and layout.
+
 For an invoker popover with an authored CSS area, use
 `position-try-fallbacks="flip-block, flip-inline, flip-block flip-inline"`.
 A fresh opening takes the first fitting attempt, retaining the base if none fits.
 An open popover keeps its chosen option while it fits, including across resize;
-if none fits after movement, the current option may overflow. Commas separate
-attempts; spaces combine flips. `none` disables fallbacks. The web and painted Apple layers implement these flips; an authored
+if none fits after movement, it keeps the current one. Commas separate
+attempts; spaces combine flips, applied in the order written. `flip-start`
+mirrors across the top-left/bottom-right diagonal (`bottom span-right` becomes
+`right span-bottom`), so `flip-start flip-block` (right, ending at the
+invoker's bottom) and `flip-block flip-start` (left) differ. `none` disables
+fallbacks. In a right-to-left document the diagonal runs from the top-right
+corner. With no fitting option, CSS shifts the box back into the window. A
+popover with an authored `position` is absolute in the top layer and is held
+only at the page's start edges (the top, and the left, or the right in a
+right-to-left document), so it can run past the others. The web and painted Apple layers implement these flips; an authored
 fallback row selects painted placement on macOS for a non-menu popover, including
 when added while open. Removing the row restores platform presentation; focus
 and text selection survive either change. Native
 menus and confirmations keep platform placement. Physical areas also accept
 `top span-left`, `bottom span-left`, `left`/`right` with `span-top`,
 `span-bottom` or `span-all`, and the four `top|bottom left|right` corners.
-This slice does not implement `flip-start`, logical areas, named rules, or
-area-dependent sizing. Use fixed sizes, zero insets and default self-alignment
+Logical areas, `flip-x`, `flip-y`, named rules and area-dependent sizing are
+not implemented. Use fixed sizes, zero insets and default self-alignment
 for native parity; percentage margins are not resolved by the native layer.
+`flip-start` also exchanges `width` and `height` in CSS; the native layers keep
+the laid-out size, so give a popover that uses it equal ones.
 
 A route with `navigationPresentation="modal"` is the same sheet on the Mac
 (LLP 1115.002 D7.4), as large as its content (an authored `width` or `height`
@@ -1222,6 +1639,10 @@ iOS, a push button on macOS, bordered on the web. Say what the action is:
 `buttonStyle="filled"` on the screen's main action, `"bordered"` on one that
 must read as a button, nothing on a secondary or inline one; and
 `destructive=true` on one that deletes, which iOS draws in the system red.
+A round control that floats over content (a search or compose button in a corner, a
+bookmark over a card) is `buttonStyle="glass"`, or `"prominent-glass"` filled with
+the accent, with its symbol coloured by `-exact-tint-color`: iOS 26's own glass, not a
+custom circle.
 `buttonStyle` needs a native button; on a default button that comes out bare,
 `lower-button-style` names the first reason and says to remove it or write
 `appearance="none"` without `buttonStyle`. It is a styleable host-policy prop;
@@ -1248,8 +1669,10 @@ lists any literal colour, font size or weight an app's `.contract` files still w
 | Write | iOS draws |
 | --- | --- |
 | `button` (`buttonStyle`, native by default) | `UIButton` |
-| `list appearance="auto" listStyle="inset-grouped"` of `section`s (`header`, rows, `footer`) | `UICollectionView` list, as Settings ([human guide](contract-for-humans.md#choosing-a-native-button)) |
-| `list` with no `appearance`, its rows down the page (each child is a row) | a plain list's cells: UIKit's separators, the cell's grey ground while a row is pressed, the row selected under the screen it pushed. Draw none of it; a border you write on a row is yours and replaces the separator there (`border-bottom="none"`: none), and `appearance="none"` keeps rows of your own (a transcript, a feed of cards). The Mac shows a table, the web and the Linux desktop one line between rows, Android none (LLP 1115.000 D16) |
+| `list appearance="auto" listStyle="inset-grouped"` of `section`s (`header`, rows, `footer`) | `UICollectionView` list, as Settings ([human guide](contract-for-humans.md#choosing-a-native-button)); a row of your own parts starts and ends at the cell's margin, as UIKit's own rows do, so write no padding at its ends |
+| the same, `listStyle="plain"`, each `section`'s `header` one letter (Contacts) | the list with UIKit's A–Z section index at its trailing edge, when every section has a row; sections above the letters (Favorites) stay out of it; a name that starts with no letter A–Z goes under `#`, not nowhere. Its headers pin as the list scrolls, over UIKit's blur; a `grouped` list's scroll away |
+| `list` with no `appearance`, its rows down the page (each child is a row) | a plain list's cells: UIKit's separators, the cell's grey ground while a row is pressed, the row selected under the screen it pushed. Draw none of it, and no inset either: a row's content stands at the cell's margin (16 at each end; UIKit's, 20 in an iPhone's landscape) where you write no padding, the row `border-box` (LLP 1138); write a padding to choose your own. The row is your box; a border you write on a row is yours and replaces the separator there (`border-bottom="none"`: none), and `appearance="none"` keeps rows of your own (a transcript, a feed of cards). The Mac shows a table, the web and the Linux desktop one line between rows, Android none (LLP 1115.000 D16) |
+| `delete=remove(id)` on either list's row (`disabled` beside it: no delete) | the cell's swipe action Delete, which a full swipe performs (`contract vocab swipe`) |
 | `input type="checkbox" switch` | `UISwitch` |
 | `input type="radio"` (the radios of one `name` are a group) | the SF Symbols circle, filled at its centre when checked, at body size; in a grouped list's row no circle but the row's checkmark, which a tap on the row moves (LLP 1115.000 D13.2) |
 | `input type="range"` (as wide as what holds it; in a `row`, `flex=1 min-width=0` beside its label) | `UISlider` |
@@ -1257,12 +1680,12 @@ lists any literal colour, font size or weight an app's `.contract` files still w
 | `select` of `option`s | a pop-up button with its menu |
 | `progress value=done max=goal` (a goal, an upload; as wide as what holds it) | `UIProgressView`, tinted by `accent-color` (LLP 1116 D8); never a drawn track and fill |
 | `progress` (no `value`) | `UIActivityIndicatorView`, `.large` from a 37-point box (LLP 1069.001) |
-| `popover="auto" role="menu"` of `button`s, opened by `popovertarget` (a row whose `popovertarget` names another menu: its submenu) | `UIMenu`, nested (LLP 1021) |
-| `dialog role="alertdialog" aria-label="Remove book?"` of a `text`, its action(s) and one Cancel | `UIAlertController(.alert)`: the label its title, the text its message (LLP 1115 D6; recipe [below](#a-confirmation)) |
+| `popover="auto" role="menu"` of `button`s, opened by `popovertarget` (a row whose `popovertarget` names another menu: its submenu; one naming any other popover opens it from the menu's own invoker, exact2's menu rule) | `UIMenu`, nested (LLP 1021) |
+| `dialog role="alertdialog" aria-label="Remove book?"` of a `text`, its action(s) and one Cancel; or a `text` and one closing button alone | `UIAlertController(.alert)`: the label its title, the text its message; the one-button alert when it has no action (LLP 1115 D6; recipe [below](#a-confirmation)) |
 | any other `dialog` (a field, Save, Cancel), opened by `showModal(id)` or a button's `command="show-modal"` | a sheet as tall as its content, up to the large detent, its content laid out as written and centred across it (`width="100%" box-sizing="border-box"` fills it); `close(id)`, its `command="close"` button or a swipe down closes it. `closedby="none"` refuses the swipe, `"any"` also takes a tap on the page behind, and a dismissal the person made fires `cancel` (LLP 1115.000 D11.5). A form with a title bar is still a sheet route |
 | `role="tablist"`: each tab a symbol over a label / one text or image | `UITabBar` / `UISegmentedControl`, the tablist at least its native height unless `min-height` says otherwise (LLP 1059) |
-| `role="radiogroup"` of `button role="radio" aria-checked=…`, each one text or image (a value chosen from a few) | `UISegmentedControl`, as a tablist's; never a tab bar (LLP 1116.004 D5.2) |
-| a route whose first child is a `header` holding one heading (`text role="heading"`; an `aria-level` alone is not one), a text after it and its buttons | the navigation bar; a level-1 heading (`aria-level=1`) is a large title, the text after it the subtitle |
+| `role="radiogroup"` of `button role="radio" aria-checked=…`, each one text or image (a value chosen from a few) | `UISegmentedControl`, as a tablist's; never a tab bar (LLP 1116.004 D5.2). Keys of your own design: a radio that paints itself (its own background, border or radius, LLP 1104 D2), or `appearance="none"` on the `radiogroup`, keeps its buttons as you paint them; on iOS and the Mac the group keeps one Tab stop (the checked radio) and arrow keys that press the next or previous radio (Left and Right swapped right to left); on tvOS the focus engine moves between them |
+| a route whose first child is a `header` holding one heading (`text role="heading"`; an `aria-level` alone is not one), a text after it and its buttons | the navigation bar; a level-1 heading (`aria-level=1`) is a large title, in a sheet too, and any other level an inline one; the text after it the subtitle |
 | a pushed route with no such `header` | a bar holding the system Back button alone (LLP 1115.000 D5.2) |
 | a route with `navigationBar="none"` | no navigation bar: a full-bleed screen that draws its own way back; the edge swipe still goes back |
 | a route with `navigationPresentation="modal"` | a sheet |
@@ -1277,8 +1700,13 @@ loop; `tabindex=-1` allows explicit focus while excluding sequential focus.
 itself: its content goes in a `scroll`, `list` or `overflow-y="auto"` box, which is
 the bar's scroller with nothing written (`navigationScroll` names another; "Routes
 and web documents"). A sheet's swipe down and a pushed screen's edge swipe press the
-route's enabled control whose `id` is the root's `navigationBack`, which is optional: a
-root with a `navigationKey` alone is the navigation root and names no control. A route with no such
+route's enabled control whose `id` is the root's `navigationBack`, or, when the route
+has none, one outside every route (a header the screens share), which is optional: a
+root with a `navigationKey` alone is the navigation root and names no control. The agent's
+`back` presses it too, as Escape does on a Mac sheet. When a sheet's swipe down should not do what its
+Cancel does (Cancel reverts the edits, a swipe down keeps them), give Cancel another `id`:
+a swipe down then dismisses without pressing it, and on the Mac Cancel stays in the header,
+out of the sheet's Cancel slot. A route with no such
 control still has the platform's back button, edge swipe and swipe down (and the
 browser's Back): they go back through the root's `navigate` handler with the location
 beneath (`nav = go(nav, url)` pops to it), or, with no handler, the runner pops the
@@ -1286,7 +1714,14 @@ router itself, as `nav = back(nav)` would (LLP 1115 D5). On the web the browser'
 Forward and a `link` to a declared route do the same with no handler: the runner goes
 there itself, as `nav = go(nav, url)` would (LLP 1115.000 D4.3); a native host's link
 still needs the handler. A declared but disabled
-control refuses them, as does `closedby="none"` on a sheet. On a pushed iOS
+control refuses them, as does `closedby="none"` on a sheet. Where the app's own Back and
+Forward go less far than its router (a palette open over the page, a history capped at
+so many visits), bind the root's `navigationHistory` to the ways it offers now (`"back
+forward"`, the default, `"back"`, `"forward"` or `"none"`): on the Mac a way withheld is
+no swipe, menu item or mouse button (`contract vocab navigationHistory`). A route whose scroller opens
+with a full-bleed picture says `navigationBar="transparent"`: iOS draws its bar clear at
+the scroller's top and insets nothing, so the picture sits under the bar as under a fixed
+transparent header on the web, and the bar's material comes as the content scrolls. On a pushed iOS
 route under the platform bar, that control's text becomes the bar's back button title
 beside the bar's own chevron (no text shows the chevron alone), so label it `Recipes`,
 not `‹ Recipes`. With no such control the back button is UIKit's default, which since
@@ -1296,11 +1731,24 @@ there is the control's text, said.
 Inside a route's `header`, wrap related bar buttons in a `row role="group"`.
 iOS 26 keeps each explicit group's buttons on one shared glass background and
 separates adjacent groups with UIKit's fixed-space item. Ungrouped buttons keep
-the existing platform default. The wrappers remain ordinary layout on the web;
+the existing platform default. `buttonStyle="glass"` on a bar button gives it a
+glass capsule of its own (`sharesBackground = false`), one for each button so styled. The wrappers remain ordinary layout on the web;
 this adds no spacing value or custom button face.
 
+A heading of only white space is no title on iOS, and a large title that starts empty
+takes no height. To keep that height while the words load, write the heading as
+`text "\u{200B}" role="heading" aria-level=1 color="transparent"`, the colour on the
+heading itself (UIKit draws U+200B alone as quotation marks), and drop the colour when
+the words arrive. Before iOS 26 a route pushed over it with no back control of its own
+shows that title on its Back button.
+
 The bar shows a header's heading, the first text after it (its subtitle), one search
-field, one tablist and its buttons; anything else in the header is not shown on iOS.
+field, one tablist and its buttons; anything else in the header is not shown on iOS. A
+menu or `dialog` written in the header is its opener's, as on the web, not bar buttons.
+On iOS the search field scrolls away with the content while it is empty, as UIKit's
+does; `position="sticky" top=0` on the `input` keeps it in view (React Navigation's
+`hideWhenScrolling={false}`). The route's scroller runs under the bars wherever its
+menus, popovers and `dialog`s are written: they take no place in its flow.
 The agent paints the authored header by default, but marks such a node in `tree` and
 `screenshot`, and an `expect` or `tap` on it fails, saying so. A `testId` on a bar
 button, the search field, a segment or a tab is its `accessibilityIdentifier`, which
@@ -1331,16 +1779,13 @@ column navigationKey=`${e.id}` navigationScroll="inbox-list" position="absolute"
     button press=compose
       text "New Message"
   // Pull to refresh: a `refresh` handler on the scroller; `refreshing` holds the
-  // spinner until the reload settles.
-  scroll id="inbox-list" refresh=reload refreshing=pending(items) flex=1 min-height=0
+  // spinner until the reload settles. A row's `delete=` is its swipe to delete.
+  // A first load is a `progress` beside the list while it has no rows, never in a
+  // row: a spinner inside a cell is something a hand-built iOS list never shows.
+  list id="inbox-list" refresh=reload refreshing=pending(items) flex=1 min-height=0
     for m in items key=m.id
-      // Swipe actions: a horizontal snap scroll naming its content and actions.
-      scroll swipeContent=`item-${m.id}` swipeTrailing=`delete-${m.id}` width="100%" overflow-x="scroll" overflow-y="hidden" scrollbar-width="none" scroll-snap-type="x mandatory"
-        row width="100%"
-          button id=`item-${m.id}` press=open(m.id) width="100%" flex-shrink=0 scroll-snap-align="start" text-align="start"
-            text m.title
-          button id=`delete-${m.id}` destructive=true press=remove(m.id) aria-label="Delete" flex-shrink=0 scroll-snap-align="start"
-            image "symbol:delete"
+      button press=open(m.id) delete=remove(m.id)
+        text m.title
 
 // A subtitle: the first text after the heading (UIKit's own on iOS 26).
 column navigationKey=`${e.id}` navigationScroll="list" position="absolute" inset=0 display="flex" flex-direction="column"
@@ -1352,7 +1797,8 @@ column navigationKey=`${e.id}` navigationScroll="list" position="absolute" inset
   scroll id="list" flex=1 min-height=0
     …
 
-// A sheet's bar: Cancel is the root's navigationBack control, Done trails.
+// A sheet's bar: Cancel is the root's navigationBack control, which a swipe down and the
+// agent's `back` press; Done trails.
 column navigationKey=`${e.id}` navigationPresentation="modal" navigationScroll="form" position="absolute" inset=0 display="flex" flex-direction="column"
   header
     button id="back" press=back
@@ -1369,8 +1815,11 @@ A segmented control in the content chooses a value or switches panels: a value
 from two to five (a preset, units, a period, a filter) is a `row role="radiogroup"` of
 `button role="radio" aria-checked=…`, each pressing its value (the web gives it the
 arrow keys and one Tab stop); switching panels, a `row role="tablist"` of text tabs
-outside the header. iOS needs a swipe row's content exactly the scroll's size
-([pitfalls](agent-pitfalls.md), "There is no `swipeleft`"). Its swipe actions
+outside the header. A list row's `delete=action` is its swipe to delete, UIKit's on
+iOS (`contract vocab swipe`). Other swipe actions are a hand-written swipe row, a
+`scroll` laid out as a row (`display="flex"`) whose content iOS needs exactly the
+scroll's size ([pitfalls](agent-pitfalls.md), "A hand-written swipe row shows its
+buttons under the row"). Its swipe actions
 are UIKit's, drawn by UIKit (rounded on iOS 26 and later) whatever the buttons
 paint; when every control the row names says `appearance="none"`, the paint is
 kept instead, in a grouped list too: the row swipes by its own scroll, as on
@@ -1385,43 +1834,82 @@ An `image` source is the same string on every host: a path under the app's
 `pause`, their `-fill`s, `skip-back-15`, `skip-forward-15`, `skip-back-30`,
 `skip-forward-30`, `speaker`, `speaker-mute` and `moon`; an unknown role is refused
 with the list), `symbol:sf/<name>` (an SF Symbol by its Apple name: drawn on Apple
-only, blank on the web and Linux with no warning, where `layout` reports `reason:
-"platform"`; a tab or button that must show everywhere takes a role), an `app:/data|cache|tmp/…` file
+only, blank on the web and Linux, where `layout` reports `reason: "platform"`; a
+build of an app that ships either warns, its first use with the repair and each
+later one in a line; a tab or button that must show everywhere takes a role or an
+icon token), an `app:/data|cache|tmp/…` file
 (a picked photo, or one the data module kept with `storage.fs`; it shows after a
 relaunch too), or a `data:` URL of at most 1 MiB, past which every host shows
-nothing (the web and Apple journal `image refused`). Shrink a picked photo for an upload limit with
+nothing (the web and Apple journal `image refused`).
+
+An `iframe` of a page under `assets/` or `deck/` is given an `app:/cache` or
+`app:/tmp` file its `src` names in its query, encoded as any query value is:
+`` src=`assets/viewer/index.html?file=${encodeURIComponent(path)}` ``. The page
+reads `new URLSearchParams(location.search).get('file')` and gets a URL it can
+fetch, of any size, until the frame's `src` changes. A value naming `app:/data`, a
+link or a missing file is emptied (`file=`), the frame loads as usual, and the host
+logs why; copy the file into `app:/cache` first. An HTML, SVG or XML file is given
+as `application/octet-stream`, so it never runs as the app: read its bytes, into a
+Blob of your own for an SVG `img`, or into a `srcdoc` frame under a `sandbox`
+without `allow-same-origin` for HTML. The web, macOS and iOS give files; Android
+does not ([LLP 1020.001 D7](../llp/1020.001-a-multi-file-bundled-page-in-an-iframe.rfc.md)). Shrink a picked photo for an upload limit with
 `storage.fs.compressImage(path, to, {maxDimension, maxBytes})`, which writes an
-upright JPEG with no location metadata ([reference](reference.md#shrink-a-picked-image-for-upload-storagefscompressimage));
-Linux answers `unsupported`. Upload a file with `fetch(url, {method: "POST", headers:
+upright JPEG with no location metadata (`type: "image/png"` writes a PNG that
+keeps transparency; [reference](reference.md#shrink-a-picked-image-for-upload-storagefscompressimage));
+Linux answers `unsupported`. Save an edit (a turn, a flip, a crop, a size) with
+`storage.fs.transformImage(path, to, {rotate, crop})`, which keeps the photo's colour,
+HDR and metadata where the host can and says what it wrote
+([reference](reference.md#save-an-edit-of-a-photo-storagefstransformimage));
+`compressImage` takes `rotate`, `flip` and `crop` too. Upload a file with `fetch(url, {method: "POST", headers:
 {"content-type": "image/jpeg"}, exactBodyFrom: path})`, not `readFile` then `body`: the host
 reads the file as it sends (under `fs.read`, at most 64 MiB), so a 2 MB photo never passes
-through the answer's 100 ms step; a missing or denied file rejects the fetch, naming why. Keep a picked photo by copying it to
+through the answer's 100 ms step; a missing or denied file rejects the fetch, naming why. To show an
+upload's percentage while the person goes on, make it a resource's stream with `exactUploadProgress: true`:
+its mapper gets `progress` (`loaded` of `total` bytes sent), then `load` with the reply's `status`, and no
+answer waits for it. It is asked once for its arguments while the app runs, across a reload too, though not the
+web JS target's development reload (a refresh or store write never sends it again, and one cut off after it began
+comes back failed, `interrupted`), so a retry puts an attempt number in its arguments and in its URL or a header:
+new arguments that make the same request keep the running upload. A launch starts afresh and sends again an upload the view still shows, so record what it answered (the
+server's id for the attachment) in the store and stop showing the resource once you have it
+([reference](reference.md), "An upload that tells its progress"). Download a file with
+`fetch(url, {exactBodyTo: path})`, not `arrayBuffer()` then `writeFile`: the host writes a 2xx body into the
+file as it arrives (under `fs.write`, at most 1 GiB), so a large file never enters the engine's 64 MiB heap;
+`response.exactBodyTo.bytes` is its size, and a reply that is not 2xx leaves the file untouched and reads as
+usual. Keep a picked photo by copying it to
 `app:/data` and answering that path; never tell hosts apart in the data module
 (`HermesInternal`) to choose a source
 ([LLP 1069.002](../llp/1069.002-media-picker.rfc.md) D7, [LLP 1011](../llp/1011-image-v1.spec.md) §2).
 
-An `image` hears HTML `<img>`'s two events, once per source, on the web, macOS and
-iOS: `load=` when the picture is ready (no payload), and `error=` when it does not
+An `image` hears HTML `<img>`'s two events, once per source, on every host: `load=` when the picture
+is ready (no payload), and `error=` when it does not
 load, with a `message` that says why (`error=failed` runs `action failed(message:
-string)`; `error=failed("icon")` passes `"icon"` before it). On macOS and iOS the
+string)`; `error=failed("icon")` passes `"icon"` before it). Natively the
 message is the reason (`HTTP 404`, `Could not connect to the server.`, `not an image
-format this host decodes`); the browser gives none, so the web says `the image did
-not load`. A symbol fires neither. What each host's fetch of an `http(s)` source
+format this host decodes`), and a link it quotes has no query; the browser gives none, so the web says `the image did
+not load`. On every native host a download that asking again may mend (the network, a lookup, TLS, a timeout, the spool,
+a 5xx, 408 or 429, an empty body) is asked again while the picture is on screen, after 1, 2, 4, 8, 16 and 30 s
+and never sooner than `Retry-After`, so its `error` comes once those are spent (about a minute of
+waits, plus the downloads and any `Retry-After`), and one that fails off screen errs only after it has shown ([LLP 1011](../llp/1011-image-v1.spec.md) §4). A symbol fires neither. What each host's fetch of an `http(s)` source
 sends, follows and accepts is LLP 1011's: macOS and iOS send no cookie and no
-`Referer`, follow redirects to any host (within App Transport Security), take any
-2xx body up to 64 MiB whatever its `Content-Type`, and keep an HTTP cache on disk;
+`Referer`, follow redirects to any host (within App Transport Security), take a
+body up to 64 MiB whatever its `Content-Type` and its status, as a browser's `<img>` does
+(a 404 that is an image draws; one that is not is `HTTP 404`), and keep an HTTP cache on disk;
 the web is the browser's `<img>` (its cookies and `Referer` rules, no size cap). SVG
 draws on the web only; on Apple it is an `error`. A tinted remote image on the web
 needs CORS headers, or it is an `error` too. A drive sees both after `clock +<ms>
 real`; `clock settle` can return just before them.
 
+### Sound, MIDI and media
+
 A sound effect is a declared WAV that an action plays ([LLP
 1096](../llp/1096-sounds-an-app-can-schedule.rfc.md)): `sound "assets/…wav"` at the
 top level (16-bit or float PCM, one or two channels, at most 10 s; the compiler
 reads it), then `playSound(src, at=, gain=, group=, playbackRate=, pan=)` from any
-action. Every call is a new voice, so a retrigger is another call. `at=` is the runner's
-clock (`performanceNow()`'s milliseconds; the past means now), `gain=` a linear 0–1,
-and a `group=` is monophonic by start time: a voice ends where the next one in its
+action. A path built at run time (`` `assets/kits/${kit}/kick.wav` ``) plays only the
+files a `sound` line declares, so declare each one it can name. Every call is a new
+voice, so a retrigger is another call. `at=` is the runner's clock
+(`performanceNow()`'s milliseconds; the past means now), `gain=` a linear 0–1, and a
+`group=` is monophonic by start time: a voice ends where the next one in its
 group starts, as a drum machine's choke does. `playbackRate=` (0.25–4, Web Audio's
 name) moves pitch and length together, as tape does: at 2 a voice is an octave up and
 lasts half as long. `pan=` places it from −1 (left) to 1 (right) by Web Audio's
@@ -1443,8 +1931,9 @@ component Ding
 To keep time (a metronome, a drum machine, an interval timer, a rhythm game), declare
 what should play with a `sequence` and let the runner play it ([LLP
 1125](../llp/1125-a-transport-midi-and-the-small-pieces.rfc.md) D2–D5); do not
-start hits from a timer. It has a task's gate, and one `play(tracks, bpm=…)`. A
-track loops at its own `beats`, `loops` times or forever (0), so tracks of
+start hits from a timer ([a step sequencer](recipes/sequencer.md): lanes of their own
+lengths, a kit, pause and resume, MIDI). It has a task's gate, and one `play(tracks,
+bpm=…)`. A track loops at its own `beats`, `loops` times or forever (0), so tracks of
 different lengths run against each other; a step is at a `beat` (a sixteenth is
 `0.25`) and plays a sample, a haptic, or both. The runner issues the steps into
 the voice table a second ahead on its own clock, so no action runs per step and a
@@ -1486,12 +1975,105 @@ component Metronome
 The shapes are flat and positional, as `playSounds`'s hit is: "none" is `""` or
 `-1`. Keep the tracks in a `derive`, so a commit that changes nothing else
 compares them at once. `exactTransport()` says what plays (`state`, `reason`,
-`bpm`, `anchorAt`, `anchorBeat`); a playhead is `anchorBeat + (performanceNow() -
-anchorAt) * bpm / 60000` in a frame task gated on it being shown. The gate turning
+`bpm`, `anchorAt`, `anchorBeat`); the beat now is `anchorBeat + (performanceNow() -
+anchorAt) * bpm / 60000`. A playhead or beat light follows it as an animation, not a
+frame task: a loop whose opacity is a computed `linear()` curve on a clock timeline,
+re-read by a task keyed on the anchor ("Following the transport", below), so no app
+code runs while it plays. A frame task is for text that changes
+with the beat, gated on it being shown, whose action writes the beat, not the time, so a
+frame that moves no beat commits nothing. The gate turning
 false stops it; `stopSounds()` silences what sounds and the next steps still play.
 For one or two scheduled hits, `playSounds(hits)` with `at=` is enough (a list of a
 shape whose fields are, in order, `src`, `at`, `gain` and `group`, then optionally
 `playbackRate` and then `pan`).
+
+**Following the transport.** A playhead or a beat light that follows `exactTransport()`
+is an animation, not a frame task: each light loops over its cycle (a bar, a lane) and
+Core Animation or the browser plays it, so no app code runs while the music plays.
+`level` passes a `linear()` curve's output through as the opacity, so a computed curve
+says when in the cycle the light is lit; a negative delay puts the cycle where the
+transport is; a clock timeline keeps a light mounted later in the same phase.
+
+```contract
+timeline Transport
+keyframes level
+  from opacity=0
+  to opacity=1
+
+shape Transport
+  state: string
+  reason: string
+  bpm: number
+  anchorAt: number
+  anchorBeat: number
+
+shape Step
+  beat: number
+  src: string
+  gain: number
+  group: string
+  note: number
+  velocity: number
+  channel: number
+  duration: number
+  haptic: string
+
+shape Track
+  beats: number
+  loops: number
+  offset: number
+  output: string
+  steps: Step[]
+
+fn pct(t: number, cycle: number): string = `${round(t / cycle * 10000) / 100}%`
+// Lit through the first `span` ms of each `cycle`, a cycle starting `start` ms along the
+// beat grid; `pos` is where the transport was when the loop mounted.
+fn lit(span: number, cycle: number, start: number, pos: number): string = `level ${cycle}ms linear(1 0% ${pct(span, cycle)}, 0 ${pct(span, cycle)} 100%) ${0 - (((pos - start) % cycle) + cycle) % cycle}ms infinite`
+
+component Beats
+  state playing = false
+  state pos = 0
+  state synced = ""
+  resource transport = exactTransport() as shape Transport
+  derive anchor = `${transport.anchorAt} ${transport.anchorBeat} ${transport.bpm}`
+  // `transport.bpm` is 0 before anything has played; a derive may not be Infinity.
+  derive beat = 60000 / max(1, transport.bpm)
+  sequence click when playing
+    play([Track(beats=1, loops=0, offset=0, output="", steps=[])], bpm=120)
+  // Where the transport is, read once per play, seek or tempo change.
+  task follow when transport.state == "playing" key=anchor
+    after(1, sync)
+  action sync
+    pos = transport.anchorBeat * beat + performanceNow() - transport.anchorAt
+    synced = anchor
+  action toggle
+    playing = not playing
+  view
+    column padding=16 gap=8
+      button press=toggle testId="toggle"
+        text (playing ? "Stop" : "Play")
+      row gap=8 role="img" aria-label="Beat"
+        for i in range(4) key=i
+          view flex=1 padding=4 border-radius=4 position="relative" background-color="-exact-tertiary-fill"
+            if transport.state == "playing" and synced == anchor
+              for g in [synced] key=g
+                view position="absolute" inset=0 border-radius=4 background-color="AccentColor" opacity=0
+                  animation=lit(beat, 4 * beat, i * beat, pos) animation-timeline=Transport
+```
+
+- **What stays a frame task:** text that changes with the beat ("Count-in 3"), gated on the
+  transport states that show it. Its action writes the beat, `floor(anchorBeat +
+  (performanceNow() - anchorAt) * bpm / 60000)`, never the time: the runner compares state
+  after an action, so a frame on which the beat has not changed commits nothing and draws
+  nothing (`apps/metronome/app.contract`'s `readout`). Read the position in an action (a
+  pause's) as `anchorBeat + (performanceNow() - anchorAt) * bpm / 60000` beats.
+- **A light that is not just on or off** puts every stop in the curve. Over a four-step cycle,
+  a trail ember lit the step after the head and fading from 0.4 to 0.18 through it is
+  `linear(0 0% 25%, 0.4 25%, 0.18 50%, 0 50% 100%)`; a fade after the beat is a few stops
+  sampled from its easing.
+- **A one-off change at a beat** (dim two beats after a touch) is a finite animation whose delay
+  is that beat's distance from now; a second, identical `keyframes` name restarts it, as CSS
+  restarts an animation only when its name changes.
 
 Tests read the runner's record: `expect sound has "assets/ding.wav" at 0`, with any
 of `gain`, `ends`, `playbackRate`, `pan` and `by end|group|cut|stop|cancelled|edit`, or
@@ -1501,23 +2083,34 @@ of `gain`, `ends`, `playbackRate`, `pan` and `by end|group|cut|stop|cancelled|ed
 `state sounds` lists the last 64 voices, `state transport` the transport.
 
 MIDI is Web MIDI's, and the runner keeps its queue as it keeps the voices (LLP
-1125 D6–D8). Grant `device.midi purpose.midi` (the data source's `grants()`, the
-text in `strings/en.json`). Read the ports with `resource midi = exactMIDI() as
+1125 D6–D8). Grant `device.midi purpose.midi`, a line of the data module's grants
+(`export const grants` in `app.ts`, `grants()` in Rust) whose second word is a key of
+`strings/en.json`: `"purpose.midi": "…"`, the text the person is shown when asked. Read the ports with `resource midi = exactMIDI() as
 shape MIDI` (`state`: `prompt`, `granted`, `denied`, `unavailable`; `outputs` and
-`inputs`, each `{id, name, manufacturer, state}`), ask for them from a press with
+`inputs`, each `{id, name, manufacturer, state}`; `sent`, the last 128 messages that
+went out in time order, each `{output, data, timeStamp}`, Timing Clock left out: an activity log; a track whose `output` is `""`, and `sendMIDI("", …)`, go to no device but are listed with `output: ""`, so the log shows what plays with none connected), ask for them from a press with
 `requestMIDIAccess()`, and let the person pick an output (a `select` of
 `midi.outputs` by `id`). Then a step's `note` plays on its track's `output` (a
 note-on, and a note-off `duration` beats later), `clockOut=output` on `play`
 sends clock, Start and Stop, and `sendMIDI(output, [144, 60, 100], at=…)` sends
 whole messages from an action. Hear a controller with `midimessage=heard
 midiinputs=[id]` (the action may take a `MIDIMessageEvent`: `input`, `data`,
-`timeStamp`, `beat`). Nothing to schedule by hand: a host hands each message to the
+`timeStamp`, `beat`). To keep a device's time instead, `clock=input` on `play`
+(a `select` of `midi.inputs`): it waits (`transport.state == "waiting"`) until the
+device sends Start, then plays at the device's tempo (`transport.bpm`), and its
+Stop leaves it waiting again. Nothing to schedule by hand: a host hands each message to the
 device 50 ms before it is due, so an edit or a stop takes back what has not gone.
 Test it with no device: `prefer midi.outputs "OP-XY"` then `tap "connect"`, and
 `expect midi sent "OP-XY" 99 4c 7f at 0` (bytes in hex) or `expect midi missing …`;
-`tap midi "keys" 90 3c 64` is a message from an input; `state midi` lists the
+`tap midi "keys" 90 3c 64` is a message from an input, `tap midi "keys" clock 125
+1000` a second of its clock at 125 bpm; `state midi` lists the
 queue ([Metronome](../apps/metronome/app.contract) is whole).
 
+A video is HTML's `video`, not a native view ([LLP 1042](../llp/1042-video.spec.md)):
+`video "assets/intro.mp4" poster="assets/intro.jpg" autoplay=true muted=true loop=true
+playsinline=true object-fit="cover"` is a looping hero, which Apple draws with an
+`AVPlayerLayer`. Give it a `poster` (a still of its first frame): AVPlayer takes 50 ms
+to a second to draw its first frame after launch, and the poster shows until it has.
 `audio` stays HTML's player for long media
 (a song, a podcast: `video`'s props and events with no picture, LLP 1042 §8).
 
@@ -1530,6 +2123,27 @@ time again (a skip back, "start over", a scrubber let go where it was grabbed)
 call `fastSeek(id, seconds)`, which seeks each time it runs. `load(id)` loads the
 source again: a retry after an `error`, or a file written since. Both name the
 element by its `id`, as `focus` does.
+
+Pictures that are not a video (a page a server streams as JPEG frames, a
+camera's stills) float in the platform's picture-in-picture window with
+`requestPictureInPicture("id")` on the `image` that shows them: the window
+shows each picture its `src` names next, and the image hears
+`enterpictureinpicture` and `leavepictureinpicture`;
+`exitPictureInPicture()` closes the window. A request that fails is the
+image's `pictureinpictureerror(message)`, on every host that cannot float it
+too, so handle it where a press asked: a toast, the control unpressed. The
+image may be a hidden 1-point one that a stream of its own paints; removing it
+closes the window. macOS and the web's JS target float it
+([LLP 1042 §9](../llp/1042-video.spec.md)). Leave the window to the platform
+unless the app must look like another: `presentation="window"` asks for a
+browser's picture-in-picture window as Chromium draws it on the Mac, and
+`presentation="panel"` for a floating panel with a title bar, each with
+`title=`, `width=` and `height=` (LLP 1042 §9.1); the web shows either in
+Document Picture-in-Picture's window where the browser has one. On macOS
+each image asked for in a panel gets a panel of its own, while the
+picture-in-picture window (the platform's or `"window"`) holds one image
+at a time, as a browser's does, and moves to the next that asks
+(LLP 1042 §9.2).
 
 To be the system's Now Playing app (the media keys, the lock screen, Control
 Center, a headset's buttons, the browser's media hub), give the player the Media
@@ -1590,6 +2204,8 @@ Tests trigger an action as the platform would and read what is published:
 `seekto`'s time), `expect mediasession title == "Episode 12, part 1"`, `expect
 mediasession has "nexttrack"`; `state mediaSession` is the whole record.
 
+### Markdown editing and colour
+
 A Markdown editor is a `textarea` with `markup="markdown"`; a `text` with it is
 the reader (one node; the value stays the source string). Its toolbar is
 `retainFocus` buttons calling `format(id, command[, argument])`, and its
@@ -1614,6 +2230,25 @@ component Editor
       text body markup="markdown"
 ```
 
+Mentions, tags and citations drawn as pills in that editor and reader are
+inline atoms: declare `atom` kinds by their source form, list them in `atoms=`,
+give each source a face with `atomFaces=` (its label, icon and tooltip, its
+colours when one chip is not coloured as its kind is, and its direction when a
+chip must read left to right in right-to-left text, `direction="ltr"`, and its
+accessible name when the drawn label is not what a screen reader should say,
+`ariaLabel=`) and hear `atompress=`
+([inline atoms](contract-grammar.md#inline-atoms-atom-atoms-atomfaces-atompress)).
+Unsaid, a pill is the platform's token; when the design draws its chips another
+way, write that on the `atom` as CSS (`padding-inline`, `border`,
+`border-radius`, an icon's size and the gap after it with `-exact-icon-size` and
+`gap`, a ring in a `:checked` block, an underline in a `:hover` block) and leave
+the rest to the platform.
+Keep them out of your own rules over `setSelectionRange` and `beforeinput`: the
+editor keeps a caret out of an atom and deletes it whole. An editor where
+Arabic or Hebrew lines sit beside English ones gives each line its base
+direction with `paragraphDirs`, HTML's `dir` words, one per source line
+([Markdown](contract-grammar.md#markdown-markup-format-select)).
+
 Choose a colour by what it means, not by how it looks. **The accent is for
 what the user can act on**: a link, a plain button's title or symbol, a filled
 button's fill, a toggle's on state, the icon of a tappable row. Write it as
@@ -1622,12 +2257,19 @@ button's fill, a toggle's on state, the icon of a tappable row. Write it as
 grey behind an alert or a sheet to say the screen under it is inert. **A
 colour of its own is for what means something by itself**: status
 (`-exact-system-green`, `-exact-system-red`), text hierarchy (`-exact-label`,
-`-exact-secondary-label`), data, and marks. A colour of its own never dims; on
-iOS the tint does where UIKit draws it, whoever set it (the root's
-`accent-color` or a node's own), as UIKit greys a view's `tintColor`:
-controls, bars, symbols drawn in the tint, and a box shadow in `AccentColor`.
-A gradient or SVG paint in `AccentColor` is resolved by Exact to the app's
-accent and does not dim. Set the app's accent once, on the root:
+`-exact-secondary-label`), data, and marks. A colour of its own never dims,
+except on a native button, which greys whole as UIKit greys a button, its
+symbol's `-exact-tint-color` too. On iOS the tint dims, whoever set it (the
+root's `accent-color` or a node's own), as UIKit greys a view's `tintColor`:
+controls, bars, text, symbols, fills, shadows and SVG paints in `AccentColor`.
+To keep the tint from dimming on a mark that must follow an accent the app
+cannot write as a value (a theme's, or one the person picks), write
+`-exact-tint-adjustment="normal"` on it or an ancestor (UIKit's
+`tintAdjustmentMode`). On a standard list row write it on the `row`, whose cell
+UIKit draws the image in; on the image it does nothing. A bar, its items and a
+tab bar keep the mode of the views UIKit holds them in, so they grey with the
+screen whatever their nodes say.
+Set the app's accent once, on the root:
 `accent-color` on the root element is the app's accent, and on iOS it is the
 window's tint, as an AccentColor asset is, so every `AccentColor`, bar, sheet
 and alert follows it. On Apple hosts only, an app may instead ship its accent
@@ -1666,6 +2308,26 @@ including the storage drain; it works with the development menu off. A
 iOS/tvOS, Linux and native agent sessions journal a refusal; for a scripted
 restart, start another drive on the same `--storage`. See [host commands](contract-grammar.md#host-commands).
 
+### Bar buttons, glass and the search field
+
+- iOS 26 puts adjacent ungrouped bar buttons on one glass capsule. `buttonStyle="glass"`
+  on each gives it a separate capsule of its own; a `row role="group"` keeps some on one.
+- A `popovertarget` button is the item's pull-down menu. Write the menu beside the header;
+  one written in it is still its button's menu, never more bar buttons.
+- The header's `input type="search"` hides when scrolling while it is empty, as UIKit's
+  does; `position="sticky" top=0` on it keeps the search field visible.
+- A header's buttons that press, and its disabled ones (dimmed, as UIKit's), are bar
+  items; a readout nothing presses ("● Clock") is a `row` or `text` with `role="status"`
+  ("Tabs and stacks"). Past the subtitle, the first text after the heading, other texts
+  and boxes are hidden on iOS (`lower-header-unplaced`).
+
+### A horizontal strip in a sheet
+
+`scrollIntoView(id)` scrolls every scroller above the element, as the web's does, so
+scrolling a strip of choices to one moves the sheet's form too. `block="nearest"` leaves a
+scroller that already shows it alone and `inline` places it across the strip:
+``scrollIntoView(`icon-${i}`, block="nearest", inline="start", behavior="instant")``.
+
 ### Native views: accessibility
 
 A native view ([recipe](recipes/native-views.md)) that says nothing to VoiceOver is one
@@ -1673,6 +2335,133 @@ element under its box's `aria-label`, with the traits of its `role`: `button`, `
 `img`, `switch` or `checkbox` (`aria-checked`), or `slider` (`aria-valuenow`). A view with
 parts sets `accessibilityElements` (`UIAccessibilityElement`s with a label, `.button` and
 `accessibilityActivate`); the box is then a group under the label.
+
+### Native views: a package's
+
+A package serves a tag by declaring it in its `exact.json` `views` (LLP 1133.001 D1): an
+app that depends on the package places it with no `app.json` entry. Its implementation
+makes it in each session, the same instance that answers its names: Swift
+`view(_:id:props:events:)` on the `ExactPackage` class, a `roster` of view classes from the
+web implementation, Kotlin `ExactExtension.view`; `id` is the node's. A view declared
+`"displayed": true` is told `displayed(id, shown, origin)` when it shows or hides, and a
+prop marked `"binds": true` `bound(id, prop, origin)` when it changes; `origin` is `app`,
+`tool` or `wake`, that of the commit that did it. `packages/fixtures/swatch` is a whole one.
+
+### A package's native module, library and web assets
+
+A package fills the data module's one native module (`native.call` in `app.ts`) from the
+`exact.json` at its root, whatever its `exports` "." names (LLP 1154 D2, D3):
+
+```json
+"native": {
+  "rust": "native/lib.rs", "class": "Vault", "link": "vault",
+  "library": { "aarch64-apple-darwin": { "url": "https://…/vault.xcframework.zip", "sha256": "…" } }
+},
+"web": { "assets": ["web/device.wasm"] }
+```
+
+`rust` is the shim's root file, relative to `exact.json`, and `class` a type in it that
+implements `exact_js::NativeModule` and has `fn new(app: &str) -> Self`; the shim names only
+`exact_js` and `std`. A native build joins it to the app's crate and attaches it (an app with
+its own `Cargo.toml` writes `.with_native(exact_native)` in `embedded_data`). Its
+`configure_storage` gets the app's roots and `sqlite(path)`, which admits `sqlite.open` under
+the app's grants and answers a `SqliteFile` guard: while the module holds it, the app's own
+`storage.sqlite` is refused the file, so a shim closes its own SQLite before dropping the guard,
+on its close operation and in `Drop` (the host drops the module on reload).
+`library` pins one `{url, sha256}` per Rust target of a dynamic library named `link`: for
+Linux a shared object whose SONAME is `lib<link>.so`, for Apple a zip of one `.xcframework`
+whose slice is `<link>.framework`, installed as `@rpath/<link>.framework/…`. The build
+fetches it by its hash before Cargo, links it from the shim's `#[link(name = "<link>")]`, and
+carries it beside a Linux executable or, signed, in an Apple bundle's `Frameworks`.
+`web.assets` are served at `/assets/<package>/<path>`, captured with the package's code when
+`app.ts` imports it. Each of these fails the build by name: a wrong hash; a target `library`
+does not list; two dependencies declaring `native` (`bake-native-twice`).
+`packages/fixtures/vault` is a whole one, its library built by `test/library.mjs`.
+
+### Arranged panes
+
+On iOS and iPadOS 27.1 or later, an element hatch can call
+`element.arrange(using: controller)` with a `UIArrangementViewController` configured
+with `UISplitArrangement` or `UIOverlayArrangement`. Exact places the element's two
+authored children in the controller and lays each out in the space UIKit gives it.
+Give the element a definite size, such as `height="100%"` in a sized route;
+allocated children do not give an auto-height parent its height. Pass `nil` to
+restore CSS layout.
+
+A `true` result accepts the request; UIKit lays it out when the owning container
+is available. `false` means the element is unavailable, it does not have exactly
+two valid children, or a new controller is already attached or has populated
+content slots. Once accepted, the request uses CSS while the element
+does not have exactly two valid children, then resumes native layout when both
+return. Child order and replacements follow the authored tree.
+
+The first child is UIKit's primary pane and the second is its secondary pane.
+Exact supplies their child controllers and manages the arrangement's content
+slots and containment. Supply a detached controller with empty slots; reuse that
+controller for configuration changes. Call UIKit's `updateArrangement(_:animated:)`
+to change axes, split or overlay behavior, dimensions and placement properties.
+Exact does not translate those settings. Navigation stays in the enclosing controller.
+UIKit may hide a pane when the allowed axes do not suit the current display.
+
+```swift
+let arrangement = UIArrangementViewController()
+arrangement.updateArrangement(.split.axes(.horizontal))
+element.arrange(using: arrangement)
+
+// A later menu action changes the same controller, keeping the authored panes.
+arrangement.updateArrangement(.overlay, animated: true)
+```
+
+The pane wrappers do not measure authored content for UIKit's `.intrinsic`
+dimension. Use native automatic, absolute or fractional dimensions for now.
+
+Use a bounded scroller in each child for independent scrolling. The first visible
+vertical scroller is the default title and scroll-to-top target; `navigationScroll`
+can name another. UIKit owns bar minimization, safe-area changes, each pane's
+scroll-edge effect and navigation transitions. Arrangement adoption leaves the
+route's native navigation policy unchanged. The route hatch receives the enclosing
+controller, so title and bar settings use UIKit directly:
+
+```swift
+let item = route.controller.navigationItem
+item.largeTitleDisplayMode = .automatic
+item.navigationBarMinimization.minimizationBehavior = .onScrollDown
+item.navigationBarMinimization.safeAreaAdjustment = .automatic
+```
+
+Set only the native properties the app needs to change. For a fixed header, set
+`minimizationBehavior` to `.never`. Select the bar's scroll view with
+`route.controller.setContentScrollView(_:for:)`. An explicit native selection
+survives authored layout updates; passing `nil` leaves discovery to UIKit and keeps
+the first visible vertical scroller as Exact's scroll-to-top target. UIKit's
+`contentScrollView(for:)` getter reports only explicit selections, so `nil` does not
+mean scrolling is disabled. Each edge is independent, and `.all` selects all edges.
+For example, a menu action can select the secondary pane after the arrangement
+has mounted:
+
+```swift
+if let scroll = arrangement.viewController(for: .secondary)?.contentScrollView(for: .top) {
+    route.controller.setContentScrollView(scroll, for: .top)
+}
+```
+
+The route hatch's `contentScrollView` is the actual selected view, including a
+native collection view or an app-owned `UIScrollView`.
+
+The containing navigation controller still owns one shared navigation bar. UIKit
+decides where its large title and each pane's edge effect appear; the panes keep
+their own scroll offsets and safe areas.
+
+Declare the hatch for its platforms in `app.json`. Keep navigation outside the
+arrangement and avoid nesting it in authored scrollers or other native layout
+containers ([Apple's containment guidance](https://developer.apple.com/documentation/uikit/uiarrangementviewcontroller)).
+Keep the same children mounted when switching between native and CSS layouts, so
+folds and resizes preserve their controls, bindings and state. Older systems and
+other hosts use the authored CSS layout. Duo Lab's
+[Panes screen](../apps/duo-lab/arrangement.contract) and
+[hatch](../apps/duo-lab/modules/apple/ArrangedPanes.swift) use UIKit split and overlay
+arrangements and responsive CSS elsewhere. See Apple's
+[arrangement guidance](https://developer.apple.com/design/human-interface-guidelines/designing-for-iphone-duo).
 
 ## Routes and web documents
 
@@ -1694,6 +2483,32 @@ Bind the host's navigation root and per-entry `navigationKey`s as the
 [router fixture](../contract/corpus/routes.contract) demonstrates. Test back,
 tab switching, the same-URL push, external navigation, and route parameters.
 
+Exact's web servers use declared routes for file-like deep links: `/profile/:handle`
+admits a navigation to `/profile/photos.zip`. Existing public files win; unmatched
+file paths stay 404, even with `notfound`.
+
+**A built site, hosted.** `bun exact.mjs web-build --out dist` writes the site to `dist/`, a
+release build as deploy makes one (no agent mode): a page for each `render=build` route
+(rendered under Bun unless the app has a render entry of its own), `404.html` for a `notfound`
+route rendered so, `shell.html`, and `routes.json`, the route table in the plan's order with each
+route's pattern, render policy and `notfound`. Inside the app, `--out` is `dist` (or a path under
+`dist/` or `target/`), which no build reads as source; the build it replaces is kept beside it in
+`dist.gen` while a page sent from it may still ask for its files, and `--out` refuses a directory
+beside which something else holds one of those names (`dist.gen`, `dist.previous`, `dist.lock`).
+`bun exact.mjs serve dist` serves it on 127.0.0.1 (`--lan`: every interface), and any static
+host serves it by the same rule: a file at the path; else, for a browser's navigation to a path
+a route matches, `shell.html` with 200; else `404.html` with 404. A host with a single fallback
+page serves `shell.html` for every page it lacks, and the client draws the `notfound` route. For
+a route declared `render=request` or `cached`, the home route's too, `serve` renders the page for
+the request under Bun from the build it serves (a `cached` page kept 60 s), so it arrives with
+its data; so is a miss, with 404, when the `notfound` route is declared so. A static host serves
+their shell. `npm start` runs `bun exact.mjs serve`, which with no directory serves the last
+`web-build` without `--out`.
+
+A launch that no link starts opens at the manifest's `start_url` (for example
+`"/today"`), as an installed web app does; Apple builds bake it in. A launch
+that a link starts opens where the link goes.
+
 For a custom scheme, declare `protocol_handlers` in `app.json`, for example
 `[{"protocol":"web+notes","url":"/open?u=%s"}]`. The Apple hosts register
 that scheme. An incoming `web+notes://auth/callback#done` reaches `/open` with
@@ -1702,22 +2517,39 @@ the complete original URL percent-encoded in `u`; read it with
 navigation root with `navigate=`. At cold launch it is the initial location;
 when already running, each link fires one `navigate` event in arrival order.
 An app without `protocol_handlers` keeps ordinary URL-to-location behavior.
-Web builds copy this key into the web app manifest; the browser decides which
-schemes it supports and whether the installed app is registered.
+A drive on macOS or iOS delivers a link as the system would, without iOS's
+"Open in …?" alert: `type <root> "web+notes://auth/callback#done"`.
+For a packaged-only scheme, use
+`[{"protocol":"notes","url":"/open?u=%s","distribution_only":true}]`.
+Apple archives and `--distribution` builds register it; local builds omit both
+its scheme and template. `--bundle` or `--release` alone does not enable it.
+Web builds copy this key into the web app manifest, without `http` and
+`https`; the browser decides which schemes it supports and whether the
+installed app is registered.
+A Mac web browser declares `https` and `http` together, each with the same
+`url` and the same `distribution_only`: a web link, and an HTML file Finder
+opens in the app (as its `file:` URL), reach that template. The person makes
+the app the default browser in System Settings. On iOS, `host.ios.webBrowser: true`
+registers the pair and signs the managed browser entitlement; Apple approval and
+a provisioning profile granting it are required. Without this opt-in iOS registers neither, and
+`host.<platform>.urlSchemes` refuses both
+([reference](reference.md#run-an-app-from-a-terminal-on-macos), its table).
 
 Every route (a node with a `navigationKey` under the root) is a direct child of the
 root or of a `role="tabpanel"` in it — through `for` and `if`, never another
 element: the compiler refuses one behind a wrapper (`lower-route-place`). Make each
 route `position="absolute" inset=0`: the hosts hide a covered route, as
 `visibility: hidden` does, so an in-flow route still takes its room. A covered
-route stays mounted (its nodes are in `tree`, marked `inactive`), so a `testId`
-two screens share names two nodes: give each screen its own (`list-error`,
-`detail-error`).
+route stays mounted (its nodes are in `tree`, marked `[hidden]`, or `[inactive]`
+beneath a sheet, which still shows it), so a `testId` two screens share names
+two nodes: give each screen its own (`list-error`, `detail-error`).
 
-A route does not scroll by itself, as a `div` does not: content taller than it is
-never seen. A fixed shell (a map, a camera, a chat whose composer stays put) is
-fine; anything else puts its content in a `scroll` or `list` with `flex=1
-min-height=0` right after its `header`:
+Content taller than a native route is unreachable without an explicit scroll
+container. The exception is an unpresented iOS route under native chrome with
+`resizes-visual`: its viewport scrolls overflow and accommodates the keyboard
+without layout reflow. Put scrolling content in a `scroll` or `list` with
+`flex=1 min-height=0` right after its `header`. Use an outer `scroll` when a
+document contains smaller scrollers, so content outside them remains reachable.
 
 ```text
 column navigationKey=`${e.id}` position="absolute" inset=0 display="flex" flex-direction="column"
@@ -1786,23 +2618,47 @@ main navigationKey=`${top(nav).id}` navigationBack="back" navigate=follow displa
   `buttonStyle="glass"` on a header button gives that item a capsule of its own
   (`sharesBackground = false`).
 - A header button is its bar item: a symbol is its image and a text its title, in
-  the bar's type, the platform's. A face that says more keeps what it says: a status
-  dot (a childless filled box) beside its label, or a label in a `font-family`,
-  `font-size` or `font-weight` of yours, is drawn as written, in its colours, as the
+  the bar's type, the platform's. A `font-size` or `font-weight` on a native button or
+  its text sets that title's font, as on a button in the page, and its glass fits the
+  words (`buttonStyle="glass" font-size=12` is a small "● Clock" chip). A face that
+  says more keeps what it says: a status dot (a childless filled box) beside its
+  label, or a label in a `font-family` of yours (which makes the button a custom
+  one), is drawn as written, in its colours, as the
   item's image inside the bar's capsule (a "● Clock" chip in 12-point monospace).
   A filled box holding a text or symbol (an avatar, a badge) is drawn without the
   capsule. Leave the font unsaid for an ordinary Edit or Done.
+- A readout nothing presses (a "● Clock" or "Saved" beside the title) is
+  `role="status"` in the header, beside the buttons. (A `button disabled=true` is a
+  dimmed bar item, UIKit's disabled one, which VoiceOver reads as a button that cannot
+  be pressed, not as a status.) A readout is an item on its side of the heading, a custom view in the bar's
+  glass drawn as written (its fonts, colours, a dot's size and corners, the gap) that
+  follows the state in place, read by VoiceOver as static text (its `aria-label`, else
+  its words). Its texts are never the subtitle. The web, the Mac and the agent's own
+  chrome draw it where it stands in the header (LLP 1075.003 §9.15):
+
+  ```
+  header display="flex" align-items="center"
+    button id="back" press=back
+      text "Settings"
+    text "Activity Log" role="heading" aria-level=2
+    row role="status" aria-label=(live ? "Clock, receiving" : "Clock") display="flex" align-items="center" gap=6
+      column width=7 height=7 border-radius=3.5 background-color=(live ? "c.cyan" : "c.dim")
+      text "Clock" font-family="Menlo" font-size=12 color=(live ? "c.cyan" : "c.dim")
+  ```
 - Each tab names its panel with `aria-controls`; the panels are the stacks, and every
   tab's stack stays mounted, so a pushed screen, a draft and a scroll offset survive
   a visit to another tab. A tab is `select(nav, name)`; selecting the shown tab
-  again pops it to its root.
+  again pops it to its root. A sheet is a route of the tab's stack, rendered in the
+  panel's `for e in t.stack` like the others, and is presented over the tabs; with
+  tabs the root's own children are no routes, and one with a `navigationKey` is refused.
 - On iOS the panels become a `UITabBarController`: a tab of one symbol over its label
   is its bar item, a filled box holding a text is the item's badge, and the
   tablist's `accent-color` (inherited, as in CSS) tints the selected item; `tap tab-…`
   works on every host. An app's `bun exact.mjs agent ios` and `test ios` drive what a
   person sees (`--chrome platform`; `--chrome agent` paints the authored tablist and
   header instead, as `scripts/agent.mjs` does by default): UIKit's tab bar, navigation bars and sheets show,
-  `screenshot "file" window` draws them, and a tap naming a tab or a header control
+  `screenshot "file" window` draws them (`display` reads the simulator's screen as it
+  is, a system alert over the app included), and a tap naming a tab or a header control
   presses it through its bar (`native: "tab-bar-item"`, `"bar-button-item"`). The
   bars' own motion runs on real time (`clock +300 real` before a screenshot); the
   software keyboard, another window, is not drawn.
@@ -1832,6 +2688,9 @@ main navigationKey=`${top(nav).id}` navigationBack="back" navigate=follow displa
 - A modal route (`navigationPresentation="modal"`) is opaque: its unsaid
   `background-color` is `-exact-background` (the grouped one when it scrolls a grouped
   list), so the route under it, dimmed, never shows through; write one to say another.
+  On iOS that unsaid ground is the sheet's: below its large detent the sheet is
+  UIKit's glass, as a hand-built one is, and at the large detent the system
+  background. A `background-color="transparent"` is clear at every detent.
   Its corners are UIKit's: on iOS 26 and later a large sheet is rounded like the
   display and inset from the bottom edge, as Apple's own are. A `border-radius` on the
   route is the sheet's corner radius (its top-left one; `preferredCornerRadius`), which
@@ -1865,6 +2724,11 @@ main navigationKey=`${top(nav).id}` navigationBack="back" navigate=follow displa
   `flex-shrink: 0`. The route does
   not pad `env(safe-area-inset-bottom)`: UIKit adds that band below the detent.
   iOS alone sizes a sheet (LLP 1075.003 §9.11).
+- A sheet opens at its first height, the shortest, as UIKit opens one, unless the
+  route says `navigationInitialDetent`, one of its `navigationDetent` words:
+  `navigationDetent="medium large" navigationInitialDetent="large"` opens tall with a
+  half-height stop (React Navigation's `sheetInitialDetentIndex`). It is read when
+  the detents are set, so changing it alone does not move an open sheet.
 - A sheet's grabber is the platform's unless the route says `navigationGrabber`:
   iOS draws one on a sheet with several detents, which it resizes, and none on a
   sheet of one height; `"visible"` or `"hidden"` says otherwise (UIKit's
@@ -1953,14 +2817,19 @@ a loop from mutations: a `then` cannot send its own mutation
 instead.
 
 `performanceNow()` is the runner's clock in milliseconds since this launch of the app (it
-restarts at 0 on every launch; the driver's clock under the agent, from 0), as the web's
+restarts at 0 on every launch, and a window opened later reads the same clock; the driver's clock under the agent, from 0), as the web's
 `performance.now()`, not a date: a deadline of `performanceNow() + ms` sent to a server is
 in 1970, and one stored is meaningless after a relaunch. Anything stored or sent takes
 `time.epochAtZero + performanceNow()` ([timer recipe](recipes/timer-that-survives-relaunch.md)). For the date, read the reserved
 `exactTime` source and add `time.epochAtZero + performanceNow()`. There is no
 `now()`: it is refused (`type-now-renamed`) with those two repairs. Its fields, which a shape declares as it reads them:
 `epochAtZero` (Unix milliseconds when `performanceNow()` read zero), `utcOffset` (minutes east
-of UTC), `locale` (BCP 47), `timeZone` (IANA), `resolvedLocale` (the language of
+of UTC), `locale` (BCP 47, the first preferred language), `formatLocale` (BCP 47, the
+regional format the platform's own formatters use: macOS and iOS's Region, so English
+with a Korean region is `en-US` and `en-KR`, with the hour cycle the user forces as
+`-u-hc-h23` or `-u-hc-h12`, so `Intl.DateTimeFormat(time.formatLocale)` writes the time in
+the device's 12- or 24-hour cycle; `locale` where a host keeps none apart),
+`timeZone` (IANA), `resolvedLocale` (the language of
 the string table the app shows, `""` with no tables) and `seed` (a whole number
 below 2^32, drawn once per launch, so `%` and `>>> 0` take all of it; mix a round
 into it in 32-bit steps, as the [random recipe](recipes/random-and-shuffle.md) does). A read does not itself schedule a future render, and a
@@ -1984,15 +2853,20 @@ they do not admit arbitrary frame callbacks or a second app-state graph.
 
 For drawing and pointer-tracking, `pointerdown`, `pointermove` and `pointerup`
 hand an action that takes it a `PointerEvent` (`offsetX`/`offsetY` from the
-node's content box, `buttons`, `pressure`, `pointerType`, `pointerId`, and
-`clientX`/`clientY` from the viewport, `frame()`'s space), on any
-node, a canvas included; set `touch-action="none"` on a drawing surface. Any
-button goes down (`buttons` 2 is a right-click's), and a `contextmenu` action may
-take the same record, where the click was. `wheel` hands a `WheelEvent` (deltas,
+node's content box, `button` and `buttons`, `pressure`, `pointerType`,
+`pointerId`, and `clientX`/`clientY` from the viewport, `frame()`'s space), on
+any node, a canvas included; set `touch-action="none"` on a drawing surface.
+Any button goes down, numbered as the DOM's: `button` 0 primary, 1 middle, 2
+secondary, 3 back, 4 forward (-1 on a move), `buttons` bits 1, 4, 2, 8, 16. A
+`contextmenu` action may take the same record, where the click was. The back
+and forward buttons go Back and Forward at their release, as a browser's do,
+unless a `pointerup` handler calls `preventDefault()`. `wheel` hands a `WheelEvent` (deltas,
 modifiers; a trackpad pinch is a Control-held wheel) and `preventDefault()` keeps
 the scroll from happening; `drop` hands a `DragEvent` whose `files` are `doc:`
-handles of the types `file_handlers` declares. See
-[Pointer](contract-grammar.md#pointer).
+handles of any type, a folder's included, and takes a file drag over a field
+inside its node; `dragenter` and `dragleave` bracket the drag for a drop
+overlay; a `paste`'s `ClipboardEvent` carries `files` too. See
+[Pointer](contract-grammar.md#pointer) and [Clipboard](contract-grammar.md#clipboard).
 
 Use `keycapture=shortcut` on a container when its shortcut must run before
 the focused field's `key=` handler. Capture runs outermost first, then the
@@ -2002,7 +2876,9 @@ target's `key` handler when called there. `preventDefault()` keeps the field
 from editing. The container gains no Tab stop from `keycapture` alone.
 
 `key` is the DOM's keydown and `keyup` its keyup; an action that takes it hears
-a `KeyboardEvent` (`metaKey`, `code`, `repeat`, …). Track a held modifier as a
+a `KeyboardEvent` (`metaKey`, `code`, `repeat`, `isComposing`, …). An Enter or
+Escape handler at a field skips `e.isComposing`, as web code does: on the web
+the Enter that picks an input method's candidate arrives composing. Track a held modifier as a
 page does: set it from the event on every keydown and keyup, and forget it when
 the window loses the focus, since a key let go in another app sends no keyup
 (the page's `window` `blur`). `exactPage().hasFocus` turning false gates the task
@@ -2041,8 +2917,12 @@ popovertargetaction="hide"`) and `hr` separators are the menu, and one row with
 does (open the conversation). iOS presents UIKit's context menu, with the row
 lifting and the preview popping into the screen its press pushes; macOS an
 `NSMenu` without the preview; the web and the agent open the popover anchored to
-the node. The node's own `contextmenu` action runs first, so one popover can
-serve every row of a list. The agent opens it with `tap <node> contextmenu`
+the node. The menu needs the popover menu-shaped ([LLP 1021](../llp/1021-menus.rfc.md)
+D3): each row its text and at most one `image`, with `aria-checked` for a checkmark;
+a row with anything else beside its label (an icon box) makes macOS open the
+painted popover anchored to the node instead. The node's own `contextmenu` action runs first, so one popover can
+serve every row of a list. A node inside an open popover opens its menu over
+that popover, which stays open, as HTML nests them. The agent opens it with `tap <node> contextmenu`
 ([LLP 1021](../llp/1021-menus.rfc.md) §5.1).
 
 #### A confirmation
@@ -2075,13 +2955,22 @@ alert; several actions with no text (an "Open in…" chooser) make an action
 sheet, unanchored on an iPhone (its Cancel drawn) when it has a Cancel and a popover
 at its invoker when it has none, so a tap outside can dismiss it (LLP 1115 D6).
 An alert has no outside, on every host (LLP 1115.000 D13.4): Escape and Back
-cancel it and a tap or click beside it does nothing, which is `closedby="closerequest"`,
+cancel it (the Mac's one-button alert excepted, below) and a tap or click beside it does nothing, which is `closedby="closerequest"`,
 implied for the alert's shape, so leave `closedby` unwritten. Write
 `closedby="any"` only to ask for the platform's dismissible form in its place:
 an action sheet on an iPhone (a popover on an iPad), a dialog a click outside
 closes on the web, a sheet a click on the window behind it closes on the Mac, a
 Material dialog a tap outside cancels on Android.
 `close("<id>")` from an action closes it as its Cancel does.
+
+An alert that only tells ("Couldn't save the note." and OK) is a `text` and its
+one closing button, with no action: iOS's alert with that one button, macOS's
+`NSAlert` with it as the default (Return presses it and Escape does nothing, as
+on AppKit's own one-button alert), the web's modal `dialog`, Material's dialog
+on Android. Under `closedby="any"` it is the dialog's own sheet on the Mac, which a
+click outside dismisses; iOS keeps the alert, since an action sheet drops a
+lone Cancel in an iPad's popover. The action that learns of the failure sets the state its `text`
+reads and calls `showModal("<id>")` ([error-alert](recipes/error-alert.md)).
 
 A prompt (a rename's, `Alert.prompt`) is the alert with a text field: an
 `input` among its rows, which counts as its message when it has no `text`:
@@ -2115,6 +3004,11 @@ makes it the default button.) Only the alert's shape takes
 one field at a time: with it, a cancel and at most three buttons, no `for`
 (`lower-alertdialog` says which row breaks it).
 
+A menu row's second `text` is its item's grey subtitle on iOS when it is a line
+under the first (two texts in a block `button`, or a `flex-direction="column"`
+one), with or without an `if` around it; two texts side by side in a row, or one
+positioned `absolute` (a count at the corner), stay one title.
+
 A submenu is a row whose `popovertarget` names another menu popover (`Copy ▸
 path / link`): a submenu `NSMenuItem` on macOS, a nested `UIMenu` on iOS, and
 on the web and under the agent the nested popover, opened by `tap <row>`. Place
@@ -2125,18 +3019,46 @@ runs it); and draw the web's `›` as an `aria-hidden` text, since the native
 menus draw their own arrow ([LLP 1021](../llp/1021-menus.rfc.md) §5.2).
 
 For the Mac menu bar, put `-exact-menu="app"` on an ordinary button to add
-an item without a shortcut. Literal destinations are `app`, `file`, `edit`,
-`view`, `go`, `window`, `help`; explicit placement overrides the usual
-`aria-keyshortcuts` chord filing. Its accessible label or text titles it,
-and `disabled` disables it. Keep the button reachable: the agent taps it,
+an item without a shortcut. Literal destinations are `about` (directly under
+About, where Check for Updates… goes), `app`, `file`, `edit`, `view`, `go`,
+`window`, `help`, and `none` (no item: the chord stays a shortcut);
+explicit placement overrides the usual `aria-keyshortcuts` chord filing. Its
+accessible label or text titles it, and `disabled` disables it. An item in the
+app menu or Help is the app's, so it stays enabled while no window is key and
+under a sheet or a Contract modal dialog. Keep the button reachable: the agent taps it,
 and other hosts show that ordinary button, with no application menu.
 On the root, `-exact-menu-remove="show-tab-bar autofill close-all"` removes
 selected standard items. Its whitespace-separated list must be literal; unknown
 ids and non-root use are refused. The fixed ids are `close-all`, `autofill`, `show-tab-bar`, `show-all-tabs`, `enter-full-screen`,
 `minimize`, `zoom`, `bring-all-to-front`, `show-previous-tab`, `show-next-tab`,
-`move-tab-to-new-window`, `merge-all-windows`.
-Other standard items and the development Develop menu remain; other hosts
-ignore removal. See the grammar’s “The Mac’s menu bar”.
+`move-tab-to-new-window`, `merge-all-windows`, `back` (Go ▸ Back), `forward` (Go ▸ Forward), `develop` (the
+Develop menu; its chords stay), `paste-and-match-style`, `find`,
+`spelling-and-grammar`, `substitutions`, `transformations`, `app-help` (Help ▸
+*App* Help), `actual-size`, `zoom-in`, `zoom-out`.
+Other standard items remain; other hosts ignore removal.
+`-exact-menu-keys="close-window=none"` on the root keeps File ▸ Close Window
+with no chord, so ⌘W reaches the page; declare `-exact-menu-remove="close-all"`
+with it, or AppKit's Close All ⌥⌘W shows as a row of its own.
+`close-window=Meta+Shift+W` gives it ⇧⌘W instead: one `aria-keyshortcuts`
+chord with `Meta` that is not the host's or the system's own. View has Actual Size
+⌘0, Zoom In ⌘+ and Zoom Out ⌘-, a page zoom as a browser's: the viewport,
+`px` and `rem` all follow it; an app's own zoom commands set it with
+`setPageZoom(factor)`. See the grammar’s “The Mac’s menu bar”.
+
+Two more presentations of a button reach past the window
+([LLP 1133.025](../llp/1133.025-desktop.rfc.md) D4, D5). `dock` beside a menu
+id, or alone, also files the button in the app's Dock menu:
+`-exact-menu="file dock"` is New Conversation in File and in the Dock menu.
+`-exact-menu="status"`, alone, makes the button the app's status item: a menu
+bar item on macOS, a notification-area icon on Windows. Its text or
+`aria-label` is the item's title and tooltip, one `img` or `svg` child its
+image (a template image on macOS), and its `popovertarget` menu the item's
+menu; a click on macOS opens that menu, or runs `press` when there is none.
+On those two hosts the button takes no room in the page; elsewhere it is an
+ordinary button. An accessory app's status menu ends with the host's Quit,
+which `-exact-menu-remove="status-quit"` removes. Bare `focus()` brings the
+window forward, showing it if it was hidden; the agent lists the items as
+`state.statusItems` and `state.dockMenu`.
 
 
 `frame(id)` and `measure("literal-id")` are action-only geometry reads returning
@@ -2178,8 +3100,20 @@ SVG uses SVG names. Native SVG geometry has incomplete support for `calc()`,
 `min()`, `max()` and `clamp()`, including nested SVG viewports and `<use>`
 placement and sizing. Use numeric lengths or percentages there; CSS layout math
 on the outer SVG element does not imply support inside its scene.
-`foreignObject` compiles and renders on the web; native hosts refuse it at run
-time, so position a box over the `svg` there. Canvas 2D calls
+SVG attribute-only lengths accept user units (unitless), `px`, `in`, `cm`, `mm`,
+`pt`, `pc` and `%`: line/linearGradient `x1`/`y1`/`x2`/`y2`, radialGradient
+`fx`/`fy`/`fr`, marker `markerWidth`/`markerHeight`/`refX`/`refY`, and each item
+of SVG text/tspan `x`/`y`/`dx`/`dy`. Relative units and function text such as
+`calc()`, `env()` and `var()` are refused in literals and literal template parts
+(LLP 1055.000 D4). Literal concatenations are checked together; an incomplete
+fragment that could finish an accepted unit is left to runtime. Literal choices in
+conditionals, matches and inlined derives are checked too. Bound values must use
+the same units. Marker `refX` also accepts `left`/`center`/`right`, and `refY`
+accepts `top`/`center`/`bottom`; native hosts currently place these keywords at 0.
+`foreignObject` renders directly on the web, but draws nothing through SVG `use`.
+The compiler warns at a `use` whose unambiguous, unconditional literal target contains
+one (`lower-svg-use-foreign-object`). Native hosts refuse `foreignObject` at run
+time; for content on every host, position an ordinary box over the `svg`. Canvas 2D calls
 live in a data module, and GPU/game surfaces in their optional module. A
 hyphenated native tag must be listed in `app.json`'s `modules` (the bake refuses
 others) and implemented by the module; its unknown attributes pass through
@@ -2214,6 +3148,19 @@ its schemes in `app.json`: `"host": { "ios": { "queriesSchemes":
 List at most 50 schemes, without `:` or `://`; changing the list requires a
 native rebuild.
 
+Write pressed `background-color`, `color` and absolute `opacity` in a
+`:active` block. `-exact-press-opacity` multiplies the node's presented opacity;
+`-exact-press-scale` multiplies its presented scale. The host applies these
+values while a finger or mouse holds the innermost pressable inside its box.
+Sliding off, cancellation or a pan releases it. Custom nodes ease over 120 ms;
+native controls keep the platform's timing. The agent applies the target at
+once, so `"tap row down" "screenshot x.png" "tap up"` shows it. Pressing requires
+no runner round trip. Active `color` reaches text that inherits the node's
+colour; descendants with their own keep it. On custom nodes, authored feedback
+replaces the platform's unsaid press. Native buttons and native list rows keep
+unwritten fields of the platform's highlighted state. Leave feedback unwritten
+for the platform default. A press that changes layout uses app state.
+
 Haptics are already there (LLP 1077 D14). `-exact-press-haptic` (`selection`,
 `impact-light|medium|heavy|soft|rigid`) plays at touch-down without a round
 trip, as `-exact-press-scale` does. `haptic("selection" | "impact-…" | "success" |
@@ -2226,7 +3173,7 @@ font-size }` (LLP 1069.000 D3). Size what should scale in `rem` (text, control
 heights, paddings) and what should not in `px`; an action calling
 `setRootFontSize(size)` re-lays every `rem` out in its own commit, on every host.
 The app's size stands over the host's (the browser's setting, iOS Dynamic Type's
-body, 13 on macOS, 16 on Linux), as an author's `html { font-size: 20px }` stands over a
+body, 13 on macOS, 16 on Linux, and 16 times Windows' Text size factor), as an author's `html { font-size: 20px }` stands over a
 browser's font-size setting; `setRootFontSize("medium")` hands it back, so a
 "Default" choice that follows Dynamic Type calls that. Smaller and Larger that
 should scale Dynamic Type instead of replacing it are percentages:
@@ -2239,20 +3186,59 @@ stored size again. Do not multiply a scale factor into every size instead.
 Platform facts are reserved sources (`exactViewport`, `exactPage`, `exactDelivery`,
 `exactSurface`, `exactTime`); the bake refuses a declared field the source does
 not have. `exactViewport().displayMode` is a string: the current CSS display
-mode on the web, `fullscreen` or `standalone` on macOS, `standalone` on other
+mode on the web, `fullscreen`, `window-controls-overlay` (the tall title row
+`display_override` asks for) or `standalone` on macOS, `standalone` on other
 native hosts. Declare it on the resource's shape; `state.device.displayMode`
 reports it too. `prefer display-mode fullscreen` substitutes it on Apple;
 browser drivers refuse that override, so test real fullscreen transitions. This reads the window, not a fullscreen navigation route.
+`exactViewport().pointer` and `.hover` are CSS's `pointer` (`fine`, `coarse`,
+`none`) and `hover` (`hover`, `none`) for the primary input: the web's media
+queries; `fine` and `hover` on macOS, Linux and Windows, and `coarse` and `none`
+on Android's touch screen and on a Linux one with no mouse or touchpad, read once
+at launch; on iOS `coarse` and `none`, or `fine` and
+`hover` while an iPad has a trackpad or mouse attached; `none` and `none` on tvOS
+and on Android TV.
+They change while the app runs. Show a game's on-screen stick under `coarse`
+(the starter does, `game/recipes/touch-controls.md`), never by platform. The web's
+neutral look sizes its own controls for a touch device instead (`any-pointer:
+coarse`: any coarse input, normally a touch screen), so they keep their size
+while an iPad's trackpad comes and goes. Under the agent each is the device
+class's from launch; `prefer pointer coarse` and
+`prefer hover none` substitute them. Chrome emulates a touch screen, so it takes
+`coarse` with `none` and `fine` with `hover`, and refuses `pointer none`; the
+Firefox and WebKit carriers refuse both.
+`exactViewport().accessibilityTextSize` is true while the person's text size is one
+of iOS's accessibility sizes (AX1 to AX5, UIKit's `isAccessibilityCategory`), where
+UIKit's own views drop decoration and stack what sat side by side; it is an Exact
+fact, not a CSS media feature, read wherever Exact draws with UIKit's metrics (iOS,
+iPadOS, tvOS, visionOS, watchOS), and false on the Mac, Android, Linux, Windows and
+the web.
+`EmptyState` drops its symbol then. Under the agent on iOS, `prefer root-font-size
+28` (Dynamic Type's AX1 body) or more sets it.
+`exactViewport().gpuTier` is `low`, `mid` or `high`: how much GPU work a frame can
+afford, chosen once before the GPU device is made from what the adapter reports
+(a phone GPU of the Adreno 600 class is `low`), else from the screen (a phone-sized
+one `low`, a computer's `high`), never from a measured frame time; a phone-sized
+screen is never `high`, nor is any iOS or Android device natively. A game's renderer follows it (`Game::quality`); a HUD can
+read it to offer a quality setting. A native host answers its GPU module's tier
+once the module loads (`high` before it). Under the agent it is `high` from launch, and
+`prefer gpu-tier low` substitutes it and remakes each world's renderer at its rung.
 `exactPage` answers `visibilityState`, `onLine`, `canShare`,
 `canShareFiles` and `canSharePictures` (whether `share(files=…)` takes
 `app:/` files and an element's `"#id"`; the web never takes a picture),
 `canOpenFiles` and `hasFocus` (`document.hasFocus()`: the app's window has the
 system's focus; false while another app or window is in front, so an app can
-choose an in-window message over a system notification). A reminder that should
-open a route uses `showNotification(title="Done", navigate="/thread/42")`;
-its click reaches the navigation root as a warm `navigate` event or a cold
-launch location. Under the agent `state.notifications` lists `navigate`, and
-`type <navigation root> "/thread/42"` checks the destination. Under the agent each
+choose an in-window message over a system notification), `persisted` and
+`restores` (the back/forward cache: `persisted` is true while the page is put
+away, from a `pagehide` with `persisted` until the `pageshow`; `restores`
+counts those `pageshow` events, so `task t when page.restores > 0
+key=page.restores` runs once for each return, never at launch; a Mac window a
+`keepRunning` close hid is put away, a minimized one only hidden). A reminder that should
+open a route uses `showNotification(title="Done", navigate="/thread/42")`
+(`@exact/notifications`); its click reaches the navigation root as a warm
+`navigate` event or a cold launch location, and without `navigate=` it is
+`notificationclick` on the root. Under the agent `state.notifications` lists
+each post, and `tap @ref` clicks one. Under the agent each
 is the drive's (`prefer has-focus false`; `state.device`). Use dimensions,
 media preferences, page facts,
 and capability state rather than suffixing files by platform. Preference facts
@@ -2314,6 +3300,24 @@ Localized strings use `t("key", name=value)` and app `strings/<locale>.json`
 files. Compile against the files to check keys and placeholders. Formatting
 functions accept a narrow set of literal formats; app wording is an app `fn`.
 
+#### Folds on iOS
+
+`exactViewport().devicePosture` and the viewport segments are the web's
+([foldables](recipes/foldables.md)). On the iOS 27.1 simulator UIKit moves an alert
+(an `alertdialog` with text) on either fold, and a page or form sheet (a sheet route
+or a modal `dialog`) on a book fold: folded like a book, an alert to the middle of
+the left segment and a page or form sheet to that segment, its right edge about 12
+points into the band (measured in left-to-right text); folded like a laptop, an
+alert to the bottom segment, while a page or form sheet still spans the fold. The
+tab bar stays clear of either fold. [Apple's adaptive-layout
+talk](https://developer.apple.com/videos/play/tech-talks/111463/) says instead that
+alerts move to the trailing side of a book fold and can move to the top of a laptop
+fold, and that action sheets, menus and popovers move clear too, which was not
+measured.
+
+A route moved off a window edge is still padded as if it reached it: its top on a
+laptop fold, its right on a book fold's segment 0.
+
 ## Inspection and testing
 
 On Apple development builds, an `iframe`'s web content is inspectable from
@@ -2323,7 +3327,7 @@ agent operations below for Exact's native tree. Production builds
 (`EXACT_UPDATE_TRUST=production`), `exact release`, and IPA archives leave
 web-view inspection disabled.
 
-An Apple build's dev menu (a four-finger tap, or ⌘D on a hardware keyboard or a simulator's; on a Mac, Develop › App Info…, ⌘D, in a development build: a Mac build with production trust, `EXACT_UPDATE_TRUST=production`, or made by `exact release` has no Develop menu and takes none of its chords unless it is built or launched with `EXACT_DEV_MENU=1`, or a person runs `defaults write <bundle id> ExactDevMenu -bool YES` and the build did not say `0`; an iOS build, a release one too, has the menu unless it is built or launched with `EXACT_DEV_MENU=0`, LLP 1115 D9) opens with the
+An Apple build's dev menu (a four-finger tap, or ⌘D on a hardware keyboard or a simulator's; on a Mac, Develop › App Info…, ⌘D, in a development build: a Mac build with production trust, `EXACT_UPDATE_TRUST=production`, or made by `exact release` has no Develop menu and takes none of its chords unless it is built or launched with `EXACT_DEV_MENU=1`, or a person runs `defaults write <bundle id> ExactDevMenu -bool YES` and the build did not say `0`; an iOS build, a release one too, has the menu unless it is built or launched with `EXACT_DEV_MENU=0`, LLP 1115 D9) uses a native grouped navigation sheet on iOS. Project commands and diagnostics have full-width rows; Build Information opens a separate, selectable text screen. On macOS, App Info opens with the
 build it is in: the app and version, when, where and with which Xcode it was
 built, the exact2 commit and the app's own (with branch and a dirty flag), the
 build kind, the device, and the app's release notes. `host/apple/build.mjs`
@@ -2333,6 +3337,348 @@ Release notes are `release-notes.md` beside `app.contract`: UTF-8 text, shown as
 written, up to 16 KB; no file, no section. A deploy script that publishes the
 build under a revision sets `EXACT_DISTRIBUTION_REVISION` for the build to show
 it. Copy (iOS and macOS) takes all of it as text.
+
+On iOS, the developer menu's **Frame Health** row opens a native card below sheets and
+alerts; the Mac's Develop menu has the same item. Row and item are checked while the
+card shows. The card starts hidden and takes the touches within its bounds: drag it
+from anywhere, even past the window's edges, and on release it springs to the window
+corner nearest where its momentum would carry it, past the safe area; accessibility
+actions move it to a corner. Close, at its top left, or the checked **Frame Health**
+dismisses it. Touches outside it reach the app. LLP 1079.000 §7.2 describes
+its rows: Live, Paused or Idle; the requested rate and any system limit; frame rate
+and missed frames for the last 0.5 s and 5 s; pacing; and charts of frame rate and
+frame time, or a table of work time, late frames, maximum frame time and pacing
+changes. A tap on a chart expands it; a tap on the title defines each figure; Share,
+at its top right, asks what to share, Agent Report, Summary or Image, and opens the
+system's share sheet with that one item. The card states no pass or fail of its own;
+Details, beside Share, swaps everything below the header for `perf frames health`'s
+three results over the last 5 s with their reasons and the counts behind them, in rows
+that scroll within the card. These are timing proxies; actual presentation and
+native-only animation cadence are unmeasured. While the card is shown, bounded hitch
+capture also records matching asynchronous owner and apply timestamps. Idle time never
+becomes a frame time.
+
+The card's charts take each frame and show the last 30 seconds: the frame rate's moving
+average over the last half second against the request, and each frame's frame time and
+work, the longest in each tenth of a second, against that frame's deadline. Within a run
+of frames the lines reach across tenths of a second without frames; an idle app, a pause
+and a reset leave gaps. The charts start no display link and store no file. Measuring
+Exact's frames, they take the frames the app's clock already runs and move with the time
+on a tenth-of-a-second timer of their own, which stops once their newest mark has left
+them. Their figures update every half second, and at once when the source stops, on the
+existing bounded publication pass in common run-loop modes, so touch tracking does not
+suspend them. Measuring the screen, the charts take every UI update and glide on Core
+Animation, and the card reads on a half-second timer of its own in place of
+publications, which stops as it hides. The reader creates no display link, reads nothing
+while the card is hidden, paused or detached, and keeps at most 60 half-second samples;
+the first read after a pause covers the paused span. During native scrolling, a card
+measuring Exact's frames stays on the app callback source; in development builds on iOS
+18 and later the separate experimental scroll source reaches `perf frames` and the
+report.
+
+`perf frames health` exposes the metrics. `state.frameHealthUI` contains only the
+card's visibility and window-local bounds, marked as host controls outside app nodes.
+On iOS 18 and later the card's face shows every UI update of the app on its screen and
+the main thread's work, which it measures only while it shows; `perf frames` reports
+Exact's own frames (LLP 1079.000 §7.4).
+Embedders opt in by passing a host view as `DevMenu.install`'s `frameHealthContainer`.
+
+`app.json` may set `"frame_health": { "mode": "off" }` or `"core"`. Without a mode, a
+build with development trust collects from launch, and a production bake on demand:
+only while the card shows, and while it is hidden every collection hook returns at
+its first check. `"core"` collects from launch in any build, and `"off"` never collects. Where
+collection is off, the developer menu's row reads **Frame Health Disabled**, dimmed,
+and a tap on it names the setting and says to remove it; on the Mac, choosing the item
+does. The core has fixed
+storage for up to 16 collectors per UI thread and does no per-callback allocation;
+these bounds do not substitute for measuring whole-hook overhead on real devices.
+
+### Compact frame-health reports on physical devices
+
+Run an Apple app on a connected phone with `bun host/apple/build.mjs --device --run`.
+Open the four-finger menu and choose **Frame Health**, which in a production bake starts
+collection, reproduce the hitch, then tap Share on the card and choose Agent Report; the share sheet takes
+the JSON text. Exact creates no report file or automatic upload. A person can send
+that text to an agent. The system share destination controls any storage it creates.
+
+For controlled device checks, `scripts/fixtures/frame-health-app` is a minimal fixture:
+one Start/Stop button, one moving canvas tile and 32 static rows. It starts paused;
+the drawing function asks for another frame only while running. There are no app
+resources, storage/network grants, widgets or content assets; the only image is
+the required app icon. It reuses the Canvas Gallery native host with its own source. Build it without
+installing or launching it on the phone:
+
+```sh
+EXACT_APP_DIR="$PWD/scripts/fixtures/frame-health-app" bun host/apple/build.mjs canvas-gallery-apple --device --phone "<phone name or UDID>" --no-install
+```
+
+The development build supports the experimental scroll observer. Use matching
+optimized collector-on/off archives for overhead comparisons; development sampling
+is excluded from production-overhead results. The prepared pair uses optimized Swift
+and Rust `host-dev`; full production LTO is a separate configuration. The fixture
+requires iOS 27.0 or later.
+
+Each source retains its latest 16 timing events in fixed memory. A report includes
+only events from the last 120 seconds. A burst can overwrite the ring sooner; the
+report names overwrite, expiry and byte-budget omissions separately. Hiding the card
+stops detail capture unless an agent lease still owns it. Reload
+preserves retained evidence and advances the generation; explicit clear or session
+teardown removes it. The core creates no expiry timer, extra display link, stack
+sampling, screenshots or log collection. The optional scroll observer is described below.
+
+An attached agent can use the existing device carrier (`ios --device`, optionally
+`--phone <name|udid>`) and these operations:
+
+```text
+perf frames capture start 60000
+perf frames health
+perf frames health scroll during "tap list drag 0 -400 over 500"
+perf frames live 5000
+perf frames report
+perf frames report scroll
+perf frames capture stop
+perf frames capture clear
+```
+
+A capture lease lasts 1–120000 ms, default 60000. The card and the agent
+lease own capture independently. Existing callbacks, applies and reads check expiry;
+an idle app gets no expiry wakeup. Power/thermal notification observers can remain until that next
+check. Reports bypass the legacy sampler and cost at most 4 KB (4000 UTF-8 bytes,
+including the agent carrier's newline). There is one encoder in flight per process;
+agent reports are admitted once per 15 seconds. Encoding runs on a utility queue after
+a bounded main-thread copy. Repeated busy/rate-limited requests receive small refusal
+packets. No report is automatically persisted, queued for retry or sent periodically.
+
+A report covers one source. The default selects the source with the most recent
+retained hitch; `report app` or `report scroll` selects explicitly. `source` identifies
+it, and `otherSources` names retained evidence in other sources. Counts and generations
+belong to their named source. Forwarded apply context does not count an app apply or
+its deadline again as a native-scroll event.
+
+`perf frames health [app|scroll]` reads `exact.frame-health.metrics/2` without starting
+the legacy sampler. It reports frames as LLP 1079.000 §4.6 defines them: a display-link
+callback that started frame work is a frame, and one held by earlier work in flight, or
+with no frame work due, is not. `frames` gives callbacks, held callbacks, frame
+intervals, their total time and rate, frame-time median, p99 and maximum bounds, pacing
+and schedule changes, intervals across a schedule change, callbacks whose timestamp went
+backwards (`outOfOrder`; each ends a run), and the requested slots and missed frames on
+the requested-rate grid.
+`work` gives one record per frame, from its timestamp until its callback returned and the
+owner work it sent had landed, with late frames (finished after `targetTimestamp`),
+median, p99 and maximum bounds, and the frames whose work is still in flight (`pending`)
+and already past their deadline (`overdue`). Where the deadline carries no information,
+as on the iOS simulator, `late` and `overdue` are null and `latenessUnknown` says why.
+The cursor carries the frame-time and work bins. The reply also carries requested
+and scheduled periods, coverage, generation and an explicit cursor. Send that cursor
+unchanged as `cursor` in a subsequent health request to read a delta. A
+producer/generation mismatch, malformed cursor or impossible histogram population
+returns `baseline-required`; retry without it. Read timestamps differ from the
+timestamps through which intervals and work are finalized. Each completed interval or
+work record enters the next finalized window, even if it began before that window's
+initial read. Never subtract lifetime maxima or assume a wall-time clipping rule.
+
+`assessments` judges the same window under `exact-frame-health-policy/2`, with one
+result for each question and no overall pass:
+
+| Assessment | Question | Decided from |
+|---|---|---|
+| `cadence` | Did frames keep to the platform's schedule? | `frameIntervals` and `skippedRefreshes`, the scheduled periods frame intervals spanned beyond each interval's first; `lateFrames`, work that finished after its frame's `targetTimestamp`, and `overdueFrames`, work still in flight past it; `unclassifiedIntervals`, frame intervals across a schedule change, which have no refresh count |
+| `target` | Did frames arrive at the requested rate? | `requestedSlots` and `missedFrames` on a grid at the requested period (spatial motion and canvases ask for the display's maximum, paint-only motion for 60 Hz); `restrictedIntervals`, frame intervals with either end scheduled more than 0.1 ms slower than the request that governed it. `context` lists conditions at the read (`simulator`, `low-power-mode`, `thermal-serious`, `thermal-critical`) without naming them as the cause |
+| `contentLatency` | Did content appear when it was meant to? | Unobserved on Apple |
+
+Each result is one of `fail`, `restricted`, `proxy-pass`, `insufficient-evidence` or
+`not-applicable`, and `reason` names the predicate that decided it. An observed
+skipped refresh, late frame (or frame still in flight past its deadline) or missed
+frame is `fail` even when the rest of the window is unobserved; a restricted schedule
+makes `target` `restricted` instead. `proxy-pass` means frames kept to schedule; it is
+never a presentation pass, and without presentation feedback target delivery is at
+best `insufficient-evidence` (`presentation-unobserved`). Other insufficient reasons
+are `virtual-clock`, the collector's unavailable code (`collection-disabled`,
+`collector-capacity`, `wrong-thread`), `schedule-unknown` (the scroll source),
+`no-frame-intervals`, `no-callbacks` (the source runs but sent none in the window),
+`stale` (the source runs but has sent no callback for over a second, as through a
+blocked main thread; `status` is `stale` too), `out-of-order` (a callback's timestamp
+went backwards and ended a run), `schedule-changed` (an interval across a schedule
+change has no single period, so no refresh count; it counts in the window where it
+finalizes) and `simulator-deadlines`. The iOS simulator dispatches display-link
+callbacks after their own `targetTimestamp`, so there lateness is unknown and only
+skipped refreshes can fail cadence. `not-applicable` is `idle`, or for `target`,
+`no-rate-request`: timers and frame tasks run at the platform's default rate without a
+request, so they have a schedule to keep but no requested rate.
+
+Frame times and work times use 64 saturating 32-bit bins: 48 of 500000 ns over [0,24
+ms), 15 doubling tails from 24 ms, and an open last bin. Quantiles are half-open
+bounds; a null upper endpoint means the open bin, and null quantiles mean no samples
+or invalid distribution accounting. Saturation is explicit. `histogram.valid`
+describes accounting, not health. All metric responses fit the same 4000-byte wire
+envelope.
+
+Apple `perf frames live <1–30000 ms>` waits in the driver with a bounded capture lease,
+then reads a cursor delta and releases its lease. During that lease the host refuses
+all virtual-clock requests, including implicit takeover from held-clock operations.
+Use real input. Platform timing now preserves frame tasks, timer wakeups, async fills
+and macOS ordinary-wheel/reorder timing; frozen-clock agents retain their deterministic path.
+Media, permissions, context-menu adapters, touch diagnostics and appearance overrides
+can still differ under an agent. Qualification uses a normally running app or an
+audited journey; these clock changes do not certify every agent workload. Plain frame
+reads under platform timing use the bounded metrics path. Plan-site `perf <target>`
+can enable its requested counters without starting the old frame sampler.
+
+### A scroller's offset per frame: `perf frames track`
+
+`perf frames track start <node> [1–120000 ms]` leases a scroll track on one node's native scroller (default
+30000 ms). `perf frames track read` returns what it recorded, and `perf frames track stop` reads the rest and
+releases it. The format is `exact.frame-health.track/1`. A fling's top hits and prepends are counted from it, which
+the bounded metrics and reports don't carry.
+
+- **Where its rows come from:** each row is one committed offset change, recorded in the host's existing scroll
+  callback: iOS `scrollViewDidScroll`, or the Mac clip's bounds change. The track adds no display link, timer or
+  observer, so a tracked fling is scheduled as an untracked one is.
+- **At rest:** a still scroller writes no rows. On the Mac, a bounds change that leaves the origin where it was (a
+  resize at rest, including the first after `start`, whose origin is the baseline) writes none either.
+- **A bounded read:** like `perf frames health`, `report` and `capture`, a track request never waits for a slice in
+  flight to land. `perf frames track start <view id>` sends only the track request. A testId is resolved with one
+  `tree` first, which does land slices in flight, so resolve it before the glide, or start with the id `tree`
+  lists to start or replace a track mid-glide.
+- **Several rows in one frame:** a frame can write more than one row when the host also moves the offset in it (a
+  prepend's anchor correction). These are separate offsets, and their short intervals aren't frames.
+- **Leases:** one track a session. A second `start` replaces the first (its unread rows go, and the reply says
+  `replaced: true`). A `start` that fails (`no-scroller`, a bad lease) leaves the current track as it was.
+- **Where it may be leased:** exactly where `perf frames capture` may: frame health enabled (a development build
+  by default, or `"core"`) and no virtual clock. An agent cannot attach to a production bake. Elsewhere it answers
+  `available: false` with capture's reason.
+- **Memory:** 4096 rows of 16 bytes, allocated at `start` and freed by the read that ends a stopped track, a
+  replacing `start`, a reload or clock change, the session's teardown, or, once the lease ends, the next track
+  request (or, while the track is still recording, the next feed). No timer ends it.
+- **Reads:** each reply fits 4000 bytes with the carrier's newline. It holds the oldest unread rows that fit; `more`
+  says there are others, and `cursor` (a row count, as a decimal string) continues from where it stopped. A read
+  with no cursor is from row 0, the track's first. The driver keeps each session's cursor, so consecutive `read`s
+  don't repeat rows, and starts again from 0 after a successful `start`.
+- **Cursors:** the driver keeps one cursor per app session it drives (`s.session`), so switching sessions doesn't
+  carry a cursor across.
+- **Stop and ends:** `stop` freezes the track: no row is written after it. Its reply is the first page of what is
+  left (`stopped: true`, `more` if there is more), the rest is read by cursor, and the read that answers
+  `more: false` releases the ring. A frozen track nobody reads to the end is released when its lease ends or a new
+  `start` replaces it. The driver's `stop` reads to the end and joins every page. A
+  read after the lease ended answers `track: false, reason: no-track`; the driver says so instead of returning a
+  partial page.
+- **Malformed nodes:** a node id that names no view (negative, too large, not an integer) is refused as
+  `no-scroller` and leaves the current track.
+- **`dropped`:** the rows the ring overwrote before the read reached them, which happens past 4096 unread rows.
+
+| Field | Meaning |
+|---|---|
+| `t_us` | Arrival of the scroll callback, `CACurrentMediaTime`, microseconds since `start` |
+| `interval_us` | Spacing from the previous row. 0 (a new run, no comparable predecessor) for the first retained row, after a gap of 0.5 s or more, and after a gap of more than two periods following a `t` or `-` row: a held finger or a scroller at rest moves nothing and writes no row, so that gap is a pause, not lost frames |
+| `missed` | A **proxy**: `max(0, round(interval / period) − 1)`, with `period_us` = 1 / the screen's `maximumFramesPerSecond` at `start`. It counts callback spacing, not presentation: a display running below its maximum rate reads as missed frames, and an unchanged offset in a frame writes no row |
+| `offset_cpt` | The scroller's committed offset along its scrolling axis (y unless it scrolls only sideways: on the Mac, its overflow says so when only one axis scrolls, whatever its content's height; otherwise, as on iOS, content wider than the scroller that fits its height), in hundredths of a point, clamped to JSON's safe integers (±(2^53 − 1)) |
+| `phase` | `t` a finger dragging, `d` decelerating, `b` past its range, `-` neither. On the Mac, `t`/`d` come from the event the scroller's own wheel handler moved it with (`phase` or `momentumPhase` began or changed; an ended phase is `-`), a plain wheel is `-`, and a move outside a wheel event (a layout's) is `-` |
+
+On macOS, phased trackpad replay (`tap … wheel … gesture`) is refused under platform
+timing with `platform-trackpad-replay-unqualified`. AppKit has no validated completion
+acknowledgement for this synthetic sequence, so an immediate layout read may see
+zero or partial movement. Use a plain wheel event in an
+agent drive, or reproduce the trackpad gesture in the normally running app. Frozen-clock
+replay remains available for functional tests and does not establish live timing.
+
+The iOS/tvOS 18 native-scroll prototype observes one mounted active scroller with a
+passive `UIUpdateLink`: it leaves continuous-update, rate, latency and presentation
+preferences at their defaults. It is disabled in release/production builds pending
+device qualification. A hidden, zero-size host lifecycle view ends observation as soon
+as the scroller leaves its window; the normal end/deceleration callbacks close it too.
+This view has no hit target or accessibility element. Reads never create the observer.
+A missing earlier update phase increments `nativeUpdateSamplesLost` and skips that
+sample. The observer reports completion-deadline overruns. Its cadence is unknown:
+passive updates can pause while a finger rests, so they contribute no FPS, interval
+histogram or maximum-gap population. This observer is not presentation feedback.
+
+On macOS, Develop offers Frame Health, and the card's Details and Share work as on iOS.
+Actions follow the responder chain to the eligible window; an embedder opts in by
+passing `frameHealthContainer` to `DevMenu.install`. The standalone adapter supplies its
+host slot. The card takes the clicks within its bounds and moves without changing the
+app's viewport. Details shows within the card on both platforms, with the app's frames.
+Active reader updates are coalesced at half-second intervals across the process.
+Lifecycle changes may publish immediately; there is no idle publication timer, and only
+an iOS card measuring the screen reads on a timer of its own, twice a second while it
+shows. macOS spatial motion, canvases and press feedback request the current display
+maximum, including above 120 Hz; press clocks are per window and update when its screen
+changes.
+
+`exact.frame-health/2` is a versioned JSON schema. Field explanations stay here to
+leave bytes for evidence. `columns` names each field in a `hitches` row. Export keeps
+the newest rows that fit, in chronological order, with `retention.omittedForBudget`;
+it never reduces timing precision to fit. Sequences, captures and generations are
+decimal strings; other numbers are safe JSON integers. `time.clamped` invalidates
+precision claims for values beyond that range. `capturedAt` is wall-clock export
+context only. All intervals use `CACurrentMediaTime`, in microseconds: a retained
+hitch keeps one absolute timestamp and stores its other times as 32-bit microsecond
+offsets (35 minutes either way) and durations (71 minutes).
+
+| Row fields | Meaning |
+|---|---|
+| `sequence`, `capture`, `generation` | Event sequence since clear, capture ID, and reload/clock generation. Identity names the installed binary, not the source of every hot reload |
+| `age_us` | Age at the export snapshot, measured from callback arrival or late apply end |
+| `flags` | Evidence, workload and power bits below |
+| `target_offset_us` | This callback/tick's platform prediction relative to the event; it is not intended content presentation |
+| `period_us`, `requested_period_us` | Scheduled callback interval and this session's preferred host interval at the event; zero is unknown/default. Other owners may request a higher rate |
+| `gap_us`, `callback_us` | Callback-arrival gap and synchronous callback duration. Gap requires a stable predecessor; zero means no comparable evidence. Apply-only events have no callback duration |
+| `before_gap_us`, `before_callback_us` | Previous callback's observed gap/duration in the same segment; zero without evidence |
+| `after_offset_us`, `after_gap_us`, `after_callback_us` | First observed following callback's arrival offset, gap and duration; null if unavailable. At most two pending events receive this context |
+| `owner_queued_offset_us`, `owner_began_offset_us`, `owner_finished_offset_us` | Matching asynchronous frame-update submission, owner start and owner completion, including decoding and host callbacks |
+| `main_landed_offset_us`, `apply_began_offset_us`, `apply_finished_offset_us` | Main arrival and outermost presenter-apply boundaries. Apply excludes legacy sampler bookkeeping |
+| `work_target_offset_us`, `operations` | Captured frame update's target and batch operation count; an apply without a frame target has no work target |
+
+A report whose `source` is `ui-update`, the card's measure of the screen's UI updates on
+iOS 18 and later, has no frame times and none of Exact's owner or apply boundaries, so
+its rows have only `sequence`, `capture`, `generation`, `age_us`, `flags`,
+`target_offset_us`, `callback_us`, `before_callback_us`, `after_offset_us`,
+`after_callback_us`, `waited_us`, `exact_us`, `card_us` and `layouts`. There
+`callback_us` is the update's work: the main thread's time from its scheduling until its
+last Core Animation commit, less `waited_us`, the time it waited between them, as UIKit
+lets it for input. The commit is as the card sees it, in an action just after Core
+Animation's, behind any action ahead of its own in that phase, so a commit that ends
+just before the deadline can count as late; an update with no commit seen ends at its
+completion. The work is placed to end at the commit, so its effective start, the commit
+less the work, is when it began only where its waits all came first. `target_offset_us`
+is UIKit's completion deadline from that effective start, negative when the deadline
+came before it; work longer than it is late. `before_callback_us` is the previous
+update's work, and `after_offset_us` and `after_callback_us` the next update's effective
+start and its work. `exact_us` is the part of the work in Exact's host phases (applying
+batches, rows, text, scroll callbacks, pictures and waits on the runtime), `card_us` the
+card's own, its drawing included, and `layouts` how many nodes' views UIKit laid out;
+the rest is UIKit's, the system's and Core Animation's commit, and Exact's work outside
+its phases, such as laying out those views. Null is unmeasured. Updates that follow each
+other as one finishes are the main thread working without a pause; a single long one
+between short ones is one stall, such as a new screen.
+
+Offsets are relative to the event's origin; negative means before it. Null boundaries
+are unavailable, never zero-cost work. Callback events attach the largest apply since
+the preceding callback, otherwise the most recent apply only if it ended within two
+scheduled periods. This is temporal evidence, not causal attribution. Queue delay,
+owner elapsed time, main-thread landing delay and apply duration can be derived by
+subtracting their matching boundaries. Elapsed time includes descheduling; it is not
+CPU time. The report cannot attribute unobserved main-thread work, GPU execution,
+presentation, input latency or native-only animations. Zero counts or an empty report do not establish healthy rendering. Live agent scheduler/apply parity remains unqualified; reproduce
+outside an agent run for production behavior.
+
+`flags` bits: 0 callback gap >1.5 stable periods, 1 synchronous callback past target, 2
+captured tick apply past its target, 3 following callback known, 4 work known, 5 largest
+apply in the callback interval; 16 motion, 17 spatial, 18 canvas, 19 frame tasks, 20
+fill pending, 21 tick pending, 22 hatch frames, 23 workload flags known (otherwise bits
+16–22 are unavailable); bits 32–33 thermal state (0 nominal, 1 fair, 2 serious, 3
+critical), 34 Low Power Mode, 35 card shown, 36 card dragging. A `ui-update` row's bits
+16–23 are the app session's and bits 35–36 the card's as its update was scheduled, and
+bits 40–46 the users of Exact's frame clock, in any session of the process, asking for
+frames then: 40 the session's clock, 41 a list's offset correction, 42 a navigation
+reveal, 43 the scroll pump, 44 deferred heavy leaves, 45 a live SVG filter, 46 a
+textarea's resize grip; with none of them, UIKit or the system asked. These cached
+observations do not establish which activity caused the hitch.
+
+Save received text as `report.frame-health.json` if needed, then use
+`bun scripts/agent.mjs trace report.frame-health.json` for the expert readout. This
+explicit recipient-side save does not create an app-side retention policy. Commit,
+presentation and host-phase probes like those explored on `ide/trace-costs` can guide
+a later targeted investigation; this bounded monitor does not run those probes.
 
 Build diagnostics include stable ids and original file ranges. Locations are
 1-based line/byte-column coordinates, with exclusive end columns; a usage, I/O or
@@ -2351,6 +3697,8 @@ keyed by its digest. Use it only for
 the accepted generation it describes. The driver can connect layout to the
 original declaration, component call sites, and winning style attribute.
 Production artifacts do not need a development source map.
+
+### The driver's operations
 
 The driver has ten operations: `tree`, `screenshot`, `tap`, `type`, `state`,
 `layout`, `logs`, `clock`, `prefer`, and `perf`. Variations are arguments, not new
@@ -2444,19 +3792,83 @@ input does not wait for a request its action sends; `clock data` lands it.
 `tap <target> drag <dx> <dy> … during "<op>" …` runs the quoted reads after the
 move, with the finger still down, before the hold. Under `--touch platform` the
 lift is scripted, so the reads run inside the hold and `during` needs one
-(`hold 300 during "state"`). `tap <target> drag to <other> [at <x> <y>]`
+(`hold 300 during "state"`); the hold then moves the clock by its length on real time,
+as a `clock +<ms> real` would, so the app's `every` and `after` run while it is held. `tap <target> drag to <other> [at <x> <y>]`
 ends the drag on another node (refused by name when it is not mounted or off
 screen); a drag that should autoscroll a list or a board is `drag dx dy hold ms`. On iOS
 without `--touch platform` a drag scrolls the scroll or list it starts on with the
 finger, no fling; any other drag there is refused, naming the flag.
+On an iOS simulator, append `then dx dy [over ms] [hold ms] [during "op" …]`
+to script another leg with the same finger. For example:
+`tap handle drag 0 120 over 300 hold 500 during "layout" then 0 -120 over 300 hold 500 during "state"`.
+Each delta starts at the previous endpoint. All legs play in one XCTest
+synthesizer record, with one down and one up. Reads run inside their leg's hold;
+if they outlast it, the drive fails. The complete path must stay inside the
+viewport, last at most 10 seconds, and spend at most 2 seconds moving, across
+at most eight legs. Library calls use `drag.path: [{dx, dy, over, hold, during}]`
+for the additional legs, with `during` read functions. Separate requests never
+keep an iOS contact down.
+Under `--touch platform` a tap replies `viewGone: true` when its view left the
+window before the finger lifted, so that view had no lift (UIKit rebuilds a
+grouped row's detail button in the first seconds after the list appears), and
+`downAfterLift: true` when the window had the down only after the finger lifted
+(the app busy, or the system slow to deliver it; a UIKit switch in a list cell
+takes a down and a lift that arrive together as no tap). Read the state, and tap
+again if nothing changed; `touch.dispatched` less `touch.ended` says how late
+the down was, and an app that blocks its main thread that long loses a
+person's tap too.
+
+#### Drags on iOS
+
+A wheel (`tap <scroller> wheel 0 300`) and, without `--touch platform`, a drag on
+the scroll or list it starts on (`tap <scroller> drag 0 -300`, past the screen
+too) leave it as a person's scroll by that distance does, with no glide: the
+content moves that far, a large title collapses as it goes, and a scroll back to
+the top opens it again. As a person's, none stops with the content partway under
+a large title: it eases to the title's open or closed rest, whichever is nearer,
+so under one a wheel of 20 from the top moves nothing (with a search field in the
+bar it stays where it ends: not measured). Under `--touch platform` a drag whose ends
+are both on screen is a real one (`delivery: platform`): the content follows the
+finger once UIKit's pan begins, some 10 points in. Without a hold it glides on
+after the lift, and `clock settle` waits up to 4 s for it to stop (`reason:
+"scroll"` past that). Held for `hold 100` or longer it stops with the finger,
+which the runner steps a point across the drag and back in the hold's last
+150 ms, as a finger does (measured along a list); `hold 50` still glides. A
+drag that ends past the screen is the agent's drag above, `delivery:
+recognized`.
+
+On macOS a wheel is applied at once, with no momentum and no rubber band.
+`tap <scroller> wheel 0 600 fling` is a trackpad's fling instead: the driver
+posts its events to the app through the window server, AppKit glides and bands
+as it does for a person, and the reply comes when the scroller rests, with its
+`offset` (on the real clock; the session's clock does not move). `wheel 0 3000
+hold` leaves the finger down, so `layout` and `screenshot` see a band pulled
+past the end, and `wheel 0 0 release` lifts it; a drive that ends with a hold
+open lifts it too. These need the terminal's Accessibility grant (System
+Settings › Privacy & Security) and a window that is on screen; without either
+the operation fails and says why. A pull that starts at a scroller's end goes to
+the scroller around it, so one from the end of the outermost moves nothing.
 During a reorder `state.reorder` reads `{ item, from, to, before, phase,
 ending }`; a grouped grip also takes `type <grip> key Space` and the arrows. `clock +N` moves the virtual clock without
 waiting for a store's or the network's reply on real time (unless a timer fires
 first); its reply says what is still in flight (`inflight`, on every host), and `clock settle` lands it.
+A request the server holds, marked `exactHeld: true` (a long poll, LLP 1016.000 D9), is the exception: no
+clock waits on it, neither a jump nor `clock settle` nor `clock data`, and each of their replies names it
+(`held`, `heldTargets`; `state.pending` marks it `held: true`). Its answer must be safe to supersede.
+After an action that causes a push you will read (a write the server echoes, a build's report), say so with
+`clock held [<target>…] [<n>s]`: real time passes with the clock frozen, so no timer fires, until each held
+request in flight (or each named) has had one reply, the server's own timeout answer included; then `clock
+data` lands what that reply started. Past its bound (20 s) it answers `settled: false, reason: "held"`,
+naming the targets that had none.
+A stream counts as landed at its first message, so for state it reaches later (a socket's READY after HELLO),
+wait with `clock until state <path> == <literal> within <ms>`: real time with the clock frozen, polling `state`
+until it equals the JSON literal; a miss fails naming the last value.
 `clock settle` also runs the clock to where the last running finite, unpaused
-transition or animation ends, firing the timers due on the way, so a test on a timer's grid moves with it.
+transition or animation ends, firing the timers due on the way, so a test on a timer's grid moves with it,
+and on past a task due a commit later (`after(1, …)`, which an input or an answer armed) until none is.
 `clock data` lands it without moving the clock: the data module's activation and
-every request in flight, each answer's `then` with it, no timer fired. A CLI drive's
+every request in flight, each answer's `then` with it, no timer fired (its reply names a task
+due a commit later, which a tap next would come before: `clock settle` runs it). A CLI drive's
 first operation runs at boot and may come before that has landed (an authored test
 lands it before its first step), so a drive that reads or taps data starts with `clock data`
 (a `tree`, `layout` or `screenshot` taken before the clock first moves, with a request
@@ -2466,6 +3878,12 @@ between operations it moves only as far as the drive took. `clock +N real` lets
 N ms of real time pass with the clock moving beside it, a step at a time: a
 video plays that far (its `timeupdate`s arrive), and a reply that lands in the
 span lands (LLP 1042 §3).
+`clock +N real until <path>` is a test harness's affordance, not something an app
+drive needs: the same real time with the clock beside it, ended early once the
+file at `<path>` (a local path, not a URL or a glob; its directory must exist)
+exists, which the harness driving the drive writes at the event it waits for. The
+clock moves by exactly the real time gone, and the reply says `until: "met"` (at
+once, `real: 0`, when the file is there already) or `until: "bound"` after N ms.
 Under the driver a picker, an export, a share or an auth session opens no panel:
 it is held and `state` lists it under `pending` with its capability. Answer it by
 the node its answer arrives at (the `id` the command names) or by its capability:
@@ -2491,6 +3909,20 @@ lines — `size 1200x800`, `epoch "2026-09-21T12:00:00Z"`, `time-zone
 names, and `fresh` (the Snapback dev server emptied first, `fresh
 "seed.json"` seeded from a file; snapback4/README.md) — written first in the
 test or, for every test, at the top of the file.
+
+`prefer prefers-color-scheme dark` sets a media preference before the first
+observation. It can lead the test or the file, or appear later to change the
+preference between steps. Use the driver's CSS media feature names and values
+(`prefers-color-scheme light|dark`, `prefers-reduced-motion reduce|no-preference`,
+and the other media preferences listed above). A test's leading value overrides
+its file's default for that name only. Duplicate names at file level or among a
+test's leading launch lines are errors; later steps may change the same name.
+A bad name, value or unsupported emulation fails that test at its line.
+`reload` and verify's relaunch keep the latest applied preferences. On native
+hosts they are applied after connection, before the test observes the app;
+they do not set its appearance before mount. MIDI's `prefer midi.…` remains a
+step inside a test.
+
 Before the first step (and after a `reload`) the driver waits for the app's data
 as `clock data` does: its data module activated and every request launch started
 (a store's open, a fetch) answered, the clock unmoved and no timer fired, so a
@@ -2527,6 +3959,11 @@ test "the list shows an error, then retries and loads"
   clock data
   expect tree has "recipes"
 ```
+
+`fail fetch` tests a rejected request; it cannot supply an HTTP status or body.
+To test malformed successful responses or a specific HTTP error, make the app's
+test server return that fixture and drive the real source against it. Do not
+invent a response-body override in Contract test syntax.
 
 To write through the app's own server as another person, `request POST "/items"
 {"title": "Bread"} as grace` is the driver calling it (`Authorization: Bearer grace`,
@@ -2572,7 +4009,11 @@ the down, then every 83 ms),
 `type "id" paste "text"` (⌘V on macOS, Ctrl+V elsewhere, then the paste; a `key` handler that `preventDefault()`s that chord keeps it from landing), `type "id" copy`, `type "id" cut`, `pick "id" "path"…` or
 `pick "id" cancel` (a held picker or export, by its node or capability as
 above; paths are the test file's), `clock settle|data|+ms|+ms real|ms` (`data`:
-what is in flight lands, with each answer's `then`, the clock unmoved), `resize
+what is in flight lands, with each answer's `then`, the clock unmoved), `clock held [<resource>…] [<n>s|<n>ms]`
+(the driver's: real time with the clock frozen until each held request, or each named, has had a reply, such as a
+long poll's after a push the test caused, within the bound, 20 s unless given; then `clock data`), `clock until
+state <path> == <literal> within <ms>` (real time with the clock frozen until `expect state`'s path equals a
+string, number, `true`, `false` or `null`), `resize
 800x600` (the window, mid-test), `reload`
 (the app restarts on the store it had, including a `secret.keep`, its state and
 clock starting over, so a test shows what persists; the web reloads its current
@@ -2588,7 +4029,11 @@ go back from fails),
 options, and a checkbox with a `checked` binding `true` or `false`; else its descendants' — a button's label — else a field's value), and
 `expect state name == <number|string|bool|none|[]>`, where `name` may go on into
 a record's fields (`board.active.present`) or a list index (`rows.0`), and the
-number may be negative (`== -3`). A failed expect names any resource that
+number may be negative (`== -3`). `expect wakelock held|released` reads
+`state.wakelock.held`: the runner's record of displayed elements requesting the
+lock, not whether the OS or browser granted it. A mismatch names the holding
+view ids and their testIds when present, or says nothing holds it.
+A failed expect names any resource that
 failed, and why; with no input before it, the requests still in flight (the boot's
 own, or what a `clock +N` left on real time). An input step ends with what it settled: an answer the data
 module gave in the input's turn, and its mutation's `then`, are there for the
@@ -2633,7 +4078,7 @@ that restates a constant is weaker evidence than the user's actual sequence.
 | Refused or misleading form | Accepted direction |
 | --- | --- |
 | `action save writes item` | Delete the clause; effects come from the body |
-| `transform` on a box, inline or through `class` (`lower-attr-tag`) | Box `transform` is deferred (LLP 1055.000 D5). Use `translate`, `rotate` and `scale`: `transform="translate(0px, 25px)"` becomes `translate="0px 25px"`; `transform="scale(0.8)"` becomes `scale=0.8`. SVG elements keep `transform`. |
+| `transform` on a box, inline or through `class`, beyond `translate`, `rotate` and `scale` in that order (`lower-attr-tag`) | A box `transform` that is those functions, each at most once, in CSS's individual-property order (translate, then rotate, then scale) lowers to the rows it equals: `transform="translate(0px, 25px) scale(0.8)"` is `translate="0px 25px" scale=0.8`; `none` is no row. The rest (`matrix`, skews, `scale(x, y)` with two factors, 3D functions, a function repeated or out of order, a bound string) is deferred (LLP 1055.000 D5): write the rows. A `transform` beside a `translate`, `rotate` or `scale` row on the same element is refused; keep one. SVG elements keep the whole property. |
 | Component `contract` assertions | Authored `test` blocks exercised by the driver |
 | `provide theme = value` around view children | Component `provide` section, wrapper component if needed |
 | `items[0]` | `first(items)` or `items.at(0)`, an option to `match` |
@@ -2645,16 +4090,20 @@ that restates a constant is weaker evidence than the user's actual sequence.
 | `selected.title` when optional | Exhaustive `match selected` |
 | `press={() => save()}` | `press=save` or `press=save(captured)` |
 | Copying an action's statements into another | Call it: `arrive(path)`; the callee runs in the same commit |
-| A helper that reads a slot its caller just assigned | Pass the value: `follow(next)` (`analyze-call-stale-read`) |
+| A helper that reads a slot its caller just assigned | Pass the value: `follow(next)` (`analyze-read-after-assign`) |
 | `button press=add` with no child, or only an `image "symbol:…"` (`lower-button-unlabelled`) | Its words in it (`text "Add"`), or `aria-label="Add"` on a symbol-only button |
+| A `button` inside a `button`, as a React Native `Pressable` in another (`lower-nested-button`): a press is the inner one's alone, but the outer's accessible name reads both ("Note Listen") | A `row` of the outer's content as one `button` (`flex=1`) and the inner one beside it |
 | A heading at the top of a route's content that says its `header` heading again, which shows twice under the iOS bar (`lower-title-twice`) | Drop it; the bar's title names the screen. A heading below names a section: `text "Results" role="heading" aria-level=2` |
-| A list and its detail (or a form) swapped by `if showingDetail` / `else`, each with its heading, in an app with no `routes` (`lower-screen-by-state`) | Each screen a route: `routes`, a row that `push`es its detail, `back` to return; the web gets Back, reload and links, a wide window the split (`contract vocab screen`) |
+| An SVG `use` whose literal `href="#id"` targets a `foreignObject` or a subtree containing one (`lower-svg-use-foreign-object`). Only unconditional literal SVG ids from one source definition resolve. Repeated copies must all contain a `foreignObject`; a conditional copy, a copy without one, ids from different source definitions, dynamic hrefs and dynamic ids stay quiet. References inside the target are not followed | A `foreignObject` draws nothing through `use`. Place it directly in the SVG for the web; native hosts refuse it. For content on every host, position an ordinary box over the SVG |
+| A list and its detail (or a form) swapped by `if showingDetail` / `else` or complementary sibling `if`s (also with the same viewport-only `or` term), each with its heading, at the top of the view or inside a route; or pages named by one state, `page == "detail"`, in three arms or sibling `if`s or more, with or without headings (`lower-screen-by-state`). A tab bar's state and a radio group's stay quiet | Each screen a route: `routes`, a row that `push`es its detail, `back` to return; the web gets Back, reload and links, a wide window the split (`contract vocab screen`) |
 | `column padding=24 width="100%"`, as wide as its parent's content plus the padding: it runs past the screen's right side (`lower-width-padding`) | Drop the width (a block or a stretched flex item fills its parent), or `box-sizing="border-box"` |
-| An absolute `width` (a number, px, pt or absolute `calc()`) containing scalable text stays fixed at accessibility sizes (`lower-text-px-width`). The lint is deliberately conservative: unresolved classes, uncertain visibility or sizing, flex sizing that can supersede width, and `min-width`/`max-width` bounds that may change it stay silent. Text in absolute or fixed positioning, popovers and dialogs is checked inside that subtree, without counting against enclosing boxes. Text inherits the platform root font. Native Apple controls use the Apple control font, which can scale with Dynamic Type; web controls inherit, and Linux control defaults are fixed. An absolute font size stops scaling within that boundary; `inherit` and `unset` use the parent font even on controls. The warning reads lowering’s grouped-list typography and checks layout boxes containing text runs or text fields, including HTML inside SVG `foreignObject`; an inline run’s own width does not constrain its paragraph | Use `width="3rem"` for a width that follows the root font, or let the content determine the width |
+| An absolute width ceiling containing scalable text stays bounded at accessibility sizes (`lower-text-px-width`). The lint follows `width` and `max-width` through their bounds: a fixed maximum alone caps growth; a minimum alone does not. A fixed minimum can override a smaller cap, but a growing or unknown minimum makes the lint stay silent. Absolute lengths include numbers, px, pt and absolute `calc()`; `em` is fixed against an authored absolute font. Flex can supersede width on a row’s main axis; zero grow with an auto basis keeps its ceiling, and flex does not size a column child’s width. Effective classes, declaration order and parent direction count. Unresolved classes and uncertain sizing stay silent. A computed display leaves the node uncertain but its children are still checked; known-hidden subtrees are skipped. Text in absolute positioning, popovers and dialogs is checked inside that subtree, without counting against enclosing boxes. Text inherits the platform root font. Native Apple controls use the Apple control font, which can scale with Dynamic Type; web controls inherit, and Linux control defaults are fixed. An absolute font size stops scaling within that boundary; `inherit` and `unset` use the parent font even on controls. The warning reads lowering’s grouped-list typography and checks layout boxes containing text runs or text fields, including HTML inside SVG `foreignObject`; an inline run’s own width does not constrain its paragraph | Express the width and its bounds in `rem`, such as `width="3rem"` or `max-width="3rem"`, so they follow the root font, or let the content determine the width |
 | `text "Results" aria-level=2`, a level with no role, which is no heading to a screen reader on any platform, gets no heading style and is not the iOS bar's title (`lower-level-without-heading`) | `text "Results" role="heading" aria-level=2`; `role="heading"` alone is level 2 |
 | `column role="dialog" aria-modal=true` for a modal you lay out (`lower-dialog-role`) | A sheet, a route with `navigationPresentation="modal"` ([navigation-stack](recipes/navigation-stack.md)); a confirmation is `dialog role="alertdialog"`, opened with `showModal(id)` |
+| `image "symbol:heart" -exact-tint-color="-exact-secondary-label"`, which Apple draws in the text colour: a symbol is drawn in its `color` on every host, and `-exact-tint-color` colours a raster image or a native button's face (`lower-symbol-tint`) | `image "symbol:heart" color="-exact-secondary-label"` |
 | `` `${n} cards` ``, which reads "1 cards" (`lower-count-plural`) | The noun chosen by the number: `` `${n} ${n == 1 ? "card" : "cards"}` `` (`contract vocab plural`) |
 | `for p in posts` with `users.filter(u => u.id == p.userId)` in the row: every update walks posts × users, about 100 ms at 1,000 × 1,000 on a Mac (`lower-row-lookup`) | Join it in the data module: the source gives each post the field it reads (`userName`). A `derive` of the join is one evaluation and passes the list bound |
+| `for t in tokens` with an offset `tokens.slice(0, tokens.indexOf(t))…` in the row, or a `fn` that walks the list it is passed: each row's work grows with the list, and past 65,536 steps that binding is unset (`lower-row-own-list`) | Count it once in the data module: the source gives each token the field it reads (`at`) |
 | `RoundButton(label="Start quiz", …)`, cut to "Start q…" in its 80-point circle (`lower-round-button-label`) | The circle is for a word (Start, Stop, Lap); a screen's main action of more words is `button buttonStyle="filled"` with its `text` (`recipes/content-design.md`) |
 | `now = performanceNow()`, then `now` read in the same action (`analyze-read-after-assign`) | Bind it and read the local: `let stamp = performanceNow()`, `now = stamp`, then `stamp` |
 | Child `resource`, `mutation`, or `task` | Root-owned declaration and props/injections |
@@ -2701,9 +4150,19 @@ syntax and vocabulary, use the [grammar reference](contract-grammar.md). For a
 new feature, start from the corresponding compiler fixture rather than memory
 of JavaScript, React Native, or the predecessor's Contract language.
 
-CSS overflow accepts `visible`, `hidden`, `scroll`, and `auto`. `auto` clips and
+CSS overflow accepts `visible`, `hidden`, `clip`, `scroll`, and `auto`.
+`clip` clips without a scroll container or the zero automatic minimum size of `hidden`. `auto` clips and
 permits scrolling, with indicators shown only when content overflows. A visible
 axis beside hidden/scroll/auto computes to auto, as on the web.
+
+`filter` on a box or an `image` takes CSS's functions in order (`blur`,
+`brightness`, `contrast`, `drop-shadow`, `grayscale`, `hue-rotate`, `invert`,
+`opacity`, `saturate`, `sepia`): `image "logo.png" filter="brightness(0.6)"`
+dims a logo. The element and its content are drawn, then filtered (Filter
+Effects 1 §12); the web, macOS and iOS draw it, and Linux draws it unfiltered
+for now (SVG Gallery's `fx-box-filter` and `fx-image-filter`). `url(#id)`
+naming an SVG `filter` works on SVG elements everywhere, but on a box or an
+image only on the web: Apple does not take it there yet (LLP 1055.000 §0).
 
 `backdrop-filter="blur(8px) saturate(1.14)"` filters content behind a box;
 the two functions may appear in either order. On macOS it samples only the
@@ -2716,6 +4175,20 @@ draw the system blur approximation described in LLP 1053.000 §3.
 (including `flex="0 1 auto"`). Numeric bindings keep the `n 1 0%` meaning.
 Shorthands may be literal choices; computed strings are refused. A scroller
 with `min-height=0` and positive shrink fits under a bounded flex column.
+
+`display="grid"` takes `grid-template-columns` and `grid-template-rows` as
+CSS track lists: px, `rem`, %, fr, `auto`, `min-content`, `max-content`, named lines,
+`fit-content(px or %)`, `minmax()` and `repeat()` (fixed counts, `auto-fill`,
+or `auto-fit`). Track lengths also accept `calc()`, `min()`, `max()` and
+`clamp()` over px, `rem` and %, including inside `minmax()` and valid repetitions:
+`grid-template-columns="repeat(auto-fill, minmax(min(100%, 12rem), 1fr))"`.
+Percentages use the grid's content box in that axis; when it is indefinite,
+they act as `auto` during intrinsic sizing and resolve against the resulting
+size. Negative calculated sizes clamp to zero. The wire and web use equivalent
+canonical CSS, so whitespace and simplified expressions may differ from the source.
+Calculated `fit-content()` limits, other length units (`em` among them), `var()` and `env()`
+remain unsupported here; `grid-auto-columns` and `grid-auto-rows` are not yet
+Contract attributes. See [CSS Grid's track sizing](https://www.w3.org/TR/css-grid-2/#track-sizes).
 
 Dimension rows (width/height, their min/max, padding/margins, offsets and
 border radii) accept `vw`, `vh`, `vmin`, `vmax`, and `svw/svh/lvw/lvh/dvw/dvh`.
@@ -2734,8 +4207,16 @@ can nest, add or subtract lengths, and multiply or divide by a number:
 order is `clamp(MIN, VAL, MAX)`, not React Native's `clamp(value, min, max)`.
 Native hosts resolve percentages during layout and update calculations when
 insets or viewport dimensions change. The web uses CSS functions directly.
+The insets are the document's: on the web the browser's, and on a native host the
+device's under `viewport-fit="cover"` and 0 under `auto`, even on iOS when a root
+`tablist` or navigation stack takes the whole screen; there a box at the root that
+pads with them stays under the status bar
+([pitfall](agent-pitfalls.md#native-presentation-and-navigation-ios)).
 Sizes, padding and radii clamp negative results to zero; margins and insets keep
-them. Unsupported: `rem`/`em`, a unitless number where a length goes
+them. `env(titlebar-area-x|y|width|height)` is the title bar beside a Mac window's
+traffic lights under `viewport-fit="cover"` (in the tall title row an app without routes
+gets from `"display_override": ["window-controls-overlay"]` in `app.json`) and is undefined
+elsewhere, so give it a fallback (`contract vocab titlebar-area`). Unsupported: `rem`/`em`, a unitless number where a length goes
 (write `0px`, not `0`), `var()`, more than 32 values or 32 levels (LLP 1001 §2,
 "Comparisons").
 
@@ -2824,6 +4305,15 @@ count, as Chrome's do, on every host. It balances up to six lines (more, or a
 `line-clamp`, wrap as usual), moves only the breaks (the box measures as
 before, and `text-align` places the lines in it), and `auto` turns it off. `pretty` and `stable` are refused; supported values are `auto | balance`.
 
+`-webkit-font-smoothing="antialiased"` (inherited) draws text as Chrome and
+Safari on the Mac do under that property: lighter glyphs, without the stem
+darkening the Mac's default smoothing adds. Write it on the root only when the
+web app being matched sets it; unsaid, text is the platform's. AppKit draws it
+and the web writes it. Linux, Windows, a terminal and the widget and watch
+drivers accept it and draw as before, as browsers off the Mac ignore it; iOS
+is expected to as well, but has not been measured. `none` and
+`subpixel-antialiased` are refused; supported values are `auto | antialiased`.
+
 `text-box` cuts a paragraph's line box to its glyphs (CSS Inline Layout 3 §4),
 to centre a label in a pill or line a heading's cap height up with an icon
 without padding by eye: `text-box="trim-both cap alphabetic"` trims the first
@@ -2866,8 +4356,12 @@ on `row` or `column` (CSS ignores them on flex and grid; write `view`).
 A text field (`input` of type `text`, `email`, `password`, `search`, `tel`,
 `url`, `number` or no type, and `textarea` outside the Markdown editor) is the
 platform's own field by default (LLP 1104). On the web it inherits the page's
-font and colour, as a CSS reset does; other platforms use their control's own
-text style. Disabled and placeholder appearances are the platform's. To colour
+font, as a CSS reset does; other platforms use their control's own text style.
+Its text is its own `color`, else the design's `FieldText`, else the
+platform's field ink, on every host: a colour set on an ancestor never tints
+it (LLP 1115 D4, LLP 1121 D9). A field of your own (`appearance="none"`) and
+the Markdown editor inherit `color` as text does. Disabled and placeholder
+appearances are the platform's. To colour
 the placeholder, write CSS's `::placeholder` as a block under the field (its
 value may compute) or in a `style`; it admits `color` alone, with its own
 alpha, and without it the placeholder keeps the platform's colour (LLP 1104
@@ -2888,6 +4382,80 @@ component App
           color=(dark ? "#9ca3af" : "#6b7280")
 ```
 
+A pressed, hovered, focused, disabled or checked look of your own is a state
+part (LLP 1121 D8): a block of that state's paint rows, in a `style` or under
+the node before its children.
+
+```contract
+style PostButton
+  background-color = "#1083fe"
+  :active
+    background-color = "#0b5fbd"
+  :disabled
+    background-color = "#9cc8fb"
+
+component App
+  state busy = false
+  view
+    column class=PostButton press=post disabled=busy
+      text "Post"
+  action post
+    busy = true
+```
+
+`:disabled` and `:checked` (`checked`, or `aria-checked`, `aria-selected` or
+`aria-pressed` true) are the runner's: they take `background-color`, `color`,
+`border-color`, `opacity`, `box-shadow` and `-exact-tint-color`, `:checked`
+under `:disabled`, and `:disabled` is your own disabled look (no default dim).
+`:active` is the host's own press of the innermost node with a `press`: it takes
+`background-color`, `color`, `opacity` and `-exact-press-scale`, which become the
+node's pressed paint (LLP 1061 D7). Custom nodes ease on the press curve (under
+Reduce Motion too) and replace the host's unsaid press. Native controls keep
+their native state beneath each authored override. Its `opacity` is the opacity
+it shows pressed, not a share.
+Its targets may compute during ordinary commits, including a conditional class
+and `none` to clear a target. Pressing needs no runner round trip.
+Absolute active opacity and `-exact-press-opacity` are mutually exclusive
+(`lower-state-press-paint`), as are two declarations of the press scale. Border
+and shadow targets remain unsupported until their host paint is implemented.
+`:hover` and `:focus-visible` take `background-color`,
+`border-color`, `opacity` and `box-shadow`, shown at once while they hold (a
+`:hover` replaces the platform's hover wash, as `:active` its press; on
+the web a `transition` of the node's own on one of those rows still times it), the
+focus's over the hover's, under the press. Each host applies them on its own
+tracking, over the node's rows (rows a part doesn't name show the base, also a
+base that changes while pressed); hover and focus rows are literals, tokens included. A
+disabled node takes none. The web (both targets) does this today; Apple, Linux
+and Android follow (LLP 1121 stage 8 B). Native buttons and list rows accept
+`:active`; their other states remain the platform's. Active properties keep a
+button native, including with `appearance="auto"`. Each written property overrides
+that field; unwritten fields keep the native highlighted state. Clearing a target
+restores the current native configuration. UIKit and AppKit own native button
+tracking, cancellation and accessibility. Native Apple controls add no fixed
+press curve to authored properties. A projected bar item, tab segment, menu row or
+confirmation action accepts only properties its native API can express. The
+host rejects an unsupported combination in the journal and keeps the native
+component. A UIKit title-only bar item supports active `color`; image bar items
+and per-item segments do not. Remove the unsupported properties.
+Other native controls refuse state parts.
+A node's own part whose state it never writes (`:disabled` with no
+`disabled`) is warned of (`lower-state-dead`).
+
+A native control takes `accent-color` and, a field, the design's `Field`,
+`FieldText` and `placeholder` roles, where its host honours them: the
+schema's control-role table says which, per host
+(`docs/control-roles-measured.md`). For each target the app ships (not the
+terminal, which draws no colour, nor tvOS or watchOS, which have no column), a
+parameter you set that the host there does not honour is said once, one line
+for each declaration that sets it, naming every host and control
+(`tamber-unreachable: accent-color on macOS switches: NSSwitch draws the
+system accent (the first at line 12; LLP 1121 D9)`): the platform's look is
+the answer there, or a control of your own (`appearance="none"`, or a styled
+pressable for a disabled prominent button). It is information, not a
+problem: `verify` and `test` say it as a note and do not count it. A field's
+own `color`, `background-color` (or `background`) or `::placeholder color`
+wins over the role, so it is not judged.
+
 A background, border or radius makes it your own box, as in a browser;
 `appearance="none"` says so explicitly. This is decided once after classes
 and shorthands: a row on any conditional arm counts, even if its value is
@@ -2901,14 +4469,17 @@ editor keep the bare text-input box or their existing specialised control.
 A focused field shows the platform's ring: the OS's on a native field, Exact's
 on a bare one (LLP 1104 D6). `outline="none"` (or `outline-style="none"`)
 takes it off on every host, for a field whose focus you draw yourself, such as
-a ring on the card around a composer: the card's `focusin` and `focusout`
+a ring on the card around a composer. It does the same on any other element
+that takes the focus (a `button`, a `link`, a native control, a `tabindex`
+box), as CSS's does; tvOS keeps its focus effect, which is how a remote
+moves. The card's `focusin` and `focusout`
 handlers hear the field's focus on every host without making the card a Tab
 stop. `focusout` also fires when focus moves between descendants and when the
 focused node is removed; use its `FocusEvent.relatedTarget` to identify a
 subtree exit. `stopPropagation()` stops a focus event at its current handler;
 autofocus delivers these events too, with IDs read when focus moves.
-A field with no visible focus fails WCAG 2.4.7. Tab still reaches the field and its accessibility is unchanged. Only
-`none` is admitted, and only on a text field or a `textarea`.
+An element with no visible focus fails WCAG 2.4.7. Tab still reaches it and its accessibility is unchanged. Only
+`none` is admitted.
 
 `textarea rows=3` sets its preferred height in lines (default 2); explicit CSS
 height and `field-sizing="content"` override it. `maxlength=80` on text inputs
@@ -2924,6 +4495,8 @@ signal; edge contact may be true with ratio 0. `intersect-margin="200px"`
 expands the root for overscan; a literal of one to four `px`/`%` lengths (units
 are case-insensitive) has IntersectionObserver's `rootMargin` semantics (percentages use the corresponding
 root dimension, as in Chrome).
+On iOS, a `resizes-visual` route's viewport also counts as a root. `overflow: clip` remains
+an intervening clip, and margins expand only the observer root.
 Removing a node stops observation, with no synthetic leave. Both web targets
 use the browser. AppKit, UIKit and Linux sample native layout and scrolling;
 inline runs, moving presentation geometry, rotated roots and SVG clip references
@@ -2931,8 +4504,12 @@ remain unqualified (LLP 1005, intersection visibility; LLP 1001 records the
 percentage-margin spec deviation). Other native hosts remain unqualified.
 Container queries and live-position feedback are still deferred.
 
-`resize="none"` disables browser resize handles. Other CSS resize values are
-refused with a native geometry explanation. Given an action instead,
+`resize` is CSS's: `vertical` (or `block`), `horizontal` (`inline`) and `both`
+give a textarea the grip a person drags to size it, on the web and on the Mac
+and iOS. Only a textarea has a grip on a native host, and no native host other
+than the Mac and iOS draws one. The drag writes `width` and `height` as the
+browser's inline style does, inside `min-*` and `max-*`. Tailwind's preflight says `textarea { resize: vertical }`;
+here a textarea's default is `none`. Given an action instead,
 `resize=fit` is the element resize event, `ResizeObserver`'s: `fit` hears the
 content box's width and height after the first layout and whenever they change
 (one more parameter: its `DOMRectReadOnly`), on every host
@@ -2947,9 +4524,23 @@ and other content text is (so put prose a reader copies in `article`, not a
 it), and a long press or a double tap there selects a word with the system's
 handles and its Copy, Look Up, Translate and Share menu, one paragraph (one
 `text`) at a time. A label inside a control stays unselectable unless the
-`text` is said on it or inside the control. Linux, Windows, Android and tvOS
-have no text selection, so `text` changes nothing there. `all` and `contain`
-are refused by name: no native host has them. These rows take literals
+`text` is said on it or inside the control. On the web `auto` leaves the
+choice to the page's stylesheet, but a control's label (a button, link,
+pressable or control role) is not selectable there either; a text's own runs
+select with it. `user-select="all"` makes an element's text one unit, as CSS
+UI 4 has it (a path, a device code): on the web and macOS one click in it
+selects all of it, and a drag, a Shift-click
+or Shift with an arrow that reaches into it takes it whole. On iOS a long
+press or a double tap in it selects it instead of a word, and a tap selects
+nothing, as on a `UITextView`; an element around a paragraph selects that
+paragraph (one selection is one paragraph there). An inline run that says
+`all` is selectable in text that is not (a label, a `header`), alone, on
+all three. Text that presses (`press=`) still presses on each click or
+tap; on macOS it does not select, and on iOS a tap while it holds a
+selection clears the selection, as in a text view. Linux, Windows, Android
+and tvOS have no text
+selection, so `text` and `all` change nothing there. `contain` is refused by
+name: no native host has it. These rows take literals
 or choices of literals, so unsupported runtime values cannot bypass the check.
 
 **Colours: say a role, not a value.** Leave a colour unsaid where you can (text,
@@ -2960,7 +4551,8 @@ the web; LLP 1095): CSS's system colours `Canvas`, `CanvasText`, `LinkText`,
 `GrayText`, `AccentColor`, `AccentColorText`, `Field`, `FieldText`, `ButtonFace`,
 `ButtonText`, `Highlight`, `HighlightText` (`AccentColor` and `LinkText` are the
 tint: the nearest `accent-color` a node or an ancestor sets, else the platform's, as
-UIKit's inherited `tintColor` is), and Exact's `-exact-label`,
+UIKit's inherited `tintColor` is; `AccentColorText` is the ink on that accent, on the web
+black or white by its lightness as a filled button's label), and Exact's `-exact-label`,
 `-exact-secondary-label`, `-exact-tertiary-label`, `-exact-quaternary-label`,
 `-exact-placeholder`, `-exact-separator`, `-exact-opaque-separator`, `-exact-link`,
 `-exact-symbol` (what a symbol nobody tinted is, the initial `-exact-tint-color`:
@@ -2974,12 +4566,14 @@ the tint on iOS and the web, the secondary label colour on the Mac),
 `color="#8e8e93"`; `border-color="-exact-separator"`, not a grey hex. Surfaces come
 in pairs: a card on a plain page (`-exact-background`, or unsaid) is
 `-exact-secondary-background`; on a `-exact-grouped-background` page it is
-`-exact-secondary-grouped-background` (white in light mode, so on a plain white page
-it vanishes); a surface inside either card is its pair's tertiary role. A route whose
+`-exact-secondary-grouped-background` (white in light mode on iOS and the web, so on a plain white page
+it vanishes there; on the Mac both card roles are AppKit's under-page grey); a surface inside either card is its pair's tertiary role. A route whose
 scroll is a grouped list (`list appearance="auto"`, `inset-grouped` or `grouped`) is a
 `-exact-grouped-background` page with nothing written, bar to bottom edge, so a switcher
 or summary between its `header` and the list sits on the list's grey (LLP 1116.007 D5); a
-`background-color` on the route, or on that content, wins. A brand colour
+`background-color` on the route, or on that content, wins. One on the list itself is its
+ground around the cards, which keep theirs: `transparent` shows what lies behind it, such
+as an `aria-hidden` `svg` at `z-index=-1` (LLP 1084 §6.5). A brand colour
 the platform has no role for is the one place for a literal.
 
 **Type: say a heading, not a size.** Body text is the platform's body size
@@ -2988,16 +4582,42 @@ browser's 16). A `text role="heading"` with no `font-size` or `font-weight` of
 its own is the platform's text style for its `aria-level` (LLP 1115 D3): 1
 `title1`, 2 (the default) `title2`, 3 `title3`, 4 and on `headline`, sized for
 the reader's Dynamic Type by Apple's own ramp (iOS at the default size:
-28/22/20/17 pt, the titles regular and `headline` semibold; the Mac: 22/17/15/13;
-the web reads the ramp at its 16 px root: 27/21/19/16, in `rem`). So omit
-`font-size` on headings; a written `font-size` or `font-weight` on the heading
-wins, an inherited one does not. Other text takes a style by name with `font`,
-as WebKit's `font: -apple-system-headline`: `font="-exact-footnote"` (or
-`"-apple-system-footnote"`) sets the style's size and weight, `normal` style and
-line height. The styles are `-exact-large-title`, `-exact-title1`, `-exact-title2`,
+28/22/20/17 pt; the Mac: 22/17/15/13; the web reads the ramp at its
+16 px root: 27/21/19/16, in `rem`). iOS, macOS and Material keep each style's
+weight and leading. The web, neutral and terminal looks use bold for levels 1
+and 2, semibold for 3. Omit heading sizes and weights unless customizing them.
+An authored `font`, `font-size` or `font-weight` wins; an inherited one does not.
+
+Native navigation bars and grouped-list headers own title typography and spacing.
+On iOS, a route's level-1 heading gives a large navigation title; other levels
+give an inline title. Set UIKit's `largeTitleDisplayMode` through a native access
+hatch to change presentation while keeping the semantic rank. Check the host's
+implementation for its supported APIs.
+
+Other text takes a style by name with `font`, as WebKit's
+`font: -apple-system-headline`: `font="-exact-footnote"` (or
+`"-apple-system-footnote"`) sets the style's size and a `normal` font style, and
+the style's weight and leading as each platform draws it (LLP 1115.000 D12.2:
+the Mac's `headline` bold and its styles' own leading, 13/16 for body; iOS's the
+face's own), beating an inherited weight or line height as CSS's shorthand
+resets them. The styles are `-exact-large-title`, `-exact-title1`, `-exact-title2`,
 `-exact-title3`, `-exact-headline`, `-exact-body`, `-exact-callout`,
 `-exact-subheadline`, `-exact-footnote`, `-exact-caption1`, `-exact-caption2`;
-`font-size="-exact-caption1"` alone sets only the size. `font` takes nothing else.
+`font-size="-exact-caption1"` alone sets the size and keeps an inherited weight
+and line height, the style filling only what nothing above says.
+`font-size="min(-exact-subheadline, 31px)"` grows with the text size up to its
+cap, as UIKit's `UIFontMetrics.scaledFont(for:maximumPointSize:)` holds one: for a
+row of equal cells that must stay one line at the accessibility sizes (a week's
+day numbers, which UIKit's calendar caps at 31 points), never to shrink text. A weight or
+line height written on the node wins either way, and `layout` names each one's
+source (`style`, `heading`, `inherited`, `authored`). `font` takes nothing else
+but `inherit`, the common reset's: a control's text then takes every font
+longhand from the text around it.
+Bold Text (iOS's setting, Android's font weight adjustment) weights the system
+font one step heavier, a written weight included, as a hand-built app's text
+is, and leaves a family the app names alone: write the weight you mean, not one
+you expect the setting to add (LLP 1115.000 D12.3). A drive turns it on, on
+Apple, with `prefer bold-text true`.
 
 A colour is any CSS colour the browser paints: hex, `rgb()`, `hsl()`, `hwb()`,
 a named colour, `transparent`, `lab()`/`oklch()`/`color()` (clipped to sRGB
@@ -3017,13 +4637,16 @@ light-dark(#f1f3f5, #16181c)`, written as CSS, dotted names allowed), and an
 `axes` block of app modes (`dark-style = black | dim  under scheme=dark`), each
 token's value in a mode on its own `when dark-style=dim: …` line. Rows name a
 token as they name a role, and an expression over tokens
-(`color-mix(in oklab, accent.fill 40%, surface.card)`) is folded by the build.
+(`color-mix(in oklab, accent.fill 40%, surface.card)`) is folded by the build,
+written whole, in a choice's arm or inside a shadow; a mix of colours alone
+(`color-mix(in srgb, red 35%, transparent)`) is a token in the `theme` block.
 `setMode("dark-style", "dim")` sets the window's mode; `-exact-mode="dark-style=black"`
 on a node holds its subtree in one (pins are `axis=value`, by spaces or commas;
 `axis:value` is refused), and inherited text inside takes the pin's value. The
 agent's `prefer mode dark-style=dim` sets it from a drive (the app's own
 `setMode` still wins after it: an app that restores a kept mode at launch
-overrides an earlier `prefer`, so prefer after `clock data`), `layout <id>` shows
+overrides an earlier `prefer`, so prefer after `clock data`; a dev reload keeps
+the window's mode unless the edit removed it), `layout <id>` shows
 the token beside each row's value, and `bun exact.mjs tamber check | eval --mode
 … | ir | fmt` checks the design, prints its tokens in a mode, writes its IR, or
 puts it in its one layout (`fmt --check` changes nothing). The
@@ -3034,14 +4657,231 @@ scheme=fixed`), and `lower-colour-one-scheme` leaves it alone; an unmarked one
 is reported once, at its line in the design. `pair=surface.page` after a
 foreground's value names what it is drawn on (a token or a role);
 `contract tamber check` warns when the two fall below 4.5:1 (`tamber-contrast`).
+The brand's states come from the theme, not a hatch (LLP 1129): `AccentColor =
+accent` is the app's tint, so the keyboard's focus ring is drawn in it (on the web
+a solid 2 px line, which reads on a control filled with the accent); `Highlight`
+and `HighlightText` colour selected text on the web (iOS draws it in the tint); a
+`button` you fill (`background-color="accent"`) hovers in its own ink, as the
+filled button does, and a row or card of your own (a `link` or a pressable)
+hovers in the brand's colour by a `:hover` part; a sheet's corners are
+`border-radius` on its route. A button
+in the brand's shape is a face you write on a `button` with no `buttonStyle`; a
+`buttonStyle` is the platform's control, which takes the accent and no radius
+(`lower-button-style`), and `ButtonText` and `LinkText` are the tint's, not the
+theme's (`lower-theme-tint`).
+A type token is CSS `font` syntax (`type.body = -exact-body/1.35 "InterVariable"`):
+`font="type.body"` writes only the longhands it names, so the text style's own
+weight applies where it names none, and a size in px is warned of
+(`tamber-type-fixed`: it does not follow the person's text size). A family token
+is a stack (`family.text = "InterVariable", system-ui`), named by `font-family`.
+One that varies by a mode goes on the text, not its container
+(`tamber-inherited-axis`); on the JS target each row it writes is a property
+per mode (`--x-type-body-size`).
+A component declares what a designer may tweak in a `params` section (LLP 1121
+D15), one param a line: `radius: length = "radius.md"  range="0..40"  step=1
+control="slider"  group="Shape"  priority=1  label="Corner radius"`. A param is a
+token the component owns: its default is any token value (a literal, a token, or
+an expression over tokens and the component's other params), and its rows and
+defaults name it `param.radius`. Every instance shares it. Its full name is the
+component's declaring file and name, `post.contract#PostButton.radius` (an import
+alias never changes it; moving the file makes it a new param), and
+`PostButton.radius` where no other component has that name (a package's file
+is its package's however a `use` reaches it). A param is a row's value in its
+component's own rows (a style, shorthand or motion row, an image's `symbol:`
+source): a string or a template, through `?:` branches, `match` arms and `+`,
+as a motion token is; and its defaults. Passed in a component's argument, it is
+the child's row's value. One in a `style` that one component's view alone
+applies is that component's (LLP 1139 D3); one in a `style` another
+component applies too, a `keyframes` or a state's value,
+or in what a row computes (a function's argument, a condition, a comparison,
+a callback), or that a child reads otherwise than as a row's value, is refused
+(`tamber-param-scope`). A param no
+row of its component reads (a state part's row counts: `:active`'s
+`background-color = "param.pressed"`), directly or through another param, is refused
+(`tamber-param-unused`); a ranged length is px (`tamber-range-unit`), or a base
+name or an expression over one, checked in every platform's column, and its
+default must be inside the range in every mode; `control` follows the kind
+(`color`, `slider`, `stepper`, `token`, `select` with `options="a|b"`, `none`),
+and `priority` is 1 to 3. A design token may not be named `param.…`.
+`contract tamber ir` and the design server's `describe` list them under
+`components`; `contract tamber check` builds an app with params to admit its
+design (a dial only a param reads is read), counts them apart, and charges a
+refusal or warning on one to its default. A view that isn't Contract (a native module's, a Rust canvas
+component) declares its params in the design instead: `component MapCard`, then
+an indented `params` block of lines like a dial's, any kind (`inset: length =
+8px  in 0..24  control=slider  priority=2`). Its identity is the design file
+and the name (`app.tamber#MapCard`); its declaration keeps every param, and
+what its default reads, as the code reads them by name; a `when` is not the
+component's (the app's design sets a param per mode).
+The app sets a param's value in its
+design's `params` block (`PostButton.radius = 8px`, `when` lines too), which
+every instance shares; the design server's `set-param` writes it,
+`unset-param` takes it back to the component's default, and a line naming no
+param of the app is warned of.
+A package can ship a design (LLP 1121 D11): a file named for the last part of
+its `package.json` name (`@exact/reading` → `reading.tamber`) beside its entry
+file (what `exports` maps `.` to, else `index.contract`), or the file its
+`package.json` `"tamber"` names inside the package. It starts `tamber reading`
+and holds one `theme` block of tokens named `reading.…`, which the package's
+views name. An app that uses the package gets them. The app's design sets one
+by its full name (`reading.card = #abcdef` in `app.tamber`), which replaces the
+package's, `when` lines and all. A package's design may declare its
+components' params (`component Map` with `params`, named
+`<package>/<file>#Map`, as its Contract components are), whose values the
+app's design sets (`Map.pin = #000000` under `params`, or the full name). It
+may declare icons (`icons`, `reading.star = icon(sf "star", svg "star.svg")`),
+each named `reading.…` and naming only its own package's icons; the app's
+design overrides one by full name under its `icons`, whole. An icon's SVG path
+is relative to the `assets/` of the root whose file writes it: the app's
+directory for the app's, the package's root for a package's (an icon's, or a
+param default's `icon(svg …)` in its design or its Contract), so a package
+whose `"tamber"` is `theme/palette.tamber` still reads `<package>/assets/`; in v1 it must be a one-colour template
+(`tamber-icon-svg`). It declares no axes, dials, `params` lines or `exports`
+(`tamber-package-block`; its `when` lines name the app's axes), declares only `reading.…` names and none of the
+base names (`tamber-package-name`), and a token in it names only tokens the
+same file declares, roles, and the base names `space.xs`…`space.xl` and
+`radius.sm`…`radius.full`, which the app's design defines until the base scale
+ships (`tamber-unknown-token`). An app can't use two packages whose names end
+alike (`@acme/reading` and `@other/reading`) when both ship a design. A
+refusal points at its line in the package's file. `contract tamber
+check|eval|ir|gen` and the design server fold the app's design with its
+packages' tokens, as the build does.
+A length token may name a base name bare (`card.pad: length = space.md`) or in
+a `calc()`, `min()`, `max()` or `clamp()` with px and numbers
+(`calc(space.md * 2 + 4px)`): each host reads it in its own column, and the
+compiler checks every column, naming the one a row refuses (a padding that is
+negative on mac). A shadow token's lengths may be any of these
+(`card.shadow: box-shadow = 0 space.md calc(space.sm * 2) black`), checked in
+every column the same way (a blur negative on mac is refused); a literal
+`box-shadow` row's lengths stay px, so name a shadow token there. A base name
+times a length, and `rem`, `em` or `%` beside one, are refused.
+A row's own value may be a `calc()`, `min()`, `max()` or `clamp()` over length
+tokens (`margin-top="calc(var(--space-2) * -1)"`, or `calc(space-2 * -1)`):
+each token is read where the row is drawn, so a `rem` token stays `rem` and
+one that varies by mode follows it. A value computed from state or data
+names a token only whole.
+A package that is `"private": true` and ships a design is a library (LLP
+1139): each component its entry declares or re-exports is held to its rules.
+Its spacing, corner and colour rows (a shorthand's each side; `border`'s
+colour), and its params' defaults of every kind, name a param, a token, a
+role or a base name, or compute over one (`color-mix`, `light-dark`,
+`calc`), never a literal (`0`/`0px` and CSS keywords such as `auto` and
+`transparent` excepted; `lower-library-literal`); a control's role is the native control's (`input`,
+`textarea`, `select`, `progress`, a native `button`) with what its platform
+needs (`checked` and `aria-label` or `aria-labelledby`, a range's
+`min`/`max`, …;
+`lower-library-control`); each of its buttons (a `button`, or a node of
+`role="button"`) is named, by `aria-label`, `aria-labelledby` or a text of
+its own, and one whose look reads a state prop (a bool named `selected`,
+`current`, `pressed`, `checked`, `on`, `active` or `expanded`, in a `?:`,
+`match` or class) says it aloud through `aria-selected`, `aria-pressed`,
+`aria-current`, `aria-checked` or `aria-expanded`, or a label that reads it
+(also `lower-library-control`; any other bool, a size or an ink, is
+presentation); and nothing in the package reads the host it runs
+on (`exactDelivery`, `exactSurface`, `exactViewport().displayMode` read
+from the viewport wherever the package passes it: an alias, a `provide`, a
+`fn`; a prop's `displayMode` is the app's data; `lower-library-platform`). Not checked yet: an injected value whose
+provider is outside the package, and per-platform host entries (no syntax
+for them). Its names are its API: an app line or a Contract row naming a
+name under its namespace that it doesn't define, or a param line naming one
+it lacks, fails the build (`tamber-package-unknown`; the nine base names are
+no package's), and its params are named in full, a short name that names
+none too (`tamber-param-short-library`). The in-repo `@exact/actions`'
+`BarItem` and `HeaderButton` are for an app's own authored bar and header (a
+design's, as Bluesky's are); the platform's `tabs` and `header` routes stay
+the platform's, and no library component wraps them. A `BarItem` says its
+selection as the bar's current item (`aria-current="page"`, iOS's selected
+trait) and takes no long press itself: an item held for more puts
+`contextmenu` on its slot fill (Bluesky's Profile avatar), so the press lands
+on the fill rather than the whole column.
+`@exact/actions` also exports `FollowButton` `(id, following, text, label,
+tone, size, shape, icon, press)`, a person's Follow button (Bluesky's
+FollowButtonInner), an authored pressable under D9's exception as
+`PostButton` is. Its variants are Bluesky's own: `tone` `"primary"`,
+`"inverted"`, `"subtle"` or `"overlay"`; `size` `"small"` or `"tiny"`;
+`shape` `"pill"` or `"round"` (icon only); `icon` `"both"` (plus, then a
+check once following), `"follow"`, `"following"` or `"none"`. Its words are
+yours: `text` is the visible label (Follow, Follow back, Following) and
+`label` the spoken one (`""` speaks `text`). It says following by its label
+alone, with no `aria-pressed`, so swap both with the state; a round one shows
+no text, so give it a `label` in both states (`"Follow Ada"`, `"Following
+Ada"`), which the compiler can't check. Each tone's fill and text, not
+following and following, are params (`fill`, `ink`, `followingFill`, …,
+`overlayFollowingInk`) over `actions.follow-*` tokens, its sizes are tokens,
+and its press scales are params, one for a small pill, a tiny one and a
+round one.
+The in-repo `@exact/cards` exports PostCard, AtCard, ProfileHeader (and its
+ProfileAlert shape), Avatar `(src, size)`, VerifiedBadge `(badge, size, ink,
+mark)` and PersonRow; `badge` is `enum<"none", "verified", "verifier">` (as
+ProfileHeader's and PostCard's), `"none"` drawing nothing. It was a string
+with `""` for none until stage 15 B batch 2: pass `"none"` now, and a data
+value of that enum type. `PersonRow` `(id, label, avatar, name, handle,
+badge, pill, description, descriptionLines, divider, disabled, press)` is a
+person in a list (Bluesky's ProfileCard), its one slot the trailing control
+(a `FollowButton`, your own, or nothing). Its one press target is the link,
+everything but the slot (`role="link"`, testId `<id>-link`, `label` its
+spoken name, such as "View Ada's profile"); the slot is a column beside it at
+the trailing edge, never in it, so the trailing control stays its own to a
+screen reader, and the pill and description run under the names;
+`handle` is the second line as shown (`"@ada.bsky.social"`), `pill` the
+pill's text (`""` for none), `divider` `"bottom"`, `"top"` or `"none"`;
+`disabled` dims the link (not your trailing control) and says so on it (`aria-disabled`) but doesn't stop `press`, so check in your
+action. Avatar's and VerifiedBadge's `size`, and VerifiedBadge's
+`ink` and `mark`, have no defaults: pass token or role names
+(`size="cards.avatar"`, `ink="cards.badge"`, `mark="cards.badge-mark"`, or
+your own), not literal colours, so setting those tokens restyles them.
+`@exact/cards` also exports EmptyState `(id, icon, iconSize, tone, title,
+message, button, buttonLabel, buttonIcon, buttonTone, press)`, what a list
+shows with nothing in it: every text is yours, and an empty `icon`, `title`
+or `button` leaves that piece out (`icon` and `buttonIcon` are image sources,
+a `symbol:` name or an icon token). The three enums are required, with no
+defaults: `iconSize` `"medium"` (48 points, Bluesky's usual), `"small"` (32)
+or `"large"` (64) in a 64-point box; `tone` `"high"` (the message in the
+label colour), `"medium"` (secondary) or `"label"` (message and icon in the
+label colour); `buttonTone` `"primary"` (the brand blue) or `"secondary"`.
+`@exact/lists` exports MenuItem `(id, label, icon, destructive,
+first, pick)` and MenuGroup (a slot of items): a menu's drawn items in a
+sheet, as Bluesky's menu is, not the platform's list cells; the sheet holding
+the groups is yours and carries `role="menu"` (the items are `menuitem`s, the
+group adds no role). Pass `first=true` on a group's first item, which has no
+hairline above it.
+The in-repo packages' icons are icon tokens, which an app overrides by full
+name: `@exact/cards`' `cards.repost`, `cards.pin`, `cards.corner-down-right`
+(PostCard's context and reply lines), `cards.ban`, `cards.eye-slash`,
+`cards.warning`, `cards.circle-info` (ProfileHeader's alerts), `cards.attie`
+(AtCard's visit button) and `cards.verified`, `cards.verified-check`,
+`cards.verifier`, `cards.verifier-check` (VerifiedBadge), and `@exact/actions`'
+`actions.reply`, `actions.repost`, `actions.heart`, `actions.heart-filled`,
+`actions.bookmark`, `actions.bookmark-filled`, `actions.share`, `actions.dots`
+(ActionRow), `actions.gallery`, `actions.camera`, `actions.gif`
+(ComposeFrame's toolbar) and `actions.follow-add`, `actions.follow-check`
+(FollowButton). Each but FollowButton's two has no `sf`, so Apple draws the
+same path as the web; those two name SF Symbols' `plus` and `checkmark`
+beside Bluesky's paths, so Apple draws the symbols (as some of the clone's
+copies did; a copy that drew a path there changes, a named pixel change). The Attie mark, the toolbar's three and the badges' paths were inline
+`svg` with `fill-rule="evenodd"`; each one's holes wind against its outline, so
+it fills the same nonzero, and its SVG has no `fill-rule` (an even-odd icon
+gives its app a new compat id). A badge is two one-colour templates stacked,
+its ground in its `ink` and its check in its `mark`, so both colours stay a
+card's tokens and a header's params; an override replaces one layer, its colour
+unchanged. Still paths: `BarItem`'s and `HeaderButton`'s icons, which are their
+caller's `d` (a prop), not the package's.
 Code outside a view names a token by its name too (LLP 1121 D12): a data module
-returns a `ColorToken` (`contract types` declares the design's, so an unknown
-one fails `tsc`), and `bun exact.mjs tamber gen ts|rust .` writes bindings into
+returns a `ColorToken` (or a `LengthToken`, `TypeToken`, … of its kind:
+`contract types` declares the design's, so an unknown one fails `tsc`), and `bun exact.mjs tamber gen ts|rust|swift|kotlin .` writes bindings into
 `.exact/tamber/` (never committed): `tamber.ts` and `tamber.css` (each token's
-CSS per mode), `tamber.rs` (`pub const SURFACE_CARD: Token<Color>`, which
+CSS per mode), `tamber.rs` (`pub const SURFACE_CARD: Token<Color>`, and
+`Token<Length>`, `Token<Number>`, `Token<Type>` for those kinds, which
 `session.tamber().get(SURFACE_CARD, place)` resolves in a running session), or
 `tamber.swift` (`ExactTamberToken.surfaceCard`, for a native view's
-`ExactTamber(view).color(.surfaceCard)`; Android's names a token by its name).
+`ExactTamber(view).color(.surfaceCard)`, `.length(_:)`, `.number(_:)` and
+`.font(_:fallback:)`, a font at the person's text size with Bold Text's step),
+or `TamberTokens.kt` (`TamberColor.SURFACE_CARD`, `TamberLength`,
+`TamberNumber`, for `ExactTamber(view).color(…)` in the app's hatches). A
+component's param is named by `<Component>.<param>` there (`mapCardInset`,
+`MAP_CARD_INSET`); two names that map alike are refused, naming both. The Apple
+build writes `tamber.swift` and the Android reader's `TamberTokens.kt` before
+an app's modules compile.
 Recipe:
 [a brand](recipes/tamber.md).
 `color-scheme="dark"` (or `"light"`) on a node makes that subtree resolve
@@ -3055,6 +4895,12 @@ a flip shows in its own batch's frame; `status-bar-animation="fade"` fades it
 `wakelock="screen"` on any node, bound to state (`wakelock=(playing ? "screen" :
 "none")`), keeps the display awake while that node is displayed; a hidden or
 unmounted one holds nothing (LLP 1125 D11; `state.wakelock` is `{held, by}`).
+`orientationlock` on any node (`orientationlock=(tilt ? "current" : "none")`)
+keeps the window to a Screen Orientation API lock type, or `current`, while
+that node is displayed; a sheet's lock wins over what it covers and a
+descendant's over its ancestor's. A type only narrows the manifest's
+`orientation`, and a lock inside a `dialog` is refused (LLP 1133.029;
+`contract vocab orientationlock`).
 `currentcolor` takes the node's `color` on borders, `background-color`,
 `-exact-tint-color`, text stroke and SVG paint. `unset` clears any row, and `inherit`
 an inherited one (`color`, fonts, `fill`…); `inherit` on a row CSS does not
@@ -3095,6 +4941,9 @@ type, over the one `type` implies (iOS: `password`, `email`): `username`,
 `cc-additional-name`, `cc-family-name`, `cc-number`, `cc-exp`, `cc-exp-month`,
 `cc-exp-year`, `cc-csc`, `cc-type`, `bday`, `bday-day`, `bday-month` and
 `bday-year`.
+macOS 26 offers verification codes from Messages and Mail in every text field;
+`app.json`'s `host.macos.oneTimeCodeAutofill: "marked"` keeps them to fields
+marked `one-time-code`.
 `off` clears the content type (the web's `autocomplete="off"`); `on` or a
 list HTML's grammar refuses (the web's default) leaves `type`'s, and so does
 a name the platform has no type for (`country`, `impp`, `sex`), which only the
@@ -3107,6 +4956,10 @@ not empty, whatever its length (an `expect text` on the field reads `•••`)
 accessibility tree still shows one bullet a character, as Chrome exposes it).
 What the app stores (`state.slots`, its data module) is the app's own; an
 `app.test.contract` `type … append` into a filled password field is refused.
+
+`aria-busy=(not ready)` marks a region as still loading: assistive technology
+hears it, and time to interactive (`modules/observe`) waits until no element is
+busy.
 
 `border`, `border-top/right/bottom/left` take CSS width/style/color in any order,
 resetting omitted components to medium/none/currentcolor. Widths are px/pt,

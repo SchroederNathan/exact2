@@ -2,12 +2,13 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { cpSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Cdp, open } from '../../../scripts/agent.mjs';
+import { chromium } from '../../../scripts/agent-launch.mjs';
 import { serveStatic, serveBuildTree, readWebRequest } from '../serve.mjs';
 import { publishRoot } from '../../../scripts/deploy.mjs';
-import { DirectoryOrigin, appDocumentPath } from '../../../scripts/origin.mjs';
+import { DirectoryOrigin, appDocumentPath, sha256 } from '../../../scripts/origin.mjs';
 const dir = process.env.EXACT_ROUTER_TEST, dist = resolve(dir, 'dist');
 // `EXACT_ROUTER_TARGET=js` (host/web/tests/it/navigation.rs): the JS target
 // (LLP 1071), each plan a JS build (the Caltrain carrier; the plans read no
@@ -17,8 +18,12 @@ const js = process.env.EXACT_ROUTER_TARGET === 'js';
 const jsBuild = (plan, out) => {
   const b = spawnSync(process.execPath, ['host/web-js/build.mjs', 'caltrain', '--plan', resolve(dir, plan), '--out', out, '--render', 'none'], { encoding: 'utf8' });
   if (b.status !== 0) throw new Error(`${plan}: its JS build failed: ${b.stderr}`);
-  const page = readFileSync(out + '/index.html', 'utf8');
-  writeFileSync(out + '/index.html', page.replace('<script type="module" src="./app.js"></script>', `<script>(${jsFixture})()</script><script type="module" src="./app.js"></script>`));
+  // Into every document a navigation can be answered with: the root's, the shell a declared deep route gets
+  // (serve.mjs `buildTreeFile`), and the miss's, where the build wrote one.
+  for (const name of ['index.html', 'shell.html', '404.html'].filter((name) => existsSync(`${out}/${name}`))) {
+    const page = readFileSync(`${out}/${name}`, 'utf8');
+    writeFileSync(`${out}/${name}`, page.replace('<script type="module" src="./app.js"></script>', `<script>(${jsFixture})()</script><script type="module" src="./app.js"></script>`));
+  }
   cpSync('host/web/navigation.js', out + '/navigation.js'); // the host-seam cases import it
   // A bare plan has no bake to copy `manifest.json` from; the link-file case needs a file there.
   writeFileSync(out + '/manifest.json', '{}\n');
@@ -27,6 +32,12 @@ if (js) jsBuild('app.plan', dist);
 else cpSync(process.env.EXACT_ROUTER_DIST, dist, { recursive: true });
 if (!js) for (const name of ['glue.js', 'navigation.js', 'motion-glue.js', 'collection-glue.js']) cpSync('host/web/' + name, dist + '/' + name);
 const bytes = [...readFileSync(dir + '/app.plan')];
+if (!js) {
+  const plan = Buffer.from(bytes), envelope = JSON.parse(readFileSync(dist + '/exact.json', 'utf8'));
+  writeFileSync(dist + '/app.plan', plan);
+  envelope.plan.sha256 = sha256(plan); envelope.plan.bytes = plan.length;
+  writeFileSync(dist + '/exact.json', JSON.stringify(envelope));
+}
 const noNavigate = [...readFileSync(dir + '/no-navigate.plan')];
 const noNotfound = [...readFileSync(dir + '/no-notfound.plan')];
 const noRoot = [...readFileSync(dir + '/no-root.plan')];
@@ -92,11 +103,14 @@ let served = dist;
 const server = createServer((req, res) => {
   if (req.url === '/__test-mirror') { res.setHeader('content-type', 'text/html'); res.end('<main id="host"></main>'); return; }
   if (req.url === '/__test-guest') { res.setHeader('content-type', 'text/html'); res.end('<script>parent.postMessage("h","*")</script>'); return; }
+  if (req.url === '/__test-slow.png') { setTimeout(() => { res.setHeader('content-type', 'image/png'); res.setHeader('cache-control', 'no-store'); res.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64')); }, 2500); return; } // a picture that keeps a fragment's hold (fragment.js)
   (js && served !== published ? serveBuildTree : serveStatic)(served, req, res);
 });
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const url = `http://127.0.0.1:${server.address().port}`;
-const child = spawn(process.env.CHROME, ['--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--no-first-run', '--disable-background-networking', `--user-data-dir=${dir}/chrome`, 'about:blank'], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+const browser = chromium();
+if (browser.unavailable) throw new Error(`Chrome is required: ${browser.unavailable}`);
+const child = spawn(browser.executable, ['--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--no-first-run', '--disable-background-networking', `--user-data-dir=${dir}/chrome`, 'about:blank'], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
 const cdp = new Cdp(child.stdio[3], child.stdio[4]);
 const exited = new Promise(r => child.on('exit', () => { cdp.fail('Chrome closed'); r(); }));
 const rows = [], failures = [], consoleLines = [], consoleErrors = [], skipped = [];
@@ -640,6 +654,24 @@ try {
       }
     }
   });
+  await run('declared dotted routes launch; unmatched files remain missing', async () => {
+    for (const tree of [dist, published]) {
+      served = tree;
+      const n = await fresh('/post/photos.zip');
+      await record('extension route', '/post/photos.zip', n, 2, 0);
+      for (const [path, accept, status] of [
+        ['/post/photos.zip', 'text/html', 200], ['/post/a%2Fb.zip', 'text/html', 200],
+        ['/post/photos.zip/', 'text/html', 404], ['/post/photos.zip', '*/*', 404],
+        ['/deck/missing.html', 'text/html', 404], ['/missing.pdf', 'text/html', 404],
+        ['/manifest.json', 'text/html', 200],
+      ]) {
+        const response = await fetch(url + path, {headers: {accept}});
+        assert.equal(response.status, status, path);
+        assert.equal(response.headers.get('cache-control'), status === 200 && (!js || tree === published) ? 'no-cache' : 'no-store', path);
+        if (status === 200) assert.equal(response.headers.get('content-type'), path === '/manifest.json' ? 'application/manifest+json' : 'text/html');
+      }
+    }
+  });
   await run('published app deep launch and HTTP policy', async () => {
     served = published;
     const n = await fresh('/post/42'); await record('published /post/42', '/post/42', n, 2, 0);
@@ -692,6 +724,66 @@ try {
       assert.equal((await session.state()).navigation.url, '/');
       assert.equal((await session.state()).slots.backPresses, 1);
     } finally { await session.close(); }
+  });
+  // @ref LLP 1153 D5 — a fragment's scroll, in a navigation root that scrolls: at launch; again by a link to the
+  // fragment shown, though the person scrolled since; never for a navigation a refused commit made, or one only
+  // computed. Back to an entry whose router is the router shown puts back the place it had; a newer destination and the
+  // app's own scrollIntoView win over the hold while a picture loads.
+  await run('a fragment scrolls once per navigation the router is assigned, and gives way to the person, the app and Back', async () => {
+    const original = js ? null : readFileSync(dist + '/index.html', 'utf8');
+    if (js) { served = dir + '/fragment'; jsBuild('fragment.plan', served); }
+    else writeFileSync(dist + '/index.html', readFileSync(process.env.EXACT_ROUTER_DIST + '/index.html', 'utf8').replace('<script type="module" src="./glue.js"></script>',
+      `<script>(${fixture})(${JSON.stringify([...readFileSync(dir + '/fragment.plan')])})</script><script type="module" src="./glue.js"></script>`));
+    try {
+      const port = () => evaluate(`document.querySelector('[data-testid="port"]').scrollTop`);
+      const offset = id => evaluate(`(()=>{const p=document.querySelector('[data-testid="port"]'),e=document.getElementById('${id}');return Math.round(e.getBoundingClientRect().top-p.getBoundingClientRect().top+p.scrollTop);})()`);
+      const centre = id => evaluate(`(()=>{const r=document.querySelector('[data-testid="${id}"]').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+      const pause = ms => evaluate(`new Promise(r => setTimeout(r, ${ms}))`);
+      const press = async id => { const at = await centre(id); for (const type of ['mousePressed', 'mouseReleased']) await call('Input.dispatchMouseEvent', { type, button: 'left', clickCount: 1, ...at }); };
+      const wheel = async dy => { await call('Input.dispatchMouseEvent', { type: 'mouseWheel', deltaX: 0, deltaY: dy, ...await centre('port') }); await pause(400); };
+      const at = (to, why) => until(`Math.round(document.querySelector('[data-testid="port"]').scrollTop) === ${to}`).catch(async () => assert.fail(`${why}: the port is at ${await port()}, not ${to}`));
+      const launch = async () => {
+        const before = await evaluate('globalThis.fixtureBoot ?? null');
+        await call('Page.resetNavigationHistory');
+        await call('Page.navigate', { url: 'about:blank' }); // else, at that URL, only a fragment's navigation
+        await call('Page.navigate', { url: url + '/item/7?agent=1#moves' });
+        await until(`globalThis.fixtureBoot !== ${JSON.stringify(before)} && document.getElementById('exact-root')?.dataset.bootMs && globalThis.exact?.${js ? 'ready' : 'agent'}`);
+        await evaluate('exact.ready');
+        if (js) await evaluate(`(exact.agent = exact.agentSettled, true)`);
+        const moves = await offset('moves');
+        await at(moves, 'the launch at #moves');
+        return moves;
+      };
+      const moves = await launch();
+      await wheel(-300);
+      const scrolled = await port();
+      assert.ok(scrolled < moves, `the wheel scrolled: ${scrolled}`);
+      await press('refused'); await pause(300);
+      assert.equal(await port(), scrolled, 'a navigation in a refused commit scrolls nothing');
+      await press('peek'); await pause(300);
+      assert.equal(await port(), scrolled, 'a navigation only computed scrolls nothing');
+      assert.equal((await state()).slots.peeked, 'moves');
+      await press('to-moves'); await at(moves, 'a link to the fragment shown, after the person scrolled');
+      await wheel(-300);
+      const kept = await port();
+      await press('to-other'); await at(await offset('other'), '#other');
+      await press('to-moves'); await at(moves, '#moves again');
+      // Loaded: while its document loads, Chrome holds its own fragment's element in view after a traversal.
+      await until('[...document.images].every(image => image.complete)');
+      await evaluate('history.go(-2)');
+      await at(kept, 'Back two entries, to #moves as it was left');
+      await launch();
+      const start = await offset('first'); // the route's, below the bar
+      await press('to-top'); await at(start, '#top');
+      await pause(3000);
+      assert.equal(await port(), start, 'the picture landed, and #top stands');
+      await launch();
+      await press('aim');
+      const row = await offset('row-3');
+      await at(row, "the app's scrollIntoView");
+      await pause(3000);
+      assert.equal(await port(), row, "the picture landed, and the app's place stands");
+    } finally { served = dist; if (original !== null) writeFileSync(dist + '/index.html', original); }
   });
   await run('autofocus preserves existing focus, and a reload keeps it at its place', async () => {
     served = dist;

@@ -143,6 +143,50 @@ fn arrive_at(p: &mut Presenter<()>, location: &str) {
 }
 
 #[test]
+fn autofocus_skips_unrendered_candidates_without_painting_and_retries_when_shown() {
+    let source = r#"component App
+  state shown = false
+  action reveal
+    shown = true
+  view
+    column
+      button press=reveal testId="reveal"
+        text "Reveal"
+      dialog id="closed"
+        input autofocus=true testId="closed-field"
+      column display=(shown ? "flex" : "none")
+        input autofocus=true testId="late" height=32
+"#;
+    let mut p = boot_source(source);
+    assert_eq!(p.focus(), None);
+    for _ in 0..3 {
+        p.repaint();
+        let serial = p.boxes_serial;
+        assert!(p.autofocus().is_none());
+        assert_eq!(p.focus(), None);
+        assert_eq!(p.boxes_serial, serial, "hidden candidates need no paint");
+        assert!(p.dirty(), "the window still needs its requested repaint");
+    }
+
+    let reveal = id(&p, "reveal");
+    assert!(p.host.dispatch_at(reveal, Event::Press, 0.).is_none());
+    assert!(p.after_commit().is_none());
+    assert_eq!(focused(&p), "late", "a hidden candidate was not consumed");
+    assert_ne!(p.focus(), Some(id(&p, "closed-field")));
+
+    assert!(p.set_focus(None, 0.).is_none());
+    p.repaint();
+    let serial = p.boxes_serial;
+    assert!(p.autofocus().is_none());
+    assert_eq!(
+        p.focus(),
+        None,
+        "a processed candidate does not steal focus"
+    );
+    assert_eq!(p.boxes_serial, serial);
+}
+
+#[test]
 fn a_push_moves_the_focus_to_the_routes_heading_and_back_returns_it_to_the_pressed_control() {
     let mut p = boot();
     assert_eq!(focused(&p), "nothing", "the first sight is no arrival");
@@ -269,4 +313,150 @@ fn a_long_mouse_press_notes_its_activation_before_the_route_arrives() {
             "{scale}: the route remembers its origin"
         );
     }
+}
+
+#[test]
+fn mouse_field_click_keeps_its_focus_when_a_route_arrives() {
+    for feedback in ["", "-exact-press-scale=0.9"] {
+        for during_press in [false, true] {
+            for prior_focus in [None, Some("open"), Some("aside")] {
+                let action = if during_press {
+                    "open(\"/detail\")"
+                } else {
+                    "typed(note)"
+                };
+                let source = APP.replace(
+                    "input testId=\"aside\"",
+                    &format!("input testId=\"aside\" press={action} {feedback}"),
+                );
+                let mut p = boot_source(&source);
+                let prior = prior_focus.map(|name| id(&p, name));
+                p.set_focus(prior, 0.);
+                let field = id(&p, "aside");
+                let (x, y, w, h) = p.rect_of(field).unwrap();
+                let (x, y) = (x + w / 2., y + h / 2.);
+                p.pointer_down(x, y, 0.).unwrap();
+                assert_eq!(focused(&p), "aside");
+                let released = Instant::now();
+                p.pointer_up(x, y, 0.).unwrap();
+                let recorded = (!during_press).then(|| p.route_focus.pressed.unwrap());
+                if !during_press {
+                    arrive_at(&mut p, "/detail");
+                }
+                assert_eq!(
+                    focused(&p),
+                    if prior_focus == Some("aside") {
+                        "detail-title"
+                    } else {
+                        "aside"
+                    },
+                    "{feedback}: press={during_press}, prior={prior_focus:?}"
+                );
+                if let Some(press) = recorded {
+                    assert_eq!(press.focus, prior, "activation remembers focus before down");
+                    assert!(press.at >= released, "activation refreshes the timestamp");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mouse_field_link_keeps_its_focus_when_the_click_follows() {
+    let source = APP.replace(
+        "      input testId=\"aside\" value=note input=typed height=30",
+        "      link href=\"/detail\"\n        input testId=\"aside\" value=note input=typed height=30",
+    );
+    let mut p = boot_source(&source);
+    let field = id(&p, "aside");
+    let (x, y, w, h) = p.rect_of(field).unwrap();
+    let (x, y) = (x + w / 2., y + h / 2.);
+    p.pointer_down(x, y, 0.).unwrap();
+    p.pointer_up(x, y, 0.).unwrap();
+    assert_eq!(
+        p.host.shown_stack().unwrap().last(),
+        Some(&id(&p, "route-detail"))
+    );
+    assert_eq!(focused(&p), "aside");
+}
+
+#[test]
+fn unactivated_mouse_field_contact_does_not_explain_a_route() {
+    for feedback in ["", "-exact-press-scale=0.9"] {
+        for already_focused in [true, false] {
+            for end in ["cancel", "lost", "pan", "outside"] {
+                let pan = if end == "pan" {
+                    "pan=drag touch-action=\"none\""
+                } else {
+                    ""
+                };
+                let source = APP.replace(
+                    "      input testId=\"aside\" value=note input=typed height=30",
+                    &format!("      button testId=\"field-parent\" press=typed(note) {feedback}\n        input testId=\"aside\" value=note input=typed height=30 {pan}"),
+                ).replace("  view\n", "  action drag(dx: number, dy: number)\n    note = note\n  view\n");
+                let mut p = boot_source(&source);
+                let field = id(&p, "aside");
+                if already_focused {
+                    p.set_focus(Some(field), 0.);
+                }
+                let (x, y, w, h) = p.rect_of(field).unwrap();
+                let (x, y) = (x + w / 2., y + h / 2.);
+                p.pointer_down(x, y, 0.).unwrap();
+                assert_eq!(focused(&p), "aside");
+                match end {
+                    "cancel" => p.pointer_cancel(0.).unwrap(),
+                    "lost" => p.pointer_lost(0.).unwrap(),
+                    "pan" => {
+                        p.pointer_move(x + 40., y, 0.).unwrap();
+                        p.pointer_up(x + 40., y, 0.).unwrap();
+                    }
+                    _ => {
+                        p.pointer_up(450., y, 0.).unwrap();
+                    }
+                }
+                let recorded = p.route_focus.pressed;
+                arrive_at(&mut p, "/detail");
+                assert_eq!(
+                    focused(&p),
+                    "aside",
+                    "{feedback}: focused={already_focused}, {end}"
+                );
+                assert!(recorded.is_none(), "no activation record");
+                p.set_focus(None, 0.);
+                assert!(p.system_back(0.));
+                settle(&mut p);
+                assert_eq!(
+                    focused(&p),
+                    "route-home",
+                    "an unactivated ancestor is no Back origin"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn in_androids_touch_mode_a_finger_after_the_press_takes_the_arrivals_ring_off() {
+    let mut p = boot();
+    (p.brush.touch_mode, p.brush.keyless) = (true, true);
+    p.set_pointer_kind(crate::presenter::PointerKind::Touch);
+    enter(&mut p, "open");
+    assert_eq!(focused(&p), "detail-title");
+    assert!(!p.brush.keyless, "a key left touch mode");
+    // A finger on the route, then a Back within the key's press: the
+    // focus returns to the control, with no ring.
+    let now = p.host.now();
+    p.pointer_down(200., 400., now).unwrap();
+    p.pointer_up(200., 400., now + 1.).unwrap();
+    assert!(p.system_back(now + 2.));
+    settle(&mut p);
+    assert_eq!(focused(&p), "open");
+    assert_eq!(p.brush.ringless, Some(id(&p, "open")));
+    // A key, then a Back with no press: the focus it returns shows its ring.
+    click(&mut p, "open");
+    p.key_down("ArrowDown", p.host.now());
+    assert!(p.system_back(p.host.now()));
+    settle(&mut p);
+    assert_eq!(focused(&p), "open");
+    assert_ne!(p.brush.ringless, Some(id(&p, "open")));
 }

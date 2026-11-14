@@ -35,11 +35,52 @@ extension NodeView {
         styleFieldEditor(editor)
     }
     @objc package func controlTextDidEndEditing(_ obj: Notification) {
-        presenter?.collections.pinsChanged()
-        showFieldFocus(false)
-        presenter?.commitEdit(id, field?.stringValue ?? "", change: handlers.contains("change"))
-        presenter?.blur(id)
+        if Self.restartingEditing === self { return }
+        editingEnded()
     }
+    /// The end of a field's editing: its `change` commits and it blurs.
+    private func editingEnded() {
+        presenter?.collections.pinsChanged()
+        // Its editor still holds it here; a turn later it is the field's alone.
+        RunLoop.main.perform(inModes: [.common]) { [weak self] in self?.syncFieldSide() }
+        leavingFocus {
+            showFieldFocus(false)
+            presenter?.commitEdit(id, field?.stringValue ?? "", change: handlers.contains("change"))
+            presenter?.blur(id)
+        }
+    }
+    /// Runs `body`, the end of a node's editing, with the node counted
+    /// as unfocused. AppKit posts the end before it detaches a field's
+    /// editor (`currentEditor()` still returns it) and before a textarea
+    /// resigns first responder, and the app's `change` and `blur` handlers
+    /// run in `body`. A restyle there draws no ring (`restyleFieldFocus`),
+    /// and a value written there goes to the field, because AppKit does
+    /// not read the leaving editor's text back (`editingEditor`).
+    func leavingFocus(_ body: () -> Void) {
+        let me = ObjectIdentifier(self)
+        let outermost = Self.leaving.insert(me).inserted
+        defer { if outermost { Self.leaving.remove(me) } }
+        body()
+    }
+    nonisolated(unsafe) private static var leaving: Set<ObjectIdentifier> = []
+    private var isLeavingFocus: Bool { Self.leaving.contains(ObjectIdentifier(self)) }
+    /// The editor editing this node's field: none once its editing is ending (`leavingFocus`).
+    var editingEditor: NSTextView? { isLeavingFocus ? nil : field?.currentEditor() as? NSTextView }
+    /// A write to a field that AppKit applies by ending the field editor's
+    /// editing and beginning it again
+    /// (`-[NSTextField setPlaceholderAttributedString:]` does, so the editor
+    /// shows the new placeholder). The field keeps the focus throughout, so
+    /// the app hears no blur and no `change` from it, as the web changes a
+    /// focused input's placeholder with neither. Editing that does not come
+    /// back ends as any does.
+    func keepingEditing(_ f: NSTextField, _ change: () -> Void) {
+        guard f.currentEditor() != nil, Self.restartingEditing == nil else { return change() }
+        Self.restartingEditing = self
+        change()
+        Self.restartingEditing = nil
+        if f.currentEditor() == nil { editingEnded() }
+    }
+    nonisolated(unsafe) private static weak var restartingEditing: NodeView?
     @objc package func controlTextDidChange(_ obj: Notification) {
         // What AppKit says of the app's own value going in is not typing.
         if writingValue { return }
@@ -50,7 +91,10 @@ extension NodeView {
             return
         }
         if !disabled { typedText(field?.stringValue ?? "") }
-        if let editor = field?.currentEditor() as? NSTextView { applyHeldValue(to: editor) }
+        if let editor = field?.currentEditor() as? NSTextView {
+            applyHeldValue(to: editor)
+            applyBaseDirection(to: editor) // an undo brings back the attributes of the text it restores
+        }
         if stepper != nil { updateNumberStepper() } // the stepper shows what the field holds (LLP 1116.007 D4)
     }
     /// The composition in `editor` is over, the app told of its text: what
@@ -93,8 +137,16 @@ extension NodeView {
         guard !writingValue, !disabled, props["emojiPicker"] != "true" else { return }
         if editor === textArea { editor.needsDisplay = true }
         typedText(editor.string)
-        // Cancelled: AppKit posts no change for it, so the held value lands here.
+        // Cancelled: AppKit posts no change for it, so the held value lands
+        // here, and faces that came while it was marked are drawn.
         applyHeldValue(to: editor)
+        if editor === textArea, !editor.hasMarkedText() { restyleMarkupProps() }
+        // And a `direction` that came while it was marked (LLP 1001 §1).
+        // The app heard its text first, and may have moved the focus: the editor is styled for its field now.
+        if !editor.hasMarkedText() {
+            if editor === textArea { applyBaseDirection(to: editor) }
+            else if let now = (editor as? FieldEditor)?.owner ?? (field?.currentEditor() === editor ? self : nil) { now.styleFieldEditor(editor) }
+        }
     }
     /// The ring Exact draws for a focused field (LLP 1104 D6): its border,
     /// painted by the box painter (`boxPlan`) two points wide in the focus
@@ -115,7 +167,7 @@ extension NodeView {
     /// AppKit's would be, in AppKit's colour at its own strength; where the
     /// node clips its box, inside the border.
     func showFieldFocus(_ on: Bool) {
-        let show = on && !disabled && !outlineNone && (!isNativeTextControl || textArea != nil)
+        let show = on && !disabled && !outlineNone && (!isNativeTextControl || textArea != nil || fieldGround != nil)
         let bordered = bordersItself
         // A textarea's scroll view covers the node's own border, so its ring
         // is a layer above the node's subviews instead.
@@ -157,13 +209,15 @@ extension NodeView {
         let uniform = number("border_width")
         return wrote && (uniform > 0 || ["top", "right", "bottom", "left"].contains { number("border_width_" + $0, uniform) > 0 })
     }
-    /// CSS `outline-style: none` on a text field (LLP 1104 D6): no ring,
-    /// Exact's or AppKit's, since the author draws the focus another way.
-    /// Tab still reaches the field, and its accessibility is unchanged.
+    /// CSS `outline-style: none` (LLP 1104 D6): no ring, Exact's or
+    /// AppKit's, on a field, a pressable or a native control, since the
+    /// author draws the focus another way. Tab still reaches it, and its
+    /// accessibility is unchanged.
     var outlineNone: Bool { style["outline_style"]?.string == "none" }
     /// Exact's ring again as the style changes, for a focused editor
     /// whose `outline` may have.
     func restyleFieldFocus() {
+        guard !isLeavingFocus else { return }
         if field?.currentEditor() != nil || (textArea != nil && window?.firstResponder === textArea) { showFieldFocus(true) }
     }
 }

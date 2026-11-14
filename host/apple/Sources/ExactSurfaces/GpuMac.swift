@@ -41,9 +41,12 @@ final class MetalCanvasView: NSView {
 /// module itself loaded once per process (LLP 1031 D12).
 final class CanvasesHost {
     lazy var lifecycle = CanvasLifecycle(self)
+    var editsAdmitted = false
     weak var session: ExactSession?
     /// postMessage events waiting for a live canvas of their surface name.
     var pendingPosts: [(name: String, text: String, at: Double)] = []
+    /// What packages wrote into the canvases' inputs (SensorRings.swift).
+    let sensorRings = SensorRings()
     final class Entry {
         let view: NodeView
         let name: String
@@ -79,6 +82,9 @@ final class CanvasesHost {
         /// or this much wall time has passed, so one lost second is not
         /// every frame lost.
         var starvedUntil: Double = 0
+        /// A render of this canvas drew nothing, as without its drawable, and none has drawn since:
+        /// the frame waiting on it finishes when one draws (LLP 1079.000 §4.6).
+        var waiting = false
         /// The artifact whose surface this canvas is (LLP 1009 D6), once created.
         var module: GpuModule?
         init(view: NodeView, name: String, values: Any) { self.view = view; self.name = name; self.values = values }
@@ -115,6 +121,9 @@ final class CanvasesHost {
     var failed: String?
     var loadedMs: Double?
     var rendered = 0
+    /// Renders that drew, so a display-link callback can tell whether it drew one
+    var drawn = 0
+    var awaitingDrawable: Bool { entries.values.contains { $0.waiting } }
     /// Modules a render recorded into since their last flush (LLP 1009 D7).
     var unflushed: [GpuModule] = []
     /// Captures since launch (LLP 1014 D3).
@@ -167,6 +176,8 @@ final class CanvasesHost {
 
     func destroy(view: UInt32) {
         if let e = entries.removeValue(forKey: view) {
+            if e.waiting { session?.frames.canvasLost() }
+            retainEdits(e)
             e.view.canvasInput = nil
             if e.id != 0 { e.module?.destroy(e.id) }
             releasePublisher(e)
@@ -245,6 +256,7 @@ final class CanvasesHost {
     /// unplaced HUD children keep their ordinary overlay. Hit-testing follows
     /// the placements the surface reports after each frame.
     private func captureEach(_ m: GpuModule, _ e: Entry, overlay: NSView, scale: CGFloat) -> Bool {
+        Capture.prepareBackingLayers(of: overlay)
         let children = overlay.subviews.compactMap { $0 as? NodeView }
         var uploaded = 0
         let t0 = CACurrentMediaTime()
@@ -257,7 +269,7 @@ final class CanvasesHost {
             let hidden = child.hiddenByHost
             if child.placementHidden { child.isHidden = false }
             defer { child.isHidden = hidden }
-            guard let rep = Capture.bitmap(of: child, scale: scale), let data = rep.bitmapData else { continue }
+            guard let rep = Capture.bitmap(of: child, scale: scale, prepared: true), let data = rep.bitmapData else { continue }
             guard live(e.view.id) === e else { return false }
             let f = child.frame
             let r = m.child(e.id, UInt32(i), child.props["testId"] ?? "", Float(f.origin.x), Float(f.origin.y), Float(f.width), Float(f.height), UInt32(rep.pixelsWide), UInt32(rep.pixelsHigh), UnsafePointer(data), rep.pixelsHigh * rep.bytesPerRow)
@@ -459,9 +471,10 @@ final class CanvasesHost {
     /// Render every dirty or wanting surface at `now`; whether more is wanted.
     func tick(now: Double) -> Bool {
         guard !modules.isEmpty, visible else { return false }
-        let previous = frameNow
+        let previous = frameNow, waited = awaitingDrawable
         frameNow = now
         defer { frameNow = previous }
+        drainSensors()
         var more = false
         for e in Array(entries.values) where live(e.view.id) === e && e.presentable {
             guard let m = e.module else { continue }
@@ -493,12 +506,16 @@ final class CanvasesHost {
             if r == 2 { FileHandle.standardError.write(Data("exact gpu: \(m.error())\n".utf8)) }
             rendered(e, r)
             rendered += 1
+            // A render that drew nothing, as without its drawable, draws when one lands (`renderStarved`)
+            e.waiting = !(m.drew.map { $0(e.id) != 0 } ?? (m.starved?(e.id) != 1))
+            if !e.waiting { drawn += 1 }
             more = more || e.wants
             readPlacements(m, e)
             messages(e)
         }
         flushRecorded()
         lastTickNow = now
+        settleWaits(waited)
         captureIfNeeded()
         return more
     }
@@ -511,7 +528,7 @@ final class CanvasesHost {
     /// instead of the main thread waiting in `nextDrawable` at the tick.
     func renderStarved() {
         guard !modules.isEmpty, visible, !settling, let now = lastTickNow else { return }
-        let previous = frameNow
+        let previous = frameNow, waited = awaitingDrawable
         frameNow = now
         defer { frameNow = previous }
         for e in Array(entries.values) where live(e.view.id) === e && e.presentable {
@@ -522,10 +539,23 @@ final class CanvasesHost {
             if r == 2 { FileHandle.standardError.write(Data("exact gpu: \(m.error())\n".utf8)) }
             rendered(e, r)
             rendered += 1
+            // A render that drew nothing, as without its drawable, draws when one lands (`renderStarved`)
+            e.waiting = !(m.drew.map { $0(e.id) != 0 } ?? (m.starved?(e.id) != 1))
+            if !e.waiting { drawn += 1 }
             readPlacements(m, e)
             messages(e)
         }
         flushRecorded()
+        settleWaits(waited)
+    }
+
+    /// After a pass, a waiting canvas no longer live will not draw, and the frame waiting on it never
+    /// finishes. Once none waits, the frame waiting on their renders has drawn.
+    private func settleWaits(_ waited: Bool) {
+        let left = entries.values.filter { $0.waiting && !(live($0.view.id) === $0 && $0.presentable) }
+        for e in left { e.waiting = false }
+        if !left.isEmpty { session?.frames.canvasLost() }
+        if waited, !awaitingDrawable { session?.frames.canvasDrawn() }
     }
 }
 #endif

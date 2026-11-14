@@ -81,6 +81,35 @@ import CoreText
             }
         }
     }
+    /// A balanced paragraph's measure is its greedy lines' widest, each less
+    /// the collapsible space that ends it (CSS Text 3 §4.1.3), in the worker
+    /// as in the ordinary layout.
+    func testABalancedRegionMeasuresItsGreedyLinesWithoutTheirTrailingSpaces() {
+        let engine = TextEngine(resolve: { _ in nil })
+        let run = Run(text: "word word word", size: 16, weight: 400, family: 0, italic: false,
+                      lineHeight: 26, letterSpacing: 0)
+        var two = run
+        two.text = "word word"
+        let first = engine.paragraph(Spec(runs: [two], align: 0, lineClamp: 0, color: [0,0,0,255], strut: two), width: .infinity).width
+        // Under `normal` and `pre-wrap` (whose spaces hang there)
+        for whiteSpace in [0, 1] {
+            let spec = Spec(runs: [run], align: 0, lineClamp: 0, color: [0,0,0,255], whiteSpace: whiteSpace, strut: run, balance: true)
+            // Room for "word word" and less than the space after it
+            let room = first + 1
+            let ordinary = engine.paragraph(spec, width: room)
+            let source = RegionTextSource.capture(spec, engine: engine)
+            let box = RegionTestBox(), done = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                box.value = RegionWorkerLayout.shape(source, width: room, compact: false).metadata
+                done.signal()
+            }
+            done.wait()
+            XCTAssertEqual(ordinary.lines.count, 2, "white-space \(whiteSpace)")
+            XCTAssertEqual(ordinary.width, first, accuracy: 1.0 / 64, "white-space \(whiteSpace): the greedy line's trailing space takes none of the measure")
+            XCTAssertEqual(box.value!.width, ordinary.width, "white-space \(whiteSpace): the worker measures as the ordinary layout does")
+        }
+    }
+
     func testShapeDoesNotEagerlyExpandEveryCaret() {
         let run = Run(text: String(repeating: "ffi אבג words ", count: 40), size: 16,
             weight: 400, family: 0, italic: false, lineHeight: 26, letterSpacing: 0)
@@ -153,6 +182,7 @@ import CoreText
                         TextEngine.draw(ordinary, spec: spec, in: CGRect(x: 7.25, y: 0.125 - scroll, width: 320, height: ordinary.height), context: ctx)
                         ctx.flush()
                         let expected = Data(bytes: ctx.data!, count: width * height * 4)
+                        XCTAssertTrue(CapturePixels.hasPaint(expected), "the fractional-phase reference draws")
                         let request = RegionRasterRequest(serial: 1, publication: 1, generation: 1,
                             rows: [RegionPaintRow(artifact: 7, box: CGRect(x: 7.25, y: 0.125, width: 320, height: ordinary.height))],
                             scroll: CGPoint(x: 0, y: scroll), size: size, scale: scale,
@@ -463,6 +493,7 @@ import CoreText
                     in: CGRect(x: 7.25, y: 0.125 - scroll, width: 163.25, height: ordinary.height), context: ctx)
                 ctx.flush()
                 let expected = Data(bytes: ctx.data!, count: width * height * 4)
+                XCTAssertTrue(CapturePixels.hasPaint(expected), "the mixed-run reference draws")
                 let request = RegionRasterRequest(serial: 1, publication: 1, generation: 1,
                     rows: [RegionPaintRow(artifact: 7, box: CGRect(x: 7.25, y: 0.125, width: 163.25, height: ordinary.height))],
                     scroll: CGPoint(x: 0, y: scroll), size: CGSize(width: 240, height: 120), scale: scale,
@@ -502,6 +533,7 @@ import CoreText
                     in: CGRect(x: 7.25, y: 0.125 - scroll, width: 163.25, height: ordinary.height), context: ctx)
                 ctx.flush()
                 let expected = Data(bytes: ctx.data!, count: width * height * 4)
+                XCTAssertTrue(CapturePixels.hasPaint(expected), "the shared-preparation reference draws")
                 let request = RegionRasterRequest(serial: 1, publication: 1, generation: 1,
                     rows: [RegionPaintRow(artifact: 7, box: CGRect(x: 7.25, y: 0.125, width: 163.25, height: ordinary.height))],
                     scroll: CGPoint(x: 0, y: scroll), size: CGSize(width: 240, height: 120), scale: scale,
@@ -645,7 +677,7 @@ private final class RegionTestGate: @unchecked Sendable {
 private func denseRegionReference(_ layout: RegionWorkerLayout) -> RegionParagraph {
     let p = layout.metadata
     return RegionParagraph(source: p.source,sourceSHA256: p.sourceSHA256,lines: (0..<layout.lineCount).map { layout.line(at: $0) },baselines: p.baselines,
-        width: p.width,height: p.height,lineBottoms: p.lineBottoms,offeredWidth: p.offeredWidth)
+        width: p.width,height: p.height,lineBottoms: p.lineBottoms,offeredWidth: p.offeredWidth,attributed: layout.preparation.attributed)
 }
 
 // All CTLine and index introspection stays on the worker. Only numeric evidence

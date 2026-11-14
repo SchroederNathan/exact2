@@ -179,10 +179,11 @@ fn fonts(out: &mut String, plan: &Plan) -> Result<(), DocumentError> {
         }
         let _ = write!(
             rules,
-            "@font-face{{font-family:\"{}\";src:url(\"{}\");font-weight:{};font-style:{}}}",
+            "@font-face{{font-family:\"{}\";src:url(\"{}\");font-weight:{};font-stretch:{};font-style:{}}}",
             face.family,
             face.source,
-            face.weight,
+            face.weight_css(),
+            face.stretch_css(),
             if face.italic { "italic" } else { "normal" }
         );
     }
@@ -204,9 +205,9 @@ fn fonts(out: &mut String, plan: &Plan) -> Result<(), DocumentError> {
 /// The runner's checkpoint (LLP 1048.000 D6) as JSON a script element can
 /// carry: the location, the render's time, the logic that answered, the
 /// answers — each `[name, source, [args…], value]`, the values in
-/// [`push_value`]'s JSON — and what is still pending. `<`, `>` and `&` are
-/// escapes, so user text can never close the element or open a comment.
-/// [`read_checkpoint`] reads it back.
+/// [`push_value`]'s JSON — what is still pending, and the open streams when
+/// there are any. `<`, `>` and `&` are escapes, so user text can never close
+/// the element or open a comment. [`read_checkpoint`] reads it back.
 ///
 /// The values are text, not their canonical bytes in base64, so a page's
 /// compression finds the strings its document already shows (titles, names,
@@ -240,17 +241,27 @@ pub fn checkpoint<D: DataSource>(runner: &Runner<D>, location: &str) -> String {
         push_value(value, &mut json);
         json.push(']');
     }
-    json.push_str("],\"pending\":[");
-    for (i, name) in checkpoint.pending.iter().enumerate() {
-        if i > 0 {
-            json.push(',');
-        }
-        crate::batch::quote(name, &mut json);
+    json.push_str("],\"pending\":");
+    push_names(&checkpoint.pending, &mut json);
+    if !checkpoint.open.is_empty() {
+        json.push_str(",\"open\":");
+        push_names(&checkpoint.open, &mut json);
     }
-    json.push_str("]}");
+    json.push('}');
     json.replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026")
+}
+
+fn push_names(names: &[String], json: &mut String) {
+    json.push('[');
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        crate::batch::quote(name, json);
+    }
+    json.push(']');
 }
 
 /// A plan value as JSON that reads back to the same value ([`read_value`]):
@@ -399,16 +410,8 @@ pub fn read_checkpoint(text: &str) -> Result<Checkpoint, String> {
                 }
                 json.expect(b']')?;
             }
-            "pending" => {
-                json.expect(b'[')?;
-                while json.peek() != Some(b']') {
-                    if !checkpoint.pending.is_empty() {
-                        json.expect(b',')?;
-                    }
-                    checkpoint.pending.push(json.string()?);
-                }
-                json.expect(b']')?;
-            }
+            "pending" => checkpoint.pending = read_names(&mut json)?,
+            "open" => checkpoint.open = read_names(&mut json)?,
             other => return Err(format!("unknown field `{other}`")),
         }
         match json.next() {
@@ -417,6 +420,19 @@ pub fn read_checkpoint(text: &str) -> Result<Checkpoint, String> {
             _ => return Err("expected `,` or the end".into()),
         }
     }
+}
+
+fn read_names(json: &mut Json) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    json.expect(b'[')?;
+    while json.peek() != Some(b']') {
+        if !names.is_empty() {
+            json.expect(b',')?;
+        }
+        names.push(json.string()?);
+    }
+    json.expect(b']')?;
+    Ok(names)
 }
 
 impl<D: DataSource> crate::Host<D> {

@@ -244,6 +244,19 @@ final class ConfirmationAlertIOSTests: XCTestCase {
     /// "Remove book?" — the shape of React Native's `Alert.alert`: a
     /// centred alert, titled by the label, its text the message, the
     /// destructive action and the Cancel both drawn.
+    func testAnOpenAlertRejectsAnActivePropertyAddedLaterWithoutReplacingItsActions() throws {
+        let (p, controller, _) = confirmation(label: "Keep?", texts: ["A message."], actions: ["Keep"], cancel: true)
+        defer { dismiss(p, controller) }
+        XCTAssertEqual(p.menus.activate(try XCTUnwrap(p.views[1])), true)
+        let alert = try XCTUnwrap(controller.presentedViewController as? UIAlertController)
+        let action = alert.actions[0], source = try XCTUnwrap(p.views[3])
+        XCTAssertNil(source.nativeActiveRefusals["UIAlertAction"])
+        p.apply(wireBatch([["op": "style", "id": 3, "style": ["press_opacity_to": 0.4]]]))
+        XCTAssertTrue(controller.presentedViewController === alert)
+        XCTAssertTrue(alert.actions[0] === action)
+        XCTAssertTrue(source.nativeActiveRefusals["UIAlertAction"]?.contains("opacity") == true)
+    }
+
     func testAConfirmationWithAMessageIsTheCentredAlertWithItsTitleAndCancel() throws {
         let (p, controller, scene) = confirmation(label: "Remove book?", texts: ["\u{201C}Piranesi\u{201D} will be removed."], actions: ["Remove"], cancel: true)
         defer { dismiss(p, controller) }
@@ -260,7 +273,8 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         settle { !p.menus.inTransition }
         let box = alert.view.convert(alert.view.bounds, to: nil)
         print("alert: \(box) in \(window!.bounds)")
-        XCTAssertEqual(box.midX, window!.bounds.midX, accuracy: 2, "centred")
+        // UIKit centres it between the window's side insets: the iPhone Duo's status column reaches into this window
+        XCTAssertEqual(box.midX, window!.bounds.inset(by: window!.safeAreaInsets).midX, accuracy: 2, "centred")
         XCTAssertEqual(box.midY, window!.bounds.midY, accuracy: 40, "centred")
     }
 
@@ -282,6 +296,25 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         XCTAssertTrue(written[0] > 0.9 && written[1] < 0.4 && written[2] < 0.4, "the platform's red its author wrote: \(written)")
         let inherited = try tint(["text_color": red])
         XCTAssertFalse(inherited[0] > 0.9 && inherited[2] < 0.4, "the same red, only inherited, leaves UIKit's tint: \(inherited)")
+    }
+
+    /// An alert's tint of the tint itself is the tint its first action draws in, a theme's
+    /// `AccentColor` included: the alert's window carries neither a theme's tint nor an embedder's
+    func testAnAlertsTintOfTheTintIsItsFirstActionsTint() throws {
+        let tint: [String: Any] = ["sys": "@tint", "c": [[0, 122, 255, 255], [10, 132, 255, 255]]]
+        let (p, controller, _) = confirmation(label: "Keep?", texts: ["A message."], actions: ["Keep"], cancel: true, bareLead: ["text_color": tint, "written": ["text_color"]])
+        defer {
+            dismiss(p, controller)
+            _ = ThemeRoles.apply(wireBatch([["op": "roles", "roles": [String: Any]()]]), root: p.root)
+            p.applyThemeTint()
+        }
+        _ = ThemeRoles.apply(wireBatch([["op": "roles", "roles": ["AccentColor": [0, 200, 0, 255]]]]), root: p.root)
+        p.applyThemeTint()
+        XCTAssertEqual(p.menus.activate(try XCTUnwrap(p.views[1])), true)
+        let alert = try XCTUnwrap(controller.presentedViewController as? UIAlertController)
+        var (r, g, b, a): (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
+        XCTAssertTrue(try XCTUnwrap(alert.view.tintColor).getRed(&r, green: &g, blue: &b, alpha: &a))
+        for (got, want) in zip([r, g, b], [0, 200.0 / 255, 0]) { XCTAssertEqual(got, want, accuracy: 0.01, "the theme's green: \([r, g, b])") }
     }
 
     /// A prompt (`kernel/src/confirmation.rs`): an alert-shaped alertdialog
@@ -310,6 +343,9 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         XCTAssertEqual(field.text, "Untitled")
         XCTAssertEqual(field.placeholder, "Name")
         XCTAssertEqual(field.accessibilityIdentifier, "name")
+        XCTAssertEqual(field.returnKeyType, .default, "an unsaid enterkeyhint keeps the alert field's Return key")
+        XCTAssertEqual(field.autocorrectionType, .no, "unsaid, the alert field's own: no correction")
+        XCTAssertEqual(field.autocapitalizationType, .none, "unsaid, the alert field's own: no capitalization")
         XCTAssertNil(alert.preferredAction, "no action drawn bold, as a hand-built prompt's")
 
         field.text = "Kick"
@@ -328,6 +364,25 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         XCTAssertNil(try XCTUnwrap(p.views[20]).headerField, "the authored field is its own again")
     }
 
+    /// An email prompt keeps its text as typed, as the page's field does: no
+    /// capitalization, correction, smart quotes or smart dashes.
+    func testAnEmailPromptKeepsItsTextAsTyped() throws {
+        let (p, controller, _) = confirmation(label: "Invite", texts: [], actions: ["Delete", "Send"], cancel: true)
+        defer { dismiss(p, controller) }
+        p.apply(wireBatch([["op": "create", "id": 20, "kind": "input", "handlers": ["input"],
+                            "props": ["value": "", "type": "email", "testId": "email"], "style": ["text_color": [0, 0, 0, 255]]],
+                           ["op": "frame", "id": 20, "x": 0.0, "y": 0.0, "w": 200.0, "h": 30.0],
+                           ["op": "children", "id": 2, "ids": [20, 3, 4, 9]]]))
+        XCTAssertEqual(p.menus.activate(try XCTUnwrap(p.views[1])), true)
+        let alert = try XCTUnwrap(controller.presentedViewController as? UIAlertController)
+        let field = try XCTUnwrap(alert.textFields?.first)
+        XCTAssertEqual(field.keyboardType, .emailAddress)
+        XCTAssertEqual(field.autocapitalizationType, .none)
+        XCTAssertEqual(field.autocorrectionType, .no)
+        XCTAssertEqual(field.smartQuotesType, .no)
+        XCTAssertEqual(field.smartDashesType, .no)
+    }
+
     private final class PromptKey: UIKey {
         var text = "7"
         var code = UIKeyboardHIDUsage.keyboard7
@@ -340,21 +395,14 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         let value = PromptKey()
         override var key: UIKey? { value }
     }
-    // A synthetic press has no UIKit hardware event. Its native default is
-    // this probe's, while the real alert below exercises UIKeyInput itself.
+    // A synthetic press reaches no gesture recognizer and no text input on its
+    // own: the test hands it to the field's `PromptKeys`, as UIKit does before
+    // the field, then asks the field's delegate for the edit or Return UIKit's
+    // field would make with it (the real alert below makes them itself).
     private final class KeyProbe: UITextField {
-        var forwarded: [String] = []
         var composing = false
         private let marked = UITextRange()
         override var markedTextRange: UITextRange? { composing ? marked : nil }
-        override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            forwarded.append("down")
-            if presses.first?.key?.keyCode == .keyboardDeleteOrBackspace { deleteBackward() }
-            if presses.first?.key?.keyCode == .keyboardReturnOrEnter { _ = delegate?.textFieldShouldReturn?(self) }
-        }
-        override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) { forwarded.append("up") }
-        override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) { forwarded.append("cancel") }
-        override func deleteBackward() { forwarded.append("delete") }
     }
 
     func testAPromptKeepsTheFieldsDefaultsAndHearsEachHardwareKeyOnce() throws {
@@ -365,6 +413,9 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         let probe = KeyProbe()
         let field: UITextField = probe
         bridge.attach(field)
+        XCTAssertTrue(type(of: field) == KeyProbe.self, "the field keeps its own class")
+        let keys = try XCTUnwrap(field.gestureRecognizers?.compactMap { $0 as? PromptKeys }.first, "a recognizer hears its presses")
+        XCTAssertFalse(keys.cancelsTouchesInView || keys.delaysTouchesBegan || keys.delaysTouchesEnded, "and takes nothing from the field")
         var events: [String] = []
         var prevent = true
         p.onKey = { _, key in
@@ -372,39 +423,45 @@ final class ConfirmationAlertIOSTests: XCTestCase {
             if !key.up && prevent { p.defaultPrevented = true }
         }
         p.onSubmit = { _ in events.append("submit") }
+        let event = UIPressesEvent()
         let press = PromptPress()
-        field.pressesBegan([press], with: nil)
-        field.pressesEnded([press], with: nil)
+        let edit = { (range: NSRange, text: String) in field.delegate?.textField?(field, shouldChangeCharactersIn: range, replacementString: text) }
+        keys.pressesBegan([press], with: event)
+        XCTAssertEqual(edit(NSRange(location: 4, length: 0), "7"), false, "a prevented digit's edit is refused")
+        keys.pressesEnded([press], with: event)
         XCTAssertEqual(events, ["down 7", "up 7"])
-        XCTAssertEqual(probe.forwarded, ["up"], "a prevented digit never reaches the field's default")
-        events.removeAll(); probe.forwarded.removeAll(); prevent = false
+        events.removeAll(); prevent = false
+        XCTAssertEqual(edit(NSRange(location: 4, length: 0), "7"), true, "and the next edit is the field's again")
         press.value.text = "\u{8}"
         press.value.code = .keyboardDeleteOrBackspace
-        field.pressesBegan([press], with: nil)
-        field.pressesEnded([press], with: nil)
-        XCTAssertEqual(events, ["down Backspace", "up Backspace"])
-        XCTAssertEqual(probe.forwarded, ["down", "delete", "up"])
-        events.removeAll(); probe.forwarded.removeAll()
+        keys.pressesBegan([press], with: event)
+        XCTAssertEqual(edit(NSRange(location: 3, length: 1), ""), true)
+        keys.pressesEnded([press], with: event)
+        XCTAssertEqual(events, ["down Backspace", "up Backspace"], "the hardware Backspace's deletion does not dispatch its key twice")
+        events.removeAll()
         press.value.text = "\r"
         press.value.code = .keyboardReturnOrEnter
-        field.pressesBegan([press], with: nil)
-        field.pressesEnded([press], with: nil)
-        XCTAssertEqual(events, ["down Enter", "submit", "up Enter"], "the hardware Return's delegate does not dispatch its key twice")
-        XCTAssertEqual(probe.forwarded, ["down", "up"])
-        events.removeAll(); probe.forwarded.removeAll()
-        field.pressesBegan([press], with: nil)
-        field.pressesCancelled([press], with: nil)
+        keys.pressesBegan([press], with: event)
         _ = field.delegate?.textFieldShouldReturn?(field)
-        XCTAssertEqual(events, ["down Enter", "submit", "down Enter", "submit"], "cancellation clears the heard hardware key")
-        XCTAssertEqual(probe.forwarded, ["down", "cancel"])
-        events.removeAll(); probe.forwarded.removeAll()
+        keys.pressesEnded([press], with: event)
+        XCTAssertEqual(events, ["down Enter", "submit", "up Enter"], "the hardware Return's delegate does not dispatch its key twice")
+        events.removeAll()
+        keys.pressesBegan([press], with: event)
+        keys.pressesCancelled([press], with: event)
+        _ = field.delegate?.textFieldShouldReturn?(field)
+        XCTAssertEqual(events, ["down Enter", "down Enter", "submit"], "cancellation clears the heard hardware key: the delegate's Return dispatches it")
+        events.removeAll(); prevent = true
+        keys.pressesBegan([press], with: event)
+        XCTAssertEqual(field.delegate?.textFieldShouldReturn?(field), false, "a prevented Return does nothing")
+        keys.pressesEnded([press], with: event)
+        XCTAssertEqual(events, ["down Enter", "up Enter"])
+        events.removeAll(); prevent = false
         probe.composing = true
         press.value.text = "7"
         press.value.code = .keyboard7
-        field.pressesBegan([press], with: nil)
-        field.pressesEnded([press], with: nil)
+        keys.pressesBegan([press], with: event)
+        keys.pressesEnded([press], with: event)
         XCTAssertEqual(events, [], "composition belongs to the displayed field, not the input left on the page")
-        XCTAssertEqual(probe.forwarded, ["down", "up"])
     }
 
     func testAPromptCanPreventSoftwareBackspaceAndReturn() throws {
@@ -430,17 +487,35 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         }
         p.onSubmit = { _ in events.append("submit") }
         p.onChange = { _, _ in events.append("change") }
-        field.deleteBackward()
+        // The software keyboard's Backspace: UIKit's keyboard asks the field's
+        // delegate about the deletion, then deletes (`deleteBackward` alone
+        // asks nothing, so the test asks as the keyboard does).
+        func backspace() {
+            guard let selection = field.selectedTextRange else { return XCTFail("no selection") }
+            let start = field.offset(from: field.beginningOfDocument, to: selection.start), end = field.offset(from: field.beginningOfDocument, to: selection.end)
+            let range = selection.isEmpty ? NSRange(location: max(0, start - 1), length: min(1, start)) : NSRange(location: start, length: end - start)
+            if field.delegate?.textField?(field, shouldChangeCharactersIn: range, replacementString: "") != false { field.deleteBackward() }
+        }
+        backspace()
         _ = field.delegate?.textFieldShouldReturn?(field)
         XCTAssertEqual(events, ["down Backspace", "down Enter"])
         XCTAssertEqual(field.text, "Kick", "a prevented Backspace leaves the text alone")
         XCTAssertTrue(field.isFirstResponder)
         events.removeAll(); prevent = false
-        field.deleteBackward()
+        backspace()
         _ = field.delegate?.textFieldShouldReturn?(field)
         XCTAssertEqual(events, ["down Backspace", "down Enter", "change", "submit"])
         XCTAssertEqual(field.text, "Kic")
         XCTAssertTrue(field.isFirstResponder)
+        // A selection's deletion is not told apart from Cut's: no key.
+        events.removeAll()
+        field.selectedTextRange = field.textRange(from: field.beginningOfDocument, to: field.endOfDocument)
+        backspace()
+        XCTAssertEqual(events, [])
+        XCTAssertEqual(field.text, "")
+        let plain = UIAlertController(title: nil, message: nil, preferredStyle: .alert)
+        plain.addTextField()
+        XCTAssertTrue(type(of: field) == type(of: try XCTUnwrap(plain.textFields?.first)), "the alert's field keeps UIKit's class")
     }
 
     /// Return in a prompt's field is its delegate's: it presses the first
@@ -476,19 +551,24 @@ final class ConfirmationAlertIOSTests: XCTestCase {
 
         // Save marked `filled`: the alert's preferred action, drawn bold.
         p.buttonFace = { id in var f = ButtonFace(); f.title = [3: "Delete", 4: "Save", 9: "Cancel"][id]; if id == 4 { f.style = "filled" }; return f }
+        p.apply(facesBatch())
         XCTAssertEqual(p.menus.activate(try XCTUnwrap(p.views[1])), true)
         let marked = try XCTUnwrap(controller.presentedViewController as? UIAlertController)
         XCTAssertEqual(marked.preferredAction?.title, "Save", "the author's one filled action, the one Return presses")
         let actions = [p.views[3], p.views[4]].compactMap { $0 }
         p.buttonFace = { id in var f = ButtonFace(); f.title = [3: "Delete", 4: "Save", 9: "Cancel"][id]; f.style = "filled"; return f }
+        p.apply(facesBatch())
         XCTAssertEqual(MenuHost.preferredAction(actions, prompt: true), 1, "a destructive one is never preferred")
         p.buttonFace = { id in var f = ButtonFace(); f.title = [3: "Delete", 4: "Save", 9: "Cancel"][id]; if id == 4 { f.style = "bordered-prominent" }; return f }
+        p.apply(facesBatch())
         XCTAssertNil(MenuHost.preferredAction(actions, prompt: false), "only `filled`, as the Mac's default button")
         p.apply(wireBatch([["op": "props", "id": 3, "clear": ["destructive"]]]))
         p.buttonFace = { id in var f = ButtonFace(); f.title = [3: "Keep", 4: "Save", 9: "Cancel"][id]; if id == 4 { f.style = "filled" }; return f }
+        p.apply(facesBatch())
         XCTAssertNil(MenuHost.preferredAction(actions, prompt: true), "a prompt's Return presses Keep: Save is not drawn bold")
         XCTAssertEqual(MenuHost.preferredAction(actions, prompt: false), 1, "an alert with no field: its one filled action")
         p.buttonFace = { id in var f = ButtonFace(); f.title = [3: "Keep", 4: "Save", 9: "Cancel"][id]; f.style = "filled"; return f }
+        p.apply(facesBatch())
         XCTAssertNil(MenuHost.preferredAction(actions, prompt: false), "emphasis never picks among several")
     }
 
@@ -654,6 +734,53 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         XCTAssertEqual(pressed, [3])
     }
 
+    /// Text and its one closing button (Charlie, 2026-10-18): the
+    /// one-button alert, which tells. Its button is the cancel UIKit keeps
+    /// (a hardware keyboard's Escape), and choosing it presses nothing.
+    func testTextAndOneClosingButtonIsTheOneButtonAlert() throws {
+        let (p, controller, scene) = confirmation(label: "Couldn't save", texts: ["The disk is full."], actions: [], cancel: true)
+        defer { dismiss(p, controller) }
+        var pressed: [UInt32] = []
+        p.onPress = { pressed.append($0) }
+        p.dialogCommand("showModal", "confirm")
+        let alert = try XCTUnwrap(controller.presentedViewController as? UIAlertController)
+        XCTAssertEqual(alert.preferredStyle, .alert)
+        XCTAssertEqual(alert.title, "Couldn't save")
+        XCTAssertEqual(alert.message, "The disk is full.")
+        XCTAssertEqual(alert.actions.map(\.title), ["Cancel"])
+        XCTAssertEqual(alert.actions.map(\.style), [.cancel])
+        XCTAssertEqual(p.menus.observation()?["presentation"] as? String, "alert")
+        guard scene else { throw missing("scene", "a presentation completes only in a scene's window") }
+        settle { !p.menus.inTransition }
+        try choose(alert.actions[0])
+        settle { p.menus.observation() == nil }
+        XCTAssertEqual(pressed, [])
+    }
+
+    /// The one button follows its own `disabled`, and a batch that changes
+    /// it ends the alert, as one that changes an action does. Only an
+    /// alertdialog is the one-button alert: a plain `dialog` of the same
+    /// rows, or one that asks for the dismissible form, is its own sheet.
+    func testTheOneButtonFollowsItsDisabledAndOnlyAnAlertdialogIsTheAlert() throws {
+        let (p, controller, _) = confirmation(label: "Couldn't save", texts: ["The disk is full."], actions: [], cancel: true)
+        defer { dismiss(p, controller) }
+        let dialog = try XCTUnwrap(p.views[2])
+        p.apply(wireBatch([["op": "props", "id": 9, "set": ["disabled": "true"], "clear": []]]))
+        p.dialogCommand("showModal", "confirm")
+        let alert = try XCTUnwrap(controller.presentedViewController as? UIAlertController)
+        XCTAssertEqual(alert.actions.map(\.isEnabled), [false])
+        p.apply(wireBatch([["op": "props", "id": 9, "set": ["disabled": "false"], "clear": []]]))
+        XCTAssertNil(p.menus.observation(), "the alert no longer shows what is there")
+
+        p.apply(wireBatch([["op": "props", "id": 2, "set": ["semanticTag": "dialog"], "clear": ["popover"]],
+                           ["op": "props", "id": 9, "set": ["commandfor": "confirm", "command": "close"], "clear": ["popovertarget", "popovertargetaction"]]]))
+        XCTAssertFalse(p.menus.isSheet(dialog), "an alertdialog of text and one button is the alert")
+        p.apply(wireBatch([["op": "props", "id": 2, "set": ["closedby": "any"], "clear": []]]))
+        XCTAssertFalse(p.menus.isSheet(dialog), "closedby=any: still the alert, which UIKit has no dismissible form of")
+        p.apply(wireBatch([["op": "props", "id": 2, "set": [String: String](), "clear": ["closedby", "accessibilityRole"]]]))
+        XCTAssertTrue(p.menus.isSheet(dialog), "a plain dialog is its own sheet")
+    }
+
     // MARK: the native fixture
 
     private func boot() throws -> ExactSession {
@@ -705,10 +832,15 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         XCTAssertTrue(p.menus.observation()?["source"] is NSNull, "raised by an action, not an invoker")
         guard Self.scene else { throw missing("scene", "a presentation completes only in a scene's window") }
         settle { !p.menus.inTransition }
-        // The agent's activation of the alert's action, by its node.
+        // The agent's activation of the alert's action, by its node. Its
+        // press follows UIKit's dismissal; the agent's wait after the input
+        // covers both, so the tap's reply comes after the press has landed.
         XCTAssertEqual(p.menus.activate(try node(session, "clear-confirm-clear")), true)
-        settle { (try? self.counts(session))?.hasPrefix("count 0") == true }
-        settle { p.menus.observation() == nil && controller.presentedViewController == nil }
+        XCTAssertTrue(try counts(session).hasPrefix("count 1"), "the press waits for the dismissal")
+        XCTAssertTrue(session.agentInstance.awaitModalTransitions())
+        XCTAssertNil(p.menus.observation())
+        XCTAssertTrue(try counts(session).hasPrefix("count 0"), "the press has landed")
+        settle { controller.presentedViewController == nil }
 
         // Its invoker opens the same alert; Cancel leaves the count.
         p.press(try node(session, "peek-bump").id)
@@ -720,6 +852,18 @@ final class ConfirmationAlertIOSTests: XCTestCase {
         settle { p.menus.observation() == nil }
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         XCTAssertTrue(try counts(session).hasPrefix("count 1"))
+
+        // Platform timing (this process's): the dismissal animates, and the
+        // wait for a chosen press still covers it.
+        settle { controller.presentedViewController == nil }
+        XCTAssertEqual(p.menus.activate(try node(session, "ask-clear")), true)
+        settle { !p.menus.inTransition && controller.presentedViewController is UIAlertController }
+        XCTAssertEqual(p.menus.activate(try node(session, "clear-confirm-clear")), true)
+        XCTAssertTrue(p.menus.choosing)
+        // The input's reply waits for it, and says it settled.
+        XCTAssertNil(session.agentInstance.completingInput(["tapped": 3])["settled"])
+        XCTAssertFalse(p.menus.choosing)
+        XCTAssertTrue(try counts(session).hasPrefix("count 0"), "the press has landed")
     }
 }
 #endif

@@ -1,6 +1,4 @@
-//! A scroller's kept rows (`paint/rows.rs`) under a backend that keeps
-//! them: what it is told of a row recorded again. The one such backend is
-//! the Android recorder, which this host does not compile elsewhere.
+//! What a backend is told when a scroller's kept row changes (`paint/rows.rs`).
 use super::*;
 use crate::image::Bitmap;
 use crate::paint::Shape;
@@ -9,6 +7,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use tiny_skia::Transform;
+
+mod measurement;
 
 /// What the backend heard: each row begun, with the row it was said to
 /// have been, and each row freed.
@@ -228,5 +228,114 @@ fn a_row_whose_padding_alone_changed_is_recorded_again() {
         let heard = heard.borrow();
         let again: Vec<_> = heard.begun.iter().map(|(_, previous)| *previous).collect();
         assert_eq!(again, [Some(first.begun[0].0)], "the padded row alone");
+    }
+}
+
+#[test]
+fn inline_frame_retained_rows_keep_initial_and_scrolled_viewport_origins() {
+    use exact_runner::geometry::InlineGeometry;
+
+    for transform in ["", "scale=1.25 transform-origin=\"0 0\""] {
+        let source = format!(
+            r#"component App
+  view
+    column padding-left=30 padding-top=100 {transform}
+      scroll testId="port" width=200 height=200
+        column
+          text height=80
+            text "first" testId="first"
+          text height=80
+            text "second" testId="second"
+          box height=400
+"#
+        );
+        let (mut p, error) = Presenter::boot_with(
+            &crate::test_plan(&source),
+            (),
+            (400., 500.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.frame();
+        let id = |name: &str| {
+            let k = p.host.kernel();
+            k.node_by_key(k.find_by_test_id(name)[0]).unwrap().id
+        };
+        let port = id("port");
+        let runs = [id("first"), id("second")];
+        let ordinary = runs.map(|id| p.ranges.frame(id));
+        assert!(ordinary
+            .iter()
+            .all(|r| !r.unavailable && r.x >= 30. && r.y >= 100.));
+        let heard = Rc::new(RefCell::new(Heard::default()));
+        p.reader_replaced(Box::new(Keeps {
+            heard: heard.clone(),
+            row: 0,
+        }));
+        p.frame();
+        assert_eq!(heard.borrow().begun.len(), 3, "each child is recorded");
+        let recorded = runs.map(|id| p.ranges.frame(id));
+        heard.borrow_mut().begun.clear();
+        p.scroll_to(port, (0., 20.)).unwrap();
+        p.frame();
+        assert!(
+            heard.borrow().begun.is_empty(),
+            "scroll replays the recordings"
+        );
+        let replayed = runs.map(|id| p.ranges.frame(id));
+        let shift = if transform.is_empty() { 20. } else { 25. };
+        for ((expected, got), moved) in ordinary.into_iter().zip(recorded).zip(replayed) {
+            assert!(!got.unavailable && !moved.unavailable);
+            assert_eq!(
+                (got.x, got.y, got.width, got.height),
+                (expected.x, expected.y, expected.width, expected.height),
+                "recorded {transform}"
+            );
+            assert_eq!(
+                (moved.x, moved.y, moved.width, moved.height),
+                (
+                    expected.x,
+                    expected.y - shift,
+                    expected.width,
+                    expected.height
+                ),
+                "replayed {transform}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fractional_row_scroll_matches_a_fresh_walk_with_clips_and_hinted_text() {
+    let source = r##"component App
+  view
+    scroll testId="port" width=120 height=80
+      column
+        view width=120 height=70 clip-path="path('M 5 5 Q 115 0 115 65 L 5 65 Z')" background-color="#2488bb"
+          text "Hinted text" font-size=17 color="#ffffff"
+        view width=120 height=200 background-color="#44aa33"
+"##;
+    let (mut p, _) = Presenter::boot_with(
+        &crate::test_plan(source),
+        (),
+        (140., 100.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Ink,
+    )
+    .unwrap();
+    p.frame();
+    let k = p.host.kernel();
+    let port = k.node_by_key(k.find_by_test_id("port")[0]).unwrap().id;
+    for offset in [0.25, 0.5, 1., 1.25] {
+        p.scroll_to(port, (0., offset)).unwrap();
+        let kept = p.frame();
+        p.brush.forget_rows();
+        p.repaint();
+        let fresh = p.frame();
+        assert!(kept.data() == fresh.data(), "scroll {offset}");
     }
 }

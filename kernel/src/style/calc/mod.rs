@@ -14,9 +14,9 @@ mod text;
 mod wire;
 
 pub use parse::nonnegative_row;
-pub(crate) use parse::{is_env, names_math, parse, refusal, signed, substitutes, Refused};
+pub(crate) use parse::{grid, is_env, names_math, parse, refusal, signed, substitutes, Refused};
 
-use super::env::{self, Edge, Env, Region, SegmentVar};
+use super::env::{self, Edge, Env, Region, SegmentVar, TitleBarVar};
 use super::{Dimension, StyleId, ViewportUnit};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,8 +29,9 @@ pub const MAX_VALUES: usize = 32;
 pub const MAX_DEPTH: usize = 32;
 
 /// A numeric value's unit: a number, a percentage, a length in px (the
-/// canonical unit every absolute length converts to when parsed) or in a
-/// viewport unit, which resolves only with the viewport.
+/// canonical unit every absolute length converts to when parsed), in a
+/// viewport unit, which resolves only with the viewport, or in `rem`, which
+/// resolves with the root font size ([`Env::root_font_size`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
     /// A number: a coefficient, or a divisor.
@@ -41,6 +42,8 @@ pub enum Unit {
     Px,
     /// A viewport unit.
     Viewport(ViewportUnit),
+    /// `rem`: the root font size.
+    Rem,
 }
 
 impl Unit {
@@ -51,12 +54,14 @@ impl Unit {
             Unit::Percent => "%",
             Unit::Px => "px",
             Unit::Viewport(unit) => unit.name(),
+            Unit::Rem => "rem",
         }
     }
 }
 
-/// An `env()` variable a length reads: a safe-area inset, or a viewport
-/// segment's variable at its indices (CSS Environment Variables 1).
+/// An `env()` variable a length reads: a safe-area inset, a viewport
+/// segment's variable at its indices (CSS Environment Variables 1), a
+/// layout region's inset, or a side of the title-bar area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvTerm {
     /// `env(safe-area-inset-<edge>)`.
@@ -65,15 +70,20 @@ pub enum EnvTerm {
     Segment(SegmentVar, u8, u8),
     /// `env(-exact-<region>-inset-<edge>)` (LLP 1123 D10).
     Region(Region, Edge),
+    /// `env(titlebar-area-<var>)` (Window Controls Overlay). No compact
+    /// [`Dimension`] holds it: a length that reads it is always a tree.
+    TitleBar(TitleBarVar),
 }
 
 impl EnvTerm {
-    /// Its points under `env`; `None` for a segment `env` does not define.
+    /// Its points under `env`; `None` for a segment or a title-bar area
+    /// `env` does not define.
     fn value(self, env: &Env) -> Option<f64> {
         match self {
             EnvTerm::Inset(edge) => Some(f64::from(env.inset(edge))),
             EnvTerm::Segment(var, x, y) => env::resolve_wide(var, x, y, env),
             EnvTerm::Region(region, edge) => Some(f64::from(env.region_inset(region, edge))),
+            EnvTerm::TitleBar(var) => env.titlebar(var).map(f64::from),
         }
     }
 }
@@ -148,6 +158,7 @@ impl Node {
                 Unit::Number | Unit::Px => *v,
                 Unit::Percent => basis? * v / 100.0,
                 Unit::Viewport(u) => f64::from(u.basis(env)) * v / 100.0,
+                Unit::Rem => f64::from(env.root_font_size) * v,
             },
             Node::Env(term) => term.value(env)?,
             Node::Sum(c) => {
@@ -236,14 +247,14 @@ pub(crate) fn dimension(tree: Node) -> Dimension {
         // only where an `f32` holds it exactly
         Node::Value(v, Unit::Percent) if exact(*v) => Some(Dimension::Percent(*v as f32)),
         Node::Value(v, Unit::Viewport(u)) if exact(*v) => Some(Dimension::Viewport(*u, *v as f32)),
-        Node::Env(term) => Some(env_dimension(*term, 0.0)),
+        Node::Env(term) => env_dimension(*term, 0.0),
         Node::Sum(c) => match &c[..] {
             [Node::Value(p, Unit::Percent), Node::Value(x, Unit::Px)] if exact(*p) && exact(*x) => {
                 Some(Dimension::Calc(*p as f32, *x as f32))
             }
             // A zero is kept in a sum, and `Env`'s zero is no term at all
             [Node::Value(x, Unit::Px), Node::Env(term)] if exact(*x) && *x != 0.0 => {
-                Some(env_dimension(*term, *x as f32))
+                env_dimension(*term, *x as f32)
             }
             _ => None,
         },
@@ -252,12 +263,19 @@ pub(crate) fn dimension(tree: Node) -> Dimension {
     compact.unwrap_or_else(|| Dimension::Compare(Comparison::intern(tree)))
 }
 
-fn env_dimension(term: EnvTerm, plus: f32) -> Dimension {
-    match term {
+/// The compact form of `env()` plus points, where one holds it.
+fn env_dimension(term: EnvTerm, plus: f32) -> Option<Dimension> {
+    Some(match term {
         EnvTerm::Inset(edge) => Dimension::Env(edge, plus),
         EnvTerm::Segment(var, x, y) => Dimension::Segment(var, x, y, plus),
         EnvTerm::Region(region, edge) => Dimension::Region(region, edge, plus),
-    }
+        EnvTerm::TitleBar(_) => return None,
+    })
+}
+
+/// A bare `env()` without a fallback as the dimension that holds it.
+pub(crate) fn lone_env(term: EnvTerm) -> Dimension {
+    dimension(Node::Env(term))
 }
 
 /// A calculation a row holds: a handle to its interned entry.
@@ -427,6 +445,17 @@ impl Comparison {
         row: StyleId,
     ) -> Result<Comparison, crate::error::DecodeError> {
         wire::decode(r, row)
+    }
+
+    pub(crate) fn is_length_percentage(self) -> bool {
+        self.tree(|t| !t.any(&|n| matches!(n, Node::Env(_) | Node::Value(_, Unit::Viewport(_)))))
+            .unwrap_or(false)
+    }
+
+    /// Whether a `rem` stands in it, which the root font size resolves.
+    pub(crate) fn reads_rem(self) -> bool {
+        self.tree(|t| t.any(&|n| matches!(n, Node::Value(_, Unit::Rem))))
+            .unwrap_or(false)
     }
 
     /// Whether a percentage stands in it: in a tree, at a leaf, which

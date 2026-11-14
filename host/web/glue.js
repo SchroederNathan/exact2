@@ -1,13 +1,13 @@
 // @ref LLP 1007 §3: the app is the wasm; this is its DOM host.
-import { textField, popoverCommand, contextAt, grantOrigins, createGrantSet, grantError, rawGrantText, scopedGrantSet, deferredFulfill, refusal, commitGuestOrigin, guestMessageAuthorized, focusController, runFocusCommands, controlEvent, environment, preferences, onPreferences, inertAncestor, editMenu, navigation, afterPaintPieces, presenceLoader, animationClock, scrollFollowers, renderMarkup, navigableURL, navigates, refuseURL, frameURL, dataURL, devFirst, reportPlace, reportTime, launchLocation, pageReporter, appRootFontSize, valuedControl, typedControl, typeControl, settleValue, foldBits, foldEnv, onFold, preferFold, fold, animationClocks, onSelection, noteFit, refitTexts, pageTitle, storeInPage } from "./navigation.js";
-let guestOutline, guestTap, guestType, reveal, viewBox, layoutBoxes, selectAll, agentInputLoading;
+import { listItem, syncListItemRoles, sheetLeaves, liveById, sourceField, popoverCommand, contextAt, grantOrigins, createGrantSet, grantError, rawGrantText, scopedGrantSet, deferredFulfill, refusal, commitGuestOrigin, guestMessageAuthorized, pageGivenFiles, focusController, runFocusCommands, controlEvent, environment, preferences, onPreferences, inertAncestor, modalLayers, editMenu, navigation, afterPaintPieces, afterPaint, presenceLoader, animationClock, scrollFollowers, renderMarkup, navigableURL, navigates, refuseURL, frameURL, dataURL, devFirst, reportPlace, reportTime, launchLocation, pageReporter, appRootFontSize, valuedControl, typedControl, settleValue, foldBits, foldEnv, onFold, preferFold, fold, animationClocks, onSelection, noteFit, refitTexts, pageTitle, pageStore, routeFlags } from "./navigation.js";
+let guestOutline, guestTap, guestType, reveal, backButton, viewBox, layoutBoxes, scrollRange, selectAll, typeControl, glidesSettled, scrollsSeen, agentInputLoading;
 const AGENT_ADMITTED = true; // false in a production bake: host/web/build.mjs rewrites this line (LLP 1069.007 D2)
-let httpModule, pickerModule, documentsModule, notifyModule; // the file picker (LLP 1069.002), documents (LLP 1069.010) and notifications, loaded on first use
+let httpModule, pickerModule, documentsModule, frameModule, frameNavigation; const frameNav = () => frameNavigation ??= loadAfterPaint('./frame-navigation.js', 'frameNavigation'); // frameNavigation: an iframe's navigation records and commands (LLP 1020.002); the file picker (LLP 1069.002) and documents (LLP 1069.010), loaded on first use
 const picker = (at = incarnation) => (pickerModule ??= loadAfterPaint('./picker-glue.js', 'picker').then(install => install({ appId: globalThis.exact.compat?.inputs?.app, generation: () => incarnation, dispatch: (id, kind, payload) => { if (views.has(id)) send(wasm.exact_dispatch(id, kind, writeIn(payload), now())); }, pickedPath: (name) => loadStage('inspection').then(() => ask({ op: "pickedPath", name }).path), log }))).then(m => m.at(at)); // its operations answer generation `at`, the one that asked
 // An `app:/` source (D7): the app's own file, as the picker glue's object URL once it resolves; the old picture stays meanwhile, as for any `src`, and an element with none gets none (an empty media `src` is a failed load). A media element plays it (podcast F19): the glue hears the URL as its source, and a path with no file is handed to it as written, which it refuses (`src-not-supported`) as HTML refuses a source it cannot fetch. `then` runs once it lands (a `load` command's). A `data:` source past its bound shows nothing, as on every host (LLP 1011 §2; exact_raster::MAX_DATA_URL_BYTES).
 const DATA_LIMIT = 1024 * 1024; function appSource(el, name, value, then) { const p = picker().then(m => m.appURL(value)).then(url => { if (el[`exactApp-${name}`] !== value) return; const media = el instanceof HTMLMediaElement && name === "src", to = url || (media ? value : null); if (el.getAttribute(name) !== to) to ? el.setAttribute(name, to) : el.removeAttribute(name); if (media) { then?.(); syncMedia(el, { src: to }); } }); track(p.catch(() => {})); return el.getAttribute(name); }
-function appFrameSource(el, value) { el.exactSource = value; if (el.exactAppFrame?.path === value) return true; el.exactAppFrame?.dispose(); el.exactAppFrame = null; if (!value?.startsWith("app:/")) return false; const state = el.exactAppFrame = { path: value, live: true, url: null, dispose() { this.live = false; if (this.url) URL.revokeObjectURL(this.url); } }; el.removeAttribute("src"); iframeLoading.set(el, true); track(picker().then(m => m.appFrame(el, state, () => commitGuestOrigin(el)))); return true; }
-const documentsGlue = (at = incarnation) => (documentsModule ??= loadAfterPaint('./documents-glue.js', 'documents').then(d => d.install({ generation: () => incarnation, dispatch: (id, kind, payload) => { if (views.has(id)) send(wasm.exact_dispatch(id, kind, writeIn(payload), now())); }, log, openFile: (value) => { const id = [...views].find(([, el]) => el.dataset?.testid === "open-file")?.[0]; if (id == null) return false; send(wasm.exact_dispatch(id, 1, writeIn(value), now())); return true; } }))).then(m => m.at(at));
+function appFrameSource(el, value) { el.exactSource = value; if (el.exactAppFrame?.path === value) return true; el.exactAppFrame?.dispose(); el.exactAppFrame = null; if (!value?.startsWith("app:/") && !pageGivenFiles(value ?? "")) return false; /* an app file, or a page of the app's origin whose query may name one (LLP 1020.001 D7; picker-glue.js decides) */ const state = el.exactAppFrame = { path: value, live: true, url: null, dispose() { this.live = false; if (this.url) URL.revokeObjectURL(this.url); } }; el.removeAttribute("src"); iframeLoading.set(el, true); track(picker().then(m => m.appFrame(el, state, () => commitGuestOrigin(el), u => frameURL(u, el.getAttribute("sandbox")) ? el.setAttribute("src", localAssetURL(u)) : refuseURL(el, "src", u)))); return true; }
+const documentsGlue = (at = incarnation) => (documentsModule ??= loadAfterPaint('./documents-glue.js', 'documents').then(d => (d.keeping(globalThis.exact.compat?.inputs?.app, grantSet), d).install({ generation: () => incarnation, dispatch: (id, kind, payload) => { if (views.has(id)) send(wasm.exact_dispatch(id, kind, writeIn(payload), now())); }, log, openFile: (value) => { const id = [...views].find(([, el]) => el.dataset?.testid === "open-file")?.[0]; if (id == null) return false; send(wasm.exact_dispatch(id, 1, writeIn(value), now())); return true; } }))).then(m => m.at(at));
 function httpHelpers() {
   return httpModule ??= moduleReady.then(() => loadAfterPaint('./http-body.js', 'httpHelpers'));
 }
@@ -18,22 +18,22 @@ const pieces = afterPaintPieces(loadAfterPaint, { root, views, applyBatch, agent
   replayed() { motion.commit(); arrange.commit(); if (agentMode) { register(agentClock); seek(agentClock); } else motion.followTimelines(); },
   wasm(name, bytes) { if (!wasm) return null; new Uint8Array(memory.buffer, wasm.exact_in(bytes.length), bytes.length).set(bytes); return JSON.parse(readOut(wasm[name](bytes.length))); } });
 const { collections, motion, arrange } = pieces, retiredViews = new WeakSet(); // committed removals must not dispatch teardown events
-const presence = presenceLoader(loadAfterPaint, root, batch => applyBatch(batch), log); // -exact-exit-animation and -exact-layout-transition, after paint at first use (LLP 1063)
-let mediaModule, mediaAttaching = new Set(), soundModule, soundOut, midiModule, midiOut, imageHold, geometry = null, resizes = null, intersects = null; // the voice table's output (sound-glue.js, LLP 1096 D7); animated images held to the agent's clock (image-glue.js, LLP 1011.000); geometry reads (geometry-glue.js, LLP 1051.000 D4); the element resize event (resize-glue.js)
-let wakeLock = null; const holdWake = () => (wakeLock ??= loadAfterPaint('./wakelock-glue.js', 'wakeLockGlue')).then(w => w.hold(w.holders(root).length > 0, log)); // LLP 1125 D11: loaded at the first `wakelock`, then asked after each batch
+const presence = presenceLoader(loadAfterPaint, root, batch => applyBatch(batch), log); /* -exact-exit-animation and -exact-layout-transition, after paint at first use (LLP 1063) */ afterPaint(() => loadAfterPaint('./menu-rows.js', 'menuRows').then(install => install(), console.error)); // a menu row's popover opens from the menu's invoker (LLP 1021)
+let mediaModule, mediaAttaching = new Set(), sizes = new Set(), soundModule, soundOut, midiModule, midiOut, imageHold, geometry = null, geometryLoading = null, resizes = null, intersects = null; // the voice table's output (sound-glue.js, LLP 1096 D7); animated images held to the agent's clock (image-glue.js, LLP 1011.000); geometry reads (geometry-glue.js, LLP 1051.000 D4); the element resize event (resize-glue.js)
+let wakeLock = null; const holdWake = () => (wakeLock ??= loadAfterPaint('./wakelock-glue.js', 'wakeLockGlue')).then(w => w.hold(w.holders(root).length > 0, log)); let orientationLock = null; const holdOrientation = () => (orientationLock ??= loadAfterPaint('./orientationlock-glue.js', 'orientationLockGlue')).then(o => o.hold(o.session(root), log, e => { for (const [i, v] of views) if (v === e) return i; return null; })); // LLP 1125 D11: loaded at the first `wakelock`, then asked after each batch; LLP 1133.029 D7: `orientationlock` the same
 function syncMedia(el, set = {}, clear = []) {
   if (!(el instanceof HTMLMediaElement)) return;
   el.exactMedia ??= { props: {}, handlers: [] };
   Object.assign(el.exactMedia.props, set);
   for (const name of clear) delete el.exactMedia.props[name];
   mediaModule ??= new Promise(resolve => requestAnimationFrame(() => resolve(loadAfterPaint('./media-glue.js', 'installMedia'))));
-  const attach = Promise.all([mediaModule, moduleReady]).then(([install]) => { if (el.isConnected) install(el, payload => { if (views.get(Number(el.dataset.view)) !== el || !inputReady) return false; send(wasm.exact_dispatch(Number(el.dataset.view), 19, writeIn(payload), now())); }); }).catch(console.error); mediaAttaching.add(attach); attach.finally(() => mediaAttaching.delete(attach)); // Attached once the data executor settles (a report before then is dropped), reporting what the element has then; `clock settle` waits for it, not `inflight`, which a module replacement drains during activation.
+  const attach = Promise.all([mediaModule, moduleReady]).then(([install]) => { if (el.isConnected) { install(el, payload => { if (views.get(Number(el.dataset.view)) !== el || !inputReady) return false; send(wasm.exact_dispatch(Number(el.dataset.view), 19, writeIn(payload), now())); }); const held = !el.exactMediaHeld && globalThis.exact.mediaHold(el); if (held) { el.exactMediaHeld = true; mediaAttaching.add(held.done); held.done.finally(() => { el.exactMediaHeld = false; mediaAttaching.delete(held.done); }); } } }).catch(console.error); mediaAttaching.add(attach); attach.finally(() => mediaAttaching.delete(attach)); // Attached once the data executor settles (a report before then is dropped), reporting what the element has then; `clock settle` waits for it, not `inflight`, which a module replacement drains during activation. A load or a seek in flight then holds a settle too, as on the JS target (media-glue.js `mediaHold`; `removeMedia` lets it go).
 }
 const iframeLoading = new WeakMap(); // iframe -> true until its latest src load
 const messageViews = new Set(), messageFrames = new Set(); // the latter: iframes whose node handles `message`
-const keyChord = e => /* a keydown or keyup as kind 6's or 43's payload: the chord `Event::key` reads, then its code and repeat (`KeyboardEvent::parse`, #140) */ (e.shiftKey ? "Shift+" : "") + (e.ctrlKey ? "Control+" : "") + (e.altKey ? "Alt+" : "") + (e.metaKey ? "Meta+" : "") + e.key + "\n" + (/^[A-Za-z0-9]*$/.test(e.code ?? "") ? e.code ?? "" : "") + "\n" + !!e.repeat;
-let messageListening = false, keyEvent = null, pointerEvent = null, pointerDepth = 0; // keyEvent: the keydown (or wheel, beforeunload, clipboard event) a handler is running for, which its `preventDefault()` command prevents; pointerEvent: the pointer's down or up, which only its `stopPropagation()` reaches (its default is the browser's), from its own batch alone (`pointerDepth`, `send`)
-let wasm = null, memory = null, inputReady = false, inputHandlers;
+const keyChord = e => /* a keydown or keyup as kind 6's or 43's payload: the chord `Event::key` reads, then its code, repeat and isComposing, which a keyCode-229 keydown is too (rt.js `onKey`; `KeyboardEvent::parse`, #140) */ (e.shiftKey ? "Shift+" : "") + (e.ctrlKey ? "Control+" : "") + (e.altKey ? "Alt+" : "") + (e.metaKey ? "Meta+" : "") + e.key + "\n" + (/^[A-Za-z0-9]*$/.test(e.code ?? "") ? e.code ?? "" : "") + "\n" + !!e.repeat + "\n" + !!(e.isComposing || e.keyCode === 229 || e.key === "Process");
+let messageListening = false, bodyHeard, keyEvent = null, pointerEvent = null, pointerDepth = 0; // keyEvent: the keydown (or wheel, beforeunload, clipboard event) a handler is running for, which its `preventDefault()` command prevents; pointerEvent: the pointer's down or up, which only its `stopPropagation()` reaches (its default is the browser's), from its own batch alone (`pointerDepth`, `send`)
+let wasm = null, memory = null, inputReady = false, inputHandlers, structuralModalLayers;
 // Native modules (LLP 1024 D3): a module node is its custom element, empty until the adapter and the app's module load after first paint (the browser's paint entry; two frames and a beat where it records none).
 let nativePaint = null;
 function afterNativePaint() {
@@ -91,14 +91,14 @@ const dataImports = {
 };
 function loadAfterPaint(file, exported) {
   return new Promise((resolve, reject) => {
-    const script = document.createElement('script');
-    script.type = 'module';
+    const script = Object.assign(document.createElement('script'), { type: 'module' });
     script.src = new URL(file, import.meta.url).href;
     script.onload = () => resolve(globalThis.exact[exported]);
     script.onerror = () => reject(new Error('host module loader failed: ' + file));
     document.head.append(script);
   });
 }
+const pageFile = name => (path, grants) => (globalThis.exact[name] ? Promise.resolve(globalThis.exact[name]) : loadAfterPaint('./storage-request.js', name)).then(f => f(globalThis.exact.compat.inputs.app, grants, path));
 async function loadRust() {
   if (rustLoader) return;
   rustLoading ??= loadAfterPaint('./rust-glue.js','createRustRuntime')
@@ -106,12 +106,12 @@ async function loadRust() {
   await rustLoading;
 }
 // @ref LLP 1043.000 §3 D7/D8 — optional executor, absent from ordinary boots.
-let textflow = null, flowLoading = null, flowContexts = [], flowDue = null, flowFrames = false, present = timestamp => send(wasm.exact_frame(timestamp - t0)); // an animation frame (LLP 1073 D5)
+let textflow = null, flowLoading = null, flowContexts = [], flowDue = null, flowLanding = false, flowFrames = false, flowWaits = [], flowTolerance = 0, present = timestamp => send(flowWaits.length ? wasm.exact_advance(timestamp - t0, 8) : wasm.exact_frame(timestamp - t0)); // an animation frame (LLP 1073 D5)
 function flowBatch(batch) {
   const op = batch.ops?.find(op => op.op === "textflow");
   if (op) flowContexts = op.contexts;
-  flowDue = batch.timer_due_ms ?? null; flowFrames = !!batch.frames;
-  ticker?.update(flowDue, flowFrames);
+  flowDue = batch.timer_due_ms ?? null; flowLanding = !!batch.landing; flowFrames = !!batch.frames; flowWaits = batch.waits ?? []; flowTolerance = batch.timer_tolerance_ms ?? 0;
+  ticker?.update(flowDue, flowFrames, flowWaits, flowTolerance);
   if (textflow) { textflow.afterBatch(batch); return; }
   if (!flowContexts.length || flowLoading) return;
   ticker?.dispose(); ticker = null;
@@ -119,14 +119,14 @@ function flowBatch(batch) {
   flowLoading = loadAfterPaint('./textflow-glue.js', 'createTextFlow').then(async create => {
     if (generation !== incarnation) return;
     const controller = await create({ views, agentMode, log, now,
-      advance: () => { followOffset(now()); send(wasm.exact_advance(now(), 0)); }, present });
+      advance: () => { followOffset(now()); send(wasm.exact_advance(now(), 0)); }, present, admitTimers: (kinds, cutoff) => { const batch = JSON.parse(readOut(wasm.exact_advance(cutoff, 16 | kinds << 8))); applyBatch(batch); return batch; } });
     if (generation !== incarnation) { controller.dispose(); return; }
     textflow = controller;
-    textflow.afterBatch({ ops: [{ op: "textflow", contexts: flowContexts }], timer_due_ms: flowDue, frames: flowFrames });
+    textflow.afterBatch({ ops: [{ op: "textflow", contexts: flowContexts }], timer_due_ms: flowDue, frames: flowFrames, waits: flowWaits, timer_tolerance_ms: flowTolerance });
   });
   flowLoading.catch(error => { if (generation === incarnation) log(`textflow module: ${error}`); });
 }
-let resolveModuleReady, headGlue = null, page = document.querySelector('script[type="application/vnd.exact.checkpoint"]') ? { holding: true, early: globalThis.exact?.taps?.() ?? [] } : null; // a built document (LLP 1048.000 D6), held until the runtime settles; the presses its capture script took before now come first
+let resolveModuleReady, headGlue = null, fragmentGlue = null, fragmentTurn = 0, page = document.querySelector('script[type="application/vnd.exact.checkpoint"]') ? { holding: true, early: globalThis.exact?.taps?.() ?? [] } : null; // a built document (LLP 1048.000 D6), held until the runtime settles; the presses its capture script took before now come first
 const moduleReady = new Promise(resolve => { resolveModuleReady = resolve; });
 const focus = focusController({ready:() => inputReady, elements:() => views.values(), inert:inertAncestor, removed:el => retiredViews.has(el)});
 const focusAutofocus = focus.autofocus;
@@ -160,7 +160,7 @@ function moduleCall(op, ptr, len) {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const t0 = performance.now();
-const agentMode = AGENT_ADMITTED && new URL(location.href).searchParams.has("agent"), agentKeepsStore = !agentMode || new URL(location.href).searchParams.has("storage"); // `--storage` on the page (platformer R10); a nameless drive stays in memory
+const agentMode = AGENT_ADMITTED && new URL(location.href).searchParams.has("agent"), agentKeepsStore = !agentMode || new URL(location.href).searchParams.has("storage"), pendingStore = pageStore(); // `--storage` on the page (platformer R10); a nameless drive stays in memory
 // The driver's fetch faults (LLP 1103, faults.js, loaded with the first request): an injected failure's journal line is the runner's.
 if (agentMode) globalThis.__exactFaultLog = line => log(line);
 let agentClock = agentMode ? 0 : null, followOnSeek = true;
@@ -169,6 +169,7 @@ const clocks = animationClocks(root), { register, seek: seekAnimations, settle: 
 const seek = to => { (imageHold ??= loadAfterPaint('./image-glue.js', 'holdImages').then(f => f({ root, now: () => agentClock }))).then(h => h.seek()); seekAnimations(to); };
 const POST_BOUND = 64; // posts held per surface before its canvas is live; gpu-glue.js's exact.postBound, Linux POST_BOUND, Apple Canvases.postBound
 const now = () => agentClock ?? performance.now() - t0;
+function postSurface(name, text, at) { if ([...views.values()].some(e => e instanceof HTMLIFrameElement && e.isConnected && !retiredViews.has(e) && e.id === name)) { const refused = `postMessage: canvas name collides with an iframe id "${name}"`; log(refused); return refused; } if (globalThis.exact.gpu) return globalThis.exact.gpu.post(name, text, at); const held = globalThis.exact.pendingPosts ??= []; if (held.filter(p => p.name === name).length < POST_BOUND) return held.push({ name, text, at, generation: incarnation }), null; const refused = `postMessage: dropped: ${POST_BOUND} posts already wait for surface "${name}"`; log(refused); return refused; } // `postMessage(text, surface)` and the driver's `post` (LLP 1139.004 D1): held per surface name until one of its canvases is live, at most POST_BOUND; the refusal past it, or null
 let frameSampler = null; // a development page's frame sampler (frames.js, LLP 1079 D3)
 let timelinesMoved = false; // a batch's `timelines` op: its consumers are sought once it is applied
 let bootAttempt = 0;
@@ -255,7 +256,7 @@ function prepareContexts(batch) {
   for (const op of batch.ops ?? []) {
     const props = op.op === "create" ? op.props : op.op === "props" ? op.set : null;
     if (!props?.contextTarget) continue;
-    const target = document.getElementById(props.contextTarget);
+    const target = liveById(props.contextTarget);
     if (target && contextAnchors.get(op.id)?.target !== target) contextAnchors.set(op.id, contextAnchor(target));
   }
 }
@@ -272,11 +273,11 @@ function positionContexts() {
   for (const [id, anchor] of contextAnchors) {
     const preview = views.get(id);
     if (!preview?.isConnected || !anchor.target.isConnected
-      || document.getElementById(preview.getAttribute("contextTarget")) !== anchor.target) contextAnchors.delete(id);
+      || liveById(preview.getAttribute("contextTarget")) !== anchor.target) contextAnchors.delete(id);
   }
   const project = (node, transform) => { node.style.transform = transform; contextTransforms.add(node); };
   for (const preview of root.querySelectorAll("[contextTarget]")) {
-    const target = document.getElementById(preview.getAttribute("contextTarget"));
+    const target = liveById(preview.getAttribute("contextTarget"));
     const panel = contextPanel(preview);
     if (!target || !panel) continue;
     const box = panel.getBoundingClientRect(), content = preview.getBoundingClientRect();
@@ -338,11 +339,11 @@ function positionContexts() {
   }
 }
 // @ref LLP 1039 D2, LLP 1061 D4 — viewport facts and display preferences, on every change, without debounce.
-const pageFacts = pageReporter(agentMode), pageChanged = () => { if (wasm?.exact_set_page && root.childElementCount) { applyBatch(JSON.parse(readOut(wasm.exact_set_page(pageFacts.bits())))); if (wasm.exact_set_root_font_size) applyBatch(JSON.parse(readOut(wasm.exact_set_root_font_size(pageFacts.rootFontSize())))); if (wasm.exact_set_display_scale) applyBatch(JSON.parse(readOut(wasm.exact_set_display_scale(pageFacts.displayScale())))); } }; pageFacts.onChange(pageChanged); addEventListener("resize", pageChanged); // @ref LLP 1069.000 D2, D3
-const mediaChanged = () => { if (wasm && root.childElementCount) applyBatch(presence.resize(JSON.parse(readOut(wasm.exact_resize(innerWidth, innerHeight, now(), preferences() | foldBits()))))); requestAnimationFrame(positionContexts); }; addEventListener("resize", mediaChanged); onPreferences(mediaChanged); const foldChanged = mediaChanged; onFold(foldChanged); // @ref LLP 1078 D6 — the posture and the segment counts ride the facts word beside the preferences; the browser resolves the `env(viewport-segment-*)` lengths itself
+const pageFacts = pageReporter(agentMode), pageChanged = () => { if (wasm?.exact_set_page && incarnation) { applyBatch(JSON.parse(readOut(wasm.exact_set_page(pageFacts.bits())))); if (wasm.exact_set_root_font_size) applyBatch(JSON.parse(readOut(wasm.exact_set_root_font_size(pageFacts.rootFontSize())))); if (wasm.exact_set_display_scale) applyBatch(JSON.parse(readOut(wasm.exact_set_display_scale(pageFacts.displayScale())))); } }; pageFacts.onChange(pageChanged); addEventListener("resize", pageChanged); // @ref LLP 1069.000 D2, D3
+const mediaChanged = () => { if (wasm && incarnation && innerWidth > 0 && innerHeight > 0) applyBatch(presence.resize(JSON.parse(readOut(wasm.exact_resize(innerWidth, innerHeight, now(), preferences() | foldBits()))))); requestAnimationFrame(positionContexts); }; addEventListener("resize", mediaChanged); onPreferences(mediaChanged); const foldChanged = mediaChanged; onFold(foldChanged); // @ref LLP 1078 D6 — the posture and the segment counts ride the facts word beside the preferences; the browser resolves the `env(viewport-segment-*)` lengths itself
 visualViewport?.addEventListener("resize", () => requestAnimationFrame(positionContexts));
-const symbolStyle = document.createElement("style"); document.head.append(symbolStyle); // @ref LLP 1095 D8 — an untinted symbol is `AccentColor`: a zero-specificity default, so any authored tint wins. LLP 1116.003 D3.2: the nearest authored accent (`--exact-accent`), as the role is (LLP 1116.001 D2) and UIKit's inherited tint.
-symbolStyle.textContent = '@property --exact-tint{syntax:"<color>";inherits:false;initial-value:#000}:where(img[data-symbol-path]){--exact-tint:var(--exact-accent,AccentColor)}img[data-symbol-path]{background-color:var(--exact-tint)!important;mask-image:var(--exact-symbol-mask);mask-repeat:no-repeat;mask-position:center;mask-size:var(--exact-symbol-fit,contain);mask-origin:content-box;mask-clip:content-box}';
+const symbolStyle = document.createElement("style"); document.head.append(symbolStyle); // @ref LLP 1081 stage 2 — a symbol is drawn in its `color`: a zero-specificity default, so a native face's or a bar's own ink wins. LLP 1116.003 D3.2: the nearest authored accent (`--exact-accent`), as the role is (LLP 1116.001 D2) and UIKit's inherited tint. LLP 1121 stage 9 B: one whose `color` its author wrote (`data-symbol-color`, element.rs) draws in it.
+symbolStyle.textContent = '@property --exact-tint{syntax:"<color>";inherits:false;initial-value:#000}:where(img[data-symbol-path]){--exact-tint:currentcolor}:where(img[data-symbol-path][data-symbol-color]){--exact-tint:currentcolor}img[data-symbol-path]{background-color:var(--exact-tint)!important;mask-image:var(--exact-symbol-mask);mask-repeat:no-repeat;mask-position:center;mask-size:var(--exact-symbol-fit,contain);mask-origin:content-box;mask-clip:content-box}';
 // A tinted raster's `scale-down` (element.rs `host_css`, LLP 1011 §3): `contain` unless its natural size fits the content box, known once it loads.
 function tintFit(el) {
   if (!el.style.getPropertyValue("mask-size").includes("--exact-tint-fit")) return;
@@ -364,40 +365,41 @@ function imageEvents(el, fire) {
   el.addEventListener("load", () => settle(false)); el.addEventListener("error", () => settle(true)); if (el.complete && el.getAttribute("src")) setTimeout(() => el.complete && settle(!el.naturalWidth));
 }
 function refreshSymbols() {
-  for (const el of views.values()) {
-    if (!(el instanceof HTMLImageElement)) continue; if (!el.hasAttribute("data-symbol-path")) { tintFit(el); continue; }
-    if (el.parentElement?.matches("button[data-button-style]")) {
-      const title = el.parentElement.querySelector(":scope > [data-exact-text]"), own = getComputedStyle(el);
-      if (title) {
-        const font = getComputedStyle(title); el.style.color = font.color;
-        if (own.getPropertyValue("--exact-symbol-size-authored").trim() !== "1") el.style.fontSize = font.fontSize;
-        if (own.getPropertyValue("--exact-symbol-weight-authored").trim() !== "1") el.style.fontWeight = font.fontWeight;
-      }
-    }
-    const cs = getComputedStyle(el), size = parseFloat(cs.fontSize), weight = Number(cs.fontWeight);
-    const path = el.getAttribute("data-symbol-path"), filled = el.hasAttribute("data-symbol-fill"), key = `${path}:${filled}:${size}:${weight}`;
-    if (!path && !el.dataset.symbolSource?.startsWith("symbol:sf/") && el.symbolRefusal !== el.dataset.symbolSource) {
+  const rasters = [], symbols = [...views.values()].filter(el => { if (!(el instanceof HTMLImageElement)) return false; if (el.hasAttribute("data-symbol-path")) return true; rasters.push(el); return false; });
+  // Batch reads before writes; computed styles are live, so keep only scalar values.
+  const titles = symbols.flatMap(el => {
+    const title = el.parentElement?.matches("button[data-button-style]") && el.parentElement.querySelector(":scope > [data-exact-text]"); if (!title) return [];
+    const own = getComputedStyle(el), font = getComputedStyle(title), style = { color: font.color };
+    for (const [axis, prop] of [["size", "fontSize"], ["weight", "fontWeight"]]) if (own.getPropertyValue(`--exact-symbol-${axis}-authored`).trim() !== "1") style[prop] = font[prop];
+    return [[el, style]]; });
+  for (const [el, style] of titles) Object.assign(el.style, style);
+  const configs = symbols.map(el => { const cs = getComputedStyle(el);
+    return { el, point: parseFloat(cs.fontSize) * (parseFloat(cs.getPropertyValue("--exact-symbol-scale")) || 1), weight: Number(cs.fontWeight), objectFit: cs.objectFit }; });
+  for (const { el, point, weight } of configs) {
+    const path = el.getAttribute("data-symbol-path"), filled = el.hasAttribute("data-symbol-fill"), box = el.getAttribute("data-symbol-viewbox") || "0 0 24 24", key = `${path}:${filled}:${point}:${weight}:${box}:${el.hasAttribute("data-symbol-nonzero")}`;
+    if (!path && !el.dataset.symbolSource?.startsWith("symbol:sf/") && el.dataset.symbolSource !== "symbol:" && el.symbolRefusal !== el.dataset.symbolSource) {
       log(`image ${el.dataset.symbolSource} refused: unknown symbol role`); el.symbolRefusal = el.dataset.symbolSource;
     }
     if (el.symbolKey !== key) {
-      el.symbolKey = key;
-      const point = size, stroke = 1.1 + (Math.max(100, Math.min(900, weight)) - 100) / 400;
-      const paint = filled ? 'fill="black" fill-rule="evenodd"' : `fill="none" stroke="black" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round"`;
-      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${point}" height="${point}" viewBox="0 0 24 24"><path d="${path}" ${paint}/></svg>`;
-      el.symbolMask = `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
+      el.symbolKey = key; const stroke = 1.1 + (Math.max(100, Math.min(900, weight)) - 100) / 400;
+      const paint = filled ? `fill="black" fill-rule="${el.hasAttribute("data-symbol-nonzero") ? "nonzero" : "evenodd"}"` : `fill="none" stroke="black" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round"`;
+      el.symbolMask = `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${point}" height="${point}" viewBox="${box}">${path.split(";").map(d => `<path d="${d}" ${paint}/>`).join("")}</svg>`)}")`;
       el.symbolPlaceholder = `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${point}" height="${point}"/>`)}`;
     }
-    if (el.getAttribute("src") !== el.symbolPlaceholder) el.src = el.symbolPlaceholder;
-    el.style.setProperty("--exact-symbol-mask", el.symbolMask);
-    const paddingX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight), paddingY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
-    const fits = size <= el.clientWidth - paddingX && size <= el.clientHeight - paddingY;
-    // `fill`, CSS's initial `object-fit`, keeps a symbol's aspect, as on the Apple hosts (LLP 1011 §4).
-    const fit = cs.objectFit === "none" || (cs.objectFit === "scale-down" && fits) ? `${size}px ${size}px` : cs.objectFit === "scale-down" || cs.objectFit === "fill" ? "contain" : cs.objectFit;
-    el.style.setProperty("--exact-symbol-fit", fit);
+    if (el.getAttribute("src") !== el.symbolPlaceholder) el.src = el.symbolPlaceholder; el.style.setProperty("--exact-symbol-mask", el.symbolMask);
   }
+  // Sources can set intrinsic size synchronously; percentage padding must resolve against the resulting layout.
+  const fits = configs.map(({ el, point, objectFit }) => {
+    const cs = objectFit === "scale-down" ? getComputedStyle(el) : null;
+    const fits = cs && point <= el.clientWidth - (parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)) && point <= el.clientHeight - (parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom));
+    // `fill`, CSS's initial `object-fit`, keeps a symbol's aspect, as on the Apple hosts (LLP 1011 §4).
+    return [el, objectFit === "none" || (objectFit === "scale-down" && fits) ? `${point}px ${point}px` : objectFit === "scale-down" || objectFit === "fill" ? "contain" : objectFit];
+  });
+  for (const [el, fit] of fits) el.style.setProperty("--exact-symbol-fit", fit);
+  for (const el of rasters) tintFit(el);
 }
 // The app's `value` into an editor as a person types: the changed middle only (`setRangeText` keeps the selection where a whole assignment throws the caret to the end), never mid-composition — held, applied at compositionend. LLP 1045 D5.
-const composing = new WeakSet(), heldValues = new WeakMap(), compositionFlush = new WeakMap();
+const composing = new WeakSet(), heldValues = new WeakMap(), compositionFlush = new WeakMap(); for (const [type, on] of [["compositionstart", true], ["compositionend", false]]) addEventListener(type, e => { e.target.exactComposing = on; }, true); // which field composes, for a piece loaded later (LLP 1114.007)
 function writeValue(el, value) {
   if (el.exactMarkup) { el.exactMarkup.setValue(value); return; } if (el instanceof HTMLTextAreaElement) el.exactSourceValue = String(value);
   const old = el.value; if (old === value) { heldValues.delete(el); return; } if (composing.has(el)) { heldValues.set(el, value); return; } heldValues.delete(el);
@@ -405,21 +407,21 @@ function writeValue(el, value) {
   let a = 0, z = 0; while (a < old.length && a < value.length && old[a] === value[a]) a++; while (z < old.length - a && z < value.length - a && old[old.length - 1 - z] === value[value.length - 1 - z]) z++;
   const end = old.length - z, text = value.slice(a, value.length - z), { selectionStart: s0, selectionEnd: s1 } = el, carry = (p) => p <= a ? p : p >= end ? p + text.length - (end - a) : a + text.length;
   el.setRangeText(text, a, end, "preserve"); if (el.value !== value) el.value = value; else el.setSelectionRange(carry(s0), Math.max(carry(s0), carry(s1))); }
-let markupModule; const markupPending = new WeakSet();
-function syncMarkup(el) {
-  if (el.exactMarkup) { el.exactMarkup.sync(); return; }
+let markupModule, decorationsModule; const markupPending = new WeakSet(); function syncMarkup(el) {
+  if (el.exactMarkup) { el.exactMarkup.sync(); return; } if (el.exactDecorations) el.exactDecorations.sync(); else if (el instanceof HTMLTextAreaElement && el.hasAttribute('data-decorations')) loadDecorations(el);
   if (!(el instanceof HTMLTextAreaElement) || el.getAttribute('markup') !== 'markdown' || markupPending.has(el)) return;
   markupPending.add(el);
   (markupModule ??= moduleReady.then(() => loadAfterPaint('./markup-editor.js', 'installMarkupEditor'))).then(install => {
     const id = Number(el.dataset.view), live = node => views.get(id) === node && node.isConnected && !retiredViews.has(node);
     if (composing.has(el)) return; // Keep the native marked range until its final input has committed.
     markupPending.delete(el); if (!live(el) || el.getAttribute('markup') !== 'markdown') return;
-    install(el, { live, replace(node) { views.set(id, node); attach(node, id, el.exactHandlers); },
+    install(el, { live, replace(node) { views.get(id)?.exactIntersect?.(); views.set(id, node); attach(node, id, el.exactHandlers); }, // (the old node's first entry lets go: the new one is observed)
       select(node, payload) { if (live(node) && inputReady && node.exactHandlers.includes('select')) send(wasm.exact_dispatch(id, 21, writeIn(payload), now())); } });
   }).catch(error => console.error('exact: Markdown editor:', error));
 }
-// LLP 1048.003 D4: `<html data-scrolldocument>` while an element is the page's scroller, which the shell's rule reads (never a `:has()` over the tree).
-const scrollDocs = new Set(), markScrollDocument = (on = false) => { for (const el of scrollDocs) if (!el.isConnected) scrollDocs.delete(el); else on ||= el.getAttribute("data-scrolldocument") === "true"; document.documentElement.toggleAttribute("data-scrolldocument", on); };
+let liveTimeModule; const loadLiveTime = el => (liveTimeModule ??= moduleReady.then(() => loadAfterPaint('./live-time-glue.js', 'installLiveTime'))).then(install => { if (el.isConnected && !retiredViews.has(el)) install(el); }).catch(error => console.error('exact: live time:', error)); const loadDecorations = el => (decorationsModule ??= moduleReady.then(() => loadAfterPaint('./decorations.js', 'installDecorations'))).then(install => { if (el.isConnected && !retiredViews.has(el) && el.hasAttribute('data-decorations')) install(el, log); }).catch(error => console.error('exact: decorations:', error)); // a plain textarea's paint-only decorations (LLP 1114.007), after first paint; they follow their attributes and typing themselves
+// LLP 1048.003 D4: `<html data-scrolldocument>` while an element is the page's scroller, and `data-exact-frame` on its ancestors while it is the one, which the shell's rule reads (never a `:has()` over the tree), as host/web-js/document.js `markDocument`.
+let pagePath = []; const scrollDocs = new Set(), markScrollDocument = () => { const live = [...scrollDocs].filter(el => el.isConnected ? el.getAttribute("data-scrolldocument") === "true" : !scrollDocs.delete(el)), path = []; document.documentElement.toggleAttribute("data-scrolldocument", live.length > 0); for (let a = live.length === 1 ? live[0].parentElement : null; a && a.id !== "exact-root"; a = a.parentElement) path.push(a); for (const a of pagePath) if (!path.includes(a)) a.removeAttribute("data-exact-frame"); for (const a of path) if (!a.hasAttribute("data-exact-frame")) a.setAttribute("data-exact-frame", ""); pagePath = path; };
 function applyProps(el, set, clear) {
   syncMedia(el, set, clear); if (set && "data-scrolldocument" in set) scrollDocs.add(el);
   let sandboxChanged = false;
@@ -430,7 +432,7 @@ function applyProps(el, set, clear) {
     else if (name === "scrollTop" || name === "scrollLeft") {
       const pending = pendingScrolls.get(el); if (pending) delete pending[name];
     }
-    else if (name === "text") el.textContent = "";
+    else if (name === "text") { if (el.localName === "time") el.exactTimeText = null; if (el.localName === "time" && el.childElementCount) el.exactLiveTime?.text(null); else el.textContent = ""; }
     else if (name === "value") { el.exactValue = undefined; writeValue(el, ""); }
     else if (name === "checked") { el.exactChecked = undefined; el.checked = false; }
     else if (name === "data-action") { el.removeAttribute(name); el.style.touchAction = ""; }
@@ -445,9 +447,9 @@ function applyProps(el, set, clear) {
     else if (name === "scrollTop" || name === "scrollLeft") {
       const offset = Number(value);
       if (Number.isFinite(offset)) pendingScrolls.set(el, { ...pendingScrolls.get(el), [name]: offset });
-    } else if (name === "text") { if (el.childElementCount === 0 && el.textContent !== value) el.textContent = value;
-    } else if (name === "markupPieces") { renderMarkup(el, value);
-    } else if (name === "contextpopover") { el.setAttribute(name, value); if (!el.exactContext) { el.exactContext = true; el.addEventListener("contextmenu", e => { if (e.$cp || !el.getAttribute(name) || editMenu(e.target) || el.matches(":disabled") || el.closest("[inert]")) return; e.$cp = 1; e.preventDefault(); e.stopPropagation(); contextAt(e, () => { if (!el.isConnected || el.matches(":disabled") || el.closest("[inert]")) return; const p = document.getElementById(el.getAttribute(name) ?? ""); if (p && !p.matches(":popover-open")) return [p, el]; }); }); } // LLP 1021 §5.1: after the node's own `contextmenu`, the popover it names then opens anchored to it (rt.js `cp`)
+    } else if (name === "text") { if (el.localName === "time") el.exactTimeText = value; if (el.localName === "time" && el.childElementCount) el.exactLiveTime?.text(value); else if (el.childElementCount === 0 && el.textContent !== value) el.textContent = value;
+    } else if (name === "markupPieces") { renderMarkup(el, value); if (el.hasAttribute("data-atoms") && !globalThis.exact.atoms) loadAfterPaint("./atoms.js", "atoms").then(() => { if (el.isConnected) renderMarkup(el, value); }); // a text with atoms draws its pills once atoms.js is here (LLP 1045.000)
+    } else if (name === "contextpopover") { el.setAttribute(name, value); if (!el.exactContext) { el.exactContext = true; el.addEventListener("contextmenu", e => { if (e.$cp || !el.getAttribute(name) || editMenu(e.target) || el.matches(":disabled") || inertAncestor(el)) return; e.$cp = 1; e.preventDefault(); e.stopPropagation(); contextAt(e, () => { if (!el.isConnected || el.matches(":disabled") || inertAncestor(el)) return; const p = liveById(el.getAttribute(name) ?? ""); if (p && !p.matches(":popover-open")) return [p, el]; }); }); } // LLP 1021 §5.1: after the node's own `contextmenu`, the popover it names then opens anchored to it (rt.js `cp`)
     } else if (name === "data-action") { el.setAttribute(name, value); el.style.touchAction = "none";
     } else if (name === "value") {
       writeValue(el, value); if (valuedControl(el)) el.exactValue = value;
@@ -458,7 +460,7 @@ function applyProps(el, set, clear) {
     } else if (name === "autofocus") { el.exactAutofocus = value === "true"; if (!el.exactAutofocus) el.removeAttribute(name);
     } else if (name === "disabled" || name === "readonly" || name === "multiple" || (el instanceof HTMLMediaElement && ["autoplay","controls","loop","muted","playsinline","disablepictureinpicture","disableremoteplayback"].includes(name))) {
       if (value === "true") { el.setAttribute(name, ""); if (name === "disabled" && el === document.activeElement && el.matches(":disabled")) el.blur(); } else el.removeAttribute(name); // a focused control that is disabled loses the focus now, not at the browser's next frame (HTML focus fixup); a box keeps it, as `disabled` means nothing on a div
-    } else if (el instanceof HTMLIFrameElement && name === "src" && appFrameSource(el, value)) {
+    } else if (el instanceof HTMLIFrameElement && (name === "src" && appFrameSource(el, value) || /^(partition|appleAllowsBackForwardNavigationGestures|appleAllowsMagnification|appleInactiveSchedulingPolicy)$/i.test(name) && (el["$" + name] = value, true))) { // an iframe's partition and Apple words stay on the element, never DOM attributes (LLP 1020.002 Q4)
     } else {
       const app = (name === "src" || name === "poster") && (el[`exactApp-${name}`] = value.startsWith("app:/") ? value : null), v = app ? appSource(el, name, value) : name === "src" && !(el instanceof HTMLIFrameElement) && value.startsWith("data:") && value.length > DATA_LIMIT ? (log(`image refused: a data: source is over ${DATA_LIMIT} bytes`), "") : (name === "src" || name === "href" || name === "poster") ? localAssetURL(value) : value, same = el.getAttribute(name) === v; // setting what is there reloads an adopted iframe or video
       if (el instanceof HTMLIFrameElement && name === "src") { el.exactSource = value; if (!same) iframeLoading.set(el, true); } // kept: the sandbox decides a `data:` one
@@ -480,7 +482,7 @@ function applyProps(el, set, clear) {
   if (el instanceof HTMLIFrameElement) commitGuestOrigin(el);
   if ((set && "value" in set) || clear?.includes("value")) settleValue(el); syncMarkup(el); // a valued control shows its committed value when it changes, not another prop (LLP 1069.001 D4, amended)
   if ((set && ("viewportFit" in set || "interactiveWidget" in set)) || clear?.some((n) => n === "viewportFit" || n === "interactiveWidget")) syncViewportFit();
-  if (set && "data-exact-wakelock" in set && !wakeLock) holdWake();
+  if (set && "data-exact-wakelock" in set && !wakeLock) holdWake(); if (set && "data-exact-orientationlock" in set && !orientationLock) holdOrientation();
 }
 function ensureMessageListener() {
   if (messageListening) return;
@@ -514,12 +516,12 @@ function syncViewportFit() {
 }
 function attach(el, id, handlers) {
   el.dataset.view = String(id); el.exactHandlers = handlers; if (handlers.length) el.dataset.exactOn = handlers.join(" "); else delete el.dataset.exactOn;
-  el.exactFlowEvents = [...new Set(handlers.flatMap(k => ({ press: ["click"], hover: ["pointerenter", "pointerleave"], focus: ["focus"], blur: ["blur"], focusin: ["focusin"], focusout: ["focusout"], key: ["keydown"], keycapture: ["keydown"] }[k] ?? [])))];
+  el.exactFlowEvents = [...new Set(handlers.flatMap(k => ({ press: ["click"], hover: ["pointerenter", "pointerleave"], focus: ["focus"], blur: ["blur"], focusin: ["focusin"], focusout: ["focusout"], key: ["keydown"], keycapture: ["keydown"], keyup: ["keyup"] }[k] ?? [])))];
   if (el.exactMedia) el.exactMedia.handlers = handlers;
   if (handlers.includes("message")) messageViews.add(id);
-  const on = (event, handle, capture = false) => el.addEventListener(event, (e) => {
+  const on = (event, handle, capture = false) => { const heard = (e) => {
     if (((views.get(id) === el && !retiredViews.has(el)) || (event === "focusout" && focus.detached(el, e))) && (inputReady || event === "load" || event === "error" && el instanceof HTMLIFrameElement) && !(page?.restoringFocus && ["focus", "blur", "focusin", "focusout"].includes(event))) handle(e);
-  }, capture);
+  }; el.addEventListener(event, heard, capture); return heard; }, atBody = (kind, heard) => { (el.exactBody ??= {})[kind] = heard; bodyHeard ??= ["keydown", "keyup", "copy", "cut", "paste"].map(t => document.documentElement.addEventListener(t, e => { const h = root.firstElementChild?.exactBody; if (!h || (e.target !== document.body && e.target !== document.documentElement)) return; if (t === "keydown") { h.keycapture?.(e); h.key?.(e); } else h[t]?.(e); })); }; // with nothing focused a key or a clipboard event targets `<body>`, outside the app, where the DOM's `window` listeners hear it: the first root's handlers hear any event whose target is `<body>` or `<html>` (never a node a flow forwards a copy to, detached), on `<html>` as it bubbles, so after the shortcuts and before the document's defaults, its `keycapture` before its `key` (rt.js `atBody`)
   if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) { on("compositionstart", () => { clearTimeout(compositionFlush.get(el)); composing.add(el); });
     on("compositionend", () => { compositionFlush.set(el, setTimeout(() => { composing.delete(el); if (views.get(id) !== el || retiredViews.has(el)) return; if (heldValues.has(el)) writeValue(el, heldValues.get(el)); markupPending.delete(el); syncMarkup(el); }, 0)); }); }
   if (el.localName === "img" && (handlers.includes("load") || handlers.includes("error"))) imageEvents(el, failure => { // kind 8, or a media `error` (kind 19) with its message
@@ -530,7 +532,7 @@ function attach(el, id, handlers) {
     if (!iframeLoading.has(el)) iframeLoading.set(el, true);
     const arrived = failure => { iframeLoading.set(el, false); const source = el.exactAppFrame, go = () => { if (views.get(id) === el && !retiredViews.has(el) && el.exactAppFrame === source && handlers.includes(failure == null ? "load" : "error")) send(failure == null ? wasm.exact_dispatch(id, 8, 0, now()) : wasm.exact_dispatch(id, 19, writeIn("error\n" + failure), now())); }; if (inputReady) go(); else moduleReady.then(() => inputReady && go()); };
     on("error", ev => arrived(ev.detail ?? "iframe did not load"));
-    on("load", () => { if (el.exactAppFrame && !el.exactAppFrame.url) return; arrived(null); });
+    on("load", () => { if (el.exactAppFrame && !el.exactAppFrame.url) return; arrived(null); }); if (handlers.includes("capture")) on("exactcapture", ev => { if (views.get(id) === el && !retiredViews.has(el)) send(wasm.exact_dispatch(id, 58, writeIn("capture\n" + JSON.stringify(ev.detail)), now())); }); /* a capture's refusal (LLP 1020.002 D7) */ if (handlers.some(h => /^(navigate|currententrychange|navigatesuccess|navigateerror)$/.test(h))) frameNav().then(m => m.watch(el, (name, r) => { const go = () => { if (views.get(id) === el && !retiredViews.has(el) && handlers.includes(name)) send(wasm.exact_dispatch(id, 58, writeIn(name + "\n" + JSON.stringify(r)), now())); }; if (inputReady) go(); else moduleReady.then(() => inputReady && go()); })); // a same-origin guest's navigation records, kind 58 (frame-navigation.js)
     if (handlers.includes("message")) {
       messageFrames.add(el);
       ensureMessageListener();
@@ -543,7 +545,7 @@ function attach(el, id, handlers) {
     if (kind === "press") {
       // A link inside a pressable node is the innermost activation, as a
       // nested press is: the link navigates and the outer press stays out.
-      on("click", e => { const a = e.target.closest?.("a[href]"); if (a && a !== el && el.contains(a)) return; focus.press(e, el, () => send(wasm.exact_dispatch(id, 0, writeIn((e.shiftKey ? "Shift+" : "") + (e.ctrlKey ? "Control+" : "") + (e.altKey ? "Alt+" : "") + (e.metaKey ? "Meta+" : "")), now()))); }); // the modifiers held, `Event::press` (gallery F20)
+      on("click", e => { const a = e.target.closest?.("a[href]"); if (a && a !== el && el.contains(a)) return; for (let n = e.target; n && n !== el.parentNode; n = n.parentNode) if (n.nodeType === 1 && n.hasAttribute("disabled")) { e.stopPropagation(); return; } focus.press(e, el, () => send(wasm.exact_dispatch(id, 0, writeIn(`${e.clientX},${e.clientY},` + (e.shiftKey ? "Shift+" : "") + (e.ctrlKey ? "Control+" : "") + (e.altKey ? "Alt+" : "") + (e.metaKey ? "Meta+" : "")), now()))); }); // where the pointer was (0, 0 from a key) and the modifiers held, `Event::press` (gallery F20; LLP 1021 D2)
     } else if (kind === "pan") {
       let pan;
       on("pointerdown", e => (pan ??= inputHandlers?.pan(el, id, on))?.(e));
@@ -554,19 +556,19 @@ function attach(el, id, handlers) {
       motion.attachSwipe(el, id, on);
     } else if (kind === "heightrelease") {
       motion.attachHeightDrag(el, id, on);
-    } else if (kind === "transformrelease") { motion.attachTransformDrag(el,id,on); } else if (kind === "resize") { (resizes ??= loadAfterPaint('./resize-glue.js', 'observeResize')).then(observe => observe(el, r => { if (views.get(id) === el && !retiredViews.has(el)) send(wasm.exact_dispatch(id, 39, writeIn(`${r.x},${r.y},${r.width},${r.height}`), now())); })); // ResizeObserver's contentRect, host kind 39
-    } else if (kind === "intersect") {
-      (intersects ??= loadAfterPaint('./intersect-glue.js', 'observeIntersect')).then(observe => { if (views.get(id) === el && !retiredViews.has(el)) el.exactIntersect = observe(el, r => { if (views.get(id) === el && !retiredViews.has(el)) send(wasm.exact_dispatch(id, 45, writeIn(`${Number(r.isIntersecting)},${r.intersectionRatio}`), now())); }); });
+    } else if (kind === "transformrelease") { motion.attachTransformDrag(el,id,on); } else if (kind === "resize") { let landed; const first = new Promise(r => { landed = r; }); mediaAttaching.add(first); sizes.add(first); first.finally(() => { mediaAttaching.delete(first); sizes.delete(first); }); el.exactResize = landed; (resizes ??= Promise.all([loadAfterPaint('./resize-glue.js', 'observeResize'), geometryLoading?.catch(() => {})]).then(([o]) => o)).then(observe => { observe(el, r => { try { if (views.get(id) === el && !retiredViews.has(el)) send(wasm.exact_dispatch(id, 39, writeIn(`${r.x},${r.y},${r.width},${r.height}`), now())); } finally { landed(); } }); if (!el.isConnected || !el.getClientRects().length) landed(); else { const bound = setTimeout(landed, globalThis.__exactFirstSizeBound ?? 2000); first.then(() => clearTimeout(bound)); } }).catch(e => { log(`resize: ${e.message}`); landed(); }); // ResizeObserver's contentRect, host kind 39. A settle waits for the first report (no box: none; no size: 2 s at most; `__exactFirstSizeBound` a test's), held beside the media's attaches, not in `inflight`, which a module replacement drains before `moduleReady`, and in `sizes`, which a clock's due timers wait for as for requests. The first report waits for the geometry its action's `frame()` reads (host/web-js/observers.js's twin)
+    } else if (kind === "intersect") { let landed; const first = new Promise(r => { landed = r; }); mediaAttaching.add(first); sizes.add(first); first.finally(() => { mediaAttaching.delete(first); sizes.delete(first); }); el.exactIntersect = landed; // (a view retired before it is observed lets go at once)
+      (intersects ??= loadAfterPaint('./intersect-glue.js', 'observeIntersect')).then(observe => { if (views.get(id) !== el || retiredViews.has(el)) { landed(); return; } const stop = observe(el, r => { try { if (views.get(id) === el && !retiredViews.has(el)) send(wasm.exact_dispatch(id, 45, writeIn(`${Number(r.isIntersecting)},${r.intersectionRatio}`), now())); } finally { landed(); } }); el.exactIntersect = () => { stop(); landed(); }; const bound = setTimeout(landed, globalThis.__exactFirstSizeBound ?? 2000); first.then(() => clearTimeout(bound)); }).catch(e => { log(`intersect: ${e.message}`); landed(); }); // The first entry (one always comes) held as a first size is, above: a settle reads the state it made, 2 s at most (host/web-js/observers.js's twin)
     } else if ((kind === "pointerdown" || kind === "pointerup" || kind === "pointermove") && !el.exactPointer) { let p; el.exactPointer = true; const own = () => p ??= inputHandlers?.pointer(el, on, (k, r, e) => { if (views.get(id) !== el || retiredViews.has(el)) return; const outer = [pointerEvent, pointerDepth]; pointerEvent = k === 31 ? null : e; pointerDepth = sending + 1; try { send(wasm.exact_dispatch(id, k, writeIn(r), now())); } finally { [pointerEvent, pointerDepth] = outer; } }); el.exactPointerDown = (e, hold) => own()?.(e, hold); on("pointerover", () => own()); // @ref LLP 1005 §3, LLP 1056 §3: DOM's own pointer down/up/move (input-glue `pointer`, whose root listener calls `exactPointerDown`)
-    } else if (kind === "toggle") { on(kind, e => send(wasm.exact_dispatch(id, 50, writeIn(`${e.oldState},${e.newState}`), now())));
-    } else if (kind === "beforeinput" || (kind === "selectionchange" && textField(el))) { controlEvent(el, kind, on, (k, text, e) => { const outer = keyEvent; keyEvent = e; try { send(wasm.exact_dispatch(id, k, writeIn(text), now())); } finally { keyEvent = outer; } });
+    } else if (kind === "toggle") { on(kind, e => send(wasm.exact_dispatch(id, 50, writeIn(`${e.oldState},${e.newState}`), now()))); } else if (kind === "atompress") { on(kind, e => { const [k, source, href, start, end, ...held] = e.detail; send(wasm.exact_dispatch(id, 59, writeIn(`${start},${end},${["Shift+", "Control+", "Alt+", "Meta+"].filter((_, i) => held[i]).join("")}\n${k}\n${href}\n${source}`), now())); }); // a press on an inline atom (LLP 1045.000 D7), host kind 59
+    } else if (kind === "beforeinput" || (kind === "selectionchange" && sourceField(el))) { controlEvent(el, kind, on, (k, text, e) => { const outer = keyEvent; keyEvent = e; try { send(wasm.exact_dispatch(id, k, writeIn(text), now())); } finally { keyEvent = outer; } });
     } else if (kind === "selectionchange") { // its part of the page's selection (navigation.js `onSelection`): kind 35, offsets, rectangle count and coordinates, then text
-      onSelection(el, (text, a, b, rects) => { if (views.get(id) === el && !retiredViews.has(el)) send(wasm.exact_dispatch(id, 35, writeIn([a, b, rects.length, ...rects.flatMap(r => r.slice(0, 4)), text].join(",")), now())); });
-    } else if (kind === "copy" || kind === "cut" || kind === "paste") { // the clipboard's events at the focused node, the nearest handler's (spreadsheet F4); a field's own paste proceeds
-      on(kind, e => { e.stopPropagation(); const outer = keyEvent; keyEvent = e; try { send(wasm.exact_dispatch(id, 32 + ["copy", "cut", "paste"].indexOf(kind), writeIn(e.clipboardData?.getData("text/plain") ?? ""), now())); } finally { keyEvent = outer; } }); // preventDefault() cancels the default (a field's own paste; #125)
-    } else if (["contextmenu", "dblclick", "wheel", "drop", "beforeunload"].includes(kind)) { // with their records (input-glue `mouse`; studio diary R22, R3, R19, R17); a running wheel or beforeunload is the event its `preventDefault()` prevents
+      el.exactSelection = onSelection(el, (text, a, b, rects) => { if (views.get(id) === el && !retiredViews.has(el)) send(wasm.exact_dispatch(id, 35, writeIn([a, b, rects.length, ...rects.flatMap(r => r.slice(0, 4)), text].join(",")), now())); });
+    } else if (kind === "copy" || kind === "cut" || kind === "paste") { // the clipboard's events at the focused node, the nearest handler's (spreadsheet F4); a field's own paste proceeds; a paste's files are minted `doc:` handles at once (57: their count, a line each, then the text; documents-glue.js `pasted`), the driver's standing in under the agent
+      if (kind === "paste") documentsGlue(); atBody(kind, on(kind, e => { e.stopPropagation(); const outer = keyEvent; keyEvent = e; try { const text = e.clipboardData?.getData("text/plain") ?? "", driver = agentMode ? globalThis.exact.agentPaste : null; globalThis.exact.agentPaste = null; const files = kind === "paste" && (e.clipboardData?.files?.length || driver) ? globalThis.exact.documents?.pasted(e.clipboardData, driver) ?? [] : []; send(wasm.exact_dispatch(id, files.length ? 57 : 32 + ["copy", "cut", "paste"].indexOf(kind), writeIn(files.length ? `${files.length}\n${files.join("\n")}\n${text}` : text), now())); } finally { keyEvent = outer; } })); // preventDefault() cancels the default (a field's own paste; #125)
+    } else if (["contextmenu", "dblclick", "wheel", "drop", "beforeunload", "dragenter", "dragleave"].includes(kind)) { // with their records (input-glue `mouse`; studio diary R22, R3, R19, R17); a running wheel or beforeunload is the event its `preventDefault()` prevents
       const go = (k, e) => inputHandlers?.mouse(el, k, e, (n, line) => { if (views.get(id) !== el || retiredViews.has(el)) return; const outer = keyEvent; keyEvent = e; try { send(wasm.exact_dispatch(id, n, writeIn(line), now())); } finally { keyEvent = outer; } });
-      if (kind === "beforeunload") addEventListener(kind, e => go(kind, e)); else on(kind, e => go(kind, e));
+      if (kind === "beforeunload") addEventListener(kind, e => go(kind, e)); else if (kind === "dragenter" || kind === "dragleave") documentsGlue().then(() => globalThis.exact.documents.hearDrags(el, kind, () => !el.matches(":disabled") && !inertAncestor(el), e => go(kind, e))); else on(kind, e => go(kind, e));
       if (kind === "drop") on("dragover", e => go("dragover", e));
     } else if ((kind === "change" || kind === "cancel") && el.type === "file") { // a picker's files, or its dismissal (LLP 1069.002 D2, D3)
       on(kind, () => { const p = picker().then(m => kind === "change" ? m.change(el, id) : m.cancel(id)); inflight.add(p); p.finally(() => inflight.delete(p)); });
@@ -582,12 +584,12 @@ function attach(el, id, handlers) {
       on(kind, () => { const dispatch = () => send(wasm.exact_dispatch(id, kind === "focus" ? 4 : 5, 0, now())); kind === "blur" ? focus.blur(el, dispatch) : dispatch(); });
     } else if (kind === "key" || kind === "keycapture" || kind === "keyup") {
       // `keycapture` (kind 44) hears keydown outermost first; `key` (6) and `keyup` (43) bubble with the web's key name (`e.key`).
-      on(kind === "keyup" ? "keyup" : "keydown", (e) => { if (e.exactStopped) return; const outer = keyEvent; keyEvent = e; try { const n = writeIn(keyChord(e)); send(wasm.exact_dispatch(id, kind === "keycapture" ? 44 : kind === "key" ? 6 : 43, n, now())); } finally { keyEvent = outer; } }, kind === "keycapture");
+      atBody(kind, on(kind === "keyup" ? "keyup" : "keydown", (e) => { if (e.exactStopped || kind === "keycapture" && e.exactFlowCapture && !e.exactFlowCapture.includes(el)) return; const outer = keyEvent; keyEvent = e; try { const n = writeIn(keyChord(e)); send(wasm.exact_dispatch(id, kind === "keycapture" ? 44 : kind === "key" ? 6 : 43, n, now())); } finally { keyEvent = outer; } }, kind === "keycapture"));
     }
     if (kind === "submit" && el.tagName !== "TEXTAREA" && !el.exactMarkup) {
       // The web's implicit submission: Enter in a text input submits — here
       // to the node's `submit` handler, no form needed (and no reload). It is Enter's default: after every `key` handler on the path (the window's listener is last), unless one prevented it.
-      on("keydown", (e) => { if (e.key === "Enter" && !e.isComposing && !e.exactSubmit) { e.exactSubmit = true; addEventListener("keydown", w => { if (w !== e || e.defaultPrevented) return; const run = () => { if (run.done) return; run.done = true; el.removeEventListener("keydown", run, true); el.removeEventListener("beforeinput", run, true); if (views.get(id) === el) send(wasm.exact_dispatch(id, 7, 0, now())); }; el.addEventListener("keydown", run, true); if (e.target.localName !== "textarea" && !e.target.isContentEditable) el.addEventListener("beforeinput", run, true); setTimeout(run); }, { once: true }); } }); // after the browser's own default, HTML's `change` on Enter (gallery F26); the field's next key or edit runs it first, before the edit applies (not an edit an Enter from a textarea or editor makes), as the JS target's (rt.js)
+      on("keydown", (e) => { if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229 && !e.exactSubmit) { e.exactSubmit = true; addEventListener("keydown", w => { if (w !== e || e.defaultPrevented) return; const run = () => { if (run.done) return; run.done = true; el.removeEventListener("keydown", run, true); el.removeEventListener("beforeinput", run, true); if (views.get(id) === el) send(wasm.exact_dispatch(id, 7, 0, now())); }; el.addEventListener("keydown", run, true); if (e.target.localName !== "textarea" && !e.target.isContentEditable) el.addEventListener("beforeinput", run, true); setTimeout(run); }, { once: true }); } }); // after the browser's own default, HTML's `change` on Enter (gallery F26); the field's next key or edit runs it first, before the edit applies (not an edit an Enter from a textarea or editor makes), as the JS target's (rt.js)
     }
   }
 }
@@ -599,7 +601,7 @@ function viewFor(op, id) {
 function apply(batch) {
   // Retire before teardown blur. Keep removed descendants attached to their removed parent for the outgoing focusout; presence reads leaving boxes before any op (LLP 1063).
   for (const op of batch.ops ?? []) {
-    if (op.op === "destroy") { const el = views.get(op.id); if (el) { retiredViews.add(el); el.exactAppFrame?.dispose(); el.exactIntersect?.(); } }
+    if (op.op === "destroy") { const el = views.get(op.id); if (el) { retiredViews.add(el); el.exactSelection?.(); el.exactAppFrame?.dispose(); el.exactIntersect?.(); el.exactResize?.(); } }
   }
   presence.live?.before(batch, views);
   listSelection?.before();
@@ -612,11 +614,11 @@ function apply(batch) {
     try {
       switch (op.op) {
       case "textflow": break; // consumed once after the complete DOM batch
-      case "keyframes": motion.keyframes(op.name, op.css); break; case "theme": (document.getElementById("exact-theme") ?? document.head.appendChild(Object.assign(document.createElement("style"), { id: "exact-theme" }))).textContent = op.css; break; // LLP 1055 D7: the page's @keyframes; LLP 1095 D4: the theme's :root rule
+      case "keyframes": motion.keyframes(op.name, op.css); break; case "looks": { const sheet = document.getElementById("exact-looks") ?? document.head.appendChild(Object.assign(document.createElement("style"), { id: "exact-looks" })), rules = sheet.exactRules ??= new Map(); if (op.css) rules.set(op.id, op.css); else rules.delete(op.id); if (!sheet.exactFlush) queueMicrotask(sheet.exactFlush = () => { sheet.exactFlush = null; sheet.textContent = [...rules.values()].join(""); }); break; } case "theme": (document.getElementById("exact-theme") ?? document.head.appendChild(Object.assign(document.createElement("style"), { id: "exact-theme" }))).textContent = op.css; break; // LLP 1055 D7: the page's @keyframes; LLP 1121 D8: a view's state looks (src/host/looks.rs); LLP 1095 D4: the theme's :root rule
       case "language": if (op.lang) document.documentElement.lang = op.lang; document.documentElement.dir = op.dir; break; // a plan with no strings table names no language: the page keeps the manifest's (LLP 1115.000 D4.6) // a plan with no strings table names no language: the page keeps the manifest's (LLP 1115.000 D4.6)
       case "head": pageTitle(op.title ?? null); (headGlue ??= loadAfterPaint('./document-glue.js', 'documentHead')).then(head => head(op)); break; // the title at once: the head's, else the route's (LLP 1115.000 D4.1)
-      case "router": navigation.apply(op); break;
-      case "sound": if (!agentMode) (soundModule ??= new Promise(r => requestAnimationFrame(r)).then(() => loadAfterPaint('./sound-glue.js', 'installSound')).then(install => install({ files: op.files ?? [], log, origin: () => t0 }))).then(s => { soundOut = s; if (op.files && op.files !== s.files) s.reset(op.files); s.ops(op.ops); }).catch(console.error); break; // LLP 1096 D7: the voice table's ops, after first paint; never under the agent, whose clock is virtual (D10) case "midi": if (!agentMode) (midiModule ??= new Promise(r => requestAnimationFrame(r)).then(() => loadAfterPaint('./midi-glue.js', 'installMidi')).then(install => install({ log, origin: () => t0, deliver: m => { if (wasm?.exact_midi) applyBatch(JSON.parse(readOut(wasm.exact_midi(writeIn(JSON.stringify(m)))))); } }))).then(m => { midiOut = m; m.ops(op.ops, op.boot); }).catch(console.error); break; // LLP 1125 D7: the MIDI queue's ops and the ports, after first paint; never under the agent, whose runner answers a request itself
+      case "router": navigation.apply(op); if (op.scroll) { op.since = navigation.personScrolls; (fragmentGlue ??= loadAfterPaint('./fragment.js', 'fragment')).then(f => f.arm(root, op, navigation)); } break; // a scroll to the visit's fragment, made at the runner's `scrollToFragment` once its content has arrived, which a scroll by the person since cancels (LLP 1153 D5)
+      case "sound": if (!agentMode) (soundModule ??= new Promise(r => requestAnimationFrame(r)).then(() => loadAfterPaint('./sound-glue.js', 'installSound')).then(install => install({ files: op.files ?? [], log, origin: () => t0 }))).then(s => { soundOut = s; if (op.files && op.files !== s.files) s.reset(op.files); s.ops(op.ops); }).catch(console.error); break; case "midi": if (!agentMode) (midiModule ??= new Promise(r => requestAnimationFrame(r)).then(() => loadAfterPaint('./midi-glue.js', 'installMidi')).then(install => install({ log, origin: () => t0, deliver: m => { if (wasm?.exact_midi) applyBatch(JSON.parse(readOut(wasm.exact_midi(writeIn(JSON.stringify(m)))))); } }))).then(m => { midiOut = m; m.ops(op.ops, op.boot); }).catch(console.error); break; // LLP 1096 D7: the voice table's ops, after first paint; never under the agent, whose clock is virtual (D10); LLP 1125 D7: the MIDI queue's ops and the ports, after first paint; never under the agent, whose runner answers a request itself
       case "create": {
         // Canvas overlays use a div; data-surface is the host-owned drawing leaf.
         const el = page?.adopting?.get(op.id) ?? (op.ns ? document.createElementNS(op.ns, op.tag) : document.createElement(op.tag === "canvas" ? "div" : op.tag)); // an adopted document's element (LLP 1048.000 D6); SVG in its namespace (LLP 1055 D4)
@@ -627,7 +629,7 @@ function apply(batch) {
           el.append(surface);
         }
         applyProps(el, op.props, []);
-        const css = op.css + (el.hasAttribute("data-action") ? ";touch-action:none" : ""); if ((el.getAttribute("style") ?? "") !== css) el.style.cssText = css; noteFit(css); // an adopted element's is already there; a fitted text's scale follows each batch (LLP 1116.001 D1.4)
+        const css = op.css + (el.hasAttribute("data-action") ? ";touch-action:none" : ""); if ((el.getAttribute("style") ?? "") !== css) el.style.cssText = css; noteFit(css); if (el.hasAttribute("data-time-reservation")) loadLiveTime(el); // an adopted element's is already there; a fitted text's scale follows each batch (LLP 1116.001 D1.4)
         attach(el, op.id, op.handlers);
         views.set(op.id, el); if (op.tag.includes("-") && !op.ns && !el.exactNative) nativeCreate(el, op.id);
         listView(el, op.id, collectionOp?.items.some(item => item.view === op.id));
@@ -635,7 +637,7 @@ function apply(batch) {
       }
       case "props": {
         const el = viewFor("props", op.id);
-        if (el) applyProps(el, op.set, op.clear);
+        if (el) { applyProps(el, op.set, op.clear); if (op.set?.role !== undefined || op.clear?.includes("role")) syncListItemRoles(el); else if ((op.set?.popover !== undefined || op.clear?.includes("popover")) && el.parentElement?.hasAttribute("data-exact-list-item")) listItem(el); if (el.hasAttribute("data-time-reservation") || el.exactLiveTime) loadLiveTime(el); }
         break;
       }
       case "style": {
@@ -649,7 +651,7 @@ function apply(batch) {
         const want = [];
         for (const id of op.ids) {
           const child = viewFor("children", id);
-          if (child) want.push(child);
+          if (child) want.push(el.hasAttribute("data-exact-list") && !lists.has(el) ? listItem(child, el) : child);
         }
         // Reorder in place: keyed rows keep their elements (and their state).
         // A canvas's surface element is skipped: not a child, never removed.
@@ -670,7 +672,7 @@ function apply(batch) {
       case "reorder-drag": { arrange.binding(op); break; }
       case "reorder-state": { arrange.state(op); break; } case "reorder-group": { arrange.group(op); break; }
       case "canvas2d": { pieces.canvas2d(op); break; } // LLP 1056 D7
-      case "surface": {
+      case "surface": { const surfaceView = views.get(op.id); if (surfaceView) surfaceView.exactSurfaceName = op.name;
         // A canvas's inputs (LLP 1009 D2): to the GPU module when it is
         // loaded, queued until then. The module itself is fetched only
         // after a rendering opportunity, and only when a canvas exists.
@@ -679,7 +681,7 @@ function apply(batch) {
           const pending = (globalThis.exact.pendingSurfaces ??= []);
           const queued = pending.find((entry) => entry.id === op.id && entry.generation === incarnation);
           if (queued) { queued.name = op.name; queued.values = op.values; }
-          else { pending.push({ id: op.id, name: op.name, values: op.values, generation: incarnation }); requestAnimationFrame(() => requestAnimationFrame(loadGpuIfNeeded)); }
+          else { pending.push({ id: op.id, name: op.name, values: op.values, generation: incarnation }); afterPaint(loadGpuIfNeeded, agentMode); }
         }
         break;
       }
@@ -688,7 +690,7 @@ function apply(batch) {
         // A secret the app kept or forgot (LLP 1018 D6): `localStorage`, origin-scoped, is the web's secret store; a persisted
         // state (LLP 1116 D5) is kept under its own name, as persist.js keeps it. A nameless agent drive
         // starts from nothing; a named `--storage` keeps this origin's keys.
-        if (agentKeepsStore) storeInPage(localStorage, op.name, op.value);
+        if (agentKeepsStore) { if (op.durable) pendingStore.discard(op.name); else pendingStore.set(op.name, op.value); }
         break;
       }
       case "storage": {
@@ -709,10 +711,10 @@ function apply(batch) {
         track(p,op.ticket);break;
       }
       case "refuse": { deferFulfill(...refusal(op, incarnation)); break; }
+      case "abort": { const c = byTicket.get(op.ticket); byTicket.delete(op.ticket); forgettable.delete(c); c?.abort(); break; } // the app aborted it: cancelled whatever its method, as a browser's fetch is
       case "continue": {
         const requestIncarnation = incarnation;
-        const p = Promise.resolve().then(() => moduleLoader.run(op.token))
-          .then(result => safelyFulfill(requestIncarnation, op.ticket, 0, 200, "", encoder.encode(JSON.stringify(result))))
+        const p = Promise.resolve().then(() => moduleLoader.run(op.token, result => safelyFulfill(requestIncarnation, op.ticket, 0, 200, "", encoder.encode(JSON.stringify(result)))))
           .catch(error => safelyFulfill(requestIncarnation, op.ticket, 3, 0, "", encoder.encode(String(error))));
         track(p, op.ticket);
         break;
@@ -742,18 +744,19 @@ function apply(batch) {
         const requestIncarnation = incarnation, controller = new AbortController(), started = performance.now();
         let p, first, messages = 0; const opened = new Promise(r => { first = r; });
         const host = {
-          grantSet, loadPageNative, moduleLoader, localAssetURL, controllers, controller, bodyFile: (path, grants) => (globalThis.exact.requestBody ? Promise.resolve(globalThis.exact.requestBody) : loadAfterPaint('./storage-request.js', 'requestBody')).then(read => read(globalThis.exact.compat.inputs.app, grants, path)), // `exactBodyFrom` (LLP 1108 D6 R2): the page's store
+          grantSet, loadPageNative, moduleLoader, localAssetURL, controllers, controller, bodyFile: pageFile('requestBody'), bodyTarget: pageFile('bodyTarget'), // `exactBodyFrom` and `exactBodyTo` (LLP 1108 D6 R2): the page's store
           active: () => requestIncarnation === incarnation,
           // A stream's message (LLP 1016.000): after its first, the stream is open, not in flight, so `clock settle`
-          // stops waiting on it (D5) — what is counted ends there, so a wait already racing it wakes (LLP 1069.004).
+          // stops waiting on it (D5), an upload only at its reply — what is counted ends there, so a wait already racing it wakes (LLP 1069.004).
           message: (m) => { if (messages++ === 0) first(); safelyFulfill(requestIncarnation, op.ticket, 8, 0, `event: ${m.event}\nid: ${m.id}\ncoalesced: ${m.coalesced}`, encoder.encode(m.data)); },
         };
-        controllers.add(controller);
-        if (op.url !== "exact-native:" && /^(GET|HEAD)$/i.test(op.method)) forgettable.set(controller, op.ticket);
+        controllers.add(controller); if (op.longPoll) controller.replied = () => { first(); if (!heldAsks.has(op.ticket)) { const entry = { target: op.target, owner: requestIncarnation }; heldAsks.set(op.ticket, entry); p.finally(() => { if (heldAsks.get(op.ticket) === entry) heldAsks.delete(op.ticket); }); } }; // a long poll's reply of any kind (LLP 1016.000 D8 on D9): out of the clocks' count, held and named
+        if (op.url !== "exact-native:" && (/^(GET|HEAD)$/i.test(op.method) || op.upload)) forgettable.set(controller, op.ticket); // an upload let go is aborted, as natively (LLP 1016.000 D10)
+        if (op.url !== "exact-native:") byTicket.set(op.ticket, controller);
         p = httpHelpers().then(({ request }) => request(op, host))
           .then(r => safelyFulfill(requestIncarnation, op.ticket, r.kind, r.status, r.headers, r.body, performance.now() - started))
           .catch(error => safelyFulfill(requestIncarnation, op.ticket, 1, 0, "", encoder.encode(String(error)), performance.now() - started));
-        const counted = Promise.race([p, opened]); if (!/^(GET|HEAD)$/i.test(op.method) && /^https?:/i.test(op.url)) counted.write = `${op.method} ${op.url}`; track(counted, op.ticket); p.finally(() => { forgettable.delete(controller); controllers.delete(controller); });
+        if (op.held) { const entry = { target: op.target, owner: requestIncarnation }; heldAsks.set(op.ticket, entry); p.finally(() => { if (heldAsks.get(op.ticket) === entry) heldAsks.delete(op.ticket); }); } else { const counted = op.upload ? p : Promise.race([p, opened]); if (!/^(GET|HEAD)$/i.test(op.method) && /^https?:/i.test(op.url)) counted.write = `${op.method} ${op.url}`; track(counted, op.ticket); } p.finally(() => { forgettable.delete(controller); controllers.delete(controller); if (byTicket.get(op.ticket) === controller) byTicket.delete(op.ticket); }); // a reply the server holds (`exactHeld`, LLP 1016.000 D9) is in flight, but no clock waits on it: listed, not tracked
         break;
       }
       case "command": { if (op.name === "relaunch") { location.reload(); break; }
@@ -763,15 +766,13 @@ function apply(batch) {
         // rule its scheme, the system's beneath the app's (LLP 1122 D4).
         // `light`/`dark` are the property's own values.
         if (op.name === "setScheme") { const s = String(op.args[0] ?? ""); document.documentElement.style.colorScheme = s === "system" ? "" : s; } else if (op.name === "haptic") navigator.vibrate?.(op.args?.[0] === "selection" ? 5 : 12); else if (op.name === "setRootFontSize") appRootFontSize(op.args?.[0], log); // LLP 1077 D14; LLP 1069.000 D3: the runner laid out at the size, the document's root takes it
-        else if (op.name === "focus" || op.name === "selectText" || op.name === "removeAllRanges" || op.name === "setSelectionRange" || op.name === "setRangeText" || op.name === "blur" || op.name === "scrollIntoView") focusCommands.push({ name: op.name, args: op.args }); // an element's scrollIntoView (a list row's is the runner's)
+        else if (op.name === "scrollToFragment") { const turn = fragmentTurn, [visit, fragment = "", activation] = op.args ?? []; (fragmentGlue ??= loadAfterPaint('./fragment.js', 'fragment')).then(f => { if (turn === fragmentTurn && f.shows(visit, fragment)) f.scroll(root, visit, fragment, log, activation); }); } /* only while its visit still shows that fragment, and no scrollIntoView of the app's came since (LLP 1153 D5) */ else if (op.name === "focus" || op.name === "selectText" || op.name === "removeAllRanges" || op.name === "setSelectionRange" || op.name === "setRangeText" || op.name === "blur" || op.name === "scrollIntoView") { focusCommands.push({ name: op.name, args: op.args }); if (op.name === "scrollIntoView") { fragmentTurn++; globalThis.exact?.fragment?.cancel(); } } // an element's scrollIntoView (a list row's is the runner's), which a fragment's scroll held or yet to come gives way to
         else if (["showPopover", "hidePopover", "togglePopover"].includes(op.name)) focusCommands.push({ name: op.name, args: op.args });
-        else if (op.name === "preventDefault") { keyEvent?.preventDefault(); if (keyEvent?.type === "beforeunload") keyEvent.returnValue = ""; } else if (op.name === "close" && op.args?.[0] == null) window.close(); /* studio diary R17 */ else if (op.name === "showModal" || op.name === "close") { const id = op.args?.[0], el = [...views.values()].find(el => el.id === id), close = op.name === "close"; if (el instanceof HTMLDialogElement) { if (close) el.close(); else if (!el.open) el.showModal(); else log(`showModal "${id}" ignored: dialog is already open`); } else if (el?.popover != null && el.getAttribute("role") === "alertdialog") { if (close) el.hidePopover(); else if (!el.matches(":popover-open")) el.showPopover(); } else if (!close) log(`showModal "${id}" refused: no dialog or alertdialog popover has that id`); } // `showModal(id)`, `close(id)` from an action: the dialog's own, or an alertdialog popover's (LLP 1101.001 P5, LLP 1115 D6), as host/web-js/commands.js `modal`
-        else if (op.name === "stopPropagation") { const e = keyEvent ?? (sending === pointerDepth ? pointerEvent : null); if (e) e.exactStopped = true; /* no ancestor's handler hears this event (a key, focus, the pointer's down or up, a wheel); its default still happens */ } else if (op.name === "requestFullscreen") { const el = [...views.values()].find(el => el.id === op.args?.[0] && el.exactMedia); if (!el) log(`requestFullscreen: refused: no video with id "${op.args?.[0]}"`); else el.requestFullscreen().catch(e => log(`requestFullscreen: refused: ${e.name}`)); } // HTML's Element.requestFullscreen(); the element reports `fullscreenchange`
-        else if (op.name === "postMessage") { // the inverse of `message=`: text into the named surface, every one in order
-          const text = String(op.args?.[0] ?? ""), name = String(op.args?.[1] ?? ""), at = now();
-          if (globalThis.exact.gpu) globalThis.exact.gpu.post(name, text, at);
-          else if ((globalThis.exact.pendingPosts ??= []).filter(p => p.name === name).length >= POST_BOUND) log(`postMessage: dropped: ${POST_BOUND} posts already wait for surface "${name}"`);
-          else globalThis.exact.pendingPosts.push({ name, text, at, generation: incarnation });
+        else if (op.name === "preventDefault") { keyEvent?.preventDefault(); if (keyEvent?.type === "beforeunload") keyEvent.returnValue = ""; if (!keyEvent && sending === pointerDepth && pointerEvent?.type === "pointerdown") pointerEvent.preventDefault(); /* a pointerdown action's: the browser keeps the focus, places no caret, starts no selection; the click still fires (LLP 1005 §3) */ } else if (op.name === "close" && op.args?.[0] == null) window.close(); /* studio diary R17 */ else if (op.name === "showModal" || op.name === "close") { const id = op.args?.[0], el = [...views.values()].find(el => el.id === id), close = op.name === "close"; if (el instanceof HTMLDialogElement) { if (close) el.close(); else if (!el.open) el.showModal(); else log(`showModal "${id}" ignored: dialog is already open`); } else if (el?.popover != null && el.getAttribute("role") === "alertdialog") { if (close) el.hidePopover(); else if (!el.matches(":popover-open")) el.showPopover(); } else if (!close) log(`showModal "${id}" refused: no dialog or alertdialog popover has that id`); } // `showModal(id)`, `close(id)` from an action: the dialog's own, or an alertdialog popover's (LLP 1101.001 P5, LLP 1115 D6), as host/web-js/commands.js `modal`
+        else if (op.name === "stopPropagation") { const e = keyEvent ?? (sending === pointerDepth ? pointerEvent : null); if (e) e.exactStopped = true; /* no ancestor's handler hears this event (a key, focus, the pointer's down or up, a wheel); its default still happens */ } else if (op.name === "requestPictureInPicture" || op.name === "exitPictureInPicture") { const why = "the wasm target does not float an image; the JS target does", el = op.name === "requestPictureInPicture" ? liveById(String(op.args?.[0] ?? "")) : null; log(`${op.name} refused: ${why}`); /* the image hears the refusal after this batch, as its pictureinpictureerror (LLP 1042 §9) */ if (el?.dataset.view) setTimeout(() => send(wasm.exact_dispatch(Number(el.dataset.view), 19, writeIn("pictureinpictureerror\n" + why), now()))); } else if (op.name === "requestFullscreen") { const el = [...views.values()].find(el => el.id === op.args?.[0] && el.exactMedia); if (!el) log(`requestFullscreen: refused: no video with id "${op.args?.[0]}"`); else el.requestFullscreen().catch(e => log(`requestFullscreen: refused: ${e.name}`)); } // HTML's Element.requestFullscreen(); the element reports `fullscreenchange`
+        else if (op.name === "postMessage") { const text = String(op.args?.[0] ?? ""), name = String(op.args?.[1] ?? ""), at = now(), frames = [...views.values()].filter(e => e instanceof HTMLIFrameElement && e.isConnected && !retiredViews.has(e) && e.id === name); // the inverse of `message=`: text into the named surface, every one in order
+          if (op.args?.[2] === "iframe") { const captured = frames.map(e => [e, e.exactFrameChannel]); (frameModule ??= loadAfterPaint('./frame-messages.js', 'frameMessages')).then(m => m.postFrameMessage(text, name, views, log, captured)); break; }
+          postSurface(name, text, at);
         }
         else if (op.name === "showPicker") { // LLP 1069.002 D2, D9: the element's own picker, inside the press's activation; under the agent, a hold
           const el = [...views.values()].find(el => el.id === op.args?.[0] && el.type === "file");
@@ -782,8 +783,8 @@ function apply(batch) {
         else if (op.name === "fastSeek" || op.name === "load") { const el = [...views.values()].find(el => el.id === op.args?.[0]), queue = () => ((el.exactMedia ??= { props: {}, handlers: [] }).commands ??= []).push([op.name, op.args?.[1]]); if (!(el instanceof HTMLMediaElement)) log(`${op.name} "${op.args?.[0]}" refused: ${el ? "not a video or audio" : "no live node with that id"}`); else if (op.name === "load" && el["exactApp-src"]) appSource(el, "src", el["exactApp-src"], queue); else { queue(); syncMedia(el); } } // a media element's, by HTML's method names (podcast F8, F18): queued for media-glue.js `run`; a `load` of an `app:/` source resolves the file again first
         else if (op.name === "format") { const owner = incarnation, run = () => { const el = [...views.values()].find(el => el.id === op.args?.[0]); if (inputReady && incarnation === owner) el?.exactMarkup?.format(op.args[1], op.args[2] ?? ''); }; if (markupModule) markupModule.then(run); else run(); }
         else if (op.name === "openURL") {
-          if (op.args?.length !== 1 || typeof op.args[0] !== "string") console.error("exact: openURL requires one string");
-          else try { const target = navigableURL(new URL(op.args[0]).href); if (!target) throw Error("unsupported external URL scheme"); window.open(target, "_blank", "noopener,noreferrer"); } catch (error) { console.error("exact: openURL refused", String(error)); }
+          let opened = false; const answer = op.args?.[1], asked = incarnation; if (!op.args?.length || op.args.length > 2 || typeof op.args[0] !== "string") console.error("exact: openURL requires a string, then optionally an element id"); // `change` at the element named second hears `opened` (handed to the browser) or `failed`, after the batch
+          else try { const target = navigableURL(new URL(op.args[0]).href); if (!target) throw Error("unsupported external URL scheme"); window.open(target, "_blank", "noopener,noreferrer"); opened = true; } catch (error) { console.error("exact: openURL refused", String(error)); } if (typeof answer === "string") queueMicrotask(() => { const view = [...views].find(([, el]) => el.id === answer)?.[0]; if (incarnation === asked && view != null) send(wasm.exact_dispatch(view, 1, writeIn(opened ? "opened" : "failed"), now())); });
         }
         else if (op.name === "copyText") {
           if (op.args?.length !== 1 || typeof op.args[0] !== "string") {
@@ -802,7 +803,7 @@ function apply(batch) {
         else if (op.name === "saveFile") { const [id, from, suggestedName, text] = op.args ?? [], r = JSON.parse(readOut(wasm.exact_command(writeIn(JSON.stringify({ command: "saveFile", id, from: from ?? undefined, suggestedName, text, agent: agentMode }))))), chosen = r.present && typeof showSaveFilePicker === "function" ? showSaveFilePicker({ suggestedName: r.suggestedName }) : null; // LLP 1069.010 D3: the runner rules; the save picker starts inside the press's activation, else a download
           if (r.present || r.view != null) { chosen?.catch(() => {}); const p = picker().then(m => m.save(r, chosen)); inflight.add(p); p.finally(() => inflight.delete(p)); } }
         else if (/^show(OpenFile|Directory|SaveFile)Picker$/.test(op.name)) { // LLP 1069.010 D2: the runner rules; a browser without the picker refuses
-          const [id, second] = op.args ?? [], r = JSON.parse(readOut(wasm.exact_command(writeIn(JSON.stringify({ command: op.name, id, multiple: second === true, suggestedName: typeof second === "string" ? second : undefined, agent: agentMode, available: op.name === "showSaveFilePicker" || typeof globalThis[op.name] === "function" }))))); if (r.present || r.view != null) { const p = documentsGlue().then(m => m.show(r, op.name)); inflight.add(p); p.finally(() => inflight.delete(p)); } }
+          const [id, second] = op.args ?? [], r = JSON.parse(readOut(wasm.exact_command(writeIn(JSON.stringify({ command: op.name, id, multiple: second === true, suggestedName: typeof second === "string" ? second : undefined, agent: agentMode, available: op.name === "showSaveFilePicker" || typeof globalThis[op.name] === "function" }))))); if (r.present || r.view != null) { const p = documentsGlue().then(m => m.show(r, op.name)); inflight.add(p); p.finally(() => inflight.delete(p)); } } else if (op.name === "requestPermission") { const [id, path, mode] = op.args ?? [], r = JSON.parse(readOut(wasm.exact_command(writeIn(JSON.stringify({ command: op.name, id, path, mode }))))); if (r.view != null) { const asked = incarnation, p = documentsGlue().then(() => globalThis.exact.documents.permission(r.path, r.mode, v => { if (incarnation === asked && views.has(r.view)) send(wasm.exact_dispatch(r.view, 1, writeIn(v), now())); })); inflight.add(p); p.finally(() => inflight.delete(p)); } } // LLP 1069.010.000 D7: the runner rules; the browser asks inside the press's activation
         else if (op.name === "share") {
           // LLP 1069.003: the runner rules (refused, or held for the agent, D6;
           // a picture of an element refused on the web, LLP 1125 D12); else the
@@ -814,17 +815,14 @@ function apply(batch) {
           else if (ruling.present) navigator.share(Object.fromEntries(Object.entries({ title, text, url }).filter(([, v]) => v != null)))
             .then(() => "share: shared", e => e?.name === "AbortError" ? "share: dismissed" : `share: refused: ${e?.name ?? e}`).then(log);
         }
-        else if (op.name === "showNotification" || op.name === "closeNotification") { // the runner rules (refused, or listed for the agent: runner/src/notify.rs); notify-glue.js posts
-          const [title, body, tag, showTrigger, navigateTo] = op.args ?? [], close = op.name === "closeNotification", ruling = JSON.parse(readOut(wasm.exact_command(writeIn(JSON.stringify(close ? { command: op.name, tag: title, agent: agentMode } : { command: op.name, title, body, tag, showTrigger, navigate: navigateTo, agent: agentMode })))));
-          if (ruling.present) (notifyModule ??= loadAfterPaint('./notify-glue.js', 'notifications')).then(n => close ? n.close(title) : n.show({ title, body, tag, showTrigger, navigate: navigateTo }, log, href => navigate(readOut(wasm.exact_location_of(writeIn(href)))))); }
-        else if (!/^(playSound|playSounds|stopSounds|sendMIDI|requestMIDIAccess)$/.test(op.name)) console.warn(`exact: unknown command ${op.name}`); // the voice table's and the MIDI queue's are the runner's own, played from its `sound` and `midi` ops (LLP 1096 D7, LLP 1125 D7)
+        else if (/^(navigate|traverseHistory|stopLoading|captureScreenshot)$/.test(op.name) || op.name === "reload" && op.args?.[0] != null) frameNav().then(m => m.command(op.name, op.args ?? [], log, [...views.values()].filter(e => e instanceof HTMLIFrameElement && !retiredViews.has(e)))); /* a frame's (LLP 1020.002 D3) */ else if (op.name === "openDevTools") log(`openDevTools("${op.args?.[0]}") refused: a page cannot open the browser's developer tools; open them from the browser's menu`); /* a frame's inspector (D11) */ else if (/^(start|stop)Trace_EXPERIMENTAL$/.test(op.name)) log(`${op.name} refused: the web host does not record traces; use the browser's performance panel`); /* the Apple hosts' */ else if (op.name === "exitFullscreen") { if (document.fullscreenElement) document.exitFullscreen().catch(e => log(`exitFullscreen: refused: ${e.name}`)); } else if (op.name === "setWindowOpacity") log("setWindowOpacity refused: a page cannot change its window's opacity"); /* LLP 1069.010 */ else if (!/^(playSound|playSounds|stopSounds|sendMIDI|requestMIDIAccess)$/.test(op.name)) console.warn(`exact: unknown command ${op.name}`); // the voice table's and the MIDI queue's are the runner's own, played from its `sound` and `midi` ops (LLP 1096 D7, LLP 1125 D7)
         break;
       }
       case "destroy": {
         arrange.destroy(op.id);
         motion.destroy(op.id);
-        const el = views.get(op.id); if (el) { retiredViews.add(el); el.exactAppFrame?.dispose(); el.exactIntersect?.(); el.exactMarkup?.destroy(); el.exactNative?.destroy(); if (el instanceof HTMLMediaElement) { globalThis.exact.removeMedia?.(el); el.pause(); el.removeAttribute("src"); el.load(); } forgetList(el); followScroll(el, false); messageFrames.delete(el); if (!presence.live?.keeps(el) && !retiredViews.has(el.parentElement)) el.remove(); }
-        views.delete(op.id); messageViews.delete(op.id); globalThis.exact.gpu?.destroy(op.id); break;
+        const el = views.get(op.id); if (el) { retiredViews.add(el); el.exactSelection?.(); el.exactAppFrame?.dispose(); el.exactIntersect?.(); el.exactResize?.(); el.exactMarkup?.destroy(); el.exactDecorations?.destroy(); el.exactLiveTime?.destroy(); el.exactNative?.destroy(); if (el instanceof HTMLMediaElement) { globalThis.exact.removeMedia?.(el); el.pause(); el.removeAttribute("src"); el.load(); } forgetList(el); followScroll(el, false); messageFrames.delete(el); if (!presence.live?.keeps(el) && !retiredViews.has(el.parentElement) && !sheetLeaves(el)) el.remove(); }
+        views.delete(op.id); messageViews.delete(op.id); globalThis.exact.gpu?.destroy(op.id); dropSurface(op.id); break;
       }
       case "roots": {
         const roots = [];
@@ -851,8 +849,8 @@ function apply(batch) {
       console.error(`exact: ${String(op?.op ?? "unknown")} op failed`, e);
     }
   }
-  navigation.project(root, log);
-  refreshSymbols();
+  if (agentKeepsStore) pendingStore.flush();
+  navigation.project(root, log); refreshSymbols();
   for (const snapshot of collectionOp?.items ?? []) followScroll(views.get(snapshot.view), false);
   for (const s of followedScrolls.values()) settleFollow(s);
   const jumps = []; // a collection builds a jump's rows, then moves, on its own axis (LLP 1050.000 §6)
@@ -879,11 +877,11 @@ function apply(batch) {
   positionContexts(); presence.live?.after(batch, views); markScrollDocument();
   return batch.timers;
 }
-function applyBatch(batch) {
+function applyBatch(batch) { for (const line of batch.alerts?.splice(0) ?? []) console.error('exact:', line);
   if (page?.hold(batch) || presence.hold(batch)) return { timers: batch.timers, batch }; textflow?.beforeBatch(batch);
   const began = frameSampler ? performance.now() : 0; // what applying it cost, for the next frame's record (LLP 1079 D3)
   globalThis.exact.applyDepth = (globalThis.exact.applyDepth ?? 0) + 1; try {
-  const timers = apply(batch); letGo(); refitTexts(); if (wakeLock) holdWake();
+  const timers = apply(batch); letGo(); refitTexts(); if (wakeLock) holdWake(); if (orientationLock) holdOrientation();
   motion.commit(); arrange.commit();
   if (agentMode) {
     // What the ops since the last marker started belongs to that marker's
@@ -913,7 +911,7 @@ async function prepareFonts(faces, assets) {
     try {
       const url = new URL(localAssetURL(face.source, assets), document.baseURI).href;
       row.loaded = await new FontFace(face.family, `url(${JSON.stringify(url)})`, {
-        weight: String(face.weight),
+        weight: face.weight, stretch: face.stretch,
         style: face.style,
       }).load();
       row.state = "loaded";
@@ -943,15 +941,15 @@ function commitFonts(faces) {
 // The agent's settle waits on active fetches; replies return to the wasm.
 let grants = [], grantSet = null, unparsed = "";
 let storageRequests = null;
-const inflight = new Set();
-const controllers = new Set(), forgettable = new Map();
+const inflight = new Set(), heldAsks = new Map(); // `heldAsks`: requests the server holds (LLP 1016.000 D9), ticket to target
+const controllers = new Set(), forgettable = new Map(), byTicket = new Map(); // `byTicket`: each request's controller, for the app's abort
 let incarnation = 0, authHost = null; // auth-glue.js once an auth.session grant asks for it (LLP 1069.006 D4)
 // A ticket's work, in flight while the runner holds the ticket (LLP 1016 D5):
 // a superseded or forgotten one never holds `clock settle`. Work without a
 // ticket counts until it ends.
 function track(p, ticket) { if (ticket != null) { p.ticket = ticket; p.owner = incarnation; } inflight.add(p); p.finally(() => inflight.delete(p)); }
 const holds = (ticket, owner = incarnation) => owner === incarnation && wasm?.exact_request_active(ticket) === 1;
-const waiting = () => [...inflight].filter(p => p.ticket == null || holds(p.ticket, p.owner));
+const waiting = () => [...inflight].filter(p => p.ticket == null || holds(p.ticket, p.owner)); const heldNamed = r => { const h = [...heldAsks].filter(([ticket, e]) => holds(ticket, e.owner)); return h.length && r && !r.error ? { ...r, held: h.length, heldTargets: h.map(([, e]) => e.target) } : r; }; // a clock reply names the held asks the runner still holds
 // After each commit: abort the reads whose tickets the runner let go of.
 function letGo() { for (const [controller, ticket] of forgettable) if (!holds(ticket)) { forgettable.delete(controller); controller.abort(); } }
 const HOST_WORK_BYTES=16*1024*1024, HOST_WORK_BASE64=4*Math.ceil(HOST_WORK_BYTES/3);
@@ -1006,7 +1004,7 @@ function log(line) {
 const INHERITED_CSS = {
   text_color: "color", font_family: "font-family", font_size: "font-size", font_weight: "font-weight",
   font_style: "font-style", line_height: "line-height", letter_spacing: "letter-spacing",
-  font_variant_numeric: "font-variant-numeric", direction: "direction", white_space: "white-space", overflow_wrap: "overflow-wrap", text_align: "text-align", widows: "widows", orphans: "orphans",
+  font_variant_numeric: "font-variant-numeric", font_variant_ligatures: "font-variant-ligatures", direction: "direction", white_space: "white-space", overflow_wrap: "overflow-wrap", text_align: "text-align", widows: "widows", orphans: "orphans",
 };
 // A field's value as agent output shows it: a password's is the runner's fixed mark, whatever its length (#134).
 const shownValue = (el) => el.type === "password" && el.value ? "•••" : el.value;
@@ -1014,7 +1012,7 @@ function nodeDetail(id, plan = false) {
   const el = views.get(id);
   if (!el || !el.isConnected) return { error: `stale node #${id}` };
   const node = ask({ op: "node", id, ...(plan ? { plan: true } : {}) });
-  if (node.error) return node;
+  if (node.error) return node; Object.assign(node, globalThis.exact.heldOf?.(el, ask)); // what is held on it, and its rows with their tokens (LLP 1122 D8)
   if (node.type === "TextInput" && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) node.props = { ...node.props, value: shownValue(el) };
   delete node.frame;
   delete node.absolute;
@@ -1034,7 +1032,7 @@ function nodeDetail(id, plan = false) {
     const aid = idOf(a);
     if (aid == null) continue;
     const cs = getComputedStyle(a);
-    if (a.dataset.scroll === "true") scroll.unshift({ id: aid, sx: r2(a.scrollLeft), sy: r2(a.scrollTop) });
+    if (a.dataset.scroll === "true") scroll.unshift({ id: aid, sx: r2(a.scrollLeft), sy: r2(a.scrollTop), ...scrollRange(a) });
     const clips = (cs.overflowX !== "visible" || cs.overflowY !== "visible" ? ["overflow"] : []).concat(cs.clipPath !== "none" ? ["clip-path"] : []);
     for (const kind of clips) {
       clip.unshift({ id: aid, kind });
@@ -1042,7 +1040,7 @@ function nodeDetail(id, plan = false) {
       if (r.right <= c.left || r.left >= c.right || r.bottom <= c.top || r.top >= c.bottom) clipped = true;
     }
   }
-  if (scrollX || scrollY) scroll.unshift({ viewport: true, sx: r2(scrollX), sy: r2(scrollY) });
+  const page = scrollRange(document.scrollingElement ?? document.documentElement); if (scrollX || scrollY || page.rx || page.ry) scroll.unshift({ viewport: true, sx: r2(scrollX), sy: r2(scrollY), ...page }); // the page's entry while it scrolls or has a range
   node.scroll = scroll;
   node.clip = clip;
   node.visible = {
@@ -1051,44 +1049,45 @@ function nodeDetail(id, plan = false) {
     inViewport: r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight,
     clipped,
   };
-  node.native = { element: el.localName }; if (el.hasAttribute("data-symbol-source")) { const source = el.dataset.symbolSource, name = source.slice(source.startsWith("symbol:sf/") ? 10 : 7), found = !!el.dataset.symbolPath; node.native.symbol = { source, name, found, ...(!found ? { reason: source === "symbol:sf/" ? "empty" : source.startsWith("symbol:sf/") ? "platform" : "role" } : {}) }; }
+  node.native = { element: el.localName }; if (el.hasAttribute("data-symbol-source")) { const source = el.dataset.symbolSource, name = source.slice(source.startsWith("symbol:sf/") ? 10 : 7), found = !!el.dataset.symbolPath || el.hasAttribute("data-symbol-file"); node.native.symbol = { source, name, found, ...(!found ? { reason: source === "symbol:sf/" || source === "symbol:" ? "empty" : source.startsWith("symbol:sf/") ? "platform" : "role" } : {}) }; }
   const cs = getComputedStyle(el);
   node.browser = Object.fromEntries(Object.entries(INHERITED_CSS).map(([row, prop]) => [row, cs.getPropertyValue(prop)]));
+  const pressed = globalThis.exact?.pressShown?.(el); if (pressed) node.press_shown = pressed; // what a pressed paint shows (input-glue.js)
   const flow = textflow?.facts(id);
   if (flow) { node.flow = flow; node.flow_shapes = flow.shapes; } if (el.getClientRects().length > 1) node.column_fragments = [...el.getClientRects()].map(rect); // a box a multi-column flow fragments, one rect per column (LLP 1093 D12)
   node.observed = { clock: now(), wall: Date.now() };
   return node;
 }
 function tree(request) {
-  const reply = ask(request);
+  const reply = ask(request), flag = routeFlags(root), flags = new Map(); // the page's route flags, not the runner's: it knows no pane, so it would hide a split's list shown beside its detail (LLP 1153 D8); a node's flags are at least its parent's, and one off the page (a flowed paragraph's run) takes its parent's, or the runner's when the read starts at it
   for (const node of reply.nodes ?? []) {
-    const el = views.get(node.id);
+    const el = views.get(node.id), up = flags.get(node.parent), f = el?.isConnected ? Math.max(flag(el), up ?? 0) : up ?? (node.hidden ? 2 : node.inactive ? 1 : 0); flags.set(node.id, f); delete node.inactive; delete node.hidden; if (f) node.inactive = true; if (f > 1) node.hidden = true;
     if (node.type === "TextInput" && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) node.props = { ...node.props, value: shownValue(el) };
     node.focused = el === document.activeElement;
     if (el?.exactNative) node.module = el.exactNative.status();
     if (!(el instanceof HTMLIFrameElement)) continue;
     node.url = el.getAttribute("src") ?? "";
-    node.loading = iframeLoading.get(el) !== false;
+    node.loading = iframeLoading.get(el) !== false; if (el.$partition != null) node.partition = el.$partition; const nav = el.exactNavigation?.last; if (nav) node.navigation = { url: nav.url, title: nav.title, loading: nav.loading, controller: nav.controller, canGoBack: nav.canGoBack, canGoForward: nav.canGoForward }; // LLP 1020.002 §10
     const guest = guestOutline(el);
     if (guest !== null) node.guest = guest;
   }
   return reply;
 }
-const SETTLE_DEADLINE_MS = 20_000, REPLACE_SETTLE_MS = 1000;
-const mediaAttached = deadline => Promise.race([Promise.all(mediaAttaching).then(() => true), new Promise(resolve => setTimeout(() => resolve(false), Math.max(0, deadline - performance.now())))]); // the media glue's attaches (syncMedia), bounded as requests are
-async function waitForInflight(deadline) {
-  if (!waiting().length) return true;
-  let timer;
-  const helpers = await Promise.race([httpHelpers(), new Promise(resolve => { timer = setTimeout(() => resolve(null), Math.max(0, deadline - performance.now())); })]);
-  clearTimeout(timer);
-  return helpers ? helpers.waitForInflight(waiting, deadline) : false;
+const SETTLE_DEADLINE_MS = 20_000, REPLACE_SETTLE_MS = 1000, GLIDE_BOUND_MS = 4000; // a glide: as a native host waits for a scroll view a finger left moving (agent.mjs reason `scroll`)
+const mediaAttached = (deadline, set = mediaAttaching) => Promise.race([Promise.all(set).then(() => true), new Promise(resolve => setTimeout(() => resolve(false), Math.max(0, deadline - performance.now())))]); // the media glue's attaches (syncMedia), bounded as requests are
+async function waitForInflight(deadline, includeRequests = false) {
+  while (waiting().length || includeRequests && wasm.exact_requests_pending()) {
+    const remaining = deadline - performance.now(); if (remaining <= 0) return false;
+    if (waiting().length) { let timer; const helpers = await Promise.race([httpHelpers(), new Promise(resolve => { timer = setTimeout(() => resolve(null), remaining); })]); clearTimeout(timer); if (!helpers || !await helpers.waitForInflight(waiting, deadline)) return false; }
+    else await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining))); // A source can park a ticket without a host promise to notify this wait.
+  } return true;
 }
 async function settleGpu() { loadGpuIfNeeded(); await gpuLoading; return await globalThis.exact.gpu?.settled() ?? []; }
-function gpuPendingReply(request, pending) { const names = pending.map(item => item.name ?? "GPU work"); return request.op === "clock" ? {clock:agentClock, settled:false, reason:"gpu", pending:names} : {error:`GPU is not settled: ${names.join(", ")}`, pending:names}; }
+function gpuPendingReply(request, pending) { const names = pending.map(item => item.name ?? "GPU work"); return request.op === "clock" ? heldNamed({clock:agentClock, settled:false, reason:"gpu", pending:names}) : {error:`GPU is not settled: ${names.join(", ")}`, pending:names}; }
 function agentInputReady() {
   if (viewBox) return Promise.resolve();
-  return agentInputLoading ??= loadAfterPaint('./input-glue.js', 'agentInput').then(helpers => {
-    ({ guestOutline, guestTap, guestType, reveal, viewBox, layoutBoxes, selectAll } = helpers);
+  return agentInputLoading ??= loadAfterPaint('./agent-input.js', 'agentInput').then(helpers => {
+    ({ guestOutline, guestTap, guestType, reveal, backButton, viewBox, layoutBoxes, scrollRange, selectAll, typeControl, glidesSettled, scrollsSeen } = helpers); helpers.watchGlides?.(); // a scroller gliding on its own holds `clock settle` (agent-input.js)
   });
 }
 // Synchronous once inspection and the agent's input helpers are ready (LLP 1043.000 D7/D8).
@@ -1100,7 +1099,8 @@ function agent(request) {
 function agentNow(request) { const r = agentReply(request), decorate = globalThis.exact.gpu?.decorate; return decorate ? decorate(request, r) : r; }
 function agentReply(request) {
   try {
-    if (!wasm) return { error: "not booted" };
+    if (!wasm) return { error: "not booted" }; if (agentMode && (request.op === "picture" || request.op === "check" || (request.op === "layout" && request.picture))) { register(agentClock); followOnSeek = false; try { seek(agentClock); } finally { followOnSeek = true; } } // a picture is the clock's (LLP 1116.003 D8): an animation begun since the last commit (a spinner, LLP 1069.001) is put on it first
+    if (request.op === "type" && request.message !== undefined) { const gpu = globalThis.exact.gpu, name = request.id !== undefined ? gpu?.surfaceOf(request.id) : request.surface ?? gpu?.liveSurface(), refused = typeof name === "string" && postSurface(name, String(request.message), now()); return typeof name !== "string" ? { error: name?.error ?? (request.id !== undefined ? `view ${request.id} has no world` : "post: no world is live; name its surface (post <surface> <text>) to hold the message until one is") } : refused ? { error: `post refused: ${refused}` } : tagged({ posted: name, delivery: "posted", ...(gpu?.waiting(name) ?? true ? { held: true } : {}) }); } // the driver's `post` (LLP 1139.004 D1)
     if (request.entity !== undefined || request.world === true || request.contact !== undefined) return globalThis.exact.gpu?.handle(request, ask, tagged) ?? { error: `view ${request.id} has no world` };
     if ((request.op === "tap" || request.op === "type") && request.ticket !== undefined) { // a held device request, by ticket (LLP 1069.007 D4)
       const { files, ...held } = request, r = ask(held); if (r.capability === "auth") deferFulfill(incarnation, r.ticket, 9, 0, "", new Uint8Array()); // a picker's answer is delivered once the runner took it (LLP 1069.002 D9); an auth answer, the runner settled (LLP 1069.006 D7)
@@ -1115,7 +1115,7 @@ function agentReply(request) {
         const st = ask(request);
         if (st.error) return st;
         st.presence = presence.live?.observation() ?? [];
-        const faults = globalThis.__exactFaults?.entries; if (faults?.length) st.faults = faults; // LLP 1103 D3 (faults.js keeps the table there)
+        for (const [c, t] of forgettable) { const s = c.retrying && st.streams?.find(s => s.ticket === t); if (s) s.retrying = { attempt: c.retrying.attempt, inMs: Math.max(0, Math.round(c.retrying.at - performance.now())), error: c.retrying.error }; } /* a long poll's backoff (LLP 1016.000 D8), which only the page sees */ const faults = globalThis.__exactFaults?.entries; if (faults?.length) st.faults = faults; // LLP 1103 D3 (faults.js keeps the table there)
         const r2 = (x) => Math.round(x * 100) / 100;
         const idOf = (e) => { for (const [i, v] of views) if (v === e) return i; return null; };
         const active = document.activeElement && document.activeElement !== document.body ? document.activeElement : null;
@@ -1124,9 +1124,9 @@ function agentReply(request) {
         st.focus = { logical: active ? idOf(active) : null, editor, responder: active ? active.localName : null, pending: null };
         const overlap = Math.max(0, innerHeight - (globalThis.visualViewport?.height ?? innerHeight));
         const policy = document.querySelector("[interactiveWidget]")?.getAttribute("interactiveWidget") ?? "resizes-visual";
-        st.keyboard = { visible: overlap > 0, overlap: r2(overlap), policy, interactive: false };
+        st.keyboard = { visible: overlap > 0, overlap: r2(overlap), policy, interactive: false }; st.atoms = globalThis.exact.atoms?.state(idOf) ?? []; // LLP 1045.000 D9 (atoms.js)
         st.navigation = navigation.observation(root); st.window = { title: document.title }; if (page) st.adopted = page.adopted === true; if (st.sounds && soundOut) st.sounds.output = soundOut.state(); if (st.midi && midiOut) st.midi.output = midiOut.state(); // LLP 1048.000 D6; LLP 1096 D10 (a page that plays)
-        const wake = globalThis.exact.wakeLockGlue; if (wake) { const by = wake.holders(root).map(idOf); st.wakelock = { held: by.length > 0, by }; } // LLP 1125 D11: what this page shows holds it (a split's list beside its detail, the routes under a sheet), which the runner cannot see; the JS target's agent.js reads the same
+        const wake = globalThis.exact.wakeLockGlue; if (wake) { const by = wake.holders(root).map(idOf); st.wakelock = { held: by.length > 0, by }; } const orient = globalThis.exact.orientationLockGlue; if (orient) st.orientationlock = orient.state(root, idOf); // LLP 1125 D11: what this page shows holds it (a split's list beside its detail, the routes under a sheet), which the runner cannot see; the JS target's agent.js reads the same
         // The drive's app storage (trivia F7): none unless it names a scratch store, as storage-environment.js's `storageKey`.
         const store = new URL(performance.getEntriesByType?.("navigation")[0]?.name ?? location.href).searchParams.get("storage");
         st.storage = store == null ? { available: false, code: "agent", message: "storage is unavailable in agent mode unless the drive names a scratch store (--storage <name>)" } : { available: true, store };
@@ -1146,7 +1146,7 @@ function agentReply(request) {
       case "midi": case "prefer": { if (request.faults) return loadAfterPaint('./faults.js', 'faults').then(m => tagged(m.faultOp(request.faults))); /* LLP 1103 D3: a fetch fault, a form of `prefer` */ if (request.op === "midi" || request.midi) { if (!wasm.exact_midi) return { error: "midi: this build has no MIDI export" }; const { batch } = applyBatch(JSON.parse(readOut(wasm.exact_midi(writeIn(JSON.stringify(request)))))); return batch.error != null ? { error: batch.error } : tagged({ midi: true }); } // @ref LLP 1125 §4: the agent's MIDI ports and a message from one are the runner's
         // @ref LLP 1069.000 D6 — the page group; the driver sets media through CDP. @ref LLP 1078 D7 — the fold group: an empty one re-reads the browser (the driver's CDP override), a filled one is the substitute.
         if (Object.entries(request.mode ?? {}).some(p => p.some(x => /[,=]/.test(String(x))))) return { malformed: true, error: 'prefer mode: an axis or value holds no `,` or `=`' }; const pins = Object.entries(request.mode ?? {}).map(([a, v]) => `${a}=${v}`).join(","), checked = request.mode ? JSON.parse(readOut(wasm.exact_set_mode(writeIn(`?${pins}`)))) : null; if (checked?.error) return { error: `prefer mode: ${checked.error}` }; try { if (request.page) pageFacts.prefer(request.page); if (request.fold) preferFold(Object.keys(request.fold).length ? request.fold : null); } catch (e) { return { error: e.message, ...(e.malformed === true ? { malformed: true } : {}) }; }
-        pageChanged(); foldChanged(); const modes = request.mode ? JSON.parse(readOut(wasm.exact_set_mode(writeIn(pins || "?")))) : null; if (pins) applyBatch(modes); if (modes?.error) return { error: `prefer mode: ${modes.error}` }; // @ref LLP 1121 D13 — the mode group: checked before any fact is set, the runner's `setMode`s in one commit after the rest
+        pageChanged(); foldChanged(); if (request.page?.["gpu-tier"]) globalThis.exact.gpu?.retier?.(request.page["gpu-tier"]); /* LLP 1139.003 D2: each world's renderer made again at the new tier's rung */ const modes = request.mode ? JSON.parse(readOut(wasm.exact_set_mode(writeIn(pins || "?")))) : null; if (pins) applyBatch(modes); if (modes?.error) return { error: `prefer mode: ${modes.error}` }; // @ref LLP 1121 D13 — the mode group: checked before any fact is set, the runner's `setMode`s in one commit after the rest
         return tagged({ page: { ...pageFacts.read() }, fold: foldEnv(), ...(modes ? { mode: modes.modes } : {}) });
       }
       case "focus": {
@@ -1159,9 +1159,9 @@ function agentReply(request) {
       case "tap": {
         const i = request.into; // @ref LLP 1070.000 §5 — the runner's request, its batch applied now
         if (i) { for (const a of [i.block === undefined ? 'start' : i.block, i.inline === undefined ? 'nearest' : i.inline]) if (!['start', 'center', 'end', 'nearest'].includes(a)) return { error: `no alignment ${typeof a === "string" ? a : JSON.stringify(a)}: start, center, end or nearest`, malformed: true }; const { batch } = sendBatch(wasm.exact_into_view(request.id, writeIn(`${i.key ?? ''}\n${i.block ?? 'start'}\n${i.inline ?? 'nearest'}`))); return batch.error != null ? { error: batch.error } : tagged({ tapped: request.id, into: i }); }
-        const frame = views.get(request.id);
+        const frame = views.get(request.id); if (request.holdState !== undefined) return (async () => { for (let i = 0; i < 40 && !globalThis.exact.hold; i++) await new Promise(ok => setTimeout(ok, 50)); return globalThis.exact.hold ? (r => r.error ? { error: r.error, ...(r.malformed ? { malformed: true } : {}) } : tagged({ tapped: request.id, holdState: r.held, delivery: "recognized" }))(globalThis.exact.hold(frame, request.holdState)) : { error: "the input glue is not loaded" }; })(); // LLP 1122 D8: `holdState`, once the glue loads (it loads after paint)
         if (request.history !== undefined || request.back) return request.back ? navigation.back(root) : navigation.travel(frame, request.history); // the agent's `back` (LLP 1116.006 D4)
-        if (frame && (frame.closest("[inert]") || ["hidden", "collapse"].includes(getComputedStyle(frame).visibility)))
+        if (frame && (inertAncestor(frame) || ["hidden", "collapse"].includes(getComputedStyle(backButton(frame) ?? frame).visibility)))
           return { handled: true, error: `view ${request.id} is hidden or inert` };
         return frame instanceof HTMLIFrameElement ? guestTap(frame, request) : { guest: false };
       }
@@ -1171,13 +1171,13 @@ function agentReply(request) {
           const batch = globalThis.exact.navigate(request.text ?? "");
           return { typed: request.id, delivery: "recognized", handled: true, ...(batch.error ? { error: batch.error } : {}) };
         }
-        return typedControl(frame) && request.key == null ? typeControl(frame, request) : frame instanceof HTMLIFrameElement ? guestType(frame, request) : { guest: false }; // a control's value (LLP 1069.001 D9)
+        return typedControl(frame) && request.key == null ? typeControl(frame, request, inertAncestor, settleValue) : frame instanceof HTMLIFrameElement ? guestType(frame, request) : { guest: false }; // a control's value (LLP 1069.001 D9)
       }
       case "clock": // then the offset at the new virtual date, in case it crossed a DST change (LLP 1069.007 D2)
-        return clock(request).then((r) => { if (!r.error) followOffset(agentClock); return tagged(r); });
+        return clock(request).then((r) => { if (!r.error) followOffset(agentClock); return tagged(heldNamed(r)); }); // naming what the server holds (LLP 1016.000 D9)
       case "tree": return tree(request);
       case "tags": return ask(request);
-      case "reveal": return tagged(reveal(views.get(request.id), request.id)); // before a tap or a type (input-glue.js)
+      case "reveal": return tagged(reveal(views.get(request.id), request.id, inertAncestor)); // before a tap or a type (agent-input.js)
       case "axStamp": // @ref LLP 1080.002 D4 — each live view's id where CDP's DOM snapshot reads it, and the document's nonce
         for (const [id, el] of views) if (el.isConnected && el.getAttribute("data-agent-view") !== String(id)) el.setAttribute("data-agent-view", id);
         return tagged({ nonce: performance.timeOrigin });
@@ -1191,7 +1191,7 @@ function agentReply(request) {
 // @ref LLP 1043.000 §3 D7/D8 — reads keep the last settled facts (LLP 1012).
 // Await flow only when requested; ordinary agent calls retain their return types.
 async function agentSettled(request) {
-  const pieceLoad = pieces.pending(); if (pieceLoad) await pieceLoad; if (markupModule) await markupModule;
+  const begun = performance.now(), pieceLoad = pieces.pending(); if (pieceLoad) await pieceLoad; if (presence.pending() && !(await presence.landed(Math.max(0, 10_000 - (performance.now() - begun))))) return { error: "the presence module did not load within 10 s" }; /* inside an agent call's 15 s carrier deadline */ if (markupModule) await markupModule; if (decorationsModule) await decorationsModule; if (liveTimeModule) await liveTimeModule;
   if (flowLoading) await flowLoading;
   if (textflow) await textflow.settle();
   return agent(request);
@@ -1217,27 +1217,27 @@ function tagged(reply) {
 // timers stops after each timer that sends, and its reply is waited for; past
 // the deadline, or 4096 stops, the rest is one advance. The clock lands where
 // the runner says; a timer's refusal is the error. A promise: the driver
-// awaits it.
+// awaits it. The agent's reply names the requests the server holds, which no clock waits on (`heldNamed`, LLP 1016.000 D9).
 async function clock(request) {
   // The end of an input (LLP 1012 §2): the `then`s of the answers it settled
   // land, the clock unmoved and no timer fired (Runner::land_then). `clock data` (web-js agent.js) first
   // waits for activation and every request in flight, landing until a landing sends nothing (a test's first step).
   if (request.land || request.data) { if (request.data) await moduleReady; const deadline = performance.now() + SETTLE_DEADLINE_MS, unsettled = { clock: agentClock, settled: false, reason: "requests" };
-    for (let round = 0; round < 16; round++) { if (request.data && !(await waitForInflight(deadline) && await mediaAttached(deadline))) return unsettled; const { batch } = applyBatch(JSON.parse(readOut(wasm.exact_advance(agentClock, 2)))); if (batch.error) return { error: `clock: ${batch.error}`, clock: agentClock }; if (!request.data) return { clock: agentClock }; if (!waiting().length && !mediaAttaching.size) return { clock: agentClock, settled: true }; } return unsettled; }
+    for (let round = 0; round < 16; round++) { if (request.data && !(await waitForInflight(deadline, true) && await mediaAttached(deadline))) return unsettled; const { batch } = applyBatch(JSON.parse(readOut(wasm.exact_advance(agentClock, 2)))); if (batch.error) return { error: `clock: ${batch.error}`, clock: agentClock }; if (!request.data) return { clock: agentClock }; if (!waiting().length && !wasm.exact_requests_pending() && !mediaAttaching.size) return { clock: agentClock, settled: true }; } return unsettled; }
   const settle = !!request.settle; if (imageHold) await (await imageHold).ready(); // an animated image starts on the clock it lands at
-  const deadline = performance.now() + SETTLE_DEADLINE_MS;
+  const deadline = performance.now() + SETTLE_DEADLINE_MS, glide = { ms: GLIDE_BOUND_MS };
   let world = {};
   const reply = (settled, requests) => ({ clock: agentClock, ...(settled === undefined ? {} : { settled }), ...world.reply, ...(settled === false && world.pending ? { reason: "world" } : settled === false && requests ? { reason: "requests" } : {}) });
   for (let rounds = 0; ; rounds++) {
-    if (settle && !(await waitForInflight(deadline) && await mediaAttached(deadline))) return reply(false, true); const pieceLoad = pieces.pending(); if (pieceLoad) await pieceLoad; if (settle) collections.settle(); // rows a list shows are built at this clock, before it moves (as the JS agent does): their animations start here
+    if (settle && glidesSettled && !(await glidesSettled(glide))) return { ...reply(false), reason: "scroll" }; const scrolled = scrollsSeen?.(); /* a scroller still gliding ends first; one this round's work moves, the next round (agent-input.js) */ if (settle && !(await waitForInflight(deadline, true) && await mediaAttached(deadline))) return reply(false, true); const pieceLoad = pieces.pending(); if (pieceLoad) await pieceLoad; if (presence.pending() && !(await presence.landed(Math.max(0, deadline - performance.now())))) return reply(false, true); if (settle) collections.settle(); // rows a list shows are built at this clock, before it moves (as the JS agent does): their animations start here
     if (gpuInPlay()) { const pending = await settleGpu(); if (pending.length) return gpuPendingReply(request, pending); }
     const to = settle ? Math.max(settleCandidate(), world.settleAt ?? agentClock) : request.to;
     if (!(to >= agentClock)) return { error: `the clock cannot go backwards (${agentClock} → ${to})` };
     let batch;
-    for (let steps = 0; ; steps++) {
-      const waited = flowDue != null && flowDue <= to && await waitForInflight(deadline), held = waited && steps < 4096;
-      ({ batch } = applyBatch(JSON.parse(readOut(wasm.exact_advance(to, held ? 1 : 0)))));
-      if (batch.error || !held) break; // a stop at `to` may leave a timer due there
+    for (let steps = 0, stops = 0; ; ) { // while a view declares a layout transition, each due time is a batch of its own, which presence plays from that time (as the native hosts lay out there), in stops apart from the 4096
+      const layout = flowDue != null && flowDue < to && stops < 36000 && presence.live?.tracking(), sensing = wasm.exact_sensor_inputs?.() ? agentClock + 1000 / 60 : Infinity, at = Math.min(layout ? Math.max(flowDue, agentClock) : to, sensing), waited = (flowDue != null && flowDue <= at || flowLanding) && await waitForInflight(deadline) && await mediaAttached(deadline, sizes), held = waited && steps < 4096; // a canvas the substitute feeds a sensor steps a display frame at a time, that frame's samples handed it first (LLP 1133.013 D6)
+      if (sensing !== Infinity) globalThis.exact.gpu?.sensors?.(JSON.parse(readOut(wasm.exact_sensor_events(at)))); ({ batch } = applyBatch(JSON.parse(readOut(wasm.exact_advance(at, held ? 1 : 0))))); if (sensing !== Infinity && at < to && !batch.error) { globalThis.exact.gpu?.schedule?.(); globalThis.exact.gpu?.clock?.(false); }
+      if (batch.error || !held && at >= to) break; if (layout && !(flowDue != null && flowDue <= at)) stops++; else steps++; // a stop at `to` may leave a timer due there
     }
     globalThis.exact.gpu?.schedule?.();
     if (flowLoading) await flowLoading;
@@ -1245,12 +1245,12 @@ async function clock(request) {
     if (batch.error) return { error: `clock: ${batch.error}`, clock: agentClock };
     if (gpuInPlay()) { const pending = await settleGpu(); if (pending.length) return gpuPendingReply(request, pending); }
     world = globalThis.exact.gpu?.clock?.(settle) ?? {};
-    if (!settle) { if (imageHold) await (await imageHold).ready(); const n = waiting().length, b = n ? ask({ op: "state" }).background : null, background = b ? b.queued + b.inFlight : 0; return { ...reply(), ...(n ? { inflight: n } : {}), ...(background ? { background } : {}) }; } // what a jump leaves in flight on real time, which the driver names (calendar F10), and the module's storage (LLP 1097 D9)
-    collections.settle(); // every list built and measured where it shows (LLP 1070 G3)
-    if (waiting().length || mediaAttaching.size) { if (rounds >= 15) return reply(false, true); continue; }
+    if (!settle) { while (ask({ op: "polls" }).asking && performance.now() < deadline) await new Promise(r => setTimeout(r, 5)); /* a polled module source's ask the jump made lands first (LLP 1133.009 D10 item 7) */ if (imageHold) await (await imageHold).ready(); const n = waiting().length, b = n ? ask({ op: "state" }).background : null, background = b ? b.queued + b.inFlight : 0; return { ...reply(), ...(n ? { inflight: n } : {}), ...(background ? { background } : {}) }; } // what a jump leaves in flight on real time, which the driver names (calendar F10), and the module's storage (LLP 1097 D9)
+    collections.settle(); const scrolls = rounds < 15 ? await collections.fireOwedScrolls() : null; if (scrolls?.fired || scrolls?.owed) continue; // every list built and measured where it shows (LLP 1070 G3); a list's moved offset owes a `scroll` event, fired at a rendering step with its handler: waited for (collection-glue `owedScrolls`)
+    if (waiting().length || wasm.exact_requests_pending() || mediaAttaching.size) { if (rounds >= 15) return reply(false, true); continue; }
     const next = Math.max(settleCandidate(), world.settleAt ?? agentClock);
-    if (next <= agentClock && !world.pending) { if (imageHold) await (await imageHold).ready(); const held = ask({ op: "holds" }); return held.holds?.length ? { ...reply(false), reason: "device", tickets: held.tickets } : reply(true); } // a hold is never waited on (LLP 1069.007 D3)
-    if (rounds >= 15) return reply(false);
+    if (next <= agentClock && !world.pending && settle && glidesSettled && !(await glidesSettled(glide))) return { ...reply(false), reason: "scroll" }; const moved = settle && next <= agentClock && !world.pending && scrollsSeen?.() !== scrolled; /* two frames: a scroll this round's work began has its first event at the next frame's step; then another round */ if (next <= agentClock && !world.pending && !moved) { if (imageHold) await (await imageHold).ready(); const held = ask({ op: "holds" }); return held.holds?.length ? { ...reply(false), reason: "device", tickets: held.tickets } : collections.owedScrolls() ? { ...reply(false), reason: "scroll-event" } : reply(true); } // a hold is never waited on (LLP 1069.007 D3)
+    if (rounds >= 15) return moved ? { ...reply(false), reason: "scroll" } : reply(false);
   }
 }
 let ticker = null, timerFactory = null, toldOffset = null;
@@ -1259,7 +1259,7 @@ let ticker = null, timerFactory = null, toldOffset = null;
 const followOffset = at => { const [epoch, offset] = reportTime(at); if (wasm.exact_set_time && offset !== toldOffset) { toldOffset = offset; applyBatch(JSON.parse(readOut(wasm.exact_set_time(epoch, offset)))); } };
 function startClock() {
   if (timerFactory && !agentMode && !textflow && !flowLoading) {
-    ticker ??= timerFactory({ now, advance: time => { followOffset(time); send(wasm.exact_advance(time, 0)); }, present }); ticker.update(flowDue, flowFrames);
+    ticker ??= timerFactory({ now, scrollPending: () => collections.scrollPending(), advance: time => { followOffset(time); send(wasm.exact_advance(time, 0)); }, present, release: (kinds, cutoff) => { const batch = JSON.parse(readOut(wasm.exact_advance(cutoff, 16 | kinds << 8))); applyBatch(batch); return batch; } }); ticker.update(flowDue, flowFrames, flowWaits, flowTolerance);
   }
 }
 function activateData() {
@@ -1274,8 +1274,7 @@ function activateData() {
   const pending = pieces.pending(); // pieces this tree first uses: input waits for their handlers (LLP 1047 D5)
   return pending ? pending.then(ready) : ready();
 }
-// Boot the app — from the plan baked into the wasm, or from `bytes` (the
-// dev loop's restart carrying compatible state, LLP 1007 §6).
+// Boot the app: the baked plan, or `bytes` carrying compatible state (the dev loop's restart, LLP 1007 §6).
 let mutation = Promise.resolve(); function mutate(work) { const next = mutation.then(work); mutation = next.catch(() => {}); return next; }
 function boot(...args) { return mutate(() => bootNow(...args)); }
 async function bootNow(bytes, assets = devAssets, current = () => true, module = null, fresh = false) {
@@ -1302,7 +1301,9 @@ async function bootNow(bytes, assets = devAssets, current = () => true, module =
   }
   const launch = encoder.encode(launchLocation()); if (wasm.exact_set_launch) { const [epoch, offset] = reportTime(now()); wasm.exact_set_launch(epoch, offset, writeIn(reportPlace())); } // @ref LLP 1038 D5; then the date and place the boot's first settle reads (LLP 1027.000.000)
   const kept = !fresh && (bytes || module) ? (await loadStage('inspection'), focus.keep(ask({ op: "tree" }), Number(document.activeElement?.closest?.("[data-view]")?.dataset.view))) : undefined;
-  let len; wasm.exact_live_clock?.(agentMode ? 0 : 1); // the page's clock owns time, the agent's when it drives (the timers RFC, D1); kept for every boot
+  // A cold WebView or hidden iframe can have no viewport. Wait without a deadline; module swaps reuse the runner's.
+  if (!current() || request !== bootAttempt) return null; while (!module && !(innerWidth > 0 && innerHeight > 0)) { await new Promise(resolve => addEventListener("resize", resolve, { once: true })); if (!current() || request !== bootAttempt) return null; }
+  const appleRoles = wasm.exact_report_colors && getComputedStyle(document.documentElement).getPropertyValue("--exact-apple-roles").trim(); if (appleRoles) { const probe = document.body.appendChild(document.createElement("i")), seen = getComputedStyle(probe), colors = []; for (const dark of [false, true]) { probe.style.colorScheme = dark ? "dark" : "light"; for (const name of JSON.parse(appleRoles).split(" ")) if (seen.getPropertyValue(`--exact-apple-${name}`).trim()) { probe.style.color = `var(--exact-apple-${name})`; colors.push([name, dark, seen.color]); } } probe.remove(); wasm.exact_report_colors(writeIn(JSON.stringify(colors))); } let len; wasm.exact_live_clock?.(agentMode ? 0 : 1); // each role look.mjs names, light and dark, as the page draws it, reported so a colour the kernel resolves itself (a canvas's ink) is the page's (src/colors.rs); the page's clock owns time, the agent's when it drives (the timers RFC, D1); kept for every boot
   if (module) {
     const id = module.rust ?? new TextEncoder().encode(JSON.stringify(module.realm.id));
     const payload = new Uint8Array(plan.length + module.receipt.length + id.length);
@@ -1321,7 +1322,7 @@ async function bootNow(bytes, assets = devAssets, current = () => true, module =
     len = wasm.exact_boot(innerWidth, innerHeight, launch.length, preferences() | foldBits());
   }
   const batch = JSON.parse(readOut(len));
-  if (batch.error) throw new Error(batch.error);
+  if (batch.error) throw new Error(batch.error); if (wasm.exact_presence?.()) presence.preload(); // after first paint, where the plan names a presence row (navigation.js)
   frameSampler?.reset(); // a new runner numbers its transactions afresh (LLP 1079 D3)
   if (module) { activeModule?.realm?.dispose(); activeModule = module; setInputReady(true); if (left.length) { const writes = left.filter(p => p.write).map(p => p.write); log(`module replacement let go of ${left.length} request${left.length === 1 ? '' : 's'} still in flight after ${REPLACE_SETTLE_MS} ms${writes.length ? `; aborted writes the server may or may not have seen: ${writes.join(', ')}` : ''}`); } }
   navigation.reset(batch.ops.find(op => op.op === "router"));
@@ -1345,13 +1346,13 @@ async function bootNow(bytes, assets = devAssets, current = () => true, module =
   collections.reset();
   for (const el of lists.keys()) forgetList(el);
   for (const el of views.values()) if (el instanceof HTMLMediaElement) { globalThis.exact.removeMedia?.(el); el.pause(); el.removeAttribute("src"); el.load(); }
-  for (const el of views.values()) { el.exactAppFrame?.dispose(); el.exactMarkup?.destroy(); el.exactNative?.destroy(); } views.clear();
+  for (const el of views.values()) { el.exactSelection?.(); el.exactAppFrame?.dispose(); el.exactMarkup?.destroy(); el.exactDecorations?.destroy(); el.exactLiveTime?.destroy(); el.exactNative?.destroy(); el.exactResize?.(); el.exactIntersect?.(); } views.clear();
   messageFrames.clear(); messageViews.clear();
   if(storageRequests){storageRequests.then(s=>s.dispose()).catch(()=>{});storageRequests=null;}
   grants = []; grantSet = null; unparsed = "";
   for (const controller of controllers) controller.abort();
-  controllers.clear(); forgettable.clear(); inflight.clear(); mediaAttaching.clear();
-  if (!page?.holding) root.replaceChildren(); document.getElementById("exact-theme")?.remove(); // the last plan's theme (LLP 1095 D4): this boot's batch sets its own
+  controllers.clear(); forgettable.clear(); inflight.clear(); heldAsks.clear(); mediaAttaching.clear(); sizes.clear();
+  globalThis.exact.holdQuiet?.(); if (!page?.holding) root.replaceChildren(); document.getElementById("exact-theme")?.remove(); document.getElementById("exact-looks")?.remove(); // a held state goes unsaid (dev.js holds it again); the last plan's theme (LLP 1095 D4) and state looks (LLP 1121 D8): this boot's batch sets its own
   commitFonts(preparedFonts);
   focus.restart(kept, () => applyBatch(batch), () => ask({ op: "tree" }), id => views.get(id));
   toldOffset = null; followOffset(now()); // @ref LLP 1027.000.000 — the date, as the clock the runner already reads
@@ -1365,13 +1366,12 @@ async function bootNow(bytes, assets = devAssets, current = () => true, module =
   if (bytes && flowLoading) await flowLoading;
   if (bytes && textflow) await textflow.settle();
   startClock();
-  if (bytes) requestAnimationFrame(() => requestAnimationFrame(loadGpuIfNeeded));
+  if (bytes) afterPaint(loadGpuIfNeeded, agentMode);
   return performance.now() - t;
 }
-// `agent`, `agentSettled` and `now` exist only in agent mode: a normal page has no agent
-// surface and no clock but the browser's.
+// `agent`, `agentSettled` and `now` exist only in agent mode; a normal page uses the browser's clock.
 let ready;
-globalThis.exact = { ...globalThis.exact, mutate, devFirst: () => devFirst(),
+globalThis.exact = { ...globalThis.exact, discardSecretWrite: name => pendingStore.discard(name), mutate, devFirst: () => devFirst(), pageFacts: Object.assign(pageFacts, { changed: () => pageChanged() }), abortWake: function wake() { if (wake.due || !wasm?.exact_collect_aborts) return; wake.due = true; setTimeout(() => { wake.due = false; send(wasm.exact_collect_aborts()); }); }, keptChanged: () => { if (wasm?.exact_changed) applyBatch(JSON.parse(readOut(wasm.exact_changed(writeIn("doc-watch:doc:/"))))); }, // the GPU tier's reader and teller (gpu-tier.js); a fetch a realm aborted between batches (module-glue.js door 23); the kept documents' list changed (documents-glue.js, LLP 1069.010.000 D5)
   // @ref LLP 1038 D8/D11 — synchronous for the serialized popstate caller.
   navigate: (location) => {
     const nav = root.firstElementChild;
@@ -1418,7 +1418,7 @@ globalThis.exact = { ...globalThis.exact, mutate, devFirst: () => devFirst(),
 // The GPU module, on demand: a script element after a rendering opportunity
 // (two animation-frame callbacks), never an eager import, and only when a
 // canvas is on the page. Until one is, an agent reply has nothing to settle.
-let gpuLoading = null; const gpuInPlay = () => Boolean(gpuLoading || globalThis.exact.gpu || globalThis.exact.pendingSurfaces?.length);
+let gpuLoading = null; const gpuInPlay = () => Boolean(gpuLoading || globalThis.exact.gpu || globalThis.exact.pendingSurfaces?.length); function dropSurface(id) { const queued = globalThis.exact.pendingSurfaces; if (queued) globalThis.exact.pendingSurfaces = queued.filter(s => s.id !== id); } // a surface gone before its module loads asks none
 function loadGpuIfNeeded() {
   if (gpuLoading || !(globalThis.exact.pendingSurfaces ?? []).length) return;
   gpuLoading = loadAfterPaint(globalThis.exact.compat?.inputs?.gpuModules ? './gpu-modules.js' : './gpu-glue.js', 'gpu').catch(error => console.error("exact gpu:", error)); // @ref LLP 1009 D6
@@ -1431,13 +1431,13 @@ async function main() {
   // again: a task after Stop (`navigateerror`, fired mid-stop) or Back from the
   // bfcache (`pageshow`); a 204 or a download says nothing, so after a second.
   // The page names the build in its preload (`./app.wasm?v=…`, LLP 1047.000 §9), so this file is the same across builds.
-  const preload = () => [...document.querySelectorAll('link[rel="preload"]')].find(l => new URL(l.href).pathname.endsWith("/app.wasm")), url = new URL(preload()?.href ?? "./app.wasm", import.meta.url), imports = { exact_grants: grantOrigins(() => memory), exact_js: { call: moduleCall }, exact_rust: rustImports, exact_data: dataImports, exact_clock: { now: () => performance.now() - t0 }, exact_geometry: { shown: view => { const el = views.get(view); if (!el?.isConnected || !root.contains(el)) return 0; for (let at = el; at && at !== root; at = at.parentElement) if (at.inert || getComputedStyle(at).display === "none") return 0; return 1; }, read: (op, view, out) => geometry?.read(op, views.get(view), new Float64Array(memory.buffer, out, 4)) ?? 0, point: (x, y) => { const el = geometry?.point(x, y)?.closest("[data-view]"), id = el && root.contains(el) ? Number(el.dataset.view) : NaN; return views.get(id) === el ? id + 1 : 0; }, points: (x, y, out, cap) => { const hits = (geometry?.points(x, y) ?? []).flatMap(hit => { const el = hit.closest("[data-view]"), id = el && root.contains(el) ? Number(el.dataset.view) : NaN; return views.get(id) === el ? [id + 1] : []; }); if (cap) new Uint32Array(memory.buffer, out, Math.min(cap, hits.length)).set(hits.slice(0, cap)); return hits.length; } } }, aborted = e => e?.name === "AbortError";
+  const preload = () => [...document.querySelectorAll('link[rel="preload"]')].find(l => new URL(l.href).pathname.endsWith("/app.wasm")), url = new URL(preload()?.href ?? "./app.wasm", import.meta.url), imports = { exact_grants: grantOrigins(() => memory), exact_js: { call: moduleCall }, exact_rust: rustImports, exact_data: dataImports, exact_clock: { now: () => performance.now() - t0 }, exact_geometry: { shown: (view, first) => { if (first) { structuralModalLayers = modalLayers(); queueMicrotask(() => { structuralModalLayers = null; }); } const el = views.get(view); if (!el?.isConnected || !root.contains(el) || inertAncestor(el)) return 0; const live = structuralModalLayers; if (live && !live.some(layer => layer.contains(el))) return 0; for (let at = el; at && at !== root; at = at.parentElement) if (getComputedStyle(at).display === "none") return 0; return 1; }, read: (op, view, out) => geometry?.read(op, views.get(view), new Float64Array(memory.buffer, out, 4)) ?? 0, range: (view, start, end, out) => geometry?.range(views.get(view), start, end, new Float64Array(memory.buffer, out, 4)) ?? 0, point: (x, y) => { const el = geometry?.point(x, y)?.closest("[data-view]"), id = el && root.contains(el) ? Number(el.dataset.view) : NaN; return views.get(id) === el ? id + 1 : 0; }, points: (x, y, out, cap) => { const hits = (geometry?.points(x, y) ?? []).flatMap(hit => { const el = hit.closest("[data-view]"), id = el && root.contains(el) ? Number(el.dataset.view) : NaN; return views.get(id) === el ? [id + 1] : []; }); if (cap) new Uint32Array(memory.buffer, out, Math.min(cap, hits.length)).set(hits.slice(0, cap)); return hits.length; } } }, aborted = e => e?.name === "AbortError";
   const download = () => { const stop = new AbortController(); globalThis.navigation?.addEventListener("navigate", e => e.destination.sameDocument || e.downloadRequest != null || (stop.abort(), preload()?.remove()), { signal: stop.signal }); return fetch(url, { signal: stop.signal }); };
   const stayed = () => new Promise(done => { const later = () => setTimeout(done); globalThis.navigation?.addEventListener("navigateerror", later, { once: true }); addEventListener("pageshow", later, { once: true }); setTimeout(done, 1000); });
   let response = (globalThis.exact.runtime ??= download()).then(r => r.url === url.href ? r : download(), e => aborted(e) ? Promise.reject(e) : download()), instance;
   let compiled; for (;;) try { ({ instance, module: compiled } = await WebAssembly.instantiateStreaming(response, imports)); break; } catch (e) { if (!aborted(e)) throw e; await stayed(); response = download(); }
   wasm = instance.exports; const [staged] = WebAssembly.Module.customSections(compiled, 'exact.stages'); if (staged) stages = JSON.parse(new TextDecoder().decode(staged)).stages;
-  memory = wasm.memory; if (WebAssembly.Module.imports(compiled).some(i => i.module === "exact_geometry")) requestAnimationFrame(() => loadAfterPaint('./geometry-glue.js', 'geometry').then(create => { geometry = create(root); })); // an artifact whose actions read geometry imports it (LLP 1051.000 D4)
+  memory = wasm.memory; if (WebAssembly.Module.imports(compiled).some(i => i.module === "exact_geometry")) geometryLoading = new Promise(r => requestAnimationFrame(r)).then(() => loadAfterPaint('./geometry-glue.js', 'geometry')).then(create => { geometry = create(root); }); // an artifact whose actions read geometry imports it (LLP 1051.000 D4)
   globalThis.exact.compat = JSON.parse(readOut(wasm.exact_compat()));
   logicInfo = typeof wasm.exact_module_artifact === 'function' && wasm.exact_logic ? { ...JSON.parse(readOut(wasm.exact_logic())), native: pageNative } : null;
   setInputReady(false); // Every data executor activates after the baked first pixel.
@@ -1468,7 +1468,7 @@ async function main() {
   const activate = async () => {
     loadGpuIfNeeded(); if (wasm.exact_motion) pieces.preload(); if (globalThis.launchQueue) documentsGlue().catch(console.error); // motion links its export (LLP 1047 D3); an installed app's launch files (LLP 1069.010)
     if (!agentMode) loadAfterPaint('./timer-glue.js', 'createTimerScheduler').then(create => { timerFactory = create; startClock(); }).catch(console.error);
-    if (!agentMode && AGENT_ADMITTED) loadAfterPaint('./frames.js', 'createFrameSampler').then(create => { frameSampler = globalThis.exact.frames = create({ origin: () => t0, log, target: 'wasm', covers: ['input', 'scroll', 'batches', 'animations', 'canvas'], gather: () => loadStage('inspection').then(() => ({ journal: ask({ op: 'logs', since: 0 }), perf: ask({ op: 'perf' }) })) }); }).catch(console.error); // a development page's frames (LLP 1079 D3)
+    if (!agentMode && AGENT_ADMITTED) loadAfterPaint('./frames.js', 'createFrameSampler').then(create => { frameSampler = globalThis.exact.frames = create({ origin: () => t0, log, target: 'wasm', covers: ['input', 'scroll', 'batches', 'animations', 'canvas'], gather: () => loadStage('inspection').then(() => ({ journal: ask({ op: 'logs', since: 0 }), perf: ask({ op: 'perf' }), traceEvents: (ask({op:'state', trace_export:true}).world ?? []).flatMap(w => (w.traceEvents ?? []).map(e => ({...e, pid:w.canvas*2+e.pid}))) })) }); }).catch(console.error); // a development page's frames (LLP 1079 D3)
     // @ref LLP 1043.000 §3 D8 — one optional load, no activation wait or retry queue.
     loadAfterPaint('./input-glue.js', 'createInputHandlers').then(create => {
       inputHandlers = create({ root, views, retiredViews, agentMode, ready: () => inputReady, inertAncestor, editMenu,
@@ -1487,10 +1487,10 @@ async function main() {
       }
     }
   };
-  // Nested rAF gives a client page's baked DOM a rendering opportunity before
-  // activation; a served document has painted already.
-  if (page) activate();
-  else requestAnimationFrame(() => { root.dataset.frameCallbackMs = (performance.now() - t0).toFixed(1); requestAnimationFrame(activate); });
+  // Nested rAF gives a client page's baked DOM a rendering opportunity before activation (a served document has painted already);
+  // a page given no frames (a cross-origin frame out of view: the design tool's canvas) activates a second on, once, as rt.js `input()`; not under the agent.
+  let activated; const activateOnce = () => activated ??= activate();
+  if (page) activateOnce(); else { requestAnimationFrame(() => { root.dataset.frameCallbackMs = (performance.now() - t0).toFixed(1); requestAnimationFrame(activateOnce); }); if (!agentMode) setTimeout(activateOnce, 1000); }
 }
 ready = main();
 ready.catch((e) => { console.error(e); root.dataset.error = String(e); });

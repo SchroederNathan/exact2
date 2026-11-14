@@ -14,6 +14,7 @@ impl Em<'_> {
         let subject = self
             .f(row.subject, scope)
             .map_err(|x| format!("region {r}: {x}"))?;
+        let subject = self.status_subject(r, parent, subject);
         let arms: Vec<u32> = row.arms.iter().map(|a| a.0).collect();
         match row.kind {
             RegionKind::When | RegionKind::Match => {
@@ -72,6 +73,15 @@ impl Em<'_> {
         Ok(())
     }
 
+    fn status_subject(&mut self, region: u32, parent: &str, subject: String) -> String {
+        let Some(owners) = self.answers.status_region(region) else {
+            return subject;
+        };
+        let owners = super::answers::status_owners(owners);
+        let guard = self.uses.rt("statusSubject");
+        format!("(globalThis.__exactRender?{guard}({parent},{subject},{owners}):{subject})")
+    }
+
     /// The declaration of arm `arm`'s own slots, as `name` (the enclosing
     /// instances' slots spread in), each a signal started from its
     /// initializer in `scope`, which then reads them through `name`; empty
@@ -86,25 +96,25 @@ impl Em<'_> {
     ) -> Result<String, String> {
         let plan = self.plan;
         let mut own = Vec::new();
-        for (k, slot) in plan.slots.iter().enumerate() {
-            if slot.owner.map(|o| o.0) == Some(arm) {
-                let init = code::expression(plan, plan.code(slot.init), scope, &mut self.uses)
-                    .map_err(|x| format!("child state {}: {x}", plan.str(slot.name)))?;
-                // Typed as a root slot is: its initializer and every write
-                // conform, or the runner refuses (SlotType).
-                let ty = serde_json::to_string(&type_code(plan, slot.ty)).unwrap();
-                if let Some(panel) = carry {
-                    let quoted = serde_json::to_string(plan.str(slot.name)).unwrap();
-                    let declared = type_json(plan, slot.ty);
-                    own.push(format!(
-                        "{k}:$devSig({quoted}+\"@\"+{panel},{init},{ty},{declared})"
-                    ));
-                    continue;
-                }
-                let sig = self.uses.rt("sig");
-                let name = string_name(plan, slot);
-                own.push(format!("{k}:{sig}({init},{ty}{name})"));
+        for &k in self.answers.slots(arm) {
+            scope.row_slots.insert(k);
+            let slot = &plan.slots[k];
+            let init = code::expression(plan, plan.code(slot.init), scope, &mut self.uses)
+                .map_err(|x| format!("child state {}: {x}", plan.str(slot.name)))?;
+            // Typed as a root slot is: its initializer and every write
+            // conform, or the runner refuses (SlotType).
+            let ty = serde_json::to_string(&type_code(plan, slot.ty)).unwrap();
+            if let Some(panel) = carry {
+                let quoted = serde_json::to_string(plan.str(slot.name)).unwrap();
+                let declared = type_json(plan, slot.ty);
+                own.push(format!(
+                    "{k}:$devSig({quoted}+\"@\"+{panel},{init},{ty},{declared})"
+                ));
+                continue;
             }
+            let sig = self.uses.rt("sig");
+            let name = string_name(plan, slot);
+            own.push(format!("{k}:{sig}({init},{ty}{name})"));
         }
         if own.is_empty() {
             return Ok(String::new());
@@ -131,6 +141,7 @@ impl Em<'_> {
         let subject = self
             .f(row.subject, scope)
             .map_err(|x| format!("region {r}: {x}"))?;
+        let subject = self.status_subject(r, parent, subject);
         let arms: Vec<u32> = row.arms.iter().map(|a| a.0).collect();
         let (item, index) = (format!("i{r}"), format!("x{r}"));
         let mut inner = scope.clone();
@@ -150,9 +161,10 @@ impl Em<'_> {
         let built = std::mem::replace(&mut self.out, saved);
         match list {
             Some(opts) => {
+                let inputs = self.row_inputs(r, scope)?;
                 let _ = write!(
                     self.out,
-                    "$vl({parent},{subject},({item},{index})=>{key},(p,{item},{index})=>{{{built}}},{opts});"
+                    "$vl({parent},{subject},({item},{index})=>{key},(p,{item},{index})=>{{{built}}},{{...{opts},{inputs}}});"
                 );
             }
             None => {
@@ -161,6 +173,13 @@ impl Em<'_> {
                     ",1"
                 } else {
                     ""
+                };
+                // A development build names the region, for inspect mode's
+                // instance paths (rt.js `Eaches`, LLP 1122 T2b).
+                let pure = match (self.dev_reload, pure) {
+                    (true, "") => format!(",0,{r}"),
+                    (true, p) => format!("{p},{r}"),
+                    (false, p) => p.to_string(),
                 };
                 let _ = write!(
                     self.out,

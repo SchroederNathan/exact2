@@ -5,7 +5,7 @@
 //! `prefer` sets — the system scheme and `prefers-color-scheme`,
 //! `prefers-contrast`, the window's modes, the root font size — each fact
 //! it does not name what the first pin replaced; a null pin hands all of
-//! them back.
+//! them back. A `hold` holds a state as the real one (`held.rs`).
 use super::*;
 use crate::build_channel::{Frame, Pin, Pinned};
 use serde_json::{json, Value};
@@ -44,6 +44,7 @@ impl<D: DataSource> Presenter<D> {
                     self.apply_pin(revision, pin);
                     status = true;
                 }
+                Some(Frame::Hold { revision, hold }) => self.hold_frame(revision, hold),
                 Some(Frame::Reserved(kind)) => self.report_unsupported(&kind, None),
                 None => {}
             }
@@ -144,7 +145,8 @@ impl<D: DataSource> Presenter<D> {
 
     /// Queue the effective facts (`status`): the scheme a `light-dark()`
     /// colour resolves to, the contrast, the window's modes, the root font
-    /// size, the plan identity and design digest, the pin revision applied.
+    /// size, the plan identity and digest (a hold's replay follows the
+    /// digest), the design digest, the pin revision applied.
     pub(super) fn report_status(&mut self) {
         let runner = self.host.runner();
         let design = runner.design();
@@ -155,6 +157,7 @@ impl<D: DataSource> Presenter<D> {
             .map(|(a, v)| (a.clone(), v.as_str().into()))
             .collect();
         let root_font_size = runner.root_font_size();
+        let plan_digest = runner.inspection_digest().to_string();
         let dark = self.dark();
         let facts = self.reported_facts();
         let epoch = self.host.kernel().epoch();
@@ -166,6 +169,7 @@ impl<D: DataSource> Presenter<D> {
             return;
         };
         link.plan = plan.clone();
+        link.plan_digest = Some(plan_digest.clone());
         link.design = Some(design.clone());
         link.facts = Some(facts);
         link.modes = Some((epoch, modes));
@@ -177,6 +181,7 @@ impl<D: DataSource> Presenter<D> {
             "mode": mode,
             "rootFontSize": root_font_size,
             "plan": plan,
+            "planDigest": plan_digest,
             "design": design,
             "revision": revision,
         }));
@@ -296,14 +301,20 @@ mod tests {
             vec![
                 json!({"kind": "pin", "revision": 2, "pin": {"scheme": "dark", "contrast": "more",
                     "mode": {"dark-style": "dim"}, "rootFontSize": 20}}),
+                json!({"kind": "inspect", "on": true, "seq": 1}),
                 json!({"kind": "outline"}),
             ],
         ));
+        // No inspect mode on Linux (LLP 1122 T2c): its commands are said unsupported.
         assert_eq!(
             reports[0],
+            json!({"kind": "unsupported", "what": "inspect", "detail": null})
+        );
+        assert_eq!(
+            reports[1],
             json!({"kind": "unsupported", "what": "outline", "detail": null})
         );
-        let status = &reports[1];
+        let status = &reports[2];
         assert_eq!(status["kind"], "status");
         assert_eq!(status["scheme"], "dark");
         assert_eq!(status["contrast"], "more");

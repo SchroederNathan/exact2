@@ -49,10 +49,18 @@ fn a_host_that_says_its_platform_reads_that_platforms_column() {
     metrics::set_column(Column::Mac);
     assert_eq!(metrics::column(), Column::Mac);
     let mac = read();
-    assert_eq!(mac.min_height, Dimension::Points(16.0));
+    assert_eq!(mac.min_height, Dimension::Points(36.0));
     assert_eq!(mac.padding_top, Dimension::Points(10.0));
     assert_eq!(mac.max_width, Dimension::Points(744.0));
-    assert_eq!(mac.background_color, Some(pair(0xf9f9_f9ff, 0x2727_27ff)));
+    let card = mac.background_color.unwrap();
+    assert_eq!(card.fallback(), pair(0xf9f9_f9ff, 0x2727_27ff));
+    let ColorValue::Platform(id) = card else {
+        panic!("the host needs the card surface identity")
+    };
+    assert_eq!(
+        roles::platform(id).unwrap().macos.as_deref(),
+        Some("exactGroupedCardColor")
+    );
     assert_eq!(
         mac.border_color_bottom,
         Some(pair(0xefef_efff, 0x3333_33ff))
@@ -119,12 +127,18 @@ fn a_host_that_says_its_platform_reads_that_platforms_column() {
     assert_eq!(ios.mask, web.mask);
 
     roles::set_overrides(vec![(card, card_theme), (separator, separator_theme)]);
-    for column in [Column::Ios, Column::Web, Column::Neutral] {
+    for column in [Column::Ios, Column::Web] {
         metrics::set_column(column);
         let unchanged = read();
         assert_eq!(unchanged.background_color, web.background_color);
         assert_eq!(unchanged.border_color_bottom, web.border_color_bottom);
     }
+    // The neutral look's card is the page's own ground, edged (LLP 1115.000
+    // D4.16), whatever a theme does to the grouped card's role.
+    metrics::set_column(Column::Neutral);
+    let neutral = read();
+    assert_eq!(neutral.background_color, Some(role("-exact-background")));
+    assert_eq!(neutral.border_color_bottom, web.border_color_bottom);
     roles::set_overrides(Vec::new());
 
     metrics::set_column(Column::Web);

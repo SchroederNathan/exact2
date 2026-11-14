@@ -73,6 +73,8 @@ final class StickyHost {
         byScroller[c.scroller, default: []].insert(id)
         place(id)
     }
+    /// `id`'s box drawn again on the grid: its translation from its new origin.
+    func regridded(_ id: UInt32) { if boxes[id] != nil { place(id) } }
     func forget(_ id: UInt32) {
         guard let old = boxes.removeValue(forKey: id) else { return }
         byScroller[old.scroller]?.remove(id)
@@ -94,6 +96,9 @@ final class StickyHost {
         place(view, c.offset(offset(of: c.scroller)))
     }
     private func place(_ view: NodeView, _ offset: CGPoint) {
+        // On the pixel grid: the moved box's own edges rounded, not the
+        // displacement apart from them (`PixelGridIOS.swift`, `PixelGridMac.swift`).
+        let offset = view.grid.map { PixelGrid.shift($0, by: offset, scale: presenter.gridScale) } ?? offset
         guard view.stickyOffset != offset else { return }
         view.stickyOffset = offset
         view.applyTransform()
@@ -119,10 +124,19 @@ final class StickyHost {
         guard v.superview === presenter.root else { return .zero }
         let page = presenter.viewport.contentView.bounds.origin
         #else
-        if let sv = v.scrollView { return sv.contentOffset }
+        // CSS's scrollTop: past the inset UIKit gives it under a bar, or a
+        // page band (LLP 1130 D3), so `top: 0` sticks at the bar's bottom, as
+        // under a web page's header in flow and as UIKit pins a header.
+        if let sv = v.scrollView { return CGPoint(x: sv.contentOffset.x, y: sv.contentOffset.y + v.scrollTopInset(sv)) }
+        // A block its host scrolls (a dialog in its sheet's scroller): how far
+        // the scroller's port has moved past the block's top.
+        if let sv = v.superview as? UIScrollView {
+            let i = sv.adjustedContentInset
+            return CGPoint(x: max(0, sv.contentOffset.x + i.left - v.frame.minX), y: max(0, sv.contentOffset.y + i.top - v.frame.minY))
+        }
         guard v.superview === presenter.root else { return .zero }
         let page = presenter.viewport.contentOffset
         #endif
-        return CGPoint(x: page.x - v.frame.minX, y: page.y - v.frame.minY)
+        return CGPoint(x: page.x - v.laidOutFrame.minX, y: page.y - v.laidOutFrame.minY)
     }
 }

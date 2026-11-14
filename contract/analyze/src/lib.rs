@@ -15,8 +15,17 @@
 mod arity;
 mod calls;
 mod gates;
+mod properties;
+pub use properties::check_properties;
+mod suggestions;
+pub use suggestions::{check_suggestions, SuggestionCheck};
 mod rereads;
 mod sends;
+mod shortcuts;
+
+pub use shortcuts::{
+    check_shortcut_keys, check_windows_shortcuts, chord_codes, declares_shortcuts,
+};
 
 pub use contract_types::handler_arity_message;
 
@@ -184,12 +193,36 @@ pub fn check_routes_root(file: &File, root_file: bool) -> Result<(), AnalyzeErro
     Ok(())
 }
 
-/// `analyze-read-after-assign` (@ref LLP 1116.003 D6): each read of a state
-/// or mutation slot that its action assigned before it on a path to it,
-/// which sees the value from before the action. Lowering reports them as
-/// warnings; a read behind a call is [`check_all`]'s refusal instead.
+/// `analyze-read-after-assign` (@ref LLP 1116.003 D6, LLP 1089 D3, LLP
+/// 1035.005.002 C2): each read of a state or mutation slot that its action
+/// assigned before it on a path to it, in the action's own body or behind a
+/// call, which sees the value from before the action. Lowering reports them
+/// as warnings.
 pub fn read_after_assign(checked: &Checked<'_>) -> Vec<AnalyzeError> {
-    rereads::check(&checked.expanded.root)
+    let root = &checked.expanded.root;
+    let mut out = rereads::check(root);
+    for e in calls::check(root) {
+        if !out.iter().any(|x| x.span == e.span) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// `analyze-send-assigned` (@ref LLP 1035.005.002 C1): each action that both
+/// sends a nonqueued mutation and assigns it on one path, in either order.
+/// Lowering reports them as warnings.
+pub fn send_assigned(checked: &Checked<'_>) -> Vec<AnalyzeError> {
+    sends::send_assigned(&checked.expanded.root)
+}
+
+/// The analyzer's warnings, which lowering reports beside its own: a read its
+/// action assigned, in its body or behind a call (C2), and a send and an
+/// assignment of one mutation (C1).
+pub fn warnings(checked: &Checked<'_>) -> Vec<AnalyzeError> {
+    let mut out = read_after_assign(checked);
+    out.extend(send_assigned(checked));
+    out
 }
 
 /// Analyze the authored file using its type-checked expansion.
@@ -239,7 +272,6 @@ pub fn check_all(checked: &Checked<'_>) -> Result<Analysis, Vec<AnalyzeError>> {
         errors.extend(check_mutation_then(scoped));
         errors.extend(sends::check(scoped));
         if ci == 0 {
-            errors.extend(calls::check(scoped));
             errors.extend(gates::check(scoped, &file.fns));
         }
         let view = View {
@@ -355,7 +387,7 @@ fn check_tasks(c: &Component) -> Vec<AnalyzeError> {
 
 /// The handler attributes (the web's events, LLP 1005 §3): `press`,
 /// `change`, `input`, `hover`, `focus`, `blur`, `key`, `submit`, `load`, `message`.
-pub const HANDLERS: [&str; 68] = [
+pub const HANDLERS: [&str; 83] = [
     "press",
     "change",
     "input",
@@ -378,6 +410,9 @@ pub const HANDLERS: [&str; 68] = [
     "load",
     "message",
     "contextmenu",
+    // A list row's swipe to delete (LLP 1116.020 D1): lowering expands it
+    // to the row's swipe and its Delete button's `press`.
+    "delete",
     "dblclick",
     // A touch or button went down on the node, and came up or was cancelled
     // (DOM's names; Charlie, 2026-10-03: hold-to-record, LLP 1005 §3); the
@@ -406,8 +441,14 @@ pub const HANDLERS: [&str; 68] = [
     // a pinch as a Control-held wheel; it may hand its action a `WheelEvent`.
     "wheel",
     // DOM's `drop` of files from outside (studio diary R19): each a `doc:`
-    // handle in the `DragEvent` its action may take.
+    // handle in the `DragEvent` its action may take. `dragenter` and
+    // `dragleave` bracket a file drag over the node, with the same record.
     "drop",
+    "dragenter",
+    "dragleave",
+    // A press on an inline atom of a Markdown text or field (LLP 1045.000
+    // D7); it may hand its action an `AtomEvent`.
+    "atompress",
     "swiperight",
     "refresh",
     "scroll",
@@ -420,6 +461,9 @@ pub const HANDLERS: [&str; 68] = [
     "loadedmetadata",
     "durationchange",
     "fullscreenchange",
+    "enterpictureinpicture",
+    "leavepictureinpicture",
+    "pictureinpictureerror",
     "timeupdate",
     "play",
     "playing",
@@ -441,6 +485,24 @@ pub const HANDLERS: [&str; 68] = [
     "nexttrack",
     "stop",
     "navigate",
+    // The platform's history swipe as it tracks it (LLP 1115.000 D5.5),
+    // on the navigation root: a `HistorySwipeEvent` to take or leave.
+    "historyswipe",
+    // An iframe's guest, by the Navigation API's names (LLP 1020.002 D2):
+    // each may hand its action a `FrameNavigation`.
+    "currententrychange",
+    "navigatesuccess",
+    "navigateerror",
+    // A guest's window request and its downloads (LLP 1020.002 D5), with a
+    // `FrameNewWindow` or a `FrameDownload`.
+    "newwindow",
+    "download",
+    // A frame's `captureScreenshot` answered (LLP 1020.002 D7), with a
+    // `FrameCapture`.
+    "capture",
+    // An agent-controlled frame's dialog (LLP 1020.002 D9), with a
+    // `FrameUserPrompt`.
+    "userpromptopened",
     "heightrelease",
     "transformgeometry",
     "transformrelease",
@@ -455,10 +517,12 @@ pub const HANDLERS: [&str; 68] = [
 
 /// Whether `name=value` is a handler: one of [`HANDLERS`], except `resize`
 /// with anything but an action (an `Ident` or a `Call`, never valid CSS
-/// there), which is CSS's `resize` property.
+/// there), which is CSS's `resize` property, and `capture` with anything
+/// but an action, which is a file input's attribute (refused by lowering).
 pub fn is_handler(name: &str, value: &Expr) -> bool {
     HANDLERS.contains(&name)
-        && (name != "resize" || matches!(value, Expr::Ident(..) | Expr::Call(..)))
+        && (!matches!(name, "resize" | "capture")
+            || matches!(value, Expr::Ident(..) | Expr::Call(..)))
 }
 
 /// What a handler's event carries as its action's last argument: `input`
@@ -468,9 +532,15 @@ pub fn is_handler(name: &str, value: &Expr) -> bool {
 /// may then offer its record ([`contract_types::event_record`]).
 pub fn handler_payload(attr: &str) -> Option<&'static str> {
     match attr {
-        "change" | "input" | "key" | "keycapture" | "keyup" | "message" | "navigate" | "error" => {
-            Some("string")
-        }
+        "change"
+        | "input"
+        | "key"
+        | "keycapture"
+        | "keyup"
+        | "message"
+        | "navigate"
+        | "error"
+        | "pictureinpictureerror" => Some("string"),
         "timeupdate" | "durationchange" => Some("number"),
         "hover" | "fullscreenchange" => Some("bool"),
         "select" => Some("MarkdownSelection"),
@@ -554,7 +624,7 @@ fn check_node(n: &Node, scope: &Scope, view: &View<'_>, errors: &mut Vec<Analyze
                             |mut e| {
                                 // A hyphenated tag is a native module's (LLP 1024 D1): an
                                 // event's name there is the box's handler, never a prop.
-                                if tag.contains('-') && e.id == "analyze-handler-shape" {
+                                if tag.contains('-') && matches!(e.id, "analyze-handler-shape" | "analyze-unknown-action") {
                                     e.message.push_str(&format!("; on `{tag}` `{}` is an event, so give the module prop another name", a.name));
                                 }
                                 e
@@ -668,11 +738,7 @@ fn check_handler(
     let given = args.len();
     // A prop of bare `action` type has unknown arity; only a real action is checked.
     if let Ref::Action(index) = r {
-        let checked_attr = if attr == "selectionchange" && control == Some("field") {
-            "beforeinput"
-        } else {
-            attr
-        };
+        let checked_attr = contract_syntax::typed_event(attr, control);
         let valid = handler_accepts(checked_attr, given, params);
         if !valid {
             let declared = view.actions.actions.get(index as usize);

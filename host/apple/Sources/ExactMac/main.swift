@@ -10,6 +10,7 @@
 import AppKit
 import ExactKit
 import ExactComposition
+import ExactLaunchParts
 
 ProcessRelaunch.waitIfRequested()
 
@@ -31,22 +32,46 @@ let agentMode = ExactEnv.agentMode
 let agentReadable = agentMode || ExactEnv.environment["EXACT_AGENT"] == "live"
 setvbuf(stdout, nil, _IOLBF, 0)
 // Nothing restores this app: a session boots its plan, and the window below is
-// not restorable. AppKit would still save the application's own state some
-// fifteen seconds after launch, and to do that it asks the window server for
-// the order of its windows and waits for the reply on the main thread: 20 ms
-// while a scroll kept the server busy, a dropped frame, and the longest wait
-// left in a scroll. Encoding nothing in an `NSApplication` subclass only moves
-// the wait to the next private caller of the same question. `ApplePersistence`
-// is AppKit's own switch for all of it, read when the application is made; a
-// registered default, so a user's `defaults write` still wins.
-UserDefaults.standard.register(defaults: ["ApplePersistence": false])
+// not restorable. AppKit still saves the application's own state some fifteen
+// seconds after launch, and to do that it asks the window server for the order
+// of its windows and waits for the reply on the main thread: 20 to 34 ms while
+// a scroll keeps the server busy, a dropped frame. Encoding nothing in an
+// `NSApplication` subclass only moves the wait to the next private caller of
+// the same question, and the switch that ends it, the `ApplePersistence`
+// default, is undocumented, which shipped code does not read (LLP 1035.003 §3).
 let app = NSApplication.shared
 ExactEnv.stamp("NSApplication.shared")
 // Under a script (LLP 1012) the app is an accessory — no Dock tile, no
 // activation, so a running smoke never takes the focus from whoever is
 // typing; its window is made key for a `type` when one comes (`AgentMac`).
-app.setActivationPolicy(agentMode ? .accessory : .regular)
+// A menu-bar app (`LSUIElement`) stays one: no Dock tile (LLP 1133.025 D4).
+app.setActivationPolicy(agentMode || LaunchKind.accessory ? .accessory : .regular)
 ExactEnv.stamp("setActivationPolicy")
+// EXACT_AGENT_ACTIVATE=1 (set only by scripts/measure-controls.mjs, never by
+// default): this one run is activated and its window made key, as AppKit
+// draws a control's accent only in a key window; the app in front before it
+// is put back when it quits (LLP 1121 stage 9 F2).
+let agentActivates = agentMode && ExactEnv.environment["EXACT_AGENT_ACTIVATE"] == "1"
+let frontBefore = agentActivates ? NSWorkspace.shared.frontmostApplication : nil
+/// The app in front before an activated agent run, in front again: at every
+/// exit (the agent's own `exit` at the end of its input, AppKit's quit, an
+/// interrupt), never launching or reopening one that has gone.
+func frontAgain() {
+    guard let front = frontBefore, !front.isTerminated, front.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+    // (Cooperative activation: this app, still in front, yields to it.)
+    if #available(macOS 14.0, *) { NSApp.yieldActivation(to: front) }
+    if !front.activate() { fputs("exact: could not put \(front.bundleIdentifier ?? "the app that was in front") back in front\n", stderr) }
+}
+nonisolated(unsafe) var interrupted: DispatchSourceSignal?
+if agentActivates {
+    atexit { frontAgain() }
+    // An interrupt (a terminal's ctrl-c reaches the whole group) quits through exit too, on the main queue (not in
+    // the signal handler, where AppKit's restore is not safe).
+    signal(SIGINT, SIG_IGN)
+    interrupted = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    interrupted?.setEventHandler { exit(130) }
+    interrupted?.resume()
+}
 let appReadyMs = ExactEnv.wall()
 
 /// The one session and its view; the session's clock is the agent's under a script.
@@ -65,10 +90,22 @@ final class Adapter: ExactSessionDelegate {
             case "light": app.appearance = NSAppearance(named: .aqua)
             default: app.appearance = nil
             }
-        case "openURL": open(args.first as? String ?? "", from: session)
+        case "openURL": open(args.first as? String ?? "", from: session) { session.answerOpenURL(args, opened: $0) }
         // `window.close()` (studio diary R17): the window this session
         // shows, without asking its `beforeunload` again.
         case "close": windows.first { $0.session === session }?.close()
+        // A quit the app holds (LLP 1069.010): its window leaves full screen
+        // and fades before the quit, `ExactWindowCommands`.
+        case "exitFullscreen", "setWindowOpacity":
+            guard let window = windows.first(where: { $0.session === session })?.window else { return }
+            if agentMode { session.log("\(name)\(args.isEmpty ? "" : " \(args[0])")") }
+            _ = ExactWindowCommands.perform(name, args, on: window, log: session.log)
+        // Bare `focus()`, as the web's `window.focus()` (LLP 1133.025 §8): the
+        // session's window shown if hidden, brought forward, and the app asks
+        // to be activated, which macOS 14's cooperative activation decides.
+        case "focus":
+            if agentMode { session.log("focus window") }
+            windows.first { $0.session === session }?.front()
         case "relaunch":
             guard !delegate.relaunching, delegate.quitting?.holding != true else { return }
             delegate.relaunching = true
@@ -79,26 +116,42 @@ final class Adapter: ExactSessionDelegate {
 
     /// A followed link. One that names a local file or directory is a
     /// document for this app (a Markdown link to the file beside it); one
-    /// that names a page goes to whatever handles pages. Nothing else opens:
-    /// a link comes out of a document this app did not write, and handing an
-    /// arbitrary scheme to Launch Services is handing it whatever is
-    /// registered for that scheme (LLP 0382 — fail closed, loudly).
-    private func open(_ target: String, from session: ExactSession) {
-        guard !target.isEmpty else { return }
+    /// that names a page goes to whatever handles pages, and one of a scheme
+    /// the app declares (`open_url.schemes`, OpenURL.swift) to what Launch
+    /// Services registered for it. Nothing else opens: a link comes out of a
+    /// document this app did not write, and handing an arbitrary scheme to
+    /// Launch Services is handing it whatever is registered for that scheme
+    /// (LLP 0382 — fail closed, loudly). `answer` hears whether it opened,
+    /// or, where the agent's drive only journals the open, whether an app
+    /// is registered for it.
+    private func open(_ target: String, from session: ExactSession, answer: @escaping (Bool) -> Void) {
+        let registered = { (url: URL) in NSWorkspace.shared.urlForApplication(toOpen: url) != nil }
+        guard !target.isEmpty else { return answer(false) }
         // A link beside a document the person chose (LLP 1069.010 D1).
-        if target.hasPrefix("doc:/") { ExactDocuments.deliver([target], to: session); return }
+        if target.hasPrefix("doc:/") { ExactDocuments.deliver([target], to: session); return answer(true) }
+        // The app's settings (LLP 1133.002 D11): macOS has no page per app, so
+        // Privacy & Security's Location Services, the one permission a module
+        // asks for today. Under the agent, journaled only.
+        if target == "app-settings:" {
+            let pane = "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
+            session.log("openURL app-settings: opens \(pane)\(agentMode ? " (not under the agent)" : "")")
+            guard let url = URL(string: pane) else { return answer(false) }
+            return answer(agentMode ? registered(url) : NSWorkspace.shared.open(url))
+        }
         let url = URL(string: target)
         let local = url?.isFileURL == true ? url!.standardizedFileURL.path
             : target.hasPrefix("/") ? URL(fileURLWithPath: target).standardizedFileURL.path : nil
         if let local, FileManager.default.fileExists(atPath: local) {
-            ExactDocuments.deliver([local], to: session)
-            return
+            ExactDocuments.deliver([local], to: session, keep: false)
+            return answer(true)
         }
+        if let url, session.openDeclaredScheme(url, open: { url, done in done(NSWorkspace.shared.open(url)) },
+                                               registered: registered, answer: answer) { return }
         guard let url, ["http", "https", "mailto"].contains(url.scheme?.lowercased() ?? "") else {
             FileHandle.standardError.write(Data("exact: refused to open \(target)\n".utf8))
-            return
+            return answer(false)
         }
-        NSWorkspace.shared.open(url)
+        answer(NSWorkspace.shared.open(url))
     }
 }
 let adapter = Adapter()
@@ -122,6 +175,15 @@ let size = NSSize(width: windowDimension("width", fallback: scripted ? 420 : 900
 let minimumSize = NSSize(width: min(windowDimension("minWidth", fallback: 320), size.width),
                          height: min(windowDimension("minHeight", fallback: 240), size.height))
 
+/// The manifest's `display_override` (LLP 1039 D8): the first mode a Mac
+/// window takes decides, as a browser takes the first it supports.
+/// `window-controls-overlay` gives an app without routes the platform's
+/// tall title row over its page.
+let windowControlsOverlay: Bool = {
+    let taken: Set<String> = ["window-controls-overlay", "standalone", "minimal-ui", "browser"]
+    return (ExactEnv.appMetadata["ExactDisplayOverride"] as? [String])?.first(where: taken.contains) == "window-controls-overlay"
+}()
+
 /// The process's physical footprint, what Activity Monitor calls its
 /// memory: what a second session costs is read as the difference.
 func footprint() -> UInt64 {
@@ -140,6 +202,11 @@ func footprint() -> UInt64 {
 final class ExactWindow: NSWindow {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
         agentMode ? frameRect : super.constrainFrameRect(frameRect, to: screen)
+    }
+    /// A navigation is timed from its input: a mouse-up or key press.
+    override func sendEvent(_ event: NSEvent) {
+        super.sendEvent(event)
+        if [.leftMouseUp, .keyDown].contains(event.type) { ExactLaunch.shared.input(at: event.timestamp) }
     }
 }
 
@@ -228,7 +295,19 @@ final class DocumentWindow: NSObject, NSWindowDelegate {
     /// keeps a normal titled window and zero insets. The window is the adapter's;
     /// the insets are the view's (`ExactView.syncInsets`).
     func coverChrome() {
-        let cover = view.viewportFit == "cover"
+        // `window-controls-overlay` (LLP 1039 D8): while the session shows
+        // no toolbar of its own (a route's header), an empty unified one
+        // stands in the title bar, which the page underlaps, as a hand-built
+        // window that draws its own title row does. Not in full screen,
+        // where Chrome's overlay goes too; it comes back once the window is
+        // windowed again, as the toolbar's height would otherwise change
+        // under AppKit's exit animation.
+        let overlay = windowControlsOverlay && toolbarAttached && !view.hasWindowToolbar
+            && !enteringFullScreen && !window.styleMask.contains(.fullScreen)
+        if overlay, window.toolbar == nil { window.toolbar = overlayToolbar }
+        if !overlay, window.toolbar === overlayToolbar { window.toolbar = nil }
+        view.controlsOverlay = overlay
+        let cover = view.viewportFit == "cover" || overlay
         sidebar?.viewportFitChanged()
         if cover {
             if !window.styleMask.contains(.fullSizeContentView) { window.styleMask.insert(.fullSizeContentView) }
@@ -250,8 +329,31 @@ final class DocumentWindow: NSObject, NSWindowDelegate {
         // 1115.002 D2): `.unified`, about 52 points on macOS 27, which is what
         // AppKit gives the style and not a number set here. A route's header
         // is this bar, so it has room for a title beside its items.
-        if view.hasWindowToolbar { window.toolbarStyle = .unified }
+        if view.hasWindowToolbar || overlay { window.toolbarStyle = .unified }
         view.syncInsets()
+    }
+    /// The toolbar `window-controls-overlay` puts in the title bar: no
+    /// items, so AppKit draws only its height (`coverChrome`).
+    private lazy var overlayToolbar: NSToolbar = {
+        let toolbar = NSToolbar(identifier: "exact.window-controls-overlay")
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        return toolbar
+    }()
+    /// The session's own toolbar has had its chance at the window
+    /// (`compose`), which takes none while the window has another.
+    private var toolbarAttached = false
+    private var enteringFullScreen = false
+    func windowWillEnterFullScreen(_ notification: Notification) { enteringFullScreen = true; coverChrome() }
+    func windowDidEnterFullScreen(_ notification: Notification) { enteringFullScreen = false }
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) { enteringFullScreen = false; coverChrome() }
+    func windowDidExitFullScreen(_ notification: Notification) { coverChrome() }
+    /// Off while the session's toolbar is attached, which takes the window
+    /// only while it has no toolbar.
+    private func attachToolbar() {
+        if window.toolbar === overlayToolbar { window.toolbar = nil }
+        view.attachWindowToolbar(to: window)
+        toolbarAttached = true
     }
 
     /// The view goes into the window once its session has booted (the
@@ -282,7 +384,8 @@ final class DocumentWindow: NSObject, NSWindowDelegate {
             // Neither, before or now: the view is the window's content.
             guard window.contentView !== view else { return }
             window.contentView = view
-            view.attachWindowToolbar(to: window)
+            attachToolbar()
+            coverChrome()
             return
         }
         // The same columns as before: nothing to compose.
@@ -311,7 +414,7 @@ final class DocumentWindow: NSObject, NSWindowDelegate {
             window.contentView = view
         }
         coverChrome()
-        view.attachWindowToolbar(to: window)
+        attachToolbar()
         coverChrome()
         guard !window.styleMask.contains(.fullScreen) else { return }
         let height = window.frame.height + under - window.contentLayoutRect.height
@@ -328,11 +431,15 @@ final class DocumentWindow: NSObject, NSWindowDelegate {
 
     /// In front — never activated under a script (LLP 1012), so a running
     /// smoke never takes the focus from whoever is typing.
+    /// Bare `focus()` (LLP 1133.005 D10): the app unhidden, the window
+    /// deminiaturized and ordered front, and activation asked for, which
+    /// macOS 14's cooperative activation may refuse; nothing more then.
     func front() {
-        if agentMode { window.orderFrontRegardless() } else {
-            window.makeKeyAndOrderFront(nil)
-            app.activate(ignoringOtherApps: true)
-        }
+        if agentMode && !agentActivates { window.orderFrontRegardless(); return }
+        if app.isHidden { app.unhide(nil) }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        if #available(macOS 14.0, *) { app.activate() } else { app.activate(ignoringOtherApps: true) }
     }
 
     /// The app's `close()`: the window goes, unasked.
@@ -346,7 +453,8 @@ final class DocumentWindow: NSObject, NSWindowDelegate {
         var row: [String: Any] = [
             "session": label, "title": window.title, "document": document ?? NSNull(),
             "edited": window.isDocumentEdited, "representedURL": window.representedURL?.path ?? NSNull(),
-            "key": window.isKeyWindow, "tabs": window.tabbedWindows?.count ?? 1,
+            "key": window.isKeyWindow, "visible": window.isVisible, "tabs":window.tabbedWindows?.count ?? 1,
+            "fullScreen": window.styleMask.contains(.fullScreen), "opacity": Double(window.alphaValue),
             "footprintBefore": footprintBefore,
         ]
         // The first window's is from the process's start (what `metrics`
@@ -356,13 +464,16 @@ final class DocumentWindow: NSObject, NSWindowDelegate {
     }
 
     /// The red button, File ▸ Close Window and ⌘W ask the app first
-    /// (`beforeunload`, studio diary R17); a window it keeps stays.
+    /// (`beforeunload`, studio diary R17); a window it keeps stays. The one
+    /// window of an app that keeps running is hidden instead (LLP 1069.010 D8).
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        closing || session.beforeUnload()
+        // A one-window app whose status item is placed keeps running (LLP 1133.025 D4).
+        let keeps = ExactDocuments.keepsRunning() || (ExactDocuments.launchMode != "navigate-new" && session.placesStatusItems)
+        if !closing, ExactDocuments.hidesOnClose(window, only: windows.count == 1, keepsRunning: keeps) { return false }
+        return closing || session.beforeUnload()
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
-        DevMenu.select(session: session)
         if !stamped, label == "main" { stamped = true; ExactEnv.stamp("windowDidBecomeKey") }
         agentReady()
     }
@@ -374,6 +485,7 @@ final class DocumentWindow: NSObject, NSWindowDelegate {
     /// its views, its label on the carrier.
     func windowWillClose(_ notification: Notification) {
         Agent.route(label, nil)
+        PageFacts.closed(window)
         // After AppKit has finished closing the window this holds.
         DispatchQueue.main.async { [self] in
             windows.removeAll { $0 === self }
@@ -509,17 +621,61 @@ Agent.hostState = {
 }
 
 final class Delegate: NSObject, NSApplicationDelegate {
+    /// What AppKit saves of the application is decoded securely; nothing of
+    /// it restores a window (`isRestorable` is off on every window here).
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
     func applicationWillFinishLaunching(_ notification: Notification) {
+        LaunchKind.install()
         exact.installNotificationClicks { session in windows.first { $0.session === session }?.front() }
+        exact.installWakes()
+        exact.installReach()
+    }
+    /// The Dock menu, one menu: the manifest's shortcuts, then the app's (LLP
+    /// 1133.023 D3), then the front window's session's `-exact-menu="dock"`
+    /// buttons (LLP 1133.025 D5), above AppKit's own items.
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let shortcuts = ExactShortcuts.dockMenu(), buttons = frontWindow()?.session.dockMenu
+        guard let shortcuts, let buttons else { return shortcuts ?? buttons }
+        shortcuts.autoenablesItems = false // a disabled button's item stays dimmed
+        shortcuts.addItem(.separator())
+        for item in buttons.items { buttons.removeItem(item); shortcuts.addItem(item) }
+        return shortcuts
+    }
+    /// A Spotlight result of the app's index opened (LLP 1133.023 D4).
+    func application(_ application: NSApplication, continue userActivity: NSUserActivity, restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void) -> Bool {
+        guard let location = ExactContentIndex.location(of: userActivity) else { return false }
+        (frontWindow() ?? openWindow()).front()
+        ExactContentIndex.open(location)
+        return true
+    }
+    override init() {
+        ExactLaunch.shared.delegateInit()
+        ExactLaunch.shared.runLaunchParts(ExactLaunchParts.all)
+        super.init()
     }
     /// A one-window app quits with its window; one whose documents each
     /// get a window (`navigate-new`, LLP 1069.010 D4) stays, as a Mac
     /// document app does, for File ▸ New Window, Open and the Dock (LLP 1115 D8).
+    /// AppKit asks this when its last window is ordered out, so it is asked
+    /// too when an app that keeps running hides its window (LLP 1069.010 D8), and that
+    /// app ends only after its own `close()`.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        ExactDocuments.launchMode != "navigate-new"
+        // A window a status item reaches, or that a launch with no window
+        // made, is hidden, not gone (LLP 1133.025 D4, D6).
+        if windows.contains(where: { !$0.closing && ($0.session.placesStatusItems || PageFacts.isUnshown($0.window)) }) { return false }
+        return ExactDocuments.endsWithoutWindows(hiding: windows.contains { !$0.closing })
     }
-    /// The Dock icon clicked with no window showing: a new one.
+    /// The Dock icon clicked, or the app opened again, with no window
+    /// showing: the window an app that keeps running hid comes back as it
+    /// was (LLP 1069.010 D8); a `navigate-new` app opens a new one.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        // Hidden by `keepRunning`, by a close while a status item is placed,
+        // or by a launch with no window (LLP 1133.025 D4, D6).
+        if !flag, ExactDocuments.launchMode != "navigate-new",
+           let hidden = windows.first(where: { !$0.window.isVisible && !$0.window.isMiniaturized }) {
+            hidden.front()
+            return false
+        }
         guard !flag, windows.isEmpty, ExactDocuments.launchMode == "navigate-new" else { return true }
         openWindow()
         return false
@@ -530,9 +686,10 @@ final class Delegate: NSObject, NSApplicationDelegate {
     /// the last window closing ends the app. Nothing is held while the app
     /// asks (LLP 1069.010 D7). Once the quit is decided, each native module
     /// starts its quit work (`ExactModule.willQuit`), and the quit is held
-    /// while that work runs or storage an answer started is still landing:
-    /// one hold, five seconds at most for all of it (LLP 1097 D10, LLP
-    /// 1069.010 Q4). AppKit's modal loop keeps the main thread running.
+    /// while that work runs, storage an answer started is still landing or
+    /// a request with effects is in flight: one hold, five seconds at most
+    /// for all of it (LLP 1097 D10, LLP 1146 D2, LLP 1069.010 Q4). AppKit's
+    /// modal loop keeps the main thread running, so a reply lands meanwhile.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // A repeated quit joins the existing hold: it neither asks the app
         // again, nor the modules, nor starts a fresh five-second deadline.
@@ -545,13 +702,13 @@ final class Delegate: NSObject, NSApplicationDelegate {
         // The open windows' sessions, and the last window's if its closing started the quit.
         let sessions = (windows + closedForQuit).map(\.session)
         for session in sessions { session.willQuit() }
-        let hold = StorageHold(bound: 5, pending: { sessions.contains { $0.storageOperations > 0 || $0.quitWorkPending } },
-                               begin: { _ in }, end: { NSApp.reply(toApplicationShouldTerminate: true) })
+        let hold = QuitHold(bound: 5, pending: { sessions.contains { $0.quitWorkPending || $0.mustFinish } },
+                            end: { NSApp.reply(toApplicationShouldTerminate: true) })
         guard hold.hold() else { return .terminateNow }
         quitting = hold
         return .terminateLater
     }
-    var quitting: StorageHold?
+    var quitting: QuitHold?
     var relaunching = false
     /// The quit is decided, however it came (⌘Q, the app menu, an Apple
     /// Event, SIGTERM, the last window closing): every session still live goes now,
@@ -568,6 +725,9 @@ final class Delegate: NSObject, NSApplicationDelegate {
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         ExactEnv.stamp("didFinishLaunching")
+        // The session already exists and AppKit boots it inside this
+        // callback, so launch is measured to this point.
+        ExactLaunch.shared.didFinishLaunching(hidden: NSApp.isHidden)
         finishLaunching()
     }
     /// Launch Services brought something: a development link, or documents —
@@ -583,7 +743,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
             if !session.booted { launchDevelopmentURL = url }
             else { ExactDevelopmentLink.open(url); frontWindow()?.front() }
             return true
-        }, document: { files.append($0) }, location: { url in
+        }, webPage: session.isWebPageFile, document: { files.append($0) }, location: { url in
             // The first window's session may have closed with its window.
             let target = frontWindow() ?? openWindow()
             if target.session.openURL(url) { target.front() }
@@ -655,7 +815,9 @@ func finishLaunching() {
             planWatch = t
         }
     }
-    DevMenu.install(session: session, planPath: devPlanPath ?? ExactEnv.environment["EXACT_PLAN"])
+    DevMenu.install(session: session, planPath: devPlanPath ?? ExactEnv.environment["EXACT_PLAN"], frameHealthContainer: window.contentView?.superview)
+    // `SIGUSR1` saves the front window's trace (LLP 1142 D5).
+    TraceSignal.install { DevMenu.session ?? session }
 
     // EXACT_PLAN=<file> boots that plan instead of the one baked into the
     // library — any compiled contract, no rebuild (smokes, fixtures).
@@ -701,11 +863,22 @@ func finishLaunching() {
     // the same from here down — and a script's (`agent.mjs --open`), whose
     // driver names the whole command line. Not under the boot smoke, which
     // measures the app's own start. @ref LLP 1033 D3
+    // An HTML file named here reaches a browser's template, as one Launch
+    // Services brings does (`isWebPageFile`).
     if !smoke {
-        route(ExactDocuments.paths(in: CommandLine.arguments))
+        var files: [URL] = []
+        IncomingURLBatch.deliver(ExactDocuments.paths(in: CommandLine.arguments).map { URL(fileURLWithPath: $0) }, development: { _ in false },
+                                 webPage: session.isWebPageFile, document: { files.append($0) }, location: { url in
+            let target = frontWindow() ?? openWindow()
+            if target.session.openURL(url) { target.front() }
+        })
+        route(ExactDocuments.paths(of: files))
     }
     firstWindow.coverChrome()
-    window.makeKeyAndOrderFront(nil)
+    // A launch with no window (LLP 1133.025 D6): made, not shown; its first
+    // pixel is the first commit and its status items.
+    let withoutWindow = LaunchKind.withoutWindow
+    if withoutWindow { launchWithoutWindow() } else { window.makeKeyAndOrderFront(nil) }
     if let url = launchDevelopmentURL {
         launchDevelopmentURL = nil
         DispatchQueue.main.async { ExactDevelopmentLink.open(url) }
@@ -713,7 +886,7 @@ func finishLaunching() {
     ExactEnv.stamp("makeKeyAndOrderFront")
     // Under a script: in front regardless, so the window is seen (a covered
     // window's canvases render nothing, LLP 1009 D4) — but never activated.
-    if agentMode { window.orderFrontRegardless() } else { app.activate(ignoringOtherApps: true) }
+    if withoutWindow {} else if agentMode && !agentActivates { window.orderFrontRegardless() } else { app.activate(ignoringOtherApps: true) }
     ExactEnv.stamp("activate")
 
     /// Agent mode: the driver owns the process from here — one JSON line in,
@@ -731,12 +904,29 @@ func finishLaunching() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             print("painted \(session.firstDrawMs.map { String(format: "%.1f", $0) } ?? "?") ms")
             print("stamps: " + ExactEnv.stamps.map { "\($0.0) \(String(format: "%.1f", $0.1))" }.joined(separator: " · ") + " · first layout \(session.firstLayoutMs.map { String(format: "%.1f", $0) } ?? "?") · first draw \(session.firstDrawMs.map { String(format: "%.1f", $0) } ?? "?")")
+            print("observe: \(ExactLaunch.shared.smokeLine())")
             print("gpu: \(session.gpuStatus)")
             print("web: \(session.webStatus)")
             print("smoke ok")
             exit(0)
         }
     }
+}
+
+/// A launch with no window (LLP 1133.025 D6): something must reach the app.
+/// The Dock's reopen does for a regular app; an accessory app has only its
+/// status items, so where none is placed once the data's first commit has
+/// settled, or when the last goes while the window is hidden, the window
+/// shows.
+func launchWithoutWindow() {
+    session.presentWithoutWindow(window)
+    let reach = {
+        guard LaunchKind.accessory, !firstWindow.closing, !window.isVisible, !session.placesStatusItems else { return }
+        session.log("no-window launch: nothing reaches the app; window shown")
+        firstWindow.front()
+    }
+    session.onStatusItemsPlaced = { placed in if !placed { reach() } }
+    NotificationCenter.default.addObserver(forName: ExactSession.dataActivated, object: session, queue: .main) { _ in reach() }
 }
 
 /// A refused EXACT_PLAN: attaching the view then boots the embedded plan,

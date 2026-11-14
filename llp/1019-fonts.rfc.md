@@ -158,10 +158,10 @@ font "Castle Display" = "assets/CastleDisplay-Variable.ttf"
 ```
 
 A single path is a whole family (a variable font, or a one-weight face).
-**A `faces` row of `weight: u16, italic: bool, path` cannot express that
-shorthand** — Sol's catch — so either the compiler inspects the file's axes at
-build time and records a range, or v1 declares itself static-only and the
-variable shorthand waits. Decide it in the table (D2), not in prose.
+**Decided in §13:** the compiler reads the file's `fvar` axes at build time and
+records each face's weight and width ranges in its `faces` row, so the
+shorthand is `@font-face` with its descriptors left `auto`; a block face
+names one weight (`600 = …`) or a range (`100 900 = …`).
 A block names faces by weight and optional `italic`, which is exact1's
 weight-map source form as syntax rather than an object literal. Paths are
 portable relative paths under the app's `assets/` directory. The compiler
@@ -392,11 +392,11 @@ web (which already does CSS matching if you emit `font-family` and
 `font-weight` and do not snap) would *create* divergence. Linux may keep it as
 a local clamp, per family, and must not snap a real `wght` axis.
 
-**Two domain questions this opens.** The kernel carries `font_weight: u16`
-defaulting to 400 (`kernel/tables/schema.json:152`) while CSS Fonts 4 is
-1–1000 and a `wght` axis is continuous; and there is no `font_stretch` row at
-all, though stretch is part of CSS matching. Each needs a decision or an
-LLP 1001 deviation, not silence.
+**Two domain questions this opens**, both answered in §13: a `wght` axis is
+continuous while `font_weight` is a whole number (a whole weight is
+indistinguishable at any text size, and CSS's computed weights are what an
+author writes), and stretch is part of CSS matching (the `font_stretch` row,
+D8).
 
 ### D7 — `font-style` lands in the same change
 
@@ -528,8 +528,8 @@ Each of these is declared here so it is not silently assumed:
 
 - **Remote fonts and `display` policy** — D5. A URL source is a `resource`
   if it ever matters.
-- **`font-feature-settings`, `font-variation-settings`, small caps,
-  `font-variant-caps`** — `font_variant_numeric` (bit 75) is the one
+- **`font-feature-settings`, `font-variation-settings`, `font-optical-sizing`,
+  small caps, `font-variant-caps`** (`font-stretch` is in: §13) — `font_variant_numeric` (bit 75) is the one
   OpenType row that exists, and it is also unreachable from Contract; it
   should get an attribute with this work or be declared unreachable on
   purpose.
@@ -779,3 +779,265 @@ list is likewise unbuilt by choice, not by accident.
 `.otf` exists in Weird Castle or exact2 outside the DejaVu fixture pair, so the
 brand face remains an open product choice — which typeface, and whether its
 licence permits bundling into a shipped binary.
+
+## 13. Variable faces and `font-stretch` (2026-10-19)
+
+A variable file is one face that covers a range of weights and widths. A
+browser draws it from `@font-face`'s range descriptors (CSS Fonts 4 §4.5,
+§4.6): a request inside `font-weight: 100 900` is set on the `wght` axis at
+that value, and one outside is matched at the range's nearer end. Exact now
+does the same on every host.
+
+### D2, decided — a face carries its ranges
+
+A `faces` row is one source, a weight range (`weight` to `weight_max`), a width
+range in tenths of a percent (`stretch_min` to `stretch_max`, 1000 normal) and
+italic: `@font-face`'s `font-weight`, `font-stretch` and `font-style`. One
+weight is a range of one value and pins `wght` there, as a single
+descriptor does.
+
+- **The shorthand is `auto`.** `font "Name" = "path"` reads the file's `fvar`
+  at compile time (`contract/lower/src/font_axes.rs`): a `wght` axis is the
+  face's weight range and a `wdth` axis its width range. A static face is 400,
+  normal width. CSS Fonts 4's `auto` would take a static face's weight from
+  its OS/2 class; Exact keeps 400, which the identity rule (D3) already
+  required of a face whose name table disagrees with its declaration.
+- **A block face names one weight or a range:** `600 = "…"` pins, `100 900 =
+  "…"` covers. Its width range is always the file's, as `auto`.
+- **No host infers a range.** The plan holds them, so web emits them as
+  descriptors and native hosts read the same rows.
+- **One variable file pinned at several weights is one face** over their
+  span (`400 = "Inter.ttf"` and `700 = "Inter.ttf"` declare `400 700`), so
+  the web writes one `@font-face` and fetches the file once; an uncached
+  page otherwise fetched it again for each weight's first use, too late for
+  an `optional` face. A weight between them draws at its own `wght` on every
+  host. A span another face of the same style overlaps stays as declared.
+
+### D8 — `font-stretch`
+
+`font_stretch` is a kernel row (bit 216): an inherited percentage, default
+100, written as CSS writes it (`75%`, `condensed`; a bare number is refused, as
+CSS refuses it). It is the first criterion of face matching (§5.2: the nearest
+width, narrower first at or below 100%, wider first above it), then style,
+then weight; a face declared over a `wdth` range draws the request on that
+axis, clamped to the range. Fonts 4 renames the property `font-width`; the
+compiler takes the name browsers implement.
+
+### Optical size
+
+`font-optical-sizing: auto` (CSS Fonts 4 §2.7) sets a face's `opsz` to the
+font size in px, and it decides more than letterforms: Roboto Flex's width
+range grows with `opsz` (at weight 944 and 168 px, `wdth` 50–150 spans 1047 to
+1241 px at `opsz` 14, 887 to 1564 at 144). Every host sets it: the browser
+itself; Apple in `RegisteredFace.drawn`, since CoreText stops choosing `opsz`
+once a descriptor carries a variation; Linux as a Parley style variation after
+fontique's synthesis (`text::shaping::push_style`), which Android's
+`FONT_AXES` carries to the reader; Android's fields in the `'opsz'` of the
+face's settings.
+
+`font-optical-sizing: none` is authorable (kernel row bit 218, inherited): no
+host sets `opsz`, and the face keeps its own. Apple also sets CoreText's
+`kCTFontOpticalSizeAttribute` to `"none"`, as WebKit does, which turns off
+the optical sizes CoreText picks for San Francisco by itself: at 96 px
+`system-ui` under `none` draws San Francisco's text cut, wider than its
+display cut. Chrome leaves `system-ui` as it is under `none`.
+
+### How each host draws it
+
+| Host | Weight and width |
+|---|---|
+| Web | `@font-face { font-weight: 100 900; font-stretch: 25% 151% }`; the browser sets the axes. |
+| Apple | `RegisteredFace` holds both ranges; `matched` is §5.2 over them; `drawn` sets `wght` and `wdth` on the descriptor per request (one declared weight stays pinned at registration). |
+| Linux, Android | fontique's `FontInfo::with_declared_ranges` (`vendor/fontique/EXACT-PATCHES.md` §5): matching takes a range at its value nearest the request, and synthesis always emits the clamped coordinate. Android draws the axes fontique chose. |
+
+### D9 — `font-variation-settings`, and the width everywhere
+
+`font_variation_settings` is a kernel row (bit 217): inherited, `normal` or a
+list of quoted four-character tags with numbers, as CSS Fonts 4 §7.2 writes it.
+A repeated tag keeps its last value; a tag the face lacks does nothing.
+
+- **The value is a fixed array of eight axes**, not an interned list.
+  `TextStyle` stays `Copy` and crosses the C ABI by value (`ExactTextRun`
+  carries a count and two arrays of eight), so no host keeps a table in step
+  with the kernel, and two values of the same tags interpolate axis by axis
+  when motion takes text rows. Eight covers every registered axis and the
+  parametric ones a face like Roboto Flex names together; a ninth distinct tag
+  is refused at compile.
+- **It draws last.** §7 orders the axes: weight, width and optical size first,
+  then each tag the settings name, which wins for its own axis.
+  `"wdth" 50` draws as `font-stretch: 50%` does.
+- **A platform family stretches.** `font-stretch` on `system-ui` (and the
+  generics Apple draws with San Francisco) sets SF's `wdth` axis (30–150) to
+  the percentage, as Chrome and WebKit draw it; `UIFont.Width` and
+  `NSFont.Width` are points on that axis. Once a variation is set CoreText
+  stops choosing `opsz`, so it is set to the size (`TextEngine.cssAxes`).
+- **Fields and Canvas 2D take the width.** Apple's native fields draw the
+  field's stretch and settings through the same font call as text. Android's
+  fields set `Typeface.Builder.setFontVariationSettings` from the weight,
+  width, optical size and settings. The device's default family is
+  `Typeface.create`, which takes no axes, so a field on it that sets a width
+  or a setting is built from the file its text is drawn from instead. Canvas 2D's `font` shorthand and
+  `fontStretch` were parsed already; Apple now draws them, as Linux and the
+  browser did. A canvas takes no `font-variation-settings`: the HTML canvas
+  has none.
+
+### How each host draws the settings
+
+| Host | `font-variation-settings` |
+|---|---|
+| Web | The property itself. |
+| Apple | `RegisteredFace.drawn` and `TextEngine.cssAxes` set the tags on the descriptor after `wght`, `wdth` and `opsz`. |
+| Linux, Android | Parley's style variations, after `opsz` and after fontique's synthesis; Android's `FONT_AXES` carries them to the reader. |
+
+### Not here
+
+Transitions and keyframes on the settings: D10, below.
+
+### D10 — The font rows move: `transition` and `@keyframes` (2026-10-20, 2026-10-24)
+
+`transition` takes `font-weight`, `font-stretch` and
+`font-variation-settings`, as CSS does: `font-weight 300ms ease-out`, a
+spring, `all`; `@keyframes` take all three (`from font-weight=100`). Each is
+a layout property: a weight's glyphs are wider, so every frame lays its text
+out again. That is admitted for these three rows alone (`rules/DEFERRED.md`
+§Motion). Measured first on an
+iPhone 17 Pro Max with the weight set every frame: the poster and a title
+hold 119 fps and as few late frames as the same screens built in UIKit;
+twelve paragraphs of body text hold the rate with more late frames (QUEUE).
+
+- **The runner plays them** (`runner/src/runner/text_axes.rs`): no
+  compositor can draw a weight it was not given, so no host's engine takes
+  their targets. After a commit that changes one under a matching
+  declaration, or a node's animation of one, the runner starts it in an
+  `exact-motion` engine of its own and writes the value presented now in
+  the same apply; each frame writes the next value as a presentation-only
+  commit, and layout follows. Interruption, reversing shortening and an
+  animation's iterations, direction, fill, delay and play state are the
+  engine's, as for every other property.
+- **A change is CSS Transitions §3's.** The before-change value is the
+  computed one presented before the commit, inherited included; the
+  after-change value leaves transitions out, so a node whose own
+  `transition` covers a row it inherits starts one when an ancestor's value
+  changes, from what it showed to the ancestor's new target. While that
+  row moves the runner writes it on the node, and at rest it clears the
+  write, so the node inherits again. A node without a transition follows a
+  moving ancestor frame by frame.
+- **The settings move axis by axis** (CSS Fonts 4 §7.2): the engine keys
+  each axis as a node of its own. Two values naming the same axes
+  interpolate each; two naming different ones change at once, as a
+  discrete property does under `transition-behavior: normal`. A keyframe's
+  axis is one value on the wire (its number, and its tag in two 16-bit
+  halves, which an `f32` carries exactly), and every keyframe that sets the
+  settings names the same axes, or the rule is refused. An axis the node's
+  own settings do not name has no underlying value to fill a keyframe the
+  rule leaves out; it takes its first keyframe's value there, and leaves
+  the settings when the animation ends.
+- **Apple links it by use**, when the plan declares any transition or
+  animation.
+- **A spring is its curve from rest**, a `linear()` over its settle time, as
+  for paint (LLP 1062 D3): nothing carries a weight's velocity.
+- **A weight moves in whole steps** of 1 in 1000, the row's own encoding.
+- **The web links none of it.** The rows emit as CSS `transition` and
+  `@keyframes`, and the browser plays them (`RunnerLinks::text_axes` is
+  `None` there).
+- **Settle** folds the runner's end time into each native host's `settle`,
+  and the seekable clock steps its virtual frames while an axis moves.
+- **Not here:** CSS's after-change value includes an ancestor's running
+  animation, so a child's own transition would restart at each of its
+  frames; here it moves toward the ancestor's own target. Two animations
+  of the settings naming different axes each move theirs, where CSS's later
+  one replaces the whole list.
+
+### D11 — A platform face's weights are the platform's (2026-10-24)
+
+Charlie: "i'm less concerned with the 300kb of heap and more concerned with
+trying to look like UIKit by default." `font-weight` on a platform generic
+(`system-ui`, `ui-serif`, `ui-monospace`, `ui-rounded` and the generics Apple
+draws with them) draws the platform's named weight at each hundred: 100 is
+UIKit's (AppKit's) ultra light, 600 its semibold, 900 its black
+(`TextEngine.cssWeight`, `PlatformWeights.swift`). Chrome and WebKit set the
+`wght` axis to the number instead, so San Francisco text at `600` is about
+0.2% narrower than the browser's, a deviation declared in LLP 1001.
+
+The named instances' `wght`, the same on iOS 27 and macOS 27:
+
+| CSS | 100 | 200 | 300 | 400 | 500 | 600 | 700 | 800 | 900 |
+|---|---|---|---|---|---|---|---|---|---|
+| San Francisco | 30.9 | 110.7 | 274.3 | 400 | 510 | 590 | 700 | 860 | 1000 |
+| SF italic, SF Rounded | 28.9 | 112.7 | 276.3 | 400 | 508 | 590.8 | 700 | 858.4 | 1000 |
+| New York | 400 | 400 | 400 | 400 | 496 | 568 | 674 | 810 | 934 |
+| SF Mono | 294.7 | 294.7 | 294.7 | 400 | 483.5 | 571.3 | 683.3 | 900 | 900 |
+
+- **Between two hundreds each axis runs linearly** from one named
+  instance's value to the next (650 is San Francisco's `wght` 645; SF Mono's
+  `YAXS` moves with its `wght`), and below 100 `wght` runs from the axis
+  minimum at 1, above 900 to the maximum at 1000. A transition is continuous
+  and comes to rest on a named instance. SF Mono has no weight lighter than
+  its light, the axis minimum, so 100 to 300 all draw it.
+- **Each hundred is the platform's own font object**, so CoreText shares
+  what it keeps per named instance (the QUEUE entry this closes measured the
+  exact-`wght` copies at about 300 KB of heap in euxy on iOS). A weight
+  between two makes one font, a copy of the lower instance.
+- **A reported weight is the inverse.** `controlWeight` reads a control's
+  font back through San Francisco's table, so UIKit's semibold reports 600.
+- **A declared face keeps the number**: its `wght` is the CSS weight, as the
+  browser draws an `@font-face` range (D2).
+
+### D12 — `-webkit-font-smoothing` (2026-10-28)
+
+A web app that sets `-webkit-font-smoothing: antialiased` on its root (T3 Code
+does, under its Font smoothing setting) draws lighter text in Chrome and
+Safari on the Mac than AppKit's default: the browser draws the glyphs with
+Core Graphics font smoothing off, which leaves grayscale coverage without the
+stem darkening smoothing adds. Matched by weight instead, a label drawn at 500
+reads a step heavier than the oracle's, and one drawn at 400 is the wrong
+weight. So the property is a row (`font_smoothing`, bit 222), with WebKit's
+name: no CSS specification defines it (CSS Fonts 4 dropped `font-smooth`).
+
+- **Values.** `auto`, the initial value, and `antialiased`. `none` (aliased
+  glyphs) and `subpixel-antialiased` are refused by name: macOS has drawn no
+  subpixel text since 10.14, and no host draws aliased text.
+- **Inherited, paint only.** A change neither measures nor lays out: smoothing
+  moves no glyph.
+- **AppKit** calls `CGContext.setShouldSmoothFonts(false)` for an
+  `antialiased` paragraph in each place it draws one: the paragraph raster,
+  both its paths (`TextRasterJob`), the direct draw (`TextEngine.draw`) and
+  the selection overlay. `Spec.antialiased` carries it, so the raster's key
+  (`TextRasterKey`, over the spec) tells the two apart and a change redraws.
+  It is paint (`TextPaint`), not geometry: the kernel's request never carries
+  it, and the paragraph it measured is the one an `antialiased` paint reuses.
+- **UIKit** sets the same flag in the paragraph raster and the direct draw
+  (the selection overlay is the Mac's alone). iOS's Core Graphics is not
+  known to smooth fonts, so it is expected to draw as before, as iOS Safari
+  ignores the property; not measured.
+- **Measured** (`scripts/fixtures/font-smoothing.contract`, black San
+  Francisco labels on white at 13 to 16 px, 400 to 600, the Mac at 2×
+  against Chrome at 2× on macOS 27). Each label's ink, the sum of its
+  darkness: `antialiased` takes 10 to 15% off on both, and leaves AppKit's
+  within 1.7% of Chrome's, where AppKit's `auto` was 11 to 18% heavier than
+  Chrome's `antialiased`. Drawn `antialiased`, a 500 label is as heavy as
+  Chrome's 500 and a 400 one as Chrome's 400, which is 16% lighter than
+  Chrome's 500: the weight need not stand in.
+- **The web** writes `-webkit-font-smoothing` and, for Firefox on the Mac,
+  `-moz-osx-font-smoothing` (`grayscale` for `antialiased`, else `auto`), as
+  Tailwind's `antialiased` does; bound values too. Browsers draw both on the
+  Mac only.
+- **Linux, Windows, a terminal and the widget and watch drivers** admit the
+  row and draw as before: no browser applies the property off the Mac, Linux's
+  and a terminal's rasterizers have no such switch, and the snapshot drivers
+  draw their runs in SwiftUI.
+- **Fields** (Daehyeon Mun, 2026-11-02, amending the declared deviation
+  below). On the Mac the text AppKit draws for a field follows the row too:
+  a textarea's text view and an input's field editor lay their text out in
+  TextKit 2 fragments that draw with smoothing off (`AntialiasedFragment`,
+  through an `NSTextLayoutManagerDelegate` an `auto` field does not have),
+  and an input's cell draws its value and placeholder so, as does a
+  textarea's placeholder. Measured on the parity page's field row (14 px,
+  500, at 2×): an `antialiased` input's and textarea's ink, editing or not,
+  equals the Exact-drawn label's beside it, 13% under `auto`'s, which is the
+  label's `auto` ink to the pixel. UIKit's fields draw as before: iOS is not
+  known to smooth fonts (UIKit above).
+- **Declared.** Apple reads the row once per paragraph, so an inline run's own
+  value gives way to its paragraph's. A native control's title keeps the
+  platform's smoothing, and so does a paragraph the content-region reader
+  holds (LLP 1072 §8.1, over 64 KB of text).

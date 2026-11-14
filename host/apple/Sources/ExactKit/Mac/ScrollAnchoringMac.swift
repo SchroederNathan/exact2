@@ -7,7 +7,7 @@
 import AppKit
 
 extension NodeView {
-    func captureScrollPosition() {
+    func captureScrollPosition(focused: NodeView?) {
         beforeLayoutScroll = scroll?.contentView.bounds.origin
         followedScroll = nil
         scrollAnchor = nil
@@ -22,7 +22,7 @@ extension NodeView {
         }
         // No anchor at the start (spec §2.2): content inserted on top shows.
         guard top > 0 else { return }
-        scrollAnchor = ScrollAnchoring.anchor(in: self, space: doc, port: doc.convert(sv.contentView.bounds, from: sv.contentView))
+        scrollAnchor = ScrollAnchoring.anchor(in: self, space: doc, port: doc.convert(sv.contentView.bounds, from: sv.contentView), focused: focused)
     }
 
     func restoreScrollPosition() {
@@ -31,6 +31,8 @@ extension NodeView {
         let maximum = max(0, doc.bounds.height - sv.contentView.bounds.height)
         var y: CGFloat
         if props["scrollFollowEnd"] == "true", followedScroll?.end ?? true {
+            // Past the end, the rubber band settles there itself (`CollectionHost.leavesRubberBand`).
+            if sv.contentView.bounds.minY > maximum + 0.5 { return }
             y = maximum
         } else {
             let top = followedScroll?.top ?? beforeLayoutScroll?.y ?? sv.contentView.bounds.minY

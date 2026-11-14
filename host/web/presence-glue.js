@@ -22,6 +22,7 @@
 // is lowered here, per move, from its displacement and velocity in points,
 // on the grid and rest threshold the engine settles on natively
 // (`exact_motion::spring`).
+import { unwrapListItem, viewParent } from './navigation.js';
 const LAYOUT = '--exact-layout-transition';
 const PAINT = ['backgroundColor', 'backgroundImage', 'backgroundSize', 'backgroundPosition', 'backgroundRepeat', 'backgroundOrigin', 'backgroundClip',
   'borderTop', 'borderRight', 'borderBottom', 'borderLeft', 'borderRadius', 'boxShadow', 'opacity', 'translate', 'rotate', 'scale', 'transform', 'transformOrigin'];
@@ -78,11 +79,10 @@ function measure() {
     return m;
   };
   // Where layout put `el` in `parent`, `[x, y, w, h]` in the parent's own
-  // points: sub-pixel and free of every transform, however its ancestors
-  // turn or scale it. A virtualized list's row wrapper (it carries
-  // `data-listitemkey`) only positions its row, so by default a row's root
-  // is placed in the list content.
-  return (el, parent = el.parentElement?.hasAttribute('data-listitemkey') ? el.parentElement.parentElement : el.parentElement) => {
+  // points: sub-pixel and free of ancestral transforms. Row wrappers only
+  // position virtual rows (`data-listitemkey`) or supply semantics without
+  // a box (`data-exact-list-item`), so measure a row in the list content.
+  return (el, parent = el.parentElement?.matches('[data-listitemkey], [data-exact-list-item]') ? el.parentElement.parentElement : el.parentElement) => {
     if (!parent || !el.isConnected || !size(getComputedStyle(el))) return null;
     const e = of(el), p = of(parent);
     // The page point of its top-left is the parent's local point through
@@ -131,6 +131,19 @@ function createPresence(root) {
     else el.style.removeProperty('isolation');
   };
   let frame = null;
+  // What a leaving view's ghost keeps (LLP 1063 D4), read as it leaves: the `left` and `top` that keep its border box
+  // where it is (its offsets less its margins), its border-box size, and whether its `z-index` applies (a positioned
+  // box's or a flex or grid item's)
+  const kept = el => {
+    const cs = getComputedStyle(el), parent = viewParent(el);
+    return [[el.offsetLeft - parseFloat(cs.marginLeft), el.offsetTop - parseFloat(cs.marginTop), el.offsetWidth, el.offsetHeight],
+      cs.position !== 'static' || /flex|grid/.test(getComputedStyle(parent).display)];
+  };
+  // Motion lets go of a view that leaves and of every view inside it, before the ghost is read and written: a lift
+  // ends, and a hold or lift that ends later writes nothing to the ghost (motion-glue.js `letGo`)
+  const release = leaving => {
+    for (const [el, letGo] of globalThis.exact?.motionHolds ?? []) if (leaving.contains(el)) letGo();
+  };
   let first = new Map();
 
   // Read the element's presented paint without our transparent surface or
@@ -154,7 +167,7 @@ function createPresence(root) {
       const cs = getComputedStyle(el);
       for (const k of PAINT) sf.box.style[k] = cs[k];
       if (placed) {
-        const place = measure(), [x, y] = place(el, el.parentElement), [ax, ay] = place(sf.stand, el.parentElement);
+        const place = measure(), [x, y] = place(el, viewParent(el)), [ax, ay] = place(sf.stand, viewParent(el));
         sf.box.style.left = `${x - ax}px`; sf.box.style.top = `${y - ay}px`;
       }
       for (const a of el.getAnimations()) {
@@ -208,7 +221,7 @@ function createPresence(root) {
     stand.setAttribute('data-exiting', ''); stand.setAttribute('aria-hidden', 'true'); stand.inert = true;
     stand.style.cssText = 'position:absolute;width:0;height:0;margin:0;padding:0;border:0;z-index:-1;pointer-events:none';
     el.before(stand);
-    const [x, y] = place(el, el.parentElement), [ax, ay] = place(stand, el.parentElement);
+    const [x, y] = place(el, viewParent(el)), [ax, ay] = place(stand, viewParent(el));
     box.style.cssText = `position:absolute;left:${x - ax}px;top:${y - ay}px;box-sizing:border-box;margin:0`;
     for (const k of PAINT) box.style[k] = cs[k];
     stand.append(box);
@@ -257,6 +270,9 @@ function createPresence(root) {
 
   return {
     sync,
+    // Whether a view declares a layout transition: an agent's jump then
+    // applies each due time's commits as their own batch (glue.js `clock`).
+    tracking() { return tracked.size > 0; },
     // Agent state reads the painted surface, including unnamed exit ghosts.
     // The ordinary layout box still describes the content's final geometry.
     observation() {
@@ -285,19 +301,26 @@ function createPresence(root) {
           if (at) first.set(el, [at, going(el)]);
         }
       }
+      // The batch's leaving views, each read before any exit takes one out of flow
+      const exits = (batch.ops ?? []).filter(op => op.op === 'exit').map(op => [views.get(op.id), op.css]).filter(([el]) => el?.isConnected);
+      for (const [el] of exits) release(el);
+      const readings = exits.map(([el]) => kept(el));
       // Let this commit update the underlying row before reapplying the
       // ghost policy in after(). Both run in the same task, before paint.
       for (const [parent, held] of ghostParents) {
         restoreIsolation(parent, held);
         held.released = true;
       }
-      for (const op of batch.ops ?? []) if (op.op === 'exit') this.exit(views.get(op.id), op.css);
+      exits.forEach(([el, css], i) => this.exit(el, css, readings[i]));
     },
-    exit(el, css) {
+    // `at`: what `kept` returned for it, when `before` read it ahead of the batch's exits
+    exit(el, css, at) {
       if (!el?.isConnected || !css) return;
       stop(el);
-      const cs = getComputedStyle(el), s = el.style;
-      const box = [el.offsetLeft - parseFloat(cs.marginLeft), el.offsetTop - parseFloat(cs.marginTop), el.offsetWidth, el.offsetHeight];
+      release(el);
+      const [box, ranked] = at ?? kept(el), s = el.style;
+      if (el.parentElement.hasAttribute('data-exact-list-item')) unwrapListItem(el.parentElement);
+      const parent = el.parentElement;
       // No input, no accessibility, no focus, no ids: a view re-created with
       // the same key while this one leaves is the only one with its names.
       el.setAttribute('data-exiting', '');
@@ -312,9 +335,12 @@ function createPresence(root) {
       s.transition = 'none';
       s.position = 'absolute'; s.left = `${box[0]}px`; s.top = `${box[1]}px`;
       s.width = `${box[2]}px`; s.height = `${box[3]}px`; s.boxSizing = 'border-box'; s.pointerEvents = 'none';
-      // Above all authored z-indices and just below the Arrange lift.
-      s.zIndex = '2147483646';
-      const parent = el.parentElement;
+      // It keeps its paint order among its siblings (LLP 1083.000 D4): its own `z-index`, or level 0 in tree
+      // order, as a positioned box. A `z-index` that had no effect before it was positioned still has none.
+      if (!ranked) s.zIndex = 'auto';
+      // And it paints its subtree in its turn, as a ghost does on Apple: a sticky or fixed box was a stacking
+      // context by its position alone, which an absolute one with no `z-index` is not
+      s.isolation = 'isolate';
       let held = ghostParents.get(parent);
       if (!held) {
         held = { count: 0, value: parent.style.getPropertyValue('isolation'), priority: parent.style.getPropertyPriority('isolation'), released: false };

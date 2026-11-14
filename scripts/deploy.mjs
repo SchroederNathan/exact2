@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { requireReleasePins } from '../game/inputs.mjs';
 // `exact deploy` — the publisher (LLP 1030.000 D3 the verb, D4 the policies,
 // D5 one library in its own process, D7 where things live; LLP 1030 D3 the
 // classifier and D3a the compatibility id; LLP 1026 D11 the signed head).
@@ -38,12 +39,6 @@
 // key and prints the public half to paste in; the private key never enters
 // the repository. `update/tests/it/publisher.rs` reads a head this script
 // produced and proves the client verifies it.
-//
-// Owed, not built: `--watch` (D5's continuous publisher: the same library,
-// a separate least-privileged process watching the deploy branch); an
-// object-store adapter (an https origin is read-only here); the binary
-// lanes (1030.000 §6). Dev imports the same artifact comparison; a
-// platform with no completed receipt is reported as unbuilt.
 import { spawnSync } from 'node:child_process';
 import { randomBytes, verify } from 'node:crypto';
 import { Refusal, refuse, canonicalBytes, canonicalJson, publicKeyFromRaw, loadSigner, keygen, validateRawIntegers } from './deploy-signing.mjs';
@@ -55,19 +50,14 @@ import { fileURLToPath } from 'node:url';
 import { buildRust, publishedSignature, rustBundle, rustPackage, tieredNative } from './rust.mjs';
 import { assertOwnTarget, cargoReproducibilityFlags, readManifest, buildBake, bakeTarget, readBuilds, cohortReceipt, classifyArtifacts, resolveApp, shaderWatchRoots } from './app.mjs';
 import { gameShells } from "../game/app/shells.mjs";
-import { appdropPlan, renderAppdrop, runAppdrop } from './deploy-appdrop.mjs';
-import { blobPath, openOrigin, OriginUnavailable, sha256, streamPath, parseWebRoot, webRootPath, webRootStream, webReleasePath } from './origin.mjs';
+import { blobPath, channelOrigin, openOrigin, OriginUnavailable, sha256, streamPath, parseWebRoot, webRootPath, webRootStream, webReleasePath, validateChannel } from './origin.mjs';
 import { filesystemLock, removePrivateTree } from './filesystem.mjs';
-import { listBuildFiles, listPublicFiles, readStaticCandidate } from '../host/web/serve.mjs';
-
+import { entryPlans, listBuildFiles, listPublicFiles, readStaticCandidate } from '../host/web/serve.mjs';
+import { BESIDE, STAGE } from '../host/web/beside.mjs';
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
 const PLATFORMS = ['web', 'ios', 'macos', 'linux'];
-/** The platforms that hold an update store and so a stream, when the manifest names none (`deploy.store`, `deploy.binaries`). The web is the origin row: a fresh load is current. */
-const STREAM_PLATFORMS = ['ios', 'macos', 'linux'];
 const USAGE = 'usage: bun scripts/deploy.mjs <app> [--origin <dir|url>] [--channel <name>] [--only bundle|origin] [--platform <web|ios|macos|linux>]... [--snapshot <sha>] [--dirty] [--release <id>] [--keys <dir>] [--json] [--yes]\n       bun scripts/deploy.mjs keygen <id> [--keys <dir>] [--json]';
-
 // ------------------------------------------------------------------ arguments
-
 function parseArgs(argv) {
   const opts = { platform: [], _: [] };
   const valued = new Set(['--origin', '--channel', '--only', '--platform', '--snapshot', '--release', '--keys']);
@@ -91,9 +81,7 @@ function parseArgs(argv) {
   opts.keys = resolve(opts.keys ?? process.env.EXACT_SIGNING_KEY_DIR ?? resolve(homedir(), '.config/exact/keys'));
   return opts;
 }
-
 // -------------------------------------------------------------- the snapshot
-
 const snapshotCaptures = new WeakMap();
 const inside = (root, path) => {
   const rel = relative(root, path);
@@ -107,17 +95,16 @@ function canonicalPath(path) {
     return parent === absolute ? absolute : resolve(canonicalPath(parent), basename(absolute));
   }
 }
-
-/** Only actual build outputs are absent from a source snapshot. These are
- * explicit root paths, not recursive basename patterns: `assets/dist/a.png`
- * and `fixtures/target/input.rs` remain inputs when the app carries them. */
-function sourcePathspec(repo, app, exactRoot) {
+/** Only actual build outputs are absent from a source snapshot: explicit root paths, not recursive basename patterns
+ * (`assets/dist/a.png` and `fixtures/target/input.rs` remain inputs when the app carries them). */
+export function sourcePathspec(repo, app, exactRoot) {
   const workspace = canonicalPath(app.workspace ?? app.dir);
+  const dist = ['dist', ...BESIDE.map((name) => `dist.${name}`), `dist.${STAGE}*`]; // what `dist` keeps beside it: beside.mjs
   const outputs = [resolve(repo, 'target'), resolve(repo, 'node_modules'),
     resolve(repo, '.agent-skill-sources'), resolve(repo, '.agent-skill-backups'), resolve(repo, '.llp/ship-runs'),
     canonicalPath(app.target ?? resolve(workspace, 'target')), resolve(workspace, 'target'), resolve(workspace, 'node_modules'), resolve(workspace, '.shells'), resolve(app.dir, '.shells'),
-    resolve(exactRoot, 'target'), resolve(exactRoot, 'node_modules'), resolve(exactRoot, 'host/web/dist'),
-    resolve(exactRoot, 'host/web/dist.previous'), resolve(exactRoot, 'host/apple/.build'),
+    resolve(exactRoot, 'target'), resolve(exactRoot, 'node_modules'), ...dist.map((name) => resolve(exactRoot, 'host/web', name)),
+    resolve(exactRoot, 'host/apple/.build'),
     resolve(exactRoot, 'host/apple/macos/.build'), resolve(exactRoot, '.claude/worktrees')];
   // Each game owns generated products. A sibling app's cache is no more
   // source than the selected app's cache; its captured Cargo.lock is source.
@@ -128,10 +115,10 @@ function sourcePathspec(repo, app, exactRoot) {
     for (const entry of readdirSync(parent, {withFileTypes:true})) {
       const dir = resolve(parent, entry.name);
       if (!entry.isDirectory() || !existsSync(resolve(dir, 'app.contract'))) continue;
-      for (const output of ['target', '.shells', 'dist', 'dist.previous', 'artifacts']) outputs.push(resolve(dir, output));
+      for (const output of ['target', '.shells', 'artifacts', ...dist]) outputs.push(resolve(dir, output));
     }
   }
-  if (app.manifest?.game) for (const output of ['target', '.shells', 'dist', 'dist.previous', 'artifacts']) outputs.push(resolve(app.dir, output));
+  for (const output of [...app.manifest?.game ? ['target', '.shells', 'artifacts'] : [], ...dist]) outputs.push(resolve(app.dir, output));
   // Keep the lexical path as well as its canonical alias. In particular,
   // `target -> /shared/cache` is still the declared in-repo output root; if
   // we realpath it first, the symlink itself re-enters the source inventory.
@@ -140,7 +127,6 @@ function sourcePathspec(repo, app, exactRoot) {
     .map((path) => unixPath(relative(repo, path))))];
   return ['.', ...excluded.flatMap((path) => [`:(exclude,top,literal)${path}`, `:(exclude,top,glob)${path}/**`])];
 }
-
 const SOURCE_MAX_BUFFER = 512 * 1024 * 1024;
 function gitResult(repo, args, what, options = {}) {
   const result = spawnSync('git', args, { cwd: repo, maxBuffer: SOURCE_MAX_BUFFER, ...options });
@@ -507,10 +493,10 @@ function keepLiveMtimes(repo, staged) {
   walk(staged);
 }
 
-/** Child tools may ask Git about their source directory. Keep discovery and
- * explicit Git process state inside the private snapshot boundary. */
+/** Keep Git discovery and process state inside the private snapshot boundary;
+ * shipping bakes ignore a proof profile inherited from the caller's shell. */
 function sealedSourceEnv(sourceRoot, extra = {}) {
-  const env = { ...process.env, ...extra };
+  const env = { ...process.env, ...extra, EXACT_GAME_PROOF_PROFILE: 'release' };
   for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
     'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) delete env[name];
   env.GIT_CEILING_DIRECTORIES = sourceRoot;
@@ -580,16 +566,16 @@ export function materializeSnapshot(snapshot, run, app, cache = null) {
   // A game without its own Cargo.lock resolves against the captured SDK lock
   // (game/app/shells.lock), still locked and offline.
   if (manifest.game) gameShells(dir, manifest.game, resolve(exactRoot, 'game'));
-  assertMaterializedCargoClosure([workspace, exactRoot], sourceRoot, target, {workspace, manifest});
-  // node_modules is an output, never captured; a TypeScript app's bake runs
-  // Rolldown from it and ships SQLite WASM out of it. Install exactly what the
-  // captured bun.lock pins, from Bun's cache, into the captured tree.
+  // node_modules is an output, never captured: a TypeScript app's bake runs Rolldown from it, ships SQLite WASM out of it,
+  // and a module package's crate is under it (LLP 1133.001 D9). Install exactly what the captured bun.lock pins, from
+  // Bun's cache, into the captured tree, before the Cargo closure is asserted.
   for (const root of new Set([exactRoot, workspace])) {
     if (!existsSync(resolve(root, 'package.json')) || !existsSync(resolve(root, 'bun.lock'))) continue;
     const installed = spawnSync(process.execPath, ['install', '--frozen-lockfile', '--prefer-offline'], {
       cwd: root, env: sealedSourceEnv(sourceRoot), stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' });
     if (installed.status !== 0) refuse(`${root}: bun install --frozen-lockfile failed in the captured source: ${(installed.stderr || installed.stdout || installed.error?.message || '').trim()}`);
   }
+  assertMaterializedCargoClosure([workspace, exactRoot], sourceRoot, target, {workspace, manifest});
   // Every Contract file the bake will read is in the captured tree: an
   // installed library that still leads outside it is live bytes (LLP 1091 D10).
   assertCapturedContractSources(contractSources(dir, exactRoot, sealedSourceEnv(sourceRoot, { CARGO_TARGET_DIR: capture.compilerTarget }), capture.compiler), sourceRoot);
@@ -627,17 +613,13 @@ export function deployRun(target, release) {
 
 // ------------------------------------------------------------------ the bake
 
-/** The web root on the JS target (LLP 1071 §7, delivery), when it takes the
- * app: the wasm bake's baked plan compiled to JavaScript into `<run>/web-js`
- * (`host/web-js/build.mjs --production`), carrying the bake's origin files,
- * so the root and every stream's bundle share one plan. The bake stays what
- * the streams publish; the web needs no update client, since a fresh load
- * of the atomic root is current. Returns the directory; a JS build that
- * fails refuses the deploy, as the app's web build does. */
+/** The web root on the JS target (LLP 1071 §7): the wasm bake's plan compiled into `<run>/web-js` (`host/web-js/build.mjs
+ * --production`) with the bake's origin files, so the root and every stream share one plan; with no bake (`web` null,
+ * LLP 1153 D3.6), the app's own Contract, with no envelope. The directory; a JS build that fails refuses the deploy. */
 function bakeJs(app, run, web, exactRoot, sourceRoot) {
   const out = resolve(run, 'web-js');
   const env = sealedSourceEnv(sourceRoot, { CARGO_TARGET_DIR: app.target, EXACT_UPDATE_TRUST: 'production', EXACT_APP_DIR: app.dir });
-  const r = spawnSync(process.execPath, [resolve(exactRoot, 'host/web-js/build.mjs'), app.name, '--plan', resolve(web, 'app.plan'), '--out', out, '--production'], {
+  const r = spawnSync(process.execPath, [resolve(exactRoot, 'host/web-js/build.mjs'), app.name, ...(web ? ['--plan', resolve(web, 'app.plan')] : []), '--out', out, '--production'], {
     cwd: exactRoot, env, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
   });
   if (r.status === 0) { process.stderr.write(`web root: the JS target (${out})\n`); return out; }
@@ -646,7 +628,7 @@ function bakeJs(app, run, web, exactRoot, sourceRoot) {
 }
 
 /** Bake the web app into `<run>/web` (`host/web/build.mjs` with `EXACT_WEB_DIST`): its output goes to stderr so stdout stays the table. Returns the directory. */
-function bake(app, run, exactRoot, sourceRoot) {
+export function bake(app, run, exactRoot, sourceRoot) {
   mkdirSync(run, { recursive: true });
   const web = resolve(run, 'web');
   const env = sealedSourceEnv(sourceRoot, { EXACT_WEB_DIST: web, CARGO_TARGET_DIR: app.target, EXACT_UPDATE_TRUST: 'production', EXACT_BAKE_OUTPUT:resolve(run,'bake') });
@@ -695,6 +677,8 @@ function buildFor(app, platform, sourceRoot, run) {
     if (sdk.status !== 0) refuse(`the ${apple} SDK is unavailable: ${sdk.stderr}`);
     env.SDKROOT = sdk.stdout.trim();
     env[apple === 'ios' ? 'IPHONEOS_DEPLOYMENT_TARGET' : 'MACOSX_DEPLOYMENT_TARGET'] = apple === 'ios' ? '17.0' : '14.0';
+    env.EXACT_APPLE_LINK = 'plan'; // a compatibility input: link as the production archive does (host/apple/link.mjs)
+    if (apple === 'ios') env.HOST_CXXFLAGS = `${process.env.HOST_CXXFLAGS ?? ''} -isysroot ${spawnSync('xcrun', ['--sdk', 'macosx', '--show-sdk-path'], {encoding:'utf8'}).stdout.trim()}`; // the build scripts' Objective-C++ for the Mac takes the Mac SDK, not SDKROOT's (cc-rs inherits it), as host/apple/build.mjs gives it
   }
   return buildBake(app, platform, target, {env, analysis:true});
 }
@@ -711,18 +695,28 @@ function channelOf(manifest) {
   return names.length === 1 ? names[0] : 'prod';
 }
 
-/** Native deployment targets, including binary-only L=0. Classification decides the carrier before touching a stream. */
+/** Native deployment targets, including binary-only L=0: what `deploy.store` and `deploy.binaries` name, else what `host` names (LLP 1153 D1.1). Classification decides the carrier before touching a stream. */
 export function nativePlatforms(manifest) {
   const deploy = manifest.deploy ?? {};
   const named = [...new Set([...Object.keys(deploy.store ?? {}), ...Object.keys(deploy.binaries ?? {})])].filter((p) => p !== 'web');
   const unknown = named.filter((p) => !PLATFORMS.includes(p));
   if (unknown.length) refuse(`app.json names the platform${unknown.length > 1 ? 's' : ''} ${unknown.join(', ')} under deploy; this repo builds ${PLATFORMS.join(', ')}`);
-  return PLATFORMS.filter((p) => (named.length ? named : STREAM_PLATFORMS).includes(p));
+  return PLATFORMS.filter((p) => p !== 'web' && (named.length ? named : Object.keys(manifest.host ?? {})).includes(p));
+}
+/** Whether the manifest names a native platform, under `host` or `deploy`; one that names none ships the web root alone, with no stream and no envelope, and its deploy bakes nothing (LLP 1153 D1.5, D3.6). */
+export const namesNative = (manifest) => [manifest.host, manifest.deploy?.store, manifest.deploy?.binaries].some((table) => Object.keys(table ?? {}).some((p) => p !== 'web'));
+
+function sunsetFor(app, stream) {
+  const cards = app.manifest.deploy?.sunset;
+  const key = `${stream.channel}/${stream.compatibilityId}`;
+  return cards && Object.hasOwn(cards, key) ? cards[key] : cards?.[stream.compatibilityId] ?? null;
 }
 
-/** What the bundle changes against a head: `app.plan` and each asset by digest — new, changed, removed — with a `.wgsl` whose cohort is this one marked an asset (its interface digest is an input to the id, so an unchanged id is an unchanged interface). */
-function changesAgainst(bundle, head) {
+/** Plan and asset changes by digest, plus the stream's advisory card. */
+function changesAgainst(bundle, head, sunset = null) {
   const changes = [];
+  const card = (value) => value ? [value.message, value.store || null] : null;
+  if (JSON.stringify(card(sunset)) !== JSON.stringify(card(head?.sunset))) changes.push({ name: 'sunset', change: !sunset ? 'removed' : !head?.sunset ? 'new' : 'changed' });
   if (!head) {
     changes.push({ name: 'app.plan', change: 'new' });
     for (const a of bundle.assets) changes.push({ name: a.name, change: 'new' });
@@ -759,6 +753,7 @@ export function streamHead({ app, bundle, stream, seq, release, sunset = null })
     stream: { app: app.id, channel: stream.channel, compatibilityId: stream.compatibilityId, seq },
     release,
   };
+  Object.assign(head, entryPlans(head.assets));
   if (sunset) head.sunset = sunset.store ? { message: sunset.message, store: sunset.store } : { message: sunset.message };
   return head;
 }
@@ -778,35 +773,35 @@ function fileCard(object, name) {
 }
 
 /** exact-update's `safe_name`: a relative path whose segments use only the
- * POSIX portable filename characters, so no filesystem can fold or normalize
- * two names into one file. */
+ * POSIX portable filename characters and `@` (`photo@2x.png`), so no
+ * filesystem can fold or normalize two names into one file. */
 function safeAssetName(name) {
   if (typeof name !== 'string' || !name) throw new Error('an asset has no nonempty name');
   for (const part of name.split('/')) {
     if (!part || part === '.' || part === '..') throw new Error(`the asset name ${name} is not a relative path`);
-    if (!/^[A-Za-z0-9._-]+$/.test(part)) throw new Error(`the asset name ${name} is not portable: segments use A-Z, a-z, 0-9, '.', '_' and '-'`);
+    if (!/^[A-Za-z0-9._@-]+$/.test(part)) throw new Error(`the asset name ${name} is not portable: segments use A-Z, a-z, 0-9, '.', '_', '-' and '@'`);
   }
 }
 
 /** exact-update's `check_asset_names`: a roster stages as distinct files on a
  * case-insensitive filesystem (APFS's default), so no two names differ only
  * by case and none is a file where another needs a directory. The bake and
- * every client refuse the same rosters. */
+ * every client refuse the same rosters, and name every refused name at once. */
 export function portableAssetNames(names) {
-  const files = new Map(), directories = new Map();
+  const files = new Map(), directories = new Map(), problems = [];
   for (const name of names) {
-    safeAssetName(name);
-    const folded = name.toLowerCase(); // ASCII after safeAssetName
-    const other = files.get(folded);
-    if (other !== undefined) throw new Error(other === name ? `the envelope names the asset ${name} twice` : `the assets ${other} and ${name} differ only by case, one file on a case-insensitive filesystem`);
-    if (directories.has(folded)) throw new Error(`the asset ${name} is a file where ${directories.get(folded)} needs a directory`);
+    try { safeAssetName(name); } catch (error) { problems.push(error.message); continue; }
+    const folded = name.toLowerCase(), other = files.get(folded); // ASCII after safeAssetName
+    if (other !== undefined) { problems.push(other === name ? `the envelope names the asset ${name} twice` : `the assets ${other} and ${name} differ only by case, one file on a case-insensitive filesystem`); continue; }
+    if (directories.has(folded)) { problems.push(`the asset ${name} is a file where ${directories.get(folded)} needs a directory`); continue; }
     for (let end = folded.indexOf('/'); end !== -1; end = folded.indexOf('/', end + 1)) {
       const directory = folded.slice(0, end);
-      if (files.has(directory)) throw new Error(`the asset ${files.get(directory)} is a file where ${name} needs a directory`);
+      if (files.has(directory)) problems.push(`the asset ${files.get(directory)} is a file where ${name} needs a directory`);
       if (!directories.has(directory)) directories.set(directory, name);
     }
     files.set(folded, name);
   }
+  if (problems.length) throw new Error(problems.join('\n'));
 }
 
 /** Parse and authenticate one origin head by the same pre-download rules as
@@ -848,6 +843,7 @@ export function inspectHead(found, app, stream) {
       fileCard(asset, asset.name);
     }
     portableAssetNames((head.assets ?? []).map((asset) => asset.name));
+    if (head.plans !== undefined && canonicalJson(head.plans) !== canonicalJson(entryPlans(head.assets ?? []).plans ?? {})) throw new Error("the envelope's plans must index its authenticated plan assets");
     if (head.sunset !== undefined) {
       if (!head.sunset || typeof head.sunset !== 'object' || Array.isArray(head.sunset)) throw new Error('the sunset card is not an object');
       if (typeof head.sunset.message !== 'string') throw new Error('the sunset card has no message');
@@ -915,7 +911,11 @@ async function authenticatedReleaseFloor(origin, app, stream) {
  * clients already hold for another bundle. Repairing an unusable head uses
  * the history alone; if none exists, overwriting would guess at the clients'
  * rollback floor and is refused. */
-async function nextSeq(origin, app, stream, admission, at) {
+async function nextSeq(origin, app, stream, admission, at, above = 0) {
+  return Math.max(above + 1, await nextOriginSeq(origin, app, stream, admission, at));
+}
+
+async function nextOriginSeq(origin, app, stream, admission, at) {
   const history = await authenticatedReleaseFloor(origin, app, stream);
   let floor;
   if (admission?.usable) floor = Math.max(admission.seq, history.floor ?? 0);
@@ -1022,7 +1022,7 @@ export async function classify({ app, opts, origin, channel, snapshot, release, 
     const check=classifyArtifacts(candidate,installed,signingKey);
     const inputs=installed?.compat.inputs ?? compat[platform]?.inputs;
     const selectedBundle=bundle.platforms?.[platform] ?? bundle;
-    const changes=admission?.usable?changesAgainst(selectedBundle,admission.head):head?[{name:'exact.json',change:'repair',note:admission.problem}]:changesAgainst(selectedBundle,null);
+    const changes=admission?.usable?changesAgainst(selectedBundle,admission.head,sunsetFor(app,stream)):head?[{name:'exact.json',change:'repair',note:admission.problem}]:changesAgainst(selectedBundle,null,sunsetFor(app,stream));
     let seq=admission?.seq;
     if(changes.length && (check.bundle || item.platform)) {
       try {seq=await nextSeq(origin,app,stream,admission,`the head at ${origin.describe()}/${streamPath(stream)}/exact.json`);}
@@ -1093,7 +1093,7 @@ export function renderTable(table) {
       : row.changes.map((c) => `${c.name} ${c.change}${c.note ? ` (${c.note})` : ''}`).join(', ');
     out.push(line('', detail, `bundle seq ${row.seq}`));
   }
-  const binaries = table.rows.filter((r) => r.action === 'binary' && !(r.kind === 'binary' && r.platform === 'ios' && table.appdrop));
+  const binaries = table.rows.filter((r) => r.action === 'binary');
   if (binaries.length) out.push(`binary needed: ${binaries.map((r) => `${r.platform ?? '?'} ${r.compatibilityId.slice(0, 8)}`).join(', ')} — a later verb (LLP 1030.000 §6); independently safe bundle rows still publish`);
   out.push(...renderReach(table.reach));
   return out.join('\n');
@@ -1125,10 +1125,11 @@ export async function publishStream({ origin, row, bundle, compat, app, signer, 
       if (!checked.bundle || installed.compat.id !== stream.compatibilityId) refuse(`the locked cohort rejects the candidate: ${checked.missing.join('; ')}`);
     }
     const changes = admission?.usable
-      ? changesAgainst(bundle, admission.head)
-      : current ? [{ name: 'exact.json', change: 'repair', note: admission.problem }] : changesAgainst(bundle, null);
-    if (admission?.usable && !changes.length) return { ...row, action: 'current', seq: admission.seq, note: 'the head is admissible and already names this bundle (published meanwhile)' };
-    const seq = await nextSeq(origin, app, stream, admission, `the locked head at ${origin.describe()}/${base}/exact.json`);
+      ? changesAgainst(bundle, admission.head, sunsetFor(app, stream))
+      : current ? [{ name: 'exact.json', change: 'repair', note: admission.problem }] : changesAgainst(bundle, null, sunsetFor(app, stream));
+    if (admission?.usable && !changes.length && admission.seq > (opts.seqAbove ?? 0)) return { ...row, action: 'current', seq: admission.seq, note: 'the head is admissible and already names this bundle (published meanwhile)' };
+    // `seqAbove`: a stream moving to a new origin starts above every seq its clients accepted from the old one.
+    const seq = await nextSeq(origin, app, stream, admission, `the locked head at ${origin.describe()}/${base}/exact.json`, opts.seqAbove ?? 0);
     let written = 0;
     for (const file of files) {
       if (await origin.put(blobPath(file.sha256), file.bytes, { immutable: true }) === 'written') written++;
@@ -1136,7 +1137,7 @@ export async function publishStream({ origin, row, bundle, compat, app, signer, 
       if (!back || sha256(back) !== file.sha256) refuse(`the blob ${file.sha256} (${file.name}) read back from ${origin.describe()} is not what was written`);
     }
     log(`  ${row.platform} ${row.compatibilityId.slice(0, 8)}: ${files.length} blobs on the origin (${written} written, ${files.length - written} present), each read back and checked`);
-    const sunset = app.manifest.deploy?.sunset?.[`${stream.channel}/${stream.compatibilityId}`] ?? app.manifest.deploy?.sunset?.[stream.compatibilityId];
+    const sunset = sunsetFor(app, stream);
     const head = streamHead({ app, bundle, stream, seq, release, sunset });
     if (installed) head.cohort = installed;
     head.signature = signer.sign(head);
@@ -1301,6 +1302,7 @@ async function deployCaptured(opts, capsule) {
   if (capsule.app.external) process.env.EXACT_APP_DIR = canonicalPath(capsule.app.dir);
   else delete process.env.EXACT_APP_DIR;
   const app = resolveApp(opts._[0]);
+  requireReleasePins(app);
   if (canonicalPath(app.dir) !== canonicalPath(capsule.app.dir)
     || canonicalPath(app.workspace) !== canonicalPath(capsule.app.workspace)) {
     refuse('the captured app resolver does not select the app and workspace frozen by the launcher');
@@ -1308,11 +1310,13 @@ async function deployCaptured(opts, capsule) {
   const snapshot = capsule.snapshot;
   const release = capsule.release;
   const channel = opts.channel ?? channelOf(app.manifest);
-  if (channel === 'blobs' || !/^[A-Za-z0-9._-]+$/.test(channel)) refuse(`the channel ${JSON.stringify(channel)} cannot name a directory under .exact/`);
-  const originSpec = opts.origin ?? app.manifest.deploy?.channels?.[channel] ?? app.origin;
+  validateChannel(channel);
+  const originSpec = opts.origin ?? channelOrigin(app.manifest, channel) ?? app.origin;
   if (!originSpec) refuse(`no origin for the channel ${channel}: pass --origin <dir|url> or name deploy.channels.${channel} in app.json`);
   const origin = openOrigin(originSpec);
-  const wantOrigin = opts.only !== 'bundle' && (!opts.platform.length || opts.platform.includes('web'));
+  // An origin that holds only update streams (AppDrop) publishes no web root.
+  if (origin.servesWeb === false && (opts.only === 'origin' || opts.platform.includes('web'))) refuse(`${origin.describe()} holds update streams, not a web app: publish the web root to another origin`);
+  const wantOrigin = origin.servesWeb !== false && opts.only !== 'bundle' && (!opts.platform.length || opts.platform.includes('web'));
   const platforms = opts.only === 'origin' ? [] : nativePlatforms(app.manifest).filter((p) => !opts.platform.length || opts.platform.includes(p));
   if (!wantOrigin && !platforms.length) refuse(`nothing to classify: ${opts.only ? `--only ${opts.only}` : ''} ${opts.platform.length ? `--platform ${opts.platform.join(',')}` : ''} leaves no row`);
   const log = (text) => process.stderr.write(`${text}\n`);
@@ -1321,20 +1325,22 @@ async function deployCaptured(opts, capsule) {
   if (opts.yes && !origin.writable) refuse(`${origin.describe()} is an https origin, read-only in v1: point --origin at the directory the host serves (an object-store adapter with a conditional put is owed)`);
   const signer = opts.yes && platforms.length ? loadSigner(app, opts.keys) : null;
   if (signer) log(`signing as ${signer.keyId} (${signer.path})`);
+  if (signer) origin.useSigner?.(signer);
 
-  log(`snapshot ${snapshot.id}${snapshot.sources.length > 1 ? ` (${snapshot.sources.map((source) => `${source.roles.join('+')} ${source.commit.slice(0, 7)}`).join(', ')})` : ''}${snapshot.dirty ? ' + uncommitted changes (--dirty)' : ''}; baking into ${run}`);
-  const web = bake(app, run, exactRoot, sourceRoot);
+  const webOnly = app.manifest.game === undefined && !namesNative(app.manifest);
+  log(`snapshot ${snapshot.id}${snapshot.sources.length > 1 ? ` (${snapshot.sources.map((source) => `${source.roles.join('+')} ${source.commit.slice(0, 7)}`).join(', ')})` : ''}${snapshot.dirty ? ' + uncommitted changes (--dirty)' : ''}; ${webOnly ? 'building the web root, no stream named,' : 'baking'} into ${run}`);
+  const web = webOnly ? null : bake(app, run, exactRoot, sourceRoot);
   const webRoot = wantOrigin && app.manifest.game === undefined ? bakeJs(app, run, web, exactRoot, sourceRoot) : web;
-  const bundle = readBundle(web, app);
-  const builds = {web:readBuilds(app,{EXACT_UPDATE_TRUST:'production',EXACT_BAKE_OUTPUT:resolve(run,'bake')}).find(r=>r.compat.inputs.platform==='web')};
-  if(!builds.web)refuse('the web build emitted no completed graph receipt');
+  const bundle = webOnly ? null : readBundle(web, app);
+  const builds = webOnly ? {} : {web:readBuilds(app,{EXACT_UPDATE_TRUST:'production',EXACT_BAKE_OUTPUT:resolve(run,'bake')}).find(r=>r.compat.inputs.platform==='web')};
+  if(!webOnly&&!builds.web)refuse('the web build emitted no completed graph receipt');
   for(const platform of platforms)builds[platform]=buildFor(app,platform,sourceRoot,run);
   const compat=Object.fromEntries(Object.entries(builds).map(([p,r])=>[p,r.compat]));
   for(const [platform,build] of Object.entries(builds)) {
     const cards=[{name:'app.plan',sha256:bundle.plan.sha256,bytes:bundle.plan.bytes.length},...bundle.assets.map(a=>({name:a.name,sha256:a.sha256,bytes:a.bytes.length}))];
     if(canonicalJson(build.graph.artifacts.map(({name,sha256,bytes})=>({name,sha256,bytes})).sort((a,b)=>a.name.localeCompare(b.name)))!==canonicalJson(cards.sort((a,b)=>a.name.localeCompare(b.name))))refuse(`${platform} bake graph differs from the packaged bundle`);
   }
-  if (rustPackage(app)) {
+  if (!webOnly && rustPackage(app)) {
     bundle.platforms = {};
     const env = sealedSourceEnv(sourceRoot, {CARGO_TARGET_DIR:app.target,EXACT_UPDATE_TRUST:'production'});
     const nativeTargets = [...new Set(platforms.filter(p=>['native','tiered'].includes(builds[p].compat.inputs.rustMode)).map(p=>builds[p].compat.target))];
@@ -1352,11 +1358,11 @@ async function deployCaptured(opts, capsule) {
       builds[platform]=result.build; bundle.platforms[platform]=result.bundle;
     }
   }
-  log(`compatibility ids: ${Object.entries(compat).map(([p, c]) => `${p} ${c.id}`).join(', ')}`);
+  if (!webOnly) log(`compatibility ids: ${Object.entries(compat).map(([p, c]) => `${p} ${c.id}`).join(', ')}`);
 
   const table = await classify({ app, opts, origin, channel, snapshot, release, web: webRoot, bundle, compat, builds, platforms, wantOrigin });
-  table.appdrop = appdropPlan(app, table, builds);
-  if (!opts.json) console.log(renderTable(table) + (table.appdrop ? `\n${renderAppdrop(table.appdrop)}` : ''));
+  if (webOnly) table.notes.push('app.json names no native platform under host or deploy, so this publishes the web root alone: no stream, and no envelope for a native client');
+  if (!opts.json) console.log(renderTable(table));
 
   if (!opts.yes) {
     if (opts.json) console.log(JSON.stringify(table));
@@ -1378,7 +1384,6 @@ async function deployCaptured(opts, capsule) {
     }
     const name = `${row.platform ?? '?'} ${row.kind} ${row.compatibilityId.slice(0, 8)}`;
     if (row.action === 'unavailable') { failed.push({ platform: row.platform, compatibilityId: row.compatibilityId, error: row.reason }); log(`  ${name}: unavailable — ${row.reason}`); continue; }
-    if (row.kind === 'binary' && row.platform === 'ios' && table.appdrop) continue; // its carrier is AppDrop, after the streams
     if (row.action === 'binary') { refused.push({ platform: row.platform, compatibilityId: row.compatibilityId, reason: row.reason }); log(`  ${name}: refused — ${row.reason}`); continue; }
     try {
       const result = await publishStream({ origin, row, bundle: bundle.platforms?.[row.platform] ?? bundle, compat: row.receipt?.compat ?? compat[row.platform], app, signer, release, snapshot: table.snapshot, opts, log, build:builds[row.platform] });
@@ -1389,7 +1394,6 @@ async function deployCaptured(opts, capsule) {
       log(`  ${name}: failed — ${e.message}; ${e.headOutcomeUnknown ? 'the head outcome is unknown and must be inspected' : "this release's head is not visible"}`);
     }
   }
-  if (table.appdrop) await runAppdrop({ table, published, failed, origin, app, channel, release, exactRoot, run, live: capsule.app.live, env: sealedSourceEnv(sourceRoot, { CARGO_TARGET_DIR: app.target }), latestRecord, log });
   const outcome = { ...table, dryRun: false, published, refused, failed };
   if (opts.json) console.log(JSON.stringify(outcome));
   else {
@@ -1409,6 +1413,7 @@ async function deployCaptured(opts, capsule) {
  * What is captured, and how it is frozen, is unchanged. */
 async function deploy(opts) {
   const locatedApp = resolveApp(opts._[0]);
+  requireReleasePins(locatedApp);
   const target = process.env.CARGO_TARGET_DIR ? canonicalPath(process.env.CARGO_TARGET_DIR) : null;
   if (!target || [locatedApp.dir, ROOT].some((dir) => inside(repoTop(dir), target))) return launch(locatedApp, opts);
   const cache = resolve(target, 'deploy');

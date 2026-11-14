@@ -22,6 +22,7 @@ use crate::layout::LayoutMirror;
 use crate::selector::SelectorIndex;
 use crate::wire::Op;
 mod defaults;
+mod text_style;
 
 /// The deepest a node may sit below the top of its tree (a root is 0). Layout
 /// recurses once per level: a release build uses up to ~3.5 KiB of stack a
@@ -335,6 +336,26 @@ fn validate(arena: &NodeArena, ops: &[Op]) -> Result<(), ApplyError> {
                     });
                 }
             }
+            Op::SetLooks { id, looks } => {
+                staged.require(op_index, *id)?;
+                let rows = crate::look_rows();
+                let mut last = None;
+                for (state, patch) in looks {
+                    // Each state once, ascending; only the look rows, set
+                    // or cleared.
+                    if !(crate::LOOK_HOVER..=crate::LOOK_FOCUS_VISIBLE).contains(state)
+                        || last.is_some_and(|l| l >= *state)
+                        || !patch.mask.union(patch.written).minus(rows).is_empty()
+                        || patch.validate_domain().is_err()
+                    {
+                        return Err(ApplyError::LookRow {
+                            op_index,
+                            state: *state,
+                        });
+                    }
+                    last = Some(*state);
+                }
+            }
             Op::SetStyle { id, patch } => {
                 staged.require(op_index, *id)?;
                 if let Err(error) = patch.validate_domain() {
@@ -403,7 +424,7 @@ fn validate(arena: &NodeArena, ops: &[Op]) -> Result<(), ApplyError> {
                         });
                     }
                     let child_type = staged.require(op_index, *child)?;
-                    if node_type == NodeType::Text && child_type != NodeType::Text {
+                    if node_type == NodeType::Text && !child_type.in_text() {
                         return Err(ApplyError::InlineRunNotText {
                             op_index,
                             parent: *id,
@@ -708,6 +729,8 @@ pub(crate) fn continue_document(
                     arena.mark_export_dirty(slot, NodeFlags::PROPS_DIRTY);
                     view_box_changed(arena, layout, slot, *prop, receipt);
                     // A first `value` makes a `progress` the bar (LLP 1116 D8).
+                    receipt.layout_invalidated |=
+                        crate::style::top_layer::prop_changed(arena, layout, slot, *prop);
                     if matches!(
                         prop,
                         PropId::Type | PropId::AccessibilityRole | PropId::Href
@@ -729,6 +752,9 @@ pub(crate) fn continue_document(
                     }
                     defaults::after_prop(arena, layout, starts, touched, receipt);
                     source_changed(arena, slot, *prop, receipt);
+                    text_style::shorthand_changed(arena, layout, slot, *prop, touched, receipt);
+                    receipt.layout_invalidated |=
+                        crate::rows::prop_changed(arena, layout, slot, *prop, touched);
                     touched.push(arena.key(slot));
                 }
                 Op::ClearProp { id, prop } => {
@@ -743,6 +769,8 @@ pub(crate) fn continue_document(
                         }
                         arena.mark_export_dirty(slot, NodeFlags::PROPS_DIRTY);
                         view_box_changed(arena, layout, slot, *prop, receipt);
+                        receipt.layout_invalidated |=
+                            crate::style::top_layer::prop_changed(arena, layout, slot, *prop);
                         if matches!(
                             prop,
                             PropId::Type | PropId::AccessibilityRole | PropId::Href | PropId::Value
@@ -763,6 +791,15 @@ pub(crate) fn continue_document(
                         }
                         defaults::after_prop(arena, layout, starts, touched, receipt);
                         source_changed(arena, slot, *prop, receipt);
+                        text_style::shorthand_changed(arena, layout, slot, *prop, touched, receipt);
+                        receipt.layout_invalidated |=
+                            crate::rows::prop_changed(arena, layout, slot, *prop, touched);
+                        touched.push(arena.key(slot));
+                    }
+                }
+                Op::SetLooks { id, looks } => {
+                    let slot = live_slot(arena, op_index, *id)?;
+                    if arena.set_looks(slot, looks) {
                         touched.push(arena.key(slot));
                     }
                 }
@@ -773,11 +810,14 @@ pub(crate) fn continue_document(
                         continue;
                     }
                     let excluded = crate::flow::is_exclusion(arena, slot);
+                    let named = arena.named_text_style(slot).is_some();
                     arena.patch_style(slot, patch);
                     arena.update_exclusion_count(slot, excluded);
                     if changed.has(crate::StyleId::Display) {
                         receipt.display_changed.push(arena.key(slot));
                     }
+                    // A text style's weight and leading move with its size.
+                    let changed = text_style::with_style_rows(arena, slot, changed, named);
                     style_changed(arena, layout, slot, changed, receipt);
                     if changed.intersects(StyleMask::LAYOUT) {
                         unstyled.remove(&slot);
@@ -792,11 +832,13 @@ pub(crate) fn continue_document(
                         continue;
                     }
                     let excluded = crate::flow::is_exclusion(arena, slot);
+                    let named = arena.named_text_style(slot).is_some();
                     arena.clear_style(slot, *mask, *written);
                     arena.update_exclusion_count(slot, excluded);
                     if changed.has(crate::StyleId::Display) {
                         receipt.display_changed.push(arena.key(slot));
                     }
+                    let changed = text_style::with_style_rows(arena, slot, changed, named);
                     style_changed(arena, layout, slot, changed, receipt);
                     touched.push(arena.key(slot));
                     propagate_inherited(arena, layout, slot, changed, touched, receipt);
@@ -823,6 +865,14 @@ pub(crate) fn continue_document(
                         .filter(|o| !retained.contains(o))
                         .map(|o| (o, arena.computed_inherited(o), arena.default_context(o)))
                         .collect();
+                    // Whether a grouped list's margins reach each box that
+                    // arrives or leaves, read before any parent changes.
+                    let reached: Vec<(u32, bool)> = {
+                        let arriving = new.iter().filter(|n| arena.parent(**n) != Some(slot));
+                        let leaving = detached.iter().map(|d| &d.0);
+                        let at = |n: &u32| (*n, crate::grouped::reached(arena, *n));
+                        arriving.chain(leaving).map(at).collect()
+                    };
                     for o in &old {
                         if !retained.contains(o) {
                             arena.set_parent(*o, None);
@@ -867,14 +917,20 @@ pub(crate) fn continue_document(
                         count(arena.children(p).len(), 0);
                         arena.prune_children(p);
                         sync_children(arena, layout, p);
-                        crate::kernel::cover_children_changed(arena, layout, p);
+                        crate::kernel::cover_children_changed(arena, layout, p, touched);
                         arena.flags_mut(p).insert(NodeFlags::CHILDREN_DIRTY);
                         touched.push(arena.key(p));
                         defaults::changed(arena, layout, p, context, touched, receipt);
                     }
                     arena.set_children(slot, new);
                     sync_children(arena, layout, slot);
-                    crate::kernel::cover_children_changed(arena, layout, slot);
+                    crate::kernel::cover_children_changed(arena, layout, slot, touched);
+                    // A box into or out of a grouped list takes or sheds the platform's margins.
+                    for (n, was) in reached {
+                        if was || crate::grouped::reached(arena, n) {
+                            crate::grouped::restyle(arena, layout, n);
+                        }
+                    }
                     arena.flags_mut(slot).insert(NodeFlags::CHILDREN_DIRTY);
                     if arena.node_type(slot) == NodeType::Text {
                         invalidate_text(arena, layout, slot);
@@ -883,15 +939,16 @@ pub(crate) fn continue_document(
                     receipt.layout_invalidated = true;
                     defaults::changed(arena, layout, slot, context, touched, receipt);
                     for (orphan, before, context) in detached {
-                        if arena.node_type(orphan) == NodeType::Text {
+                        if matches!(arena.node_type(orphan), NodeType::Text | NodeType::Image) {
                             text_nodes.push(arena.key(orphan));
                         }
                         defaults::changed(arena, layout, orphan, context, touched, receipt);
                         inherited_after_move(arena, layout, orphan, before, touched, receipt);
                     }
                     for (m, before, context) in moved {
-                        if arena.node_type(m) == NodeType::Text
-                            && (earlier_creations || !created.contains(&m))
+                        if arena.node_type(m) == NodeType::Image
+                            || arena.node_type(m) == NodeType::Text
+                                && (earlier_creations || !created.contains(&m))
                         {
                             text_nodes.push(arena.key(m));
                         }
@@ -1006,9 +1063,9 @@ pub(crate) fn finish_document(arena: &NodeArena, commit: DocumentCommit) -> Comm
     receipt
 }
 
-/// Inline runs are part of their paragraph's measurement, never independent
-/// layout boxes. A run promoted to a paragraph gets its current computed style;
-/// a paragraph moved into another paragraph releases its derived engine node.
+/// Inline runs and images are their paragraph's measurement, never layout
+/// boxes (an image created with one sheds it there). A promoted run gets its
+/// computed style; a paragraph moved into another releases its engine node.
 /// Keys discard destroyed generations, including slots reused in this batch.
 fn sync_text_nodes(arena: &mut NodeArena, layout: &mut dyn LayoutMirror, nodes: Vec<NodeKey>) {
     let mut parents = IdSet::default();
@@ -1016,7 +1073,7 @@ fn sync_text_nodes(arena: &mut NodeArena, layout: &mut dyn LayoutMirror, nodes: 
         let Some(slot) = arena.resolve(key) else {
             continue;
         };
-        if arena.is_inline_run(slot) {
+        if arena.in_paragraph(slot) {
             if let Some(node) = arena.taffy(slot) {
                 layout.remove(node);
                 arena.set_taffy(slot, None);
@@ -1090,8 +1147,16 @@ fn sync_children(arena: &NodeArena, layout: &mut dyn LayoutMirror, parent: u32) 
         return;
     };
     let _entries = layout.sync_children(arena, parent, node);
-    if arena.neutral_alert(parent) {
-        for child in arena.children(parent) {
+    // An alert's defaults read its children: whether it is grouped or a part
+    // box empty (its own and, for its actions' margin, its siblings'), and a
+    // row's place among them (arena/alert.rs)
+    if arena.neutral_alert(parent) || arena.alert_group(parent) {
+        layout.restyle(arena, parent, node);
+        let siblings = match arena.parent(parent) {
+            Some(alert) if arena.alert_group(parent) => arena.children(alert),
+            _ => &[],
+        };
+        for child in arena.children(parent).iter().chain(siblings) {
             if let Some(node) = arena.taffy(*child) {
                 layout.restyle(arena, *child, node);
                 layout.mark_dirty(node);
@@ -1147,7 +1212,7 @@ impl Detach {
                 count(arena.children(parent).len(), 0);
                 arena.prune_children(parent);
                 sync_children(arena, layout, parent);
-                crate::kernel::cover_children_changed(arena, layout, parent);
+                crate::kernel::cover_children_changed(arena, layout, parent, touched);
                 defaults::changed(arena, layout, parent, context, touched, receipt);
             }
         }
@@ -1326,16 +1391,11 @@ fn style_changed(
         {
             sync_children(arena, layout, slot);
         }
-        // A replaced header's padding is part of its route's top cover.
-        if arena.cover(slot) == Some(crate::kernel::HostCover::Whole) {
-            if let Some((p, node)) = arena.parent(slot).and_then(|p| Some((p, arena.taffy(p)?))) {
-                layout.restyle(arena, p, node);
-                layout.mark_dirty(node);
-            }
-        }
+        // What a cover takes of the box's parent or covered box (`cover::style_changed`).
+        crate::kernel::cover_style_changed(arena, layout, slot, &mask);
         receipt.layout_invalidated = true;
     }
-    if mask.intersects(StyleMask::TEXT) {
+    if arena.remeasures(slot, mask) {
         invalidate_text(arena, layout, slot);
         receipt.layout_invalidated = true;
     }

@@ -1,32 +1,25 @@
 // Real DOM geometry and deterministic feedback admission; no app data/network.
 import { beforeAll, afterAll, test as bunTest, expect } from 'bun:test';
-import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { Cdp } from '../../scripts/agent.mjs';
-import { chromium } from '../../scripts/agent-launch.mjs';
+import { readFileSync } from 'node:fs';
+import { cdpBrowser, chromium } from '../../scripts/agent-launch.mjs';
 import { collectionBytes } from './collection-glue.js';
 import { motionBytes } from './motion-glue.js';
 import { need } from '../../scripts/coverage.mjs';
 
-const { executable: chrome, unavailable } = chromium();
+const { unavailable } = chromium();
 const test = need('chrome', unavailable, { test: bunTest });
-let server, child, cdp, evaluate, protocol, dir;
+let server, suite, cdp, evaluate, protocol;
 beforeAll(async () => {
   if (unavailable) return;
-  dir = mkdtempSync(join(tmpdir(), 'exact-collection-'));
   server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch(req) {
     const path = new URL(req.url).pathname;
     return new Response(['/collection-glue.js', '/motion-glue.js'].includes(path) ? readFileSync(new URL('.' + path, import.meta.url)) : '<!doctype html><body><main id="root"></main>', {
       headers: { 'content-type': new URL(req.url).pathname.endsWith('.js') ? 'text/javascript' : 'text/html' },
     });
   }});
-  child = spawn(chrome, ['--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--disable-background-networking', `--user-data-dir=${dir}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
-  cdp = new Cdp(child.stdio[3], child.stdio[4]);
-  child.on('exit', () => cdp.fail('Chrome closed'));
-  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
-  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+  suite = await cdpBrowser();
+  ({ cdp } = suite);
+  const { sessionId } = await suite.page();
   const call = (method, params) => cdp.send(method, params, sessionId);
   protocol = call;
   evaluate = async expression => {
@@ -39,9 +32,8 @@ beforeAll(async () => {
   await evaluate(`(${setup})()`);
 }, 60_000); // hang bounds: Chrome's launch and exit are awaited as events, and take longer than 5 s under load
 afterAll(async () => {
-  if (child && child.exitCode === null) { const exit = new Promise(r => child.once('exit', r)); child.kill(); await exit; }
+  await suite?.close();
   server?.stop(true);
-  if (dir) rmSync(dir, { recursive: true, force: true });
 }, 60_000);
 function setup() {
   globalThis.fixture = (options = {}) => {
@@ -133,20 +125,20 @@ test('observer baseline: commit to feedback to real observer reads each row once
       f.views.get(2).style.height='40.5px';f.views.get(4).style.height='60.25px';
       f.controller.commit([f.snapshot('7')]);commit=[...reads.counts];
     } finally { globalThis.ResizeObserver=NativeObserver; }
-    f.port.scrollTop=110;f.views.get(3).focus({preventScroll:true});
+    const ended=new Promise(r=>f.port.addEventListener('scrollend',r,{once:true}));f.port.scrollTop=110;f.views.get(3).focus({preventScroll:true}); // the reader's move, which the browser's scrollend ends: the one report owed after the deliveries says so
     f.views.get(5).dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,pointerId:7}));
     f.flush();const feedback=[...reads.counts], wire=f.wires.at(-1);
     await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
-    const observed=[...reads.counts], queued=f.frames.size;f.flush();
+    await ended;const observed=[...reads.counts];f.flush();
     await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
-    return {commit,feedback,observed,deliveries,queued,pending:f.frames.size,reports:f.reports.length,wire,width:f.port.clientWidth};
+    return {commit,feedback,observed,deliveries,pending:f.frames.size,reports:f.reports.length,flags:new DataView(new Uint8Array(f.wires.at(-1)).buffer).getUint32(92,true),wire,width:f.port.clientWidth};
   })()`);
   expect(result.wire).toEqual([...collectionBytes({view:1,revision:'7',scroll_sequence:'1',offset:50,
     port_cross:result.width,port_main:180,cross:result.width-24,padding:[10,10],focus_view:3,interaction_view:5,
-    measurements:[{view:2,epoch:'9007199254740993',size:40.5},{view:4,epoch:'2',size:60.25}]},{limit:1})]);
+    measurements:[{view:2,epoch:'9007199254740993',size:40.5},{view:4,epoch:'2',size:60.25}]},{limit:1,scrolling:true})]);
   expect(result.deliveries.flat().filter(v=>v==='2')).toHaveLength(1);
   expect(result.deliveries.flat().filter(v=>v==='4')).toHaveLength(1);
-  expect([result.reports,result.queued,result.pending]).toEqual([1,0,0]);
+  expect([result.reports,result.flags,result.pending]).toEqual([2,0,0]);
   console.log('observer baseline commit/feedback/observer',JSON.stringify(result));
   expect(result.commit).toEqual([1,1,0,0]);
   expect(result.feedback.slice(2)).toEqual([1,1]);
@@ -266,7 +258,7 @@ test('collection read reuse: one row sample preserves fractional wire, epochs an
     return {beforeReport,wire:f.wires.at(-1),width:f.port.clientWidth,pending:f.frames.size};})()`);
   expect(result.wire).toEqual([...collectionBytes({view:1,revision:'7',scroll_sequence:'1',offset:50,
     port_cross:result.width,port_main:180,cross:result.width-24,padding:[10,10],focus_view:3,interaction_view:5,
-    measurements:[{view:2,epoch:'9007199254740993',size:40.5},{view:4,epoch:'2',size:60.25}]},{limit:1})]);
+    measurements:[{view:2,epoch:'9007199254740993',size:40.5},{view:4,epoch:'2',size:60.25}]},{limit:1,scrolling:true})]);
   expect(result.pending).toBe(0);
   expect(result.beforeReport.slice(2)).toEqual([1,1]);
 });
@@ -570,8 +562,8 @@ test('an anchor correction after the extent shrank under the port moves from whe
   expect(result.top).toBe(1000);
 });
 test('a scrollIntoView correction applies across the browser\'s own moves until the reader\'s input', async () => {
-  const result = await evaluate(`(() => { const f=(${jumpFixture})();
-    f.list.scrollTop=300; f.list.dispatchEvent(new Event('scroll')); f.frames.splice(0).forEach(fn=>fn());
+  const result = await evaluate(`(() => { const f=(${jumpFixture})(); // the reader's scroll to 300 ends before the request lands (LLP 1070.000 §2.6)
+    f.list.scrollTop=300; f.list.dispatchEvent(new Event('scroll')); f.frames.splice(0).forEach(fn=>fn()); f.list.dispatchEvent(new Event('scrollend'));
     f.controller.commit([f.snapshot('2',{seeking:true,correction:{scrollSequence:'0',offset:900}})]); const authored=f.list.scrollTop;
     f.list.dispatchEvent(new WheelEvent('wheel')); f.list.scrollTop=700; f.list.dispatchEvent(new Event('scroll'));
     f.controller.commit([f.snapshot('3',{seeking:true,correction:{scrollSequence:'0',offset:950}})]);
@@ -1446,7 +1438,7 @@ test('a row list reports scrollLeft, the port width and height, its rows\' heigh
   expect(result.overflowAnchor).toBe('none');
   expect(result.wire).toEqual([...collectionBytes({ view: 1, revision: '1', scroll_sequence: '1', offset: 40, port_main: result.w,
     port_cross: result.h, cross: result.h - 12, padding: [0, 0], focus_view: null, interaction_view: null,
-    measurements: [{ view: 2, epoch: '1', size: 100 }, { view: 4, epoch: '1', size: 150.5 }] }, { limit: 1 })]);
+    measurements: [{ view: 2, epoch: '1', size: 100 }, { view: 4, epoch: '1', size: 150.5 }] }, { limit: 1, scrolling: true })]);
 });
 test('a correction on x moves scrollLeft; not while the strip moves, and a column list keeps correcting', async () => {
   const run = axis => evaluate(`(() => { const f=(${axisFixture})('${axis}'), l=f.list, n=f.name;
@@ -1493,4 +1485,15 @@ test('Chrome: no inline-axis anchoring, a block-axis control anchors; a re-inser
     strip.scrollLeft=350; await ${frames(2)}; const parent=strip.parentNode, next=strip.nextSibling; strip.remove(); parent.insertBefore(strip,next);
     await ${frames(2)}; return {inline,block,reinserted:strip.scrollLeft}; })()`);
   expect(result).toEqual({ inline: 1000, block: 1300, reinserted: 0 });
+});
+test('a list offset the controller moves owes its scroll event until the browser fires it, and the agent\'s settle waits for it', async () => {
+  // A correction's offset (a landing at the end, as scroll-start="end" makes one); then a reader's handler that jumps again, whose scroll stays owed; then nothing.
+  // The reader's listener is the page's, there before the list's own (as an authored `scroll=` is).
+  const r = await evaluate(`(async () => { const f=fixture({own:true}); let armed=false, jumped=null, seen=0; f.port.addEventListener('scroll', () => { if (armed) seen++; if (armed && jumped === null) { f.controller.jump(1, 400, 'scrollTop'); jumped=f.controller.owedScrolls(); } });
+    f.controller.commit([f.snapshot()]); f.flush(); await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+    const idle=f.controller.owedScrolls(); f.controller.commit([f.snapshot('2',{correction:{scrollSequence:'0',offset:200}})]); const owed=f.controller.owedScrolls(), first=await f.controller.fireOwedScrolls();
+    armed=true; f.controller.jump(1, 300, 'scrollTop');
+    const second=await f.controller.fireOwedScrolls(); return {idle,owed,first,jumped,second,seen,none:await f.controller.fireOwedScrolls()}; })()`);
+  // Both events the reader is owed (300's, and its own jump's to 400) ran before the wait ended.
+  expect(r).toEqual({ idle: 0, owed: 1, first: { fired: true, owed: 0 }, jumped: 1, second: { fired: true, owed: 0 }, seen: 2, none: { fired: false, owed: 0 } });
 });

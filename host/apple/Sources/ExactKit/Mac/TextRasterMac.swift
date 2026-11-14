@@ -9,7 +9,7 @@
 // while the row is still a screen away. Scrolling mounted text is compositing.
 //
 // `NodeView.draw` still paints text for everything this declines: a
-// selection, a capture, a canvas, a decorated text box, a clamp, a paragraph
+// selection, a capture, a decorated text box, a paragraph
 // taller than a screen, and one too small to repay a surface (unless HDR).
 #if os(macOS)
 import AppKit
@@ -40,7 +40,7 @@ final class TextRasterizer {
 
     private func key(_ node: NodeView) -> TextRasterKey {
         TextRasterKey(spec: node.paragraphSpec(), size: node.bounds.size,
-                      box: node.contentBox(), scale: node.window?.backingScaleFactor ?? 2)
+                      box: node.paragraphBox(), scale: node.pixelScale ?? 2)
     }
 
     private func prepare(_ node: NodeView, key: TextRasterKey) -> TextRasterJob? {
@@ -55,9 +55,11 @@ final class TextRasterizer {
         let source = paragraph?.shape?.attributed ?? engine.attributed(key.spec)
         return TextRasterJob(source: source.copy() as! NSAttributedString,
                    ranges: geometry.ranges, baselines: geometry.baselines,
-                   flush: key.spec.align == 1 ? 0.5 : key.spec.align == 2 ? 1 : 0, justifies: key.spec.align == 3, insets: paragraph?.insets ?? LineInsets(key.spec, source: source),
-                   box: key.box, size: key.size, scale: key.scale, ellipsis: key.spec.ellipsis, clamped: geometry.clamped,
-                   shadow: key.spec.hdrShadow.map(TextRunShadow.init))
+                   flush: key.spec.align == 1 ? 0.5 : key.spec.align == 2 ? 1 : 0, whiteSpace: key.spec.whiteSpace, justifies: key.spec.align == 3, insets: paragraph?.insets ?? LineInsets(key.spec, source: source),
+                   box: key.box, size: key.size, scale: key.scale, lineScale: engine.lineScale, ellipsis: key.spec.ellipsis, clamped: geometry.clamped,
+                   shadow: key.spec.hdrShadow.map(TextRunShadow.init), antialiased: key.spec.antialiased,
+                   measuredGlyphs: key.spec.color.count == 4 ? engine.measuredGlyphs(key.spec, width: key.box.width) : nil,
+                   measuredColor: TextEngine.color(key.spec.color).cgColor)
     }
 
     /// Only first pixels may rasterize synchronously. A replacement uses the
@@ -75,7 +77,7 @@ final class TextRasterizer {
         guard firstPixels || active < Self.maxConcurrent else { return false }
         guard let job = prepare(node, key: key) else { node.dropTextRaster(); return true }
         if firstPixels {
-            let lines = node.text?.rasterLines(key.spec, ranges: job.ranges, width: key.box.width).1
+            let lines = job.measuredGlyphs == nil ? node.text?.rasterLines(key.spec, ranges: job.ranges, width: key.box.width).1 : nil
             let image = Self.render(job, firstPixels: true, lines: lines)
             node.showTextRaster(image?.surface, for: key, frame: image?.frame, cast: image?.cast)
             return true
@@ -196,11 +198,14 @@ extension NodeView {
         // it broke at (`LineGeometry.clamped`), as on iOS (873cec46e): a
         // clamped or ellipsized label no longer paints on the main thread.
         guard kind == "text", isParagraph, flowShapes.isEmpty, columnRecord == nil, !hasBoxPaint, !Capture.capturing, backgroundClip != "text",
-              bounds.width > 0, bounds.height > 0, bounds.height <= TextRasterizer.maxHeight, !textIsSmall,
+              bounds.width > 0, bounds.height > 0, bounds.height <= TextRasterizer.maxHeight,
               window != nil, readerParagraph == nil, let presenter else { return false }
+        // Canvas snapshots must share our surfaces, not AppKit's backing
+        // stores: borrowing those can blank the live label after scrolling.
+        guard !textIsSmall || canvasAbove != nil else { return false }
         if presenter.selection.isActive, let selected = presenter.selection.range(self), selected.length > 0 { return false }
         if presenter.session?.regions.owns(self) == true { return false }
-        return canvasAbove == nil && !paintsVisibleInlineRun
+        return !paintsVisibleInlineRun
     }
 
     /// Too few pixels to repay a surface. Such text draws whole rather than in
@@ -208,9 +213,9 @@ extension NodeView {
     /// paragraphs too large to paint at once. HDR text is never small: only a
     /// raster's layers follow `dynamic-range-limit` (LLP 1100 D8).
     var textIsSmall: Bool {
-        let scale = window?.backingScaleFactor ?? 2
+        let scale = pixelScale ?? 2
         guard bounds.width * bounds.height * scale * scale < TextRasterizer.minPixels else { return false }
-        return !(isParagraph && paragraphSpec().headroom > 1)
+        return !(isParagraph && paragraphHeadroom(drawing: true) > 1)
     }
 
     /// Whether the pump still owes this paragraph pixels.
@@ -236,7 +241,7 @@ extension NodeView {
             needsDisplay = true
             return
         }
-        if let key = textRasterKey, key.size == bounds.size && key.box == contentBox() { return }
+        if let key = textRasterKey, key.size == bounds.size && key.box == paragraphBox() { return }
         textRasterKey = nil
         textRasterPending = false
         // Position the accepted surface at its original dimensions immediately;
@@ -315,6 +320,8 @@ extension NodeView {
         }
         textRasterPending = false
         CATransaction.commit()
+        presenter?.boxFilters.changed(self)
+        repaintThrough()
     }
 
     func dropTextRaster() {

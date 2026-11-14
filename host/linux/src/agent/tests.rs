@@ -5,6 +5,45 @@ use exact_runner::{DataError, Value};
 
 // The clipboard, keys, modifiers and mouse contacts.
 mod input;
+// An orderly exit's wait for the work the app must finish.
+mod exit;
+// A re-ask after a turn over its budget, which `clock settle` waits for.
+mod overrun;
+
+#[test]
+fn a_seek_past_the_discrete_instant_cap_reports_where_it_stopped() {
+    let plan = crate::test_plan(
+        r#"keyframes blink
+  from opacity=1
+  to opacity=0
+component App
+  view
+    box animation="blink 1s steps(2, jump-none) infinite"
+"#,
+    );
+    let (mut p, error) = Presenter::boot_with(
+        &plan,
+        (),
+        (80., 40.),
+        1.,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (landed, error) = clock_hatched(&mut p, 2_049_000., deadline);
+    assert_eq!(
+        error.as_deref(),
+        Some("clock seek exceeds 4096 discrete instants")
+    );
+    assert_eq!(landed, 2_048_000.);
+    // The caller can resume from the reported instant without losing an edge.
+    assert_eq!(
+        clock_hatched(&mut p, 2_049_000., deadline),
+        (2_049_000., None)
+    );
+}
 
 /// A source whose one request is handed to work that never replies: the
 /// reply is leaked, so neither an outcome nor the drop's abort arrives.
@@ -250,6 +289,44 @@ fn prefer_sets_the_display_preferences_by_their_media_names() {
     assert!(p.dark(), "no app override: the system's dark");
     p.app_scheme(Some(false));
     assert!(!p.dark(), "the app's own choice wins");
+}
+
+/// LLP 1132 D10: `prefer pointer` and `prefer hover` set the primary
+/// input `exactViewport()` answers; an unknown value applies nothing.
+#[test]
+fn prefer_sets_the_pointer_and_hover_facts() {
+    let plan = contract::compile(
+        "shape M\n  pointer: string\n  hover: string\ncomponent App\n  resource m = exactViewport() as shape M\n  view\n    text `${m.pointer} ${m.hover}` testId=\"t\"\n",
+    )
+    .unwrap();
+    let bytes = contract::bake(plan, ()).unwrap().encode();
+    let (mut p, _) = Presenter::boot_with(
+        &bytes,
+        (),
+        (300.0, 300.0),
+        1.0,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    let text = |p: &mut Presenter<()>| handle(p, r#"{"op":"tree"}"#);
+    assert!(text(&mut p).contains("fine hover"), "{}", text(&mut p));
+    let reply: serde_json::Value = serde_json::from_str(&handle(
+        &mut p,
+        r#"{"op":"prefer","media":{"pointer":"coarse","hover":"none"}}"#,
+    ))
+    .unwrap();
+    assert_eq!(reply["media"]["pointer"], "coarse");
+    assert_eq!(reply["media"]["hover"], "none");
+    assert!(text(&mut p).contains("coarse none"), "{}", text(&mut p));
+    let refused = handle(
+        &mut p,
+        r#"{"op":"prefer","media":{"pointer":"none","hover":"sometimes"}}"#,
+    );
+    assert!(refused.contains("\"malformed\""), "{refused}");
+    assert!(text(&mut p).contains("coarse none"), "nothing applied");
+    handle(&mut p, r#"{"op":"prefer","media":{"pointer":"none"}}"#);
+    assert!(text(&mut p).contains("none none"), "{}", text(&mut p));
 }
 
 /// LLP 1069.000 D1, D2, D6: `prefer` sets contrast, the system's scheme
@@ -532,6 +609,7 @@ fn a_clock_move_across_a_dst_change_recomputes_the_offset() {
         locale: "en-US".into(),
         time_zone: "America/Los_Angeles".into(),
         seed: 1.0,
+        format_locale: String::new(),
     };
     assert!(p.set_place(&place).is_none());
     assert!(p.set_time(1_772_960_400_000.0, -480.0).is_none());
@@ -595,7 +673,8 @@ fn a_picker_is_held_and_answered_by_ticket() {
         &format!(r#"{{"op":"type","ticket":{t},"text":"/x/a.jpg"}}"#),
     );
     assert!(wrong.contains("not among accept"), "{wrong}");
-    let text = serde_json::Value::from(fixture.to_string_lossy().into_owned());
+    // One path a line, as the driver writes it: a path may hold a space.
+    let text = serde_json::Value::from(format!("{}\n", fixture.to_string_lossy()));
     let answered = json(handle(
         &mut p,
         &format!(r#"{{"op":"type","ticket":{t},"text":{text}}}"#),
@@ -670,7 +749,7 @@ fn an_unrestricted_picker_copies_an_unknown_file_under_the_agent() {
         &mut p,
         &format!(
             r#"{{"op":"type","ticket":{ticket},"text":{}}}"#,
-            serde_json::Value::from(file.to_string_lossy().into_owned())
+            serde_json::Value::from(format!("{}\n", file.to_string_lossy()))
         ),
     );
     let state: serde_json::Value =
@@ -1127,29 +1206,6 @@ fn clock_settle_waits_for_background_storage_and_a_jump_names_it() {
     assert_eq!(state["pending"], serde_json::json!([]), "{state}");
 }
 
-/// LLP 1097 D10: an orderly exit pumps the module's storage to its end
-/// first, within its bound.
-#[test]
-fn an_orderly_exit_finishes_background_storage() {
-    let plan = contract::compile(
-        "component App\n  resource item = save() as shape number else save()\n  view\n    text item.toString() testId=\"item\" height=20\n",
-    )
-    .unwrap();
-    let (mut p, _) = Presenter::boot_with(
-        &plan.encode(),
-        Saving::default(),
-        (300.0, 300.0),
-        1.0,
-        std::path::PathBuf::new(),
-        PainterChoice::Cpu,
-    )
-    .unwrap();
-    assert!(p.host().runner().background_operations() > 0);
-    crate::teardown::finish(&mut p, crate::teardown::EXIT_BOUND);
-    assert_eq!(p.host().runner().background_operations(), 0);
-    assert!(!p.host().runner().has_pending());
-}
-
 /// `prefer mode` (LLP 1121 D13): the app's `setMode` for each pin, the
 /// scheme left as it is; an axis or value the design lacks is refused.
 #[test]
@@ -1327,4 +1383,28 @@ fn a_date_picker_is_held_for_the_agent_and_answered_by_kind() {
         state["pending"].as_array().is_none_or(|a| a.is_empty()),
         "{state}"
     );
+}
+
+#[test]
+fn surface_refusals_keep_the_host_and_subsystem_on_the_wire() {
+    let plan = contract::compile("component App\n  view\n    text \"ready\"\n").unwrap();
+    let (mut p, _) = Presenter::boot_with(
+        &plan.encode(),
+        Echo,
+        (300.0, 300.0),
+        1.0,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    p.surfaces.error = Some("GPU module test: digest mismatch".into());
+    let reply: serde_json::Value =
+        serde_json::from_str(&handle(&mut p, r#"{"op":"state"}"#)).unwrap();
+    assert_eq!(
+        reply["refused"],
+        serde_json::json!({"host":if cfg!(windows) { "windows" } else if cfg!(target_os = "android") { "android" } else { "linux" }, "subsystem":"gpu", "message":"GPU module test: digest mismatch"})
+    );
+    let clean: serde_json::Value =
+        serde_json::from_str(&handle(&mut p, r#"{"op":"state"}"#)).unwrap();
+    assert!(clean["refused"].is_null());
 }

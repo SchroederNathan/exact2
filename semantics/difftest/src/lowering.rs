@@ -46,7 +46,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The plan as a `LowerCheck.PlanInfo` term.
 fn plan_info(plan: &Plan) -> String {
-    let strings: Vec<String> = plan.strings.iter().map(|s| string(s)).collect();
+    let strings: Vec<String> = plan.strings.iter().map(string).collect();
     let types: Vec<String> = plan
         .types
         .iter()
@@ -101,7 +101,9 @@ fn plan_info(plan: &Plan) -> String {
     }
     for r in &plan.resources {
         let name = plan.str(r.name);
-        if name.contains('#') {
+        // A list's arguments read its element as a parameter, which the
+        // semantics binds as a local (`settleEach`): not this check's.
+        if name.contains('#') || r.each.len != 0 {
             continue;
         }
         for (k, a) in r.args.iter().enumerate() {

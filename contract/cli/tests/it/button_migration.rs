@@ -11,6 +11,10 @@ fn sources(path: &Path, out: &mut Vec<PathBuf>) {
         .collect();
     entries.sort();
     for path in entries {
+        // An installed package's copy is the package's, not the app's source.
+        if path.is_dir() && path.file_name().is_some_and(|n| n == "node_modules") {
+            continue;
+        }
         if path.is_dir() {
             sources(&path, out);
         } else if path.extension().is_some_and(|e| e == "contract")
@@ -112,6 +116,41 @@ fn source_sweep_revisits_partial_import_graphs() {
     assert_eq!(read, vec![app, broken, branch]);
 }
 
+// The design-tool stub is a server fixture. Its regen.mjs stages these two
+// inputs under the conventional app names before compiling them together.
+fn compile_sweep_root(
+    root: &Path,
+    path: &Path,
+) -> Result<(exact_plan::Plan, contract::SourceMap), contract::CompileError> {
+    if path != root.join("apps/design-tool/stub/app.contract") {
+        return contract::compile_path_mapped(path);
+    }
+    let dir = std::env::temp_dir().join(format!("exact-sweep-design-stub-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    struct Staged(std::path::PathBuf);
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            let removed = std::fs::remove_dir_all(&self.0);
+            if !std::thread::panicking() {
+                removed.unwrap();
+            }
+        }
+    }
+    let staged = Staged(dir);
+    std::fs::copy(path, staged.0.join("app.contract")).unwrap();
+    std::fs::copy(
+        path.with_file_name("dials.tamber"),
+        staged.0.join("app.tamber"),
+    )
+    .unwrap();
+    let result = contract::compile_path_mapped(&staged.0.join("app.contract"));
+    result.map(|(plan, mut map)| {
+        map.relocate_sources(&staged.0, path.parent().unwrap())
+            .unwrap();
+        (plan, map)
+    })
+}
+
 #[test]
 fn every_app_corpus_and_example_compiles_and_the_button_migration_is_complete() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -126,7 +165,7 @@ fn every_app_corpus_and_example_compiles_and_the_button_migration_is_complete() 
     let mut failures = Vec::new();
     let mut compiled = 0;
     for path in paths.iter().filter(|path| !imported.contains(*path)) {
-        match contract::compile_path_mapped(path) {
+        match compile_sweep_root(&root, path) {
             Ok((_, map)) => {
                 compiled += 1;
                 for (file, span) in map.button_migrations() {

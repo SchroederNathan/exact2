@@ -795,6 +795,8 @@ fn plan_refolds_the_synthetic_tokens_and_a_lost_one_is_rebuild() {
     let synthetic = exact_tamber::Synthetic {
         file: "app.tamber",
         exprs: &exprs,
+        retention: None,
+        params: &exact_tamber::params::NONE,
     };
     let set = |value: &str| {
         vec![(
@@ -829,6 +831,8 @@ fn plan_refolds_the_synthetic_tokens_and_a_lost_one_is_rebuild() {
     let row = exact_tamber::Synthetic {
         file: "app.tamber",
         exprs: &strict,
+        retention: None,
+        params: &exact_tamber::params::NONE,
     };
     let refused = exact_tamber::plan(&host, &set("CanvasText"), &vocab(), false, row).unwrap();
     assert_eq!(refused.class, exact_tamber::Class::Rebuild);
@@ -845,4 +849,379 @@ fn plan_refolds_the_synthetic_tokens_and_a_lost_one_is_rebuild() {
         synthetic,
     );
     assert!(to_profile.is_err() || to_profile.unwrap().class == exact_tamber::Class::Rebuild);
+}
+
+/// LLP 1121 stage 6 B: a length or number value edit is live, as a colour's
+/// is; one that changes the token's kind (written or inferred) is a rebuild,
+/// since it moves which rows may name it.
+#[test]
+fn a_length_or_number_edit_is_live_and_a_kind_change_rebuilds() {
+    let files = vec![(
+        "app.tamber".to_string(),
+        "tamber app\n\naxes\n  density = regular | compact\n\ntheme\n  space.row = 12px\n    when density=compact: 8px\n  opacity.faded: number = 0.5\n  gap = 4px\n".to_string(),
+    )];
+    let none: Vec<(String, bool)> = Vec::new();
+    let synthetic = exact_tamber::Synthetic {
+        file: "app.tamber",
+        exprs: &none,
+        retention: None,
+        params: &exact_tamber::params::NONE,
+    };
+    let set = |name: &str, value: &str| {
+        vec![(
+            "app.tamber".to_string(),
+            Op::SetToken {
+                name: name.into(),
+                when: Vec::new(),
+                value: value.into(),
+                at: None,
+                comment: None,
+            },
+        )]
+    };
+    let plan = |ops: Vec<(String, Op)>| {
+        exact_tamber::plan(&files, &ops, &vocab(), false, synthetic).unwrap()
+    };
+    assert_eq!(
+        plan(set("space.row", "16px")).class,
+        exact_tamber::Class::Live
+    );
+    assert_eq!(
+        plan(set("space.row", "1.25rem")).class,
+        exact_tamber::Class::Live
+    );
+    assert_eq!(
+        plan(set("opacity.faded", "0.75")).class,
+        exact_tamber::Class::Live
+    );
+    // An inferred length becoming a colour moves its kind.
+    assert_eq!(
+        plan(set("gap", "#ffffff")).class,
+        exact_tamber::Class::Rebuild
+    );
+}
+
+/// Stage 6 C: a type token's style, weight, size or line height changing is
+/// live; the longhands it writes changing, or its family, or a family
+/// token's stack, rebuilds (the lead's ruling, D6).
+#[test]
+fn a_type_value_edit_is_live_and_a_longhand_or_family_change_rebuilds() {
+    let files = vec![(
+        "app.tamber".to_string(),
+        "tamber app\n\ntheme\n  type.body = 600 -exact-body/1.35 \"InterVariable\"\n  family.mono: family = ui-monospace\n".to_string(),
+    )];
+    let none: Vec<(String, bool)> = Vec::new();
+    let synthetic = exact_tamber::Synthetic {
+        file: "app.tamber",
+        exprs: &none,
+        retention: None,
+        params: &exact_tamber::params::NONE,
+    };
+    let set = |name: &str, value: &str| {
+        vec![(
+            "app.tamber".to_string(),
+            Op::SetToken {
+                name: name.into(),
+                when: Vec::new(),
+                value: value.into(),
+                at: None,
+                comment: None,
+            },
+        )]
+    };
+    let class = |name: &str, value: &str| {
+        exact_tamber::plan(&files, &set(name, value), &vocab(), false, synthetic)
+            .unwrap()
+            .class
+    };
+    use exact_tamber::Class::{Live, Rebuild};
+    assert_eq!(
+        class("type.body", "700 -exact-headline/1.5 \"InterVariable\""),
+        Live
+    );
+    assert_eq!(class("type.body", "700 18px/22px \"InterVariable\""), Live);
+    assert_eq!(
+        class("type.body", "-exact-body/1.35 \"InterVariable\""),
+        Rebuild,
+        "the weight unsaid"
+    );
+    assert_eq!(
+        class("type.body", "600 -exact-body/1.35 Georgia"),
+        Rebuild,
+        "another family"
+    );
+    assert_eq!(class("family.mono", "monospace"), Rebuild);
+}
+
+/// D7's retention decides the class (theme2's ruling, LLP 1121 stage 5): a
+/// token the plan does not keep moves nothing, one it keeps added, gone or
+/// starting to vary moves its retained shape; `exports` bounds what an app
+/// with bindings keeps.
+#[test]
+fn the_class_asks_the_plans_retention() {
+    let files = vec![(
+        "app.tamber".to_string(),
+        "tamber app\n\naxes\n  tone = warm | cool\n\ntheme\n  ink = #111111\n  spare = #222222\n"
+            .to_string(),
+    )];
+    let add = vec![(
+        "app.tamber".to_string(),
+        Op::AddToken {
+            name: "fresh".into(),
+            kind: None,
+            value: "#123456".into(),
+            meta: Vec::new(),
+            whens: Vec::new(),
+            comment: None,
+            before: None,
+        },
+    )];
+    let when = |name: &str| {
+        vec![(
+            "app.tamber".to_string(),
+            Op::SetToken {
+                name: name.into(),
+                when: vec![("tone".into(), "cool".into())],
+                value: "#0a7aff".into(),
+                at: None,
+                comment: None,
+            },
+        )]
+    };
+    let class = |ops: &[(String, Op)], retention: &exact_tamber::Retention| {
+        let synthetic = exact_tamber::Synthetic {
+            file: "app.tamber",
+            exprs: &[],
+            retention: Some(retention),
+            params: &exact_tamber::params::NONE,
+        };
+        exact_tamber::plan(&files, ops, &vocab(), false, synthetic)
+            .unwrap()
+            .class
+    };
+    use exact_tamber::Class::{Live, Rebuild};
+    let plain = exact_tamber::Retention {
+        words: ["ink".to_string()].into(),
+        ..Default::default()
+    };
+    assert_eq!(class(&add, &plain), Live, "a token no view names");
+    assert_eq!(
+        class(&when("spare"), &plain),
+        Live,
+        "an unkept token starting to vary"
+    );
+    assert_eq!(
+        class(&when("ink"), &plain),
+        Rebuild,
+        "a kept token starting to vary"
+    );
+    // A token a colour keyframe names is folded into the plan's keyframes:
+    // its value is structure (rt1 round 2), another's is not.
+    let value = |name: &str| {
+        vec![(
+            "app.tamber".to_string(),
+            Op::SetToken {
+                name: name.into(),
+                when: Vec::new(),
+                value: "#0a7aff".into(),
+                at: None,
+                comment: None,
+            },
+        )]
+    };
+    let keyframed = exact_tamber::Retention {
+        words: ["ink".to_string(), "spare".to_string()].into(),
+        folded: ["ink".to_string()].into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        class(&value("ink"), &keyframed),
+        Rebuild,
+        "a keyframe's token"
+    );
+    assert_eq!(class(&value("spare"), &keyframed), Live, "a row's token");
+    assert_eq!(class(&value("ink"), &plain), Live, "no keyframe names it");
+    let bound = exact_tamber::Retention {
+        bindable: true,
+        ..Default::default()
+    };
+    assert_eq!(class(&add, &bound), Rebuild, "every token kept");
+    assert_eq!(class(&when("spare"), &bound), Rebuild);
+    let design = exact_tamber::parse(
+        "tamber app\n\nexports\n  ink\n\ntheme\n  ink = #111111\n  spare = #222222\n",
+    )
+    .unwrap();
+    assert!(bound.keeps(&design, "ink", None, exact_tamber::Kind::Color));
+    assert!(
+        !bound.keeps(&design, "spare", None, exact_tamber::Kind::Color),
+        "exports bounds it"
+    );
+    assert!(
+        plain.keeps(
+            &design,
+            "CanvasText",
+            Some("CanvasText"),
+            exact_tamber::Kind::Color
+        ),
+        "a role override is always kept"
+    );
+    // A computed length or number row may name any token of those kinds,
+    // a computed colour row any colour token (stage 6 B's rule).
+    let measured = exact_tamber::Retention {
+        computed_measure: true,
+        ..Default::default()
+    };
+    assert!(measured.keeps(&design, "gap", None, exact_tamber::Kind::Length));
+    assert!(!measured.keeps(&design, "spare", None, exact_tamber::Kind::Color));
+    // A role override respelled: the plan's row carries the name as written.
+    let role = vec![(
+        "app.tamber".to_string(),
+        "tamber app\n\ntheme\n  CanvasText = #000000\n".to_string(),
+    )];
+    let respell = vec![
+        (
+            "app.tamber".to_string(),
+            Op::RemoveToken {
+                name: "CanvasText".into(),
+            },
+        ),
+        (
+            "app.tamber".to_string(),
+            Op::AddToken {
+                name: "canvastext".into(),
+                kind: None,
+                value: "#000000".into(),
+                meta: Vec::new(),
+                whens: Vec::new(),
+                comment: None,
+                before: None,
+            },
+        ),
+    ];
+    let synthetic = exact_tamber::Synthetic {
+        file: "app.tamber",
+        exprs: &[],
+        retention: Some(&plain),
+        params: &exact_tamber::params::NONE,
+    };
+    let planned = exact_tamber::plan(&role, &respell, &vocab(), false, synthetic).unwrap();
+    assert_eq!(planned.class, Rebuild, "a role override respelled");
+    // A kept token that comes to be a role the web draws in the accent: the
+    // JS target writes it apart.
+    let accent = vec![(
+        "app.tamber".to_string(),
+        Op::SetToken {
+            name: "ink".into(),
+            when: Vec::new(),
+            value: "AccentColor".into(),
+            at: None,
+            comment: None,
+        },
+    )];
+    assert_eq!(
+        class(&accent, &plain),
+        Rebuild,
+        "a kept token taking the accent"
+    );
+    // Which tuples take the accent, and a value the structure carries whole
+    // (a platform colour's custom property), are the plan's too.
+    let shaped = |text: &str, ops: &[(String, Op)]| {
+        let files = vec![("app.tamber".to_string(), text.to_string())];
+        let synthetic = exact_tamber::Synthetic {
+            file: "app.tamber",
+            exprs: &[],
+            retention: Some(&plain),
+            params: &exact_tamber::params::NONE,
+        };
+        exact_tamber::plan(&files, ops, &vocab(), false, synthetic)
+            .unwrap()
+            .class
+    };
+    let set = |when: Vec<(String, String)>, value: &str| {
+        (
+            "app.tamber".to_string(),
+            Op::SetToken {
+                name: "ink".into(),
+                when,
+                value: value.into(),
+                at: None,
+                comment: None,
+            },
+        )
+    };
+    let swapped = [
+        set(Vec::new(), "CanvasText"),
+        set(vec![("tone".into(), "cool".into())], "AccentColor"),
+    ];
+    assert_eq!(
+        shaped(
+            "tamber app\n\naxes\n  tone = warm | cool\n\ntheme\n  ink = AccentColor\n    when tone=cool: CanvasText\n",
+            &swapped
+        ),
+        Rebuild,
+        "the accent's tuples swapped"
+    );
+    assert_eq!(
+        shaped(
+            "tamber app\n\ntheme\n  ink = -exact-platform-color(web var(--ink), #111111)\n",
+            &[set(
+                Vec::new(),
+                "-exact-platform-color(web var(--ink), #222222)"
+            )]
+        ),
+        Rebuild,
+        "a value naming a custom property"
+    );
+}
+
+/// A role override a colour keyframe names by the role's spelling
+/// (`-exact-label` for `label`, `canvastext` for `CanvasText`) is folded into
+/// the keyframes too: its value edit rebuilds.
+#[test]
+fn a_keyframes_role_spelling_folds_its_override() {
+    for (design, name, word) in [
+        (
+            "tamber t\n\ntheme\n  label = #101010\n",
+            "label",
+            "-exact-label",
+        ),
+        (
+            "tamber t\n\ntheme\n  CanvasText = #101010\n",
+            "CanvasText",
+            "canvastext",
+        ),
+    ] {
+        let files = vec![("app.tamber".to_string(), design.to_string())];
+        let ops = vec![(
+            "app.tamber".to_string(),
+            Op::SetToken {
+                name: name.into(),
+                when: Vec::new(),
+                value: "#0a7aff".into(),
+                at: None,
+                comment: None,
+            },
+        )];
+        let class = |folded: &[&str]| {
+            let retention = exact_tamber::Retention {
+                folded: folded.iter().map(|w| w.to_string()).collect(),
+                ..Default::default()
+            };
+            let synthetic = exact_tamber::Synthetic {
+                file: "app.tamber",
+                exprs: &[],
+                retention: Some(&retention),
+                params: &exact_tamber::params::NONE,
+            };
+            exact_tamber::plan(&files, &ops, &vocab(), false, synthetic)
+                .unwrap()
+                .class
+        };
+        assert_eq!(
+            class(&[word]),
+            exact_tamber::Class::Rebuild,
+            "{name} by {word}"
+        );
+        assert_eq!(class(&[]), exact_tamber::Class::Live, "{name}, no keyframe");
+    }
 }

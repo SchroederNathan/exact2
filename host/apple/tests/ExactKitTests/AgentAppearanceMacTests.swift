@@ -12,7 +12,7 @@ final class AgentAppearanceMacTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let source = "shape Viewport\n  prefersColorScheme: string\ncomponent App\n  resource viewport = exactViewport() as shape Viewport\n  view\n    column\n      if viewport.prefersColorScheme == \"dark\"\n        text \"dark\"\n      else\n        text \"light\"\n"
+        let source = "shape Viewport\n  prefersColorScheme: string\ncomponent App\n  resource viewport = exactViewport() as shape Viewport\n  view\n    column width=\"100%\" height=\"100%\" background-color=\"light-dark(#f0f0f0, #101010)\"\n      if viewport.prefersColorScheme == \"dark\"\n        text \"dark\"\n      else\n        text \"light\"\n"
         try source.write(to: dir.appendingPathComponent("app.contract"), atomically: true, encoding: .utf8)
         let compiler = Process()
         compiler.executableURL = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_CONTRACT"], "build.mjs --test builds the Contract compiler and names it"))
@@ -57,6 +57,30 @@ final class AgentAppearanceMacTests: XCTestCase {
         XCTAssertEqual(scheme(session)?.id, light.id, "a page fact leaves the scheme's subtree mounted")
     }
 
+    /// Characterizes a simple light-dark fill; QUEUE 1581's Caltrain timing failure remains unreproduced.
+    func testCharacterizationOfThePreferredBodyColourAfterSettlement() throws {
+        NSApp.appearance = nil
+        Agent.systemAppearance = Agent.launchAppearance()
+        let session = ExactApp.shared.makeSession(label: "agent-appearance-picture")
+        defer { session.destroy() }
+        XCTAssertNil(session.boot(plan: try Self.plan.get(), size: CGSize(width: 200, height: 160)).error)
+        let view = ExactView(session: session)
+        let window = NSWindow(contentRect: NSRect(x: 240, y: 160, width: 200, height: 160), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        window.contentView = view
+        window.orderFrontRegardless()
+        let agent = session.agentInstance
+        for name in ["light", "dark", "light"] {
+            XCTAssertNil(agent.prefer(["media": ["prefers-color-scheme": name]])["error"])
+            XCTAssertNil(agent.clock(["settle": true])["error"])
+            let picture = try XCTUnwrap(Capture.picture(of: view))
+            let colour = try XCTUnwrap(picture.paintedColorAt(x: picture.pixelsWide / 2, y: picture.pixelsHigh / 2)?.usingColorSpace(.sRGB))
+            if name == "dark" { XCTAssertLessThan(colour.redComponent, 0.15) }
+            else { XCTAssertGreaterThan(colour.redComponent, 0.85) }
+        }
+    }
+
     /// Under the agent the appearance is light from launch, as
     /// `Agent.systemAppearance` starts: on the app, which the window draws,
     /// and read by the first boot, whatever the Mac's; an app's own stays.
@@ -75,6 +99,28 @@ final class AgentAppearanceMacTests: XCTestCase {
         NSApp.appearance = NSAppearance(named: .darkAqua)
         _ = Agent.launchAppearance()
         XCTAssertEqual(NSApp.appearance?.name, .darkAqua, "an app's own appearance stays")
+    }
+
+    /// Off the agent, the system appearance is the application's effective
+    /// one while the app sets none, and the last one read beneath an
+    /// appearance it sets (`setScheme`); a session hears each change of
+    /// the effective appearance.
+    func testTheSystemAppearanceIsTheApplicationsBeneathItsOwn() {
+        Agent.systemAppearance = nil
+        NSApp.appearance = nil
+        let system = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        XCTAssertEqual(DisplayPreferences.systemDark, system)
+        var heard = 0
+        let tokens = DisplayPreferences.observe { heard += 1 }
+        NSApp.appearance = NSAppearance(named: system ? .aqua : .darkAqua)
+        XCTAssertGreaterThan(heard, 0, "a change of the effective appearance is heard")
+        XCTAssertEqual(DisplayPreferences.systemDark, system, "the app's own appearance is not the system's")
+        NSApp.appearance = nil
+        XCTAssertEqual(DisplayPreferences.systemDark, system)
+        DisplayPreferences.forget(tokens)
+        let after = heard
+        NSApp.appearance = NSAppearance(named: system ? .aqua : .darkAqua)
+        XCTAssertEqual(heard, after, "a forgotten observer hears nothing")
     }
 }
 #endif

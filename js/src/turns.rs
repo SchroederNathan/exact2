@@ -1,8 +1,8 @@
 //! Liveness: an answer waiting on another's work, or on the background's,
 //! is asked again after each delivery (LLP 1027.003.000 §13; LLP 1097 D2);
 //! a call let go mid-turn runs its steps to the end (ledger F12).
-use super::{Key, Module, WAITING};
-use exact_runner::{Dispatch, InFlight, Outcome};
+use super::{secrets, Key, Module, TIMER, WAITING, YIELDED};
+use exact_runner::{Dispatch, InFlight, Outcome, Request};
 use std::collections::HashMap;
 
 impl Module {
@@ -13,11 +13,21 @@ impl Module {
         Dispatch::Again
     }
 
+    /// Whether `token` is an answer parked on `scheduler.yield()` or on its
+    /// own timer: its work is only to be asked again (a timer's, once the
+    /// runner's clock reaches it; the runner keeps it back until then).
+    pub(crate) fn asked_again(&self, token: u64) -> bool {
+        self.parked
+            .iter()
+            .any(|(_, p)| p.call == token && matches!(p.ticket, YIELDED | TIMER))
+    }
+
     /// Whether anything in the module may yet settle a waiting answer: a
-    /// fetch, a storage step, a stream. The module's storage queued or in flight counts, an answer's or the
+    /// fetch, a storage step, a stream, a yield. The module's storage queued or in flight counts, an answer's or the
     /// background's (LLP 1097 D2: an answer may await background work).
     pub(crate) fn outstanding(&self) -> bool {
         !self.streams.is_empty()
+            || self.host.module_outstanding > 0
             || self.background.state.queued + self.background.state.in_flight > 0
             || self.parked.iter().any(|(_, p)| p.ticket != WAITING)
     }
@@ -39,6 +49,35 @@ impl Module {
         None
     }
 
+    /// The answer awaiting request `f`, a fetch of its own, has a timer of
+    /// its own due before the fetch's reply (`fetch_timer`): the fetch runs
+    /// on as module work (`__exact_adopt`), its reply delivered under its
+    /// ticket in a module turn, and the answer parks on its timer, asked
+    /// again at once. On the main thread only: a worker runs one turn to its
+    /// end.
+    pub(crate) fn timer_first(&mut self, f: &InFlight<'_>) -> Option<(u64, Request)> {
+        if !self.main_thread {
+            return None;
+        }
+        let key = Module::key(Some(f.target), f.source, f.args);
+        let at = self.parked.iter().position(|(k, p)| {
+            *k == key && !matches!(p.ticket, 0 | WAITING | YIELDED | TIMER | secrets::TICKET)
+        })?;
+        let (call, ticket) = (self.parked[at].1.call, self.parked[at].1.ticket);
+        let adopted = self.engine.as_mut()?.call(
+            "__exact_adopt",
+            [&call.to_string(), &ticket.to_string(), ""],
+        );
+        if adopted.ok().as_deref() != Some("adopted") {
+            return None;
+        }
+        let parked = &mut self.parked[at].1;
+        parked.ticket = TIMER;
+        parked.effects = false;
+        parked.progress = self.progress;
+        Some((ticket, Request::continuation(call)))
+    }
+
     /// Parked calls let go in the prelude too, with the fetches they wait on.
     /// One let go between storage steps cannot be stopped: the steps it began
     /// are running, and the app's promise chain (a serialized database, say)
@@ -52,12 +91,16 @@ impl Module {
         };
         let (mut owed, mut rejected) = (false, false);
         for call in &calls {
+            self.host.secrets.cancel_wait(*call);
             // Its waiter, if one is still running, now gives up without
             // taking any compression's right (LLP 1069.002 A1.5).
             if let Some(retired) = self.retired.remove(call) {
                 retired.store(true, std::sync::atomic::Ordering::Release);
             }
         }
+        // No answer's turn: a live answer's step that would run here waits
+        // for its own (LLP 1146 D2).
+        let _ = engine.call("__exact_turn", ["", "", ""]);
         for call in calls {
             if let Ok(said) = engine.call("__exact_forget", [&call.to_string(), "", ""]) {
                 owed |= said.starts_with("storage");
@@ -71,6 +114,8 @@ impl Module {
         // they start is the background's, not refused as at bake.
         if rejected {
             self.host.between_answers = true;
+            // Steps a let-go answer had waiting on module work run here too.
+            let _ = engine.call("__exact_module_discarded", ["", "", ""]);
             // An interrupt (or a job that throws) ends the job it stopped;
             // the jobs queued behind it still run here, not in the next
             // answer's drain. Each try pops at least the job it stopped; the
@@ -125,12 +170,10 @@ impl Module {
             .into_iter()
             .partition(|(key, _)| key.0.is_some() && !keep.contains_key(key));
         self.streams = open;
-        self.forget_calls(
-            gone.into_iter()
-                .chain(ended)
-                .map(|(_, parked)| parked.call)
-                .collect(),
-        );
+        self.work.flight = keep;
+        let mut calls = self.set_aside(gone);
+        calls.extend(ended.into_iter().map(|(_, parked)| parked.call));
+        self.forget_calls(calls);
     }
 
     /// Deliver the storage steps of calls let go mid-turn until none is left.

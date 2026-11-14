@@ -89,44 +89,39 @@ fn quoted(json: &str, field: &str) -> u64 {
 fn boot_source(source: &str) -> (Host<NoData>, Packet, String) {
     boot_plan(&contract::compile(source).unwrap().encode())
 }
-/// `source` compiled, with the handle's constant `testId` rewritten to trap
-/// once `x` passes 1e39: a failure while the tree changes, after an action
-/// wrote `x`. (Since 2026-09-22 a bound value its row refuses, such as a
-/// `translate` past f32, is unset rather than failing the commit.)
+/// `source` compiled, with the `if shown` around the handle rewritten to
+/// trap once `x` passes 1e39: a failure while the tree changes, after an
+/// action wrote `x`. A region's subject, since a prop or style binding that
+/// traps is unset rather than failing the commit (LLP 1017.003 D3), as a
+/// bound value its row refuses is.
 fn boot_trapping(source: &str) -> (Host<NoData>, Packet, String) {
-    use exact_plan::{asm::Asm, builder::PlanBuilder, Opcode, SlotsId, StrId};
+    use exact_plan::{asm::Asm, builder::PlanBuilder, Opcode, RegionKind, SlotsId};
     let plan = contract::compile(source).unwrap();
-    let x = plan
-        .slots
+    let slot = |name: &str| {
+        let at = plan.slots.iter().position(|s| plan.str(s.name) == name);
+        SlotsId(at.unwrap() as u32)
+    };
+    let (x, shown) = (slot("x"), slot("shown"));
+    let when = plan
+        .regions
         .iter()
-        .position(|s| plan.str(s.name) == "x")
-        .unwrap();
-    let handle = plan
-        .bindings
-        .iter()
-        .position(|b| {
-            let code = plan.code(b.expr);
-            code.len() == 6
-                && code[0] == Opcode::Str as u8
-                && plan.str(StrId(u32::from_le_bytes(code[1..5].try_into().unwrap()))) == "handle"
-        })
-        .expect("the handle's testId");
+        .position(|r| r.kind == RegionKind::When)
+        .expect("the `if shown`");
     let mut b = PlanBuilder::from_plan(plan);
-    let name = b.str("handle");
     let mut guard = Asm::new();
     let fits = guard.label();
     guard
-        .load_slot(SlotsId(x as u32))
+        .load_slot(x)
         .number(1e39)
         .simple(Opcode::Gt)
         .jump_if_false(fits)
         .simple(Opcode::Unit)
         .simple(Opcode::Unwrap)
         .place(fits)
-        .str(name);
+        .load_slot(shown);
     let guard = b.code(guard);
     let mut plan = b.finish().unwrap();
-    plan.bindings[handle].expr = guard;
+    plan.regions[when].subject = guard;
     plan.validate().unwrap();
     boot_plan(&plan.encode())
 }
@@ -1125,4 +1120,49 @@ fn a_refusing_timer_is_reported_and_the_release_still_commits() {
         "the timer's refusal is reported: {reply}"
     );
     assert_eq!(count(&host, "released"), 1.0);
+}
+
+#[test]
+fn passed_over_transform_target_is_journaled_until_its_binding_disappears() {
+    let source = SOURCE
+        .replace("  state zoom = 1", r#"  state otherShown = true
+  state otherReference = "other-photo"
+  action toggleBinding
+    otherReference = otherReference == "" ? "other-photo" : ""
+  action toggleOther
+    otherShown = !otherShown
+  state zoom = 1"#)
+        .replace("      text `${released}", r#"      button testId="toggle-binding" press=toggleBinding width=80 height=24
+      button testId="toggle-other" press=toggleOther width=80 height=24
+      if otherShown
+        column width=320.25 height=200.5 overflow="hidden" padding=0 border-width=0
+          column id="other-photo" testId="other-photo" width="100%" height="100%" box-sizing="border-box" padding=0 border-width=0
+            column transformDragFor=otherReference transformgeometry=geometry transformrelease=finish
+            column transformDragFor=otherReference transformgeometry=geometry transformrelease=finish
+      text `${released}"#);
+    let (mut host, _, _) = boot_source(&source);
+    let message = |host: &Host<NoData>| {
+        format!(
+        "transformDragFor: target view #{} passed over for owner view #{}; one owner (first valid, never stolen; LLP 1071)",
+        id(host, "other-photo"), id(host, "photo")
+    )
+    };
+    let logs = |host: &Host<NoData>| host.agent(r#"{"op":"logs"}"#);
+    assert!(logs(&host).contains(&message(&host)), "{}", logs(&host));
+    let reports = |host: &Host<NoData>| logs(host).matches("passed over for owner").count();
+    assert_eq!(reports(&host), 1, "two handles for one skipped target");
+    host.advance(1.0);
+    assert_eq!(reports(&host), 1, "reconcile must not repeat the report");
+    press(&mut host, "toggle-binding", 2.0);
+    assert_eq!(reports(&host), 1, "an invalid binding is silent");
+    press(&mut host, "toggle-binding", 3.0);
+    assert_eq!(reports(&host), 2, "a valid binding reappeared");
+    press(&mut host, "toggle-other", 4.0);
+    assert_eq!(reports(&host), 2);
+    press(&mut host, "toggle-other", 5.0);
+    assert_eq!(reports(&host), 3, "a retired target was remounted");
+    assert!(logs(&host).contains(&message(&host)));
+    press(&mut host, "remove", 6.0);
+    host.advance(7.0);
+    assert_eq!(reports(&host), 3, "the remaining target becomes owner");
 }

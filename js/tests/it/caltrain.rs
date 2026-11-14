@@ -93,8 +93,9 @@ fn identity_and_grants_are_the_bakes_and_the_modules_agree() {
     assert!(abi_supported("1") && abi_supported(&ABI.to_string()));
     let mut names = m.sources();
     names.sort_unstable();
-    // `exactDelivery` (LLP 1030 D7) and `exactViewport` (the TV fit,
-    // 1e6cb3bb0) are the plan's too: the runner answers them before the
+    // `exactDelivery` (LLP 1030 D7), `exactViewport` (the TV fit,
+    // 1e6cb3bb0), `exactActivities` and the three activity sends (LLP
+    // 1126.001 WP9) are the plan's too: the runner answers them before the
     // data seam, so the module is never asked for them and need not
     // export them.
     assert_eq!(
@@ -102,12 +103,16 @@ fn identity_and_grants_are_the_bakes_and_the_modules_agree() {
         [
             "board",
             "defaultLocation",
+            "endActivity",
+            "exactActivities",
             "exactDelivery",
             "exactViewport",
             "nearest",
             "search",
+            "startActivity",
             "station",
-            "stations"
+            "stations",
+            "updateActivity",
         ]
     );
     // The bake's word and the module's must agree, by name.
@@ -163,9 +168,9 @@ fn the_executor_refuses_what_the_plan_does_not_declare_and_what_does_not_fit() {
 #[test]
 fn console_lines_are_collected_for_the_runners_logs() {
     let mut m = module();
-    assert!(m.take_logs().is_empty());
+    assert!(crate::authored_logs(m.take_logs()).is_empty());
     m.query("defaultLocation", &[]).unwrap();
-    let logs = m.take_logs();
+    let logs = crate::authored_logs(m.take_logs());
     assert_eq!(
         logs,
         ["defaultLocation {\"lat\":37.3947,\"lon\":-122.0763}"]
@@ -180,7 +185,7 @@ fn a_call_over_budget_is_unavailable_and_counted() {
     let (lat, lon) = DEFAULT_LOCATION;
     assert!(matches!(
         m.query("stations", &[loc(lat, lon)]),
-        Err(DataError::Unavailable(ref e)) if e.contains("over the 0 ms budget")
+        Err(DataError::Overrun(ref e)) if e.contains("over the 0 ms budget")
     ));
     assert_eq!(m.overruns(), 1);
 }

@@ -1,7 +1,7 @@
 # Recipe: list rows: search, swipe, filter and long-press
 
-A list under a large title and the bar's search field; its rows swipe to delete and
-long-press for a menu.
+A list under a large title and the bar's search; its rows swipe to delete and long-press
+for a menu.
 
 ```contract
 routes nav
@@ -33,14 +33,8 @@ component Notes
           list id="notes-list" appearance="auto" listStyle="inset-grouped" flex=1 min-height=0
             section
               for n in shown key=n.id
-                scroll swipeContent=`row-${n.id}` swipeTrailing=`delete-${n.id}` padding-right=0
-                  overflow-x="scroll" overflow-y="hidden" scrollbar-width="none" scroll-snap-type="x mandatory"
-                  row id=`row-${n.id}` width="100%" flex-shrink=0 scroll-snap-align="start"
-                    padding-right=16 box-sizing="border-box" contextmenu=aim(n.id) contextPopover="menu"
-                    text n.title testId=`note-${n.id}`
-                  button id=`delete-${n.id}` destructive=true press=remove(n.id) aria-label="Delete"
-                    flex-shrink=0 scroll-snap-align="start" testId=`delete-${n.id}`
-                    image "symbol:delete"
+                row delete=remove(n.id) contextmenu=aim(n.id) contextPopover="menu" testId=`note-${n.id}`
+                  text n.title
           column id="menu" popover="auto" role="menu"
             button press=remove(aimed) destructive=true popovertarget="menu" popovertargetaction="hide"
               testId="menu-delete"
@@ -53,17 +47,24 @@ test "search, swipe to delete, delete from the menu"
   type "search" "gro"
   expect tree missing "note-2"
   type "search" ""
-  tap "delete-2"
+  tap "note-2-delete"
   expect tree missing "note-2"
   tap "note-1" contextmenu
   tap "menu-delete"
   expect tree missing "note-1"
 ```
 
-- The swipe is a horizontal snap scroll naming its content and its trailing action (on iOS
-  UIKit's own; a full swipe runs it). In a grouped list: no `width` on the scroll,
-  `padding-right=0` on it, `padding-right=16` on the content.
-- A filter: a `row role="radiogroup"` of `button role="radio"` above the list
-  ([persisted-setting](persisted-setting.md)).
-- One long-press menu serves every row: the row notes which (`aim`), each item acts on `aimed`
-  and hides it (iOS: a `UIMenu`). Test: `tap "note-1" contextmenu`.
+- `delete=` on a row is its swipe to delete (iOS: UIKit's); `disabled` keeps the row from
+  deleting. A test taps `"<row testId>-delete"`; other actions: `contract vocab swipe`.
+- The swipe deletes without asking (as Mail); a detail screen's Delete asks first
+  (`contract vocab confirm`).
+- The empty search field scrolls away on iOS, as UIKit's does; `position="sticky" top=0`
+  on the `input` pins it. Querying a server: `contract vocab search`.
+- A filter: a `row role="radiogroup"` of `button role="radio"`
+  ([persisted-setting](persisted-setting.md)): a segmented control, unless you paint them.
+- One long-press menu serves every row: the row notes which (`aim`); each item acts on
+  `aimed` and hides it (iOS: a `UIMenu`).
+- The list runs under the bar and under a row of only controls pinned beside it (a
+  composer), blurred as iOS does. A caption or a filled row there stops the rows in a hard
+  line (`lower-list-beside-fixed`): put it in a section's `header` or `footer`.
+- `verify ios` scrolls the list by real touches and names what differs from UIKit's.

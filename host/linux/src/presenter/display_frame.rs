@@ -36,6 +36,7 @@ struct Witness {
 struct Seen {
     key: NodeKey,
     parent: Option<ViewId>,
+    scroll_parent: Option<ViewId>,
     scroll: Option<ScrollBounds>,
 }
 #[cfg(any(target_os = "linux", target_os = "android", test))]
@@ -43,6 +44,8 @@ struct Picture {
     paint: Presentation,
     boxes: Vec<PaintedBox>,
     witness: Witness,
+    /// The runner it was painted for (`rangeFrame`'s reader).
+    session: u64,
 }
 
 /// The pending pixel owner. ACK consumes its metadata even if a caller retains
@@ -122,6 +125,19 @@ impl State {
         }
         true
     }
+    /// The node the acknowledged picture painted at `id`, if it painted one.
+    pub(super) fn painted_key(&self, id: ViewId) -> Option<NodeKey> {
+        self.witness().and_then(|a| a.nodes.get(&id)).map(|s| s.key)
+    }
+    /// Whether the acknowledged picture holds scroller `id`'s travel (always, with no display): a scroller
+    /// it doesn't (hidden, or not yet painted where it shows) has none to clamp to there.
+    pub(super) fn witnessed(&self, kernel: &Kernel, id: ViewId) -> bool {
+        !self.active
+            || self
+                .witness()
+                .filter(|_| self.allows(kernel, id))
+                .is_some_and(|a| a.nodes.get(&id).is_some_and(|s| s.scroll.is_some()))
+    }
     pub(super) fn bounds(&self, kernel: &Kernel, id: ViewId) -> Option<ScrollBounds> {
         if !self.active {
             return None;
@@ -143,6 +159,12 @@ impl State {
         self.witness()
             .filter(|_| self.allows(kernel, id))
             .and_then(|a| a.nodes.get(&id).and_then(|s| s.parent))
+            .filter(|parent| self.allows(kernel, *parent))
+    }
+    pub(super) fn scroll_parent(&self, kernel: &Kernel, id: ViewId) -> Option<ViewId> {
+        self.witness()
+            .filter(|_| self.allows(kernel, id))
+            .and_then(|a| a.nodes.get(&id).and_then(|s| s.scroll_parent))
             .filter(|parent| self.allows(kernel, *parent))
     }
     pub(super) fn document(&self) -> Option<(f32, f32)> {
@@ -182,6 +204,7 @@ impl<D: DataSource> Presenter<D> {
         // afterward moves B into its receipt, without deep-copying any payload.
         let old_paint = self.brush.presentation();
         let old_boxes = std::mem::take(&mut self.boxes);
+        let old_shown = self.ranges.shown.get();
         self.boxes_serial += 1;
         self.display.active = true;
         self.display.rendering = true;
@@ -217,6 +240,7 @@ impl<D: DataSource> Presenter<D> {
                         Seen {
                             key: n.key,
                             parent: n.parent,
+                            scroll_parent: self.geometry_parent(n.id),
                             scroll,
                         },
                     );
@@ -232,8 +256,11 @@ impl<D: DataSource> Presenter<D> {
             paint: self.brush.replace_presentation(old_paint),
             boxes: std::mem::replace(&mut self.boxes, old_boxes),
             witness,
+            session: self.ranges.session(),
         };
         self.boxes_serial += 1;
+        self.ranges.shown.set(old_shown);
+        self.publish_ranges();
         self.display.pending = Some(identity.clone());
         Some(SubmittedFrame {
             pixels,
@@ -262,6 +289,8 @@ impl<D: DataSource> Presenter<D> {
                 self.brush.replace_presentation(picture.paint);
                 self.boxes = picture.boxes;
                 self.boxes_serial += 1;
+                self.ranges.shown.set(picture.session);
+                self.publish_ranges();
                 self.display.acknowledged = Some(picture.witness);
                 self.retire_acknowledged_pointer();
                 self.acknowledge_collection_scroll(model_scroll);
@@ -319,6 +348,7 @@ impl<D: DataSource> Presenter<D> {
             self.collection.data_ready();
             self.queue_collections();
         }
+        self.land_cold_share();
         if let Some(u) = self.updates.as_mut() {
             u.boot_succeeded();
         }
@@ -339,6 +369,7 @@ fn witness_svg(kernel: &Kernel, node: &exact_kernel::NodeRef<'_>, witness: &mut 
             let seen = witness.nodes.entry(id).or_insert(Seen {
                 key: child.key,
                 parent: child.parent,
+                scroll_parent: child.parent,
                 scroll: None,
             });
             seen.key = child.key;

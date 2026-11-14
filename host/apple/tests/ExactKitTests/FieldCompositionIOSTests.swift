@@ -37,7 +37,7 @@ final class FieldCompositionIOSTests: XCTestCase {
                 if let editor = node.textArea {
                     let paragraph = try XCTUnwrap(editor.textStorage.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)
                     XCTAssertEqual(paragraph.alignment, expected)
-                    XCTAssertEqual(paragraph.minimumLineHeight, 24)
+                    XCTAssertEqual(paragraph.minimumLineHeight + paragraph.lineSpacing, 24, "lines 24 apart")
                     XCTAssertEqual((editor.typingAttributes[.paragraphStyle] as? NSParagraphStyle)?.alignment, expected)
                 }
             }
@@ -252,9 +252,12 @@ final class FieldCompositionIOSTests: XCTestCase {
         XCTAssertFalse(node.passesComposition("KeyA", command: false, down: true))
         XCTAssertFalse(node.passesComposition("KeyB", command: true, down: false), "a chord's keyup waits for its keydown's commit")
         XCTAssertTrue(node.passesComposition("ShiftLeft", command: false, down: false))
+        XCTAssertTrue(node.composes("ShiftLeft"), "a modifier's own key that passes is isComposing")
+        XCTAssertFalse(node.composes("Enter"))
         XCTAssertNotNil(field.markedTextRange, "none of these commits it")
         XCTAssertTrue(node.passesComposition("Enter", command: true, down: true))
         XCTAssertNil(field.markedTextRange)
+        XCTAssertFalse(node.composes("MetaLeft"), "a chord's handlers run on committed text")
         XCTAssertEqual(field.text, "한")
         XCTAssertNil(node.pendingValue)
         node.fieldChanged()

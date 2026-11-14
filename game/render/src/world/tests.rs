@@ -72,6 +72,7 @@ impl Writes for Recording {
             merged: &[],
             members: &[],
             starts: &[],
+            parts: &[],
             materials: &[],
             custom: &self.custom,
         })
@@ -177,6 +178,7 @@ impl Game for Moving {
         w.spawn((Transform::default(), Mesh::cube(1.0), Material::default()));
     }
     fn tick(w: &mut World, _: &Input, _: &Self::Args) {
+        let _spans = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"].map(|name| w.span(name));
         for (_, t) in w.query::<&mut Transform>().iter() {
             t.position.x += 1.0;
         }
@@ -819,6 +821,7 @@ fn fixture_writes_one_or_two_pages_while_moving_and_none_at_rest() {
         code: "KeyW".into(),
         down: true,
         at_ms: 0.,
+        player: 0,
     });
     let writes = |r: &Recording| {
         r.calls
@@ -840,11 +843,13 @@ fn fixture_writes_one_or_two_pages_while_moving_and_none_at_rest() {
         code: "KeyW".into(),
         down: false,
         at_ms: 1600.001,
+        player: 0,
     });
     sim.input(exact_game::InputEvent::Key {
         code: "KeyE".into(),
         down: true,
         at_ms: 1600.001,
+        player: 0,
     });
     let mut glowing = 0;
     let mut previous_emissive = 0.;
@@ -1482,3 +1487,9 @@ fn a_static_offset_writes_no_pages_per_tick() {
         r.calls
     );
 }
+
+#[path = "../pose_cycle_tests.rs"]
+mod pose_cycle_tests;
+
+#[path = "../teleport_tests.rs"]
+mod teleport_tests;

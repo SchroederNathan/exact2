@@ -16,9 +16,10 @@ Names are read in a *frame*. The root's frame reads the root's own
 declarations as `Contract.Eval` does. An instance's frame reads, in this
 order, its component's derives (the body, evaluated in the frame at every
 read: a child's derive is not settled), its states (the store at the
-instance's path), its injects and props. A prop or inject is a thunk: the
-expression the use (or the providing component) wrote, with the frame and
-the locals where it was written, evaluated at each read. A `slot`
+instance's path), its injects and props, and its device resources (shared
+by all instances in the root's resource environment). A prop or inject is
+a thunk: the expression the use (or the providing component) wrote, with
+the frame and the locals where it was written, evaluated at each read. A `slot`
 component's fill is rendered where its `children` node stands, in the use
 site's frame, locals, providers and fill. A handler names an action of its
 component or an `action` prop, resolved through the props to the action
@@ -30,7 +31,7 @@ in the same commit, reading the same state.
 
 The root's own declarations — slots, settlement of derives and resources,
 root actions, timers — mean what `Contract.Runtime` says of a program made
-of the root alone (`rootProgram`): no component is involved there.
+of the root with the children's shared device resources (`rootProgram`).
 -/
 import Contract.Runtime
 import Contract.Observe
@@ -77,15 +78,14 @@ def lookupBind (x : String) : List (String × Expr × Frame × Locals) → Optio
   | [] => .none
   | (y, e, f, ls) :: rest => if x == y then .some (e, f, ls) else lookupBind x rest
 
-/-- The root alone, as a program of the flat semantics: its states (the
-router's slot first, as the compiler puts it), derives, resources,
-mutations, actions and tasks. -/
+/-- The root as a flat program, including every child's shared device
+resources. Its states put the router's slot first, as the compiler does. -/
 def rootProgram (p : CProgram) : Program :=
   { shapes := p.shapes, fns := p.fns,
     states := (match p.router with
       | .some x => [{ name := x, ty := .record "Router", init := .none }]
       | .none => []) ++ p.localeStates ++ p.root.states,
-    derives := p.root.derives, resources := p.root.resources,
+    derives := p.root.derives, resources := p.resources,
     mutations := p.root.mutations, actions := (ownCallsComponent p.root).actions, tasks := p.root.tasks,
     routes := p.routes, router := p.router, strings := p.strings, locale := p.locale }
 
@@ -146,6 +146,11 @@ def ceval : Nat → CEnv → Frame → Locals → Expr → Result Value
         let xs ← (← ceval fuel ce f ls l).asList
         let ys ← cevalFilter fuel ce f ls ps body xs 0
         .ok (.list ys)
+      | "sortBy", l :: .arrow ps body :: dir => do
+        let xs ← (← ceval fuel ce f ls l).asList
+        let ks ← cevalMap fuel ce f ls ps body xs 0
+        let d ← sortDir dir
+        sortByKeys xs ks d
       | "pending", [.var x] => cpending fuel ce f ls "pending" x
       | "failed", [.var x] => cpending fuel ce f ls "failed" x
       | "failure", [.var x] => cpending fuel ce f ls "failure" x
@@ -194,7 +199,7 @@ def ceval : Nat → CEnv → Frame → Locals → Expr → Result Value
     | .some v => ceval fuel ce f ((x, v) :: ls) a
     | .none => ceval fuel ce f ls b
     | _ => .error (.type "match on a value that is not an option")
-  | .arrow _ _ => .error (.type "an arrow outside `map` or `filter`")
+  | .arrow _ _ => .error (.type "an arrow outside `map`, `filter` or `sortBy`")
   | .letE x v body => do
     let w ← ceval fuel ce f ls v
     ceval fuel ce f ((x, w) :: ls) body
@@ -203,7 +208,7 @@ def ceval : Nat → CEnv → Frame → Locals → Expr → Result Value
 
 /-- A name an instance's frame reads that no local binds: a derive (its
 body, in the frame, with no locals), a state (the store), an inject or a
-prop (its thunk). -/
+prop (its thunk), or a device resource (the shared root resource). -/
 def cvar : Nat → CEnv → String → InstId → List (String × Expr × Frame × Locals) → String →
     Result Value
   | 0, _, _, _, _, _ => .error outOfFuel
@@ -219,7 +224,9 @@ def cvar : Nat → CEnv → String → InstId → List (String × Expr × Frame 
       else
         match lookupBind x binds with
         | .some (e, f', ls') => ceval fuel ce f' ls' e
-        | .none => .error (.unbound x)
+        | .none =>
+          if C.deviceResources.any (·.name == x) then ce.root.global (hoisted C.name x)
+          else .error (.unbound x)
 
 /-- What `pending(x)`, `failed(x)` (`false`) or `failure(x)` (`none`) says
 of a name that is no resource. -/
@@ -246,7 +253,7 @@ def cpending : Nat → CEnv → Frame → Locals → String → String → Resul
         match lookupBind x binds with
         | .some (.var y, f', ls') => cpending fuel ce f' ls' which y
         | .some _ => .error (.unsupported s!"roster entry `{which}`")
-        | .none => eval fuel ce.root false [] (.call which [.var x])
+        | .none => eval fuel ce.root false [] (.call which [.var (C.resourceName x)])
 
 def cevalList : Nat → CEnv → Frame → Locals → List Expr → Result (List Value)
   | 0, _, _, _, _ => .error outOfFuel
@@ -384,7 +391,9 @@ def cexec : Nat → CEnv → Frame → Locals → List Stmt → CEffects → Res
     | .send t src args => do
       let vs ← cevalList fuel ce f ls args
       cexec fuel ce f ls rest { fx with flat := { fx.flat with sends := fx.flat.sends ++ [(t, src, vs)] } }
-    | .refresh t => cexec fuel ce f ls rest { fx with flat := { fx.flat with refreshes := fx.flat.refreshes ++ [t] } }
+    | .refresh t =>
+      let target := if (lookup t ls).isSome then t else C.resourceName t
+      cexec fuel ce f ls rest { fx with flat := { fx.flat with refreshes := fx.flat.refreshes ++ [target] } }
     | .call a args => do
       let vs ← cevalList fuel ce f ls args
       match ce.prog.actionIn f a with
@@ -424,6 +433,7 @@ structure CVNode where
   handlers : List CHandler
   control : Option String := .none
   windowed : Bool := false
+  navigation : TabInfo := {}
   children : List CVNode
   deriving Inhabited
 
@@ -448,9 +458,12 @@ structure RCx where
   path : InstId
   provides : List Provided
   fill : Option Fill
+  tabs : TabCx := {}
 
 def RCx.enter (cx : RCx) (node : Nat) (key : Value) (dup : Nat) : RCx :=
-  { cx with path := cx.path ++ [{ comp := cx.comp, node, key, dup }] }
+  { cx with
+    path := cx.path ++ [{ comp := cx.comp, node, key, dup }],
+    tabs := cx.tabs.enter key dup }
 
 def nearest (x : String) (ps : List Provided) : Option (Expr × Frame × Locals) :=
   lookupBind x ps.reverse
@@ -460,15 +473,19 @@ def ctext (fuel : Nat) (ce : CEnv) (f : Frame) (ls : Locals) (tag : String) (pos
   match pos with
   | e :: _ =>
     if tag == "text" || tag == "tspan" || tag == "option" then do
-      let v ← ceval fuel ce f ls e
-      pure (Option.some (← v.display))
+      match ← unsetRefused (ceval fuel ce f ls e) with
+      | .some v => pure (Option.some (← v.display))
+      | .none => pure Option.none
     else pure Option.none
   | [] => pure Option.none
 
 def ctestId (fuel : Nat) (ce : CEnv) (f : Frame) (ls : Locals) (props : List (String × Expr)) :
     Result (Option String) :=
   match lookupField "testId" props with
-  | .some e => do pure (Option.some (← (← ceval fuel ce f ls e).display))
+  | .some e => do
+    match ← unsetRefused (ceval fuel ce f ls e) with
+    | .some v => pure (Option.some (← v.display))
+    | .none => pure Option.none
   | .none => pure Option.none
 
 /-- An instance's states: kept from the store before the render, or
@@ -488,6 +505,25 @@ def instSlots (fuel : Nat) (cx : RCx) (C : CComponent) (f : Frame) (id : InstId)
       s := s ++ [(st.name, v)]
     pure s
 
+/-- Resolve literal props, injects and component derives as expansion
+does. A local or state read remains a read even when its value is constant. -/
+def cliteral : Nat → CProgram → Frame → Locals → Expr → Expr
+  | 0, _, _, _, e => e
+  | fuel + 1, p, f, ls, .typed e _ => cliteral fuel p f ls e
+  | fuel + 1, p, f@(.inst c _ binds), ls, e@(.var x) =>
+    if (lookup x ls).isSome then e else
+      match p.component? c with
+      | .none => e
+      | .some C =>
+        match C.derives.find? (·.name == x) with
+        | .some d => cliteral fuel p f [] d.body
+        | .none =>
+          if C.states.any (·.name == x) then e else
+            match lookupBind x binds with
+            | .some (value, frame, locals) => cliteral fuel p frame locals value
+            | .none => e
+  | _ + 1, _, _, _, e => e
+
 /-- Render a component's view. Returns the elements and the instances
 live after it (their states, kept or initialized now). -/
 def crender : Nat → RCx → Locals → List CNode → Store → Result (List CVNode × Store)
@@ -501,11 +537,17 @@ def crender : Nat → RCx → Locals → List CNode → Store → Result (List C
         let handlers ← hs.mapM fun (ev, a, args) => do
           let (f, act, ts) ← resolveAction fuel cx.env.prog cx.frame ls a (args.map (·, cx.frame, ls))
           pure ({ event := ev, frame := f, action := act, args := ts } : CHandler)
-        let (kids, live) ← crender fuel cx ls kids live
+        let values ← (tabProps props).mapM fun (name, e) => do
+          pure (name, ← unsetRefused (ceval fuel cx.env cx.frame ls e))
+        let literals := props.map fun (name, e) => (name, cliteral fuel cx.env.prog cx.frame ls e)
+        let navigation := cx.tabs.element literals (values.filterMap fun (n, v) => v.map (n, ·))
+        let (kids, live) ← (if navigation.opened then
+          crender fuel { cx with tabs := cx.tabs.children props } ls kids live
+          else pure ([], live))
         pure ([{ tag, testId, text, handlers,
                  control := elementControl tag props,
-                 windowed := tag == "list" && (lookupField "virtualized" props matches .some (.bool true)),
-                 children := kids : CVNode }], live)
+                 windowed := tag == "list" && (lookupField "virtualized" literals matches .some (.bool true)),
+                 navigation, children := kids : CVNode }], live)
       | .when id c thn els => do
         match ← ceval fuel cx.env cx.frame ls c with
         | .bool true => crender fuel (cx.enter id (.num 0) 0) ls thn live
@@ -534,7 +576,7 @@ def crender : Nat → RCx → Locals → List CNode → Store → Result (List C
         let slots ← instSlots fuel cx C f path
         let cx' : RCx := { cx with
           env := { cx.env with store := (path, slots) :: cx.env.store },
-          frame := f, comp := name, path,
+          frame := f, comp := name, path, tabs := cx.tabs.enter,
           provides := cx.provides ++ C.provides.map fun (x, e) => (x, e, f, []),
           fill := if C.slot then Option.some (.mk fill cx.frame ls cx.provides cx.fill) else Option.none }
         crender fuel cx' [] C.view (live ++ [(path, slots)])
@@ -547,9 +589,9 @@ def crender : Nat → RCx → Locals → List CNode → Store → Result (List C
             | .inst c _ _ => c)
           let step : Step := { comp := cx.comp, node := id }
           let cx' : RCx := { cx with frame := f, comp := cname, path := cx.path ++ [step],
-                                     provides := provides, fill := outer }
+                                     provides := provides, fill := outer, tabs := cx.tabs.enter }
           crender fuel cx' ls' nodes live : Result (List CVNode × Store))
-    let (more, live) ← crender fuel cx ls rest live
+    let (more, live) ← crender fuel { cx with tabs := cx.tabs.next } ls rest live
     pure (here ++ more, live)
 where
   crenderRows : Nat → RCx → Locals → Nat → String → Option String → Expr → List CNode →
@@ -566,6 +608,21 @@ where
       let (vs, live) ← crender fuel (cx.enter id k dup) ls' body live
       let (more, live) ← crenderRows fuel cx ls id x ix key body items (i + 1) (seen ++ [k]) live
       pure (vs ++ more, live)
+
+def ctabIndex : List CVNode → Tabs.Index
+  | [] => []
+  | n@{ children, .. } :: rest => n.navigation ::
+      ((if n.windowed then [] else ctabIndex children) ++ ctabIndex rest)
+
+def crenderTabs : Nat → RCx → Result (List CVNode × Store)
+  | 0, _ => .error outOfFuel
+  | n + 1, cx => do
+    let (view, live) ← crender fuel cx [] cx.env.prog.root.view []
+    let opened := Tabs.toOpen (ctabIndex view)
+    if opened.isEmpty then pure (view, live) else
+      crenderTabs n { cx with
+        prev := live,
+        tabs := { cx.tabs with opened := Tabs.visited (ctabIndex view) ++ opened } }
 
 /-! ## Configurations and steps -/
 
@@ -589,13 +646,16 @@ def rootEnv (p : CProgram) (slots : List (String × Value)) (st : Settled) (now 
   { prog := rootProgram p, slots, derives := st.derives, resources := st.resources, now }
 
 /-- Render the root's view against the root's slots and settled values,
-keeping the instances `prev` holds. -/
+keeping the instances `prev` holds; `every` when the host builds every tab
+panel (`Oracle.everyTab`). -/
 def renderRoot (p : CProgram) (slots : List (String × Value)) (st : Settled) (now : F64)
-    (prev : Store) : Result (List CVNode × Store) :=
+    (prev : Store) (view : List CVNode := []) (every : Bool := false) :
+    Result (List CVNode × Store) :=
   let env : CEnv := { prog := p, root := rootEnv p slots st now, store := [] }
-  crender fuel { env, prev, frame := .root, comp := p.root.name, path := [],
-                 provides := p.root.provides.map fun (x, e) => (x, e, .root, []),
-                 fill := .none } [] p.root.view []
+  crenderTabs fuel {
+    env, prev, frame := .root, comp := p.root.name, path := [],
+    provides := p.root.provides.map fun (x, e) => (x, e, .root, []),
+    fill := .none, tabs := { opened := Tabs.visited (ctabIndex view), every } }
 
 /-- The declared type of an instance's state. -/
 def instSlotTy (p : CProgram) (c x : String) : Ty :=
@@ -641,14 +701,14 @@ def crunAction (p : CProgram) (o : Oracle) (c : CConfig) (f : Frame) (name : Str
         match settle rp o slots c.now c.settled fx.refreshes with
         | .error e => refuse e
         | .ok st =>
-          match renderRoot p slots st c.now store with
+          match renderRoot p slots st c.now store c.view o.everyTab with
           | .ok (view, live) =>
             ({ c with slots, settled := st, store := live, view,
-                      commands := c.commands ++ fx.commands,
+                      commands := c.commands ++ hostCommands fx.commands,
                       armed := armThens rp c.armed fx.sends c.now }, .ok)
           | .error e =>
             ({ c with slots, settled := st, store, poisoned := true,
-                      commands := c.commands ++ fx.commands }, .poisoned e)
+                      commands := c.commands ++ hostCommands fx.commands }, .poisoned e)
 
 /-- Boot: the root's slots, its timers, settlement, then the root's view,
 every instance initialized as it first renders. -/
@@ -668,7 +728,7 @@ def cboot (p : CProgram) (o : Oracle) : CConfig × Outcome :=
       match settle rp o slots 0 with
       | .error e => (empty, .refused e)
       | .ok st =>
-        match renderRoot p slots st 0 [] with
+        match renderRoot p slots st 0 [] [] o.everyTab with
         | .ok (view, live) => ({ slots, settled := st, store := live, view, now := 0, timers }, .ok)
         | .error e => (empty, .refused e)
 
@@ -738,7 +798,7 @@ def cadvance (p : CProgram) (o : Oracle) (c : CConfig) (t : F64) : CConfig × Ou
 
 partial def CVNode.toVNode (n : CVNode) : VNode :=
   { tag := n.tag, testId := n.testId, text := n.text, handlers := [], locals := [],
-    control := n.control, windowed := n.windowed, rows := [],
+    control := n.control, windowed := n.windowed, navigation := n.navigation, rows := [],
     children := n.children.map CVNode.toVNode }
 
 /-- The configuration as `Contract.Observe` prints it: the root's slots,

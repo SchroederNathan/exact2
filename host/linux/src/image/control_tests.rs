@@ -8,6 +8,9 @@ use std::sync::{
 /// A hang detector, not a speed claim: a wait returns once nothing is
 /// pending, and a 2048² decode took over 3 s on this Mac at load 170.
 const SETTLED: Duration = Duration::from_secs(60);
+// These fixtures must occupy both process workers before releasing either.
+// Running them together can leave each holding one while waiting for the other.
+static BOTH_WORKERS: Mutex<()> = Mutex::new(());
 
 fn encoded(w: u32, h: u32, color: [u8; 4]) -> Arc<[u8]> {
     let mut data = Vec::new();
@@ -38,6 +41,205 @@ fn assets() -> Assets {
             )))
         }),
     )
+}
+
+#[test]
+fn boot_metadata_waits_for_layout_size_before_decoding() {
+    let mut k = kernel(2);
+    source(&mut k, 2, "symbol:checkmark");
+    let mut images = Images::with_assets(Assets::selected(
+        PathBuf::new(),
+        Arc::new(|_| Ok(Some(encoded(512, 512, [40, 100, 200, 255])))),
+    ));
+    images.prepare_boot(&k, &k.roots(), 2.);
+    images.poll();
+    assert!(
+        images.views[&1].source_id.is_none(),
+        "binding starts no I/O"
+    );
+    assert!(images.views[&1].request.is_none());
+    assert!(images.bitmaps.is_empty());
+    assert!(
+        !images.views.contains_key(&2),
+        "symbols still owe their intrinsic size"
+    );
+    boxed(&mut k, 1, 32., 32., exact_kernel::ObjectFit::Cover);
+    images.enable_decode();
+    let reports = images.sync_visible(&k, &k.roots(), 2., |_| true);
+    assert!(reports.iter().any(|(id, size)| *id == 2 && size.is_some()));
+    until(|| {
+        images.poll();
+        images.bitmaps.contains_key(&1)
+    });
+    let picture = &images.bitmaps[&1];
+    assert!(
+        picture.width() < 512 && picture.height() < 512,
+        "layout must size the decode"
+    );
+    assert_eq!(picture.natural(), (512, 512));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn painted_boot_requests_no_images_below_the_first_screen() {
+    use crate::{
+        host::PlanBytes,
+        presenter::{PainterBoot, PainterChoice, Presenter},
+    };
+    let mut source =
+        String::from("component App\n  view\n    column width=100 height=2600\n      box height=200 flex-shrink=0\n");
+    for i in 0..60 {
+        source.push_str(&format!(
+            "      image \"offscreen-{i}.png\" width=40 height=40 flex-shrink=0\n"
+        ));
+    }
+    let bytes = contract::compile(&source).unwrap().encode();
+    let decoded = std::cell::Cell::new(0);
+    let ready = |_: &exact_plan::Plan| decoded.set(decoded.get() + 1);
+    let (mut p, error) = Presenter::boot_selected(
+        PlanBytes::Painted(&bytes, &ready),
+        (),
+        (100., 100.),
+        1.,
+        ".".into(),
+        None,
+        ("{}", exact_runner::Delivery::default()),
+        "/",
+        None,
+        PainterBoot::selected(PainterChoice::Cpu),
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(decoded.get(), 1);
+    assert_eq!(p.images().views.len(), 60);
+    for id in p.images().views.keys() {
+        let frame = p.host().kernel().node(*id).unwrap().frame;
+        assert!(
+            frame.y >= 200.,
+            "off-screen fixture was laid out at {frame:?}"
+        );
+    }
+    assert!(p
+        .images()
+        .views
+        .values()
+        .all(|v| !v.visible && v.source_id.is_none() && v.request.is_none()));
+    assert!(!p.images().pending());
+    let (ordinary, error) =
+        Presenter::boot_with(&bytes, (), (100., 100.), 1., ".".into(), PainterChoice::Cpu).unwrap();
+    assert!(error.is_none());
+    assert!(
+        ordinary.images().views.values().all(|v| v.visible),
+        "ordinary hosts keep their pre-paint mounted-image policy"
+    );
+    p.frame();
+    p.finish_boot_images();
+    assert!(
+        p.images().views.values().all(|v| v.visible && !v.on_screen),
+        "the ordinary mounted first-load pass resumes only after first paint"
+    );
+    assert!(p.images().views.values().any(|v| v.source_id.is_some()));
+}
+
+#[test]
+fn a_boot_symbol_has_no_picture_request_to_wait_for() {
+    let mut k = kernel(1);
+    source(&mut k, 1, "symbol:checkmark");
+    let mut images = Images::new(PathBuf::new());
+    images.prepare_boot(&k, &k.roots(), 1.);
+    images.enable_decode();
+    images.sync_visible(&k, &k.roots(), 1., |_| true);
+    assert!(images.views[&1].symbol_size.is_some());
+    assert!(!images.pending());
+}
+
+#[test]
+fn a_refused_boot_picture_is_settled_content() {
+    let k = kernel(1);
+    let mut images = Images::with_assets(Assets::selected(PathBuf::new(), Arc::new(|_| Ok(None))));
+    images.prepare_boot(&k, &k.roots(), 1.);
+    images.enable_decode();
+    images.sync_visible(&k, &k.roots(), 1., |_| true);
+    until(|| {
+        images.poll();
+        images.has_refusals()
+    });
+    assert!(
+        !images.pending(),
+        "a terminal refusal must not keep boot alive"
+    );
+}
+
+#[test]
+fn http_images_share_a_download_without_blocking_local_images() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/redirect", listener.local_addr().unwrap());
+    let png = encoded(24, 16, [40, 120, 220, 255]);
+    let (arrived, requested) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for request in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(SETTLED)).unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() < 8192);
+            }
+            let header = String::from_utf8(header).unwrap().to_ascii_lowercase();
+            assert!(
+                !header.contains("authorization:")
+                    && !header.contains("cookie:")
+                    && !header.contains("referer:")
+            );
+            if request == 0 {
+                assert!(header.starts_with("get /redirect "));
+                stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /photo\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            } else {
+                assert!(header.starts_with("get /photo "));
+                arrived.send(()).unwrap();
+                released.recv_timeout(SETTLED).unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len()).unwrap();
+                stream.write_all(&png).unwrap();
+            }
+        }
+    });
+    let mut k = kernel(3);
+    source(&mut k, 1, &url);
+    source(&mut k, 2, &url);
+    let mut images = Images::with_assets(assets());
+    images.sync(&k, &k.roots());
+    requested.recv_timeout(SETTLED).unwrap();
+    until(|| {
+        images.poll();
+        images.bitmaps.contains_key(&3)
+    });
+    assert!(!images.bitmaps.contains_key(&1));
+    release.send(()).unwrap();
+    images.wait(SETTLED);
+    server.join().unwrap();
+    assert_eq!(
+        (images.bitmaps[&1].width(), images.bitmaps[&1].height()),
+        (24, 16)
+    );
+    assert!(Arc::ptr_eq(&images.bitmaps[&1], &images.bitmaps[&2]));
+    let path = images.views[&1].source_id.as_ref().unwrap().file().unwrap();
+    assert!(path.is_file());
+    drop(images);
+    // The shared download cache survives a view's lifetime. A later view
+    // must reuse it even after the fixture server has closed.
+    let mut again = Images::with_assets(assets());
+    again.sync(&k, &k.roots());
+    again.wait(SETTLED);
+    assert!(again.bitmaps.contains_key(&1));
+    assert_eq!(
+        again.views[&1].source_id.as_ref().unwrap().file(),
+        Some(path)
+    );
 }
 fn kernel(count: u32) -> Kernel {
     let mut k = Kernel::with_monospace();
@@ -90,7 +292,12 @@ fn symbols_clear_rasters_without_loading_and_follow_font_size() {
     images.sync(&k, &k.roots());
     images.wait(SETTLED);
     assert!(images.bitmaps.contains_key(&1));
-    for name in ["symbol:sf/airpodsmax", "symbol:sf/", "symbol:unknown"] {
+    for name in [
+        "symbol:sf/airpodsmax",
+        "symbol:sf/",
+        "symbol:",
+        "symbol:unknown",
+    ] {
         source(&mut k, 1, name);
         assert_eq!(images.sync(&k, &k.roots()), vec![(1, Some((16., 16.)))]);
         assert!(!images.bitmaps.contains_key(&1));
@@ -210,6 +417,7 @@ fn twenty_replacement_waves_decode_distinct_sources_without_retaining_history() 
 
 #[test]
 fn full_undrained_session_does_not_block_another_sessions_native_workers() {
+    let _both = BOTH_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
     let k = kernel(2);
     let mut a = Images::with_assets(assets());
     // Prepare metadata without occupying a decode worker. Holding one worker
@@ -253,6 +461,113 @@ fn full_undrained_session_does_not_block_another_sessions_native_workers() {
     assert_eq!(undrained.ready, 2);
     assert_eq!(undrained.running, 0);
     assert_eq!(undrained.delivery_cells, 2);
+}
+
+#[test]
+fn raster_demand_follows_the_content_box_fit_and_device_scale() {
+    use exact_kernel::{AxisOffer, BoxSizing, Dimension, ObjectFit, Offer, StyleId, StyleProps};
+    let mut k = kernel(1);
+    let mut style = StyleProps {
+        width: Dimension::Points(420.),
+        height: Dimension::Points(140.),
+        padding_left: Dimension::Points(16.),
+        padding_right: Dimension::Points(16.),
+        padding_top: Dimension::Points(16.),
+        padding_bottom: Dimension::Points(16.),
+        ..Default::default()
+    };
+    style.box_sizing = BoxSizing::BorderBox;
+    style.border_width_top = 4.;
+    style.border_width_right = 4.;
+    style.border_width_bottom = 4.;
+    style.border_width_left = 4.;
+    style.border_style_top = exact_kernel::BorderStyle::Solid;
+    style.border_style_right = exact_kernel::BorderStyle::Solid;
+    style.border_style_bottom = exact_kernel::BorderStyle::Solid;
+    style.border_style_left = exact_kernel::BorderStyle::Solid;
+    style.object_fit = ObjectFit::Contain;
+    for id in [
+        StyleId::Width,
+        StyleId::Height,
+        StyleId::PaddingLeft,
+        StyleId::PaddingRight,
+        StyleId::PaddingTop,
+        StyleId::PaddingBottom,
+        StyleId::BoxSizing,
+        StyleId::BorderWidthTop,
+        StyleId::BorderWidthRight,
+        StyleId::BorderWidthBottom,
+        StyleId::BorderWidthLeft,
+        StyleId::BorderStyleTop,
+        StyleId::BorderStyleRight,
+        StyleId::BorderStyleBottom,
+        StyleId::BorderStyleLeft,
+        StyleId::ObjectFit,
+    ] {
+        style.mask.set(id);
+    }
+    k.apply(
+        0,
+        2,
+        &[Op::SetStyle {
+            id: 1,
+            patch: Box::new(style),
+        }],
+    )
+    .unwrap();
+    k.compute_layout(
+        1,
+        Offer {
+            width: AxisOffer::Definite(420.),
+            height: AxisOffer::Definite(140.),
+        },
+    )
+    .unwrap();
+    let mut images = Images::with_assets(assets());
+    images.sync_visible(&k, &k.roots(), 2., |_| true);
+    let view = images.views.get_mut(&1).unwrap();
+    assert_eq!(view.desired, (760., 200.));
+    let header = png_decode::Header::jpeg(exact_raster::Metadata {
+        natural: PixelSize {
+            width: 1600,
+            height: 900,
+        },
+        encoded_bytes: 1000,
+        header_bytes: 100,
+    });
+    for (fit, longest) in [
+        (ObjectFit::Contain, 384),
+        (ObjectFit::Cover, 768),
+        (ObjectFit::Fill, 768),
+        (ObjectFit::None, 1600),
+        (ObjectFit::ScaleDown, 384),
+    ] {
+        view.object_fit = fit;
+        let plan = plan_view(header, view, 2., SESSION_BYTES).unwrap();
+        assert_eq!(plan.pixels.width, longest, "{fit:?}");
+    }
+    view.object_fit = ObjectFit::Cover;
+    view.requested_for = view.desired;
+    view.requested_fit = view.object_fit;
+    view.requested_scale = 2.;
+    view.desired = (764., 200.);
+    assert!(
+        !resize_changes_view(header, view, 2.),
+        "a small resize keeps its size class"
+    );
+    view.desired = view.requested_for;
+    view.requested_fit = ObjectFit::Contain;
+    assert!(
+        resize_changes_view(header, view, 2.),
+        "cover replaces the smaller contain raster"
+    );
+    view.requested_fit = ObjectFit::Cover;
+    view.desired = (1100., 200.);
+    assert!(resize_changes_view(header, view, 2.));
+    assert_eq!(
+        drawn_size(header, (4000., 4000.), ObjectFit::ScaleDown, 2.),
+        (3200., 1800.)
+    );
 }
 
 #[test]
@@ -352,6 +667,7 @@ fn source_identity_survives_displayed_replacement_and_cold_unmount() {
 
 #[test]
 fn metadata_progresses_under_known_decode_pressure_in_shared_pool() {
+    let _both = BOTH_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
     use std::sync::atomic::AtomicUsize;
     let decoded = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(AtomicBool::new(false));
@@ -424,7 +740,7 @@ fn provider_identity_outlives_metadata_churn_and_generation_retirement() {
     for n in 100..180 {
         let owner = images
             .backend
-            .source(images.generation, &n.to_string(), &images.assets)
+            .source(images.generation, &n.to_string(), &images.assets, false)
             .unwrap();
         until(|| matches!(images.backend.prepared(owner.id), Some(Prepared::Ready(_))));
     }
@@ -447,7 +763,7 @@ fn provider_identity_outlives_metadata_churn_and_generation_retirement() {
     drop(a);
     until(|| weak_owner.upgrade().is_none());
     images.reset();
-    assert_eq!(images.backend.sources(), 0);
+    until(|| images.backend.sources() == 0);
 }
 
 #[test]

@@ -6,9 +6,10 @@ use super::*;
 
 impl Collection {
     /// Whether the window anchors the end: the list follows it, or it is
-    /// still opening there.
+    /// still opening there. Not while a `scrollIntoView` is under way: the
+    /// request overrides the list's kept position (LLP 1070.000 §2.5).
     pub(super) fn follows(&self) -> bool {
-        (self.follow_end || self.at_end) && self.preview.is_none()
+        (self.follow_end || self.at_end) && self.preview.is_none() && self.target.is_none()
     }
     /// Before any host report: the window is the last rows, and the host is
     /// told to start at the end (it clamps the offset to its extent).
@@ -37,10 +38,10 @@ impl Collection {
             .unwrap_or(0))
     }
     /// The reader's own motion ends the opening: travel a host samples from
-    /// a drag, a fling or a wheel, in two reports running, as it cancels a
-    /// `scrollIntoView`. Not a report short of the end: a host clamps its
-    /// port to rows it laid out at their real size before the runner
-    /// measured them, and one may report before it applies the correction.
+    /// a drag, a fling or a wheel, in two reports running. Not a report
+    /// short of the end: a host clamps its port to rows it laid out at their
+    /// real size before the runner measured them, and one may report before
+    /// it applies the correction.
     pub(super) fn leave_end_if_moved(&mut self, velocity: f64) {
         if !self.at_end {
             return;
@@ -54,10 +55,11 @@ impl Collection {
             self.at_end = false;
         }
     }
-    /// The offset an opening list's anchor is taken at: its end.
-    pub(super) fn anchor_offset(&self, offset: f64) -> f64 {
+    /// The offset an opening list's anchor is taken at: its end, in a port of
+    /// `port`, and no overshoot past it.
+    pub(super) fn anchor_offset(&self, offset: f64, port: f64) -> f64 {
         if self.at_end {
-            self.index.scroll_extent()
+            self.index.max_offset(port)
         } else {
             offset
         }

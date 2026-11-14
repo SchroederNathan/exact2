@@ -1,7 +1,7 @@
 import type { Storage } from "../../../vendor/ibex/crates/ibex2/src/bindings/storage";
 type Store = { get(name:string):string|null; set(name:string,value:string):void; forget(name:string):void };
 const appId = "dev.exact.storage-test";
-const grants = "fs.read app:/data\nfs.write app:/data\nfs.read doc:/\nfs.write doc:/\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n";
+const grants = "fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n";
 
 // Work queued behind whatever the module started last, the way an app serializes its
 // database operations. The second answer's storage calls run in a later microtask.
@@ -13,16 +13,19 @@ let shared: Promise<{text:string}>;
 // the last failure a background step reported to the app.
 let saving: Promise<unknown> = Promise.resolve(), lastError = "";
 let compressAndWrite = 0;
+const slept: string[] = [];
 const bytes = (value: string) => new Uint8Array(Array.from(value).map(c => c.charCodeAt(0)));
 
 // Writes an answer starts and does not await (kanban F22): the answer is
 // given before they land, and they must land all the same.
 function answer(source:string, args:unknown[], store:Store, storage:Storage, native:any) {
   const op = String(args[0]), value = String(args[1]);
-  if (op === "shared-live") {
+  if (op === "shared-live" || op === 'letgo-shared') {
     shared = fetch("https://example.test/shared").then(async () => {
       await storage.fs.atomicWriteFile(storage.fs.directories.data + "/shared", new Uint8Array([1]));
-      store.set("session", value);
+      if (op === 'shared-live') {
+        store.set("session", value);
+      }
       return {text: value};
     });
     return shared;
@@ -41,6 +44,21 @@ function answer(source:string, args:unknown[], store:Store, storage:Storage, nat
   }
   // An answer that awaits background work: waits with the module.
   if (op === "await-saving") return saving.then(() => ({text:"after " + lastError}));
+  if (op === 'await-saving-native' || op === 'await-shared-native') {
+    return (async (): Promise<{ text: string }> => {
+      await (op === 'await-shared-native' ? shared : saving);
+      const result = native.call({ value });
+      store.set('session', value);
+      return { text: String(result.text) };
+    })();
+  }
+  if (op === 'await-saving-file') {
+    return (async (): Promise<{ text: string }> => {
+      await saving;
+      await storage.fs.atomicWriteFile(storage.fs.directories.data + '/resumed', bytes(value));
+      return { text: value };
+    })();
+  }
   // 258 writes at once: one in flight, 256 waiting, the 258th refused.
   if (op === "flood") {
     const codes: Promise<string>[] = [];
@@ -97,6 +115,8 @@ function answer(source:string, args:unknown[], store:Store, storage:Storage, nat
   return work(source, args, store, storage, native);
 }
 
+let busyOnceDone = false;
+let held: {close(): Promise<void>} | null = null;
 async function work(_source:string, args:unknown[], store:Store, storage:Storage, native:{available:boolean; call(request:Record<string,unknown>):Record<string,unknown>; later(request:Record<string,unknown>):Promise<Record<string,unknown>>}|null) {
   const op = String(args[0]), value = String(args[1]);
   if (op === 'later') {
@@ -105,6 +125,10 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
     catch(error:any) { return {text:'refused: ' + error.message}; }
   }
   if (op === 'native-direct') return {text: String(native!.call({value}).text)}; // no bake branch
+  // A turn over its budget the first time, then at once (a load-caused refusal asked again: overrun.rs).
+  if (op === 'busy-once') { if (!busyOnceDone) { busyOnceDone = true; let acc = 0; for (let i = 0; i < 30000000; i++) acc = (acc + i * 7) % 1000003; return {text: String(acc)}; } return {text: 'answered'}; }
+  // A turn of the module's own work, `value` iterations long (the turn budget's test: turn_budget.rs).
+  if (op === 'busy') { let acc = 0; for (let i = 0, n = Number(value); i < n; i++) acc = (acc + i * 7) % 1000003; return {text: String(acc)}; }
   if (op === 'native' || op === 'native-fetch') {
     if (!native?.available) return {text: 'no native module'};
     try {
@@ -130,6 +154,21 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
       catch (error: any) { out.push(error.message.includes("doc:/") ? "refused" : "wrong namespace"); }
     }
     return {text: out.join(" ")};
+  }
+  // LLP 1069.010.000 D5: what the host keeps, watched, and one forgotten.
+  if (op === "kept") {
+    storage.fs.watch("doc:/");
+    const listed = await storage.fs.recentDocuments();
+    await storage.fs.forgetDocument(value);
+    let again = "";
+    try { await storage.fs.forgetDocument(value); } catch (e: any) { again = e.code; }
+    const left = (await storage.fs.recentDocuments()).length;
+    return {text: [listed.map((d) => `${d.path} ${d.kind} ${d.mode}`).join(","), left, again].join(" | ")};
+  }
+  // LLP 1069.010.000 D4: the app's own atomic save of a kept file.
+  if (op === "kept-save") {
+    await storage.fs.atomicWriteFile(value, new TextEncoder().encode("saved"));
+    return {text: (await storage.fs.recentDocuments()).map((d) => d.path).join(",")};
   }
   // LLP 1069.010.000 D1, D2a: the answer watches a chosen file and its
   // folder, and a write that expects a stale stat is refused.
@@ -172,6 +211,22 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
     }
     return {text: out.join(" ")};
   }
+  // LLP 1069.010 D1 (2026-10-26): a chosen file copied by the host into an
+  // app file, its size read back, and the copies still refused.
+  if (op === "doc-copy") {
+    const out: string[] = [], folder = value.slice(0, value.lastIndexOf("/"));
+    const steps: (() => Promise<unknown>)[] = [
+      () => storage.fs.copyFile(value, "app:/data/copied").then(() => storage.fs.stat("app:/data/copied")).then((s) => "copied " + s.size),
+      () => storage.fs.copyFile(value, "app:/cache/ungranted"),
+      () => storage.fs.copyFile(value, folder + "/copy"),
+      () => storage.fs.copyFile("app:/data/copied", folder + "/copy"),
+      () => storage.fs.rename(value, "app:/data/moved"),
+    ];
+    for (const step of steps) {
+      try { const r = await step(); out.push(typeof r === "string" ? r : "ok"); } catch (e: any) { out.push(e.kind + " " + e.code); }
+    }
+    return {text: out.join(" ")};
+  }
   // Ledger's shape (ledger F12): every answer queued on one chain, a listing
   // that reads, and a save that refuses bad input before touching storage.
   if (op === "count" || op === "invalid") {
@@ -187,6 +242,16 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
     tail = run.catch(() => {});
     return run;
   }
+  // A write, then a timer once it lands: refused to a call let go meanwhile,
+  // whose chain still runs (LLP 1027.000 D1: its timer would never run).
+  if (op === "write-then-sleep") {
+    return storage.fs.writeFile(storage.fs.directories.data + "/slept", bytes(value)).then(() => {
+      try { setTimeout(() => {}, 10); slept.push(value + " armed"); }
+      catch (e) { slept.push(value + " refused: " + e.message); }
+      return {text: value};
+    });
+  }
+  if (op === "slept") return {text: slept.join("; ")};
   if (op === "serial") {
     const run = tail.then(async () => {
       const db = await storage.sqlite.open("app:/data/notes.db");
@@ -221,6 +286,14 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
     await storage.fs.atomicWriteFile(ordered, new Uint8Array(Array.from(before + value).map(c => c.charCodeAt(0))));
     store.set("session", value);
     return {text: value};
+  }
+  if (op === "write-only") {
+    await storage.fs.atomicWriteFile('app:/cache/widget-hidden', new Uint8Array([1]));
+    return {text:'written'};
+  }
+  if (op === "copy-to-write-only") {
+    await storage.fs.copyFile(path, 'app:/cache/widget-copy');
+    return {text:'copied'};
   }
   if (op === "file" || op === "file-kept") {
     await storage.fs.atomicWriteFile(path, new Uint8Array(Array.from(value).map(c=>c.charCodeAt(0))));
@@ -267,6 +340,41 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
     ];
     for (const step of steps) {
       try { await step(); out.push("ok"); } catch (e:any) { out.push(e.name + " " + e.code + " " + e.message); }
+    }
+    return {text: out.join("\n")};
+  }
+  // `type: "image/png"` (LLP 1069.002 A1.11): the record and the file's
+  // first 26 bytes (its IHDR's colour type last), then a type it refuses.
+  if (op === "compress-png") {
+    const data = storage.fs.directories.data, out: string[] = [];
+    try {
+      const r = await storage.fs.compressImage(data + "/in.png", data + "/out.png", { maxDimension: Number(value), maxBytes: 100_000, type: "image/png" });
+      const back = new Uint8Array(await storage.fs.readFile(r.path));
+      out.push([r.path, r.type, r.size, r.width, r.height, Array.from(back.subarray(0, 26)).join(",")].join(" "));
+    } catch (e:any) { out.push(e.name + " " + e.code + " " + e.message); }
+    try { await storage.fs.compressImage(data + "/in.png", data + "/x.webp", { maxDimension: 8, maxBytes: 100, type: "image/webp" as any }); out.push("ok"); }
+    catch (e:any) { out.push(e.name + " " + e.code + " " + e.message); }
+    return {text: out.join("\n")};
+  }
+  // `fs.transformImage` and `compressImage`'s edit (LLP 1133.019 D14, D15):
+  // each record, then each refusal's name and code, in one answer.
+  if (op === "transform") {
+    const data = storage.fs.directories.data, out: string[] = [];
+    const steps: (() => Promise<any>)[] = [
+      () => storage.fs.transformImage(data + "/in.jpg", data + "/turned", { rotate: 90 }),
+      () => storage.fs.transformImage(data + "/in.jpg", data + "/private", { flip: "horizontal", metadata: "no-location", type: "image/png", resizeWidth: 24 }),
+      () => storage.fs.compressImage(data + "/in.jpg", data + "/crop.jpg", { maxDimension: 100, maxBytes: 2_000_000, rotate: 90, crop: { x: 0, y: 0, width: 64, height: 24 } }),
+      () => storage.fs.transformImage(data + "/in.jpg", data + "/x.jpg", { crop: { x: 100, y: 0, width: 4, height: 4 } }),
+      () => storage.fs.transformImage(data + "/in.jpg", data + "/x.webp", { type: "image/webp" }),
+      () => storage.fs.transformImage(data + "/in.jpg", "app:/tmp/x.jpg"),
+      () => storage.fs.transformImage(data + "/in.jpg", data + "/x.jpg", { flip: "both" as any }),
+      () => storage.fs.compressImage(data + "/in.jpg", data + "/x.jpg", { maxDimension: 10, maxBytes: 10_000, crop: { x: 0, y: 0, width: 0, height: 1 } }),
+    ];
+    for (const step of steps) {
+      try {
+        const r = await step();
+        out.push([r.path, r.type, r.size, r.width, r.height, r.colorSpace, r.hdr, r.metadata, (await storage.fs.readFile(r.path)).byteLength].join(" "));
+      } catch (e:any) { out.push(e.name + " " + e.code + " " + e.message); }
     }
     return {text: out.join("\n")};
   }
@@ -322,6 +430,56 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
     }
     return {text: out.join("\n")};
   }
+  // `exactBodyTo` (LLP 1108 D6 R2): the host writes a 2xx body to the file.
+  // The status, what was written, the body and the header names, or the
+  // rejection's name, kind and message.
+  if (op === "download" || op === "download-missing") {
+    try {
+      const r = await fetch("https://example.test/" + op, { exactBodyTo: value } as any);
+      return {text: [r.status, JSON.stringify((r as any).exactBodyTo), await r.text(), [...r.headers.keys()].join(",")].join(" ")};
+    } catch (e:any) { return {text: e.name + " " + e.kind + " " + e.message}; }
+  }
+  if (op === "download-refusals") {
+    const url = "https://example.test/download", data = storage.fs.directories.data, out: string[] = [];
+    const inits: any[] = [
+      { exactBodyTo: 42 },
+      { exactBodyTo: "/tmp/photo.jpg" },
+      { exactBodyTo: data + "/../photo.jpg" },
+      { exactBodyTo: data + "/" + "\ud800".repeat(1500) },
+      { method: "HEAD", exactBodyTo: data + "/photo.jpg" },
+      { exactBodyTo: data + "/photo.jpg", exactStream: () => null },
+      { exactBodyTo: data + "/photo.jpg", exactIndependentHttp: { maxResponseBytes: 1073741825 } },
+      { exactIndependentHttp: { maxResponseBytes: 67108865 } },
+    ];
+    for (const init of inits) {
+      try { await fetch(url, init); out.push("sent"); } catch (e:any) { out.push(e.name + ": " + e.message); }
+    }
+    return {text: out.join("\n")};
+  }
+  // An upload's progress (LLP 1016.000 D10): each
+  // event as its mapper gets it, a `progress` of the bytes sent, then `load`.
+  // (`upload-patient`: a deadline past the portable transport's own 30 s)
+  if (op === "upload-progress" || op === "upload-patient") {
+    return fetch("https://example.test/upload", { method: "POST", exactBodyFrom: value, exactUploadProgress: true, exactTimeout: op === "upload-patient" ? 60000 : 30000,
+      exactStream: (e: any) => ({text: e.type === "progress" ? `progress ${e.loaded}/${e.total} ${e.lengthComputable}` : e.type === "load" ? `load ${e.status} ${e.data}` : `${e.type} ${e.kind} ${e.message}`}) } as any);
+  }
+  if (op === "upload-progress-refusals") {
+    const url = "https://example.test/upload", exactStream = () => ({text: ""}), out: string[] = [];
+    const inits: [string, any][] = [
+      [url, { method: "POST", exactStream, exactUploadProgress: "yes" }],
+      [url, { method: "POST", exactUploadProgress: true }],
+      [url, { exactStream, exactUploadProgress: true }],
+      ["wss://example.test/upload", { method: "POST", exactStream, exactUploadProgress: true }],
+      [url, { exactStream, exactUploadProgress: true, exactLongPoll: { cursor: "since", from: "seq" } }],
+      [url, { method: "POST", exactStream, exactUploadProgress: true, redirect: "manual" }],
+      [url, { method: "POST", exactStream, exactTimeout: 30000 }],
+      ["exact-native:", { method: "POST", exactStream, exactUploadProgress: true }],
+    ];
+    for (const [to, init] of inits) {
+      try { await fetch(to, init); out.push("sent"); } catch (e:any) { out.push(e.name + ": " + e.message); }
+    }
+    return {text: out.join("\n")};
+  }
   if (op === "write-slow") {
     await storage.fs.writeFile(storage.fs.directories.data + "/slow.jpg", bytes(value));
     return {text: "wrote " + value};
@@ -349,6 +507,13 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
     catch (e) { return {text:"denied"}; }
     return {text:"leaked"};
   }
+  // A connection kept open across answers, and its close (native_storage.rs).
+  if (op === "hold") {
+    try { held = await storage.sqlite.open("app:/data/notes.db"); }
+    catch (e:any) { return {text:e.message}; }
+    return {text:"held"};
+  }
+  if (op === "release") { await held?.close(); held = null; return {text:"released"}; }
   if (op === "sqlite-refused") {
     try { await storage.sqlite.open("app:/data/notes-bob.db"); }
     catch (e:any) { return {text:e.code + " " + e.message}; }

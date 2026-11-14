@@ -1,3 +1,4 @@
+//! Every fact a boot takes first lives here, including root size and display scale.
 //! The display preferences (LLP 1061 D4; LLP 1069.000 D1), told to the
 //! running host and kept for the next boot's first frame; the date (LLP
 //! 1027.000.000) and where the viewer is, told to the running host, and
@@ -10,6 +11,51 @@ use super::{not_booted, Bridge};
 use exact_runner::DataSource;
 
 impl<D: DataSource> Bridge<D> {
+    /// Frame tasks at their presentation target after timer admission.
+    pub fn admitted_frame(&mut self, target_ms: f64, wall_ms: f64) -> u32 {
+        let out = self
+            .host
+            .as_mut()
+            .map_or_else(not_booted, |h| h.admitted_frame(target_ms, wall_ms));
+        self.emit(out)
+    }
+
+    /// Delegate ordinary live timers to independent platform callbacks.
+    pub fn native_timers(&mut self, enabled: bool) {
+        self.native_timers = enabled;
+        if let Some(h) = self.host.as_mut() {
+            h.runner_mut().use_native_timers(enabled);
+        }
+    }
+
+    /// Deliver one platform timer instance; stale generations do nothing.
+    pub fn fire_native_timer(&mut self, index: u32, generation: u64, now: f64) -> u32 {
+        let out = self
+            .host
+            .as_mut()
+            .map_or_else(not_booted, |h| h.fire_native_timer(index, generation, now));
+        self.emit(out)
+    }
+
+    /// Set whether the display drives frame tasks.
+    pub fn present_frames(&mut self, on: bool) {
+        if let Some(h) = self.host.as_mut() {
+            h.present_frames(on);
+        }
+    }
+
+    /// Configure and admit timer waits through the host's batch boundary.
+    pub fn timer_waits(&mut self, kinds: u8, cutoff: f64, mode: u32) -> u32 {
+        if mode == 0 {
+            self.wait_kinds = kinds;
+        }
+        let out = self
+            .host
+            .as_mut()
+            .map_or_else(not_booted, |h| h.timer_waits(kinds, cutoff, mode));
+        self.emit(out)
+    }
+
     /// 1 when the running plan reads `onLine`, and before boot: the host
     /// watches the network only then.
     pub fn reads_on_line(&self) -> u32 {
@@ -143,11 +189,16 @@ impl<D: DataSource> Bridge<D> {
     /// Where the viewer is, for the next boot's first settle, as
     /// `set_place` reads it from the input buffer (`locale NUL timeZone NUL
     /// seed`); the running host is not told. A fact that does not validate
-    /// (or a missing seed) leaves the last one.
-    pub fn set_launch_place(&mut self, len: usize) {
+    /// (or a missing seed) leaves the last one and returns a refusal batch.
+    pub fn set_launch_place(&mut self, len: usize) -> u32 {
         let text = std::str::from_utf8(&self.input[..len.min(self.input.len())]).unwrap_or("");
         if let Some(place) = exact_runner::time::Place::launched(text) {
             self.launch_facts.place = Some(place);
+            0
+        } else {
+            // The refusal alone: a reload primes a place while a live host
+            // runs, and its pending work is not this call's to pump (`emit`).
+            self.prepare_error("invalid launch place")
         }
     }
 
@@ -156,6 +207,15 @@ impl<D: DataSource> Bridge<D> {
         exact_runner::Viewport {
             preferences: self.preferences,
             ..exact_runner::Viewport::sized(width as f64, height as f64)
+        }
+    }
+
+    /// What a boot is told at launch: the date and place last told, and a
+    /// live clock's reading now, where a fresh runner's clock starts.
+    pub(super) fn launch(&self) -> exact_runner::time::Launch {
+        exact_runner::time::Launch {
+            clock: self.live_clock.map(|wall| wall()),
+            ..self.launch_facts.clone()
         }
     }
 
@@ -170,8 +230,22 @@ impl<D: DataSource> Bridge<D> {
 }
 
 impl<D: DataSource> Bridge<D> {
-    /// A MIDI message in the input buffer (LLP 1125 D6–D8): the arm's
-    /// report of the ports or the inputs, or the agent's (`Host::midi`).
+    /// Declare the packaged arm for this handle’s boots and reloads.
+    pub fn link_activities(&mut self) {
+        self.links.activities = true;
+    }
+
+    /// Activity facts or one send completion in the input buffer.
+    pub fn activities(&mut self, len: usize) -> u32 {
+        let text = String::from_utf8_lossy(&self.input[..len.min(self.input.len())]).into_owned();
+        let out = self
+            .host
+            .as_mut()
+            .map_or_else(not_booted, |h| h.activities(&text));
+        self.emit(out)
+    }
+
+    /// MIDI ports or messages in the input buffer.
     pub fn midi(&mut self, len: usize) -> u32 {
         let text = std::str::from_utf8(&self.input[..len.min(self.input.len())])
             .unwrap_or("")
@@ -180,6 +254,66 @@ impl<D: DataSource> Bridge<D> {
             .host
             .as_mut()
             .map_or_else(not_booted, |h| h.midi(&text));
+        self.emit(out)
+    }
+
+    /// The extensions the app's module composes, a name a line; `agent
+    /// <name>` for one bound under the agent.
+    pub fn bind_extensions(&mut self, len: usize) {
+        let text = std::str::from_utf8(&self.input[..len.min(self.input.len())])
+            .unwrap_or("")
+            .to_owned();
+        let (agent, real): (Vec<&str>, Vec<&str>) = (text.lines())
+            .filter(|l| !l.is_empty())
+            .partition(|l| l.starts_with("agent "));
+        let agent: Vec<&str> = agent.iter().map(|l| &l["agent ".len()..]).collect();
+        // Binding tells the module its views' state at once (`retell_views`), which reaches it only through
+        // the current source's native slot: before data is prepared that slot has not yet adopted the module.
+        self.adopt_app_module();
+        if let Some(h) = self.host.as_mut() {
+            h.runner_mut().bind_extensions(&real, &agent);
+        }
+    }
+
+    /// A package picture's admission (`exact_picture`), on this target.
+    pub fn picture(&mut self, len: usize) -> u32 {
+        let source = std::str::from_utf8(&self.input[..len.min(self.input.len())])
+            .unwrap_or("")
+            .to_owned();
+        let target = if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "ios"
+        };
+        let out = (self.host.as_mut())
+            .and_then(|h| h.runner_mut().admit_picture(&source, target))
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        self.emit(out)
+    }
+
+    /// The agent's `prefer extension` in the input buffer (`Host::extension`).
+    pub fn extension(&mut self, len: usize) -> u32 {
+        let text = std::str::from_utf8(&self.input[..len.min(self.input.len())])
+            .unwrap_or("")
+            .to_owned();
+        let out = self
+            .host
+            .as_mut()
+            .map_or_else(not_booted, |h| h.extension(&text));
+        self.emit(out)
+    }
+
+    /// A module event the platform reported, in the input buffer
+    /// (`Host::module_event`, LLP 1133.004 D6).
+    pub fn module_event(&mut self, len: usize) -> u32 {
+        let text = std::str::from_utf8(&self.input[..len.min(self.input.len())])
+            .unwrap_or("")
+            .to_owned();
+        let out = self
+            .host
+            .as_mut()
+            .map_or_else(not_booted, |h| h.module_event(&text));
         self.emit(out)
     }
 }
@@ -195,3 +329,36 @@ pub(super) fn sampler(wall: LiveClockFn) -> Box<dyn FnMut() -> f64> {
 #[cfg(test)]
 #[path = "live_clock_tests.rs"]
 mod live_clock_tests;
+
+impl<D: DataSource> Bridge<D> {
+    /// The root font size in points (LLP 1069.000 D3): a relayout.
+    pub fn set_root_font_size(&mut self, px: f64) -> u32 {
+        if self.host.is_none() {
+            if !px.is_finite() || !(px as f32).is_finite() || px <= 0.0 {
+                return self.refuse("root font size must be finite and positive");
+            }
+            self.launch_layout.root_font_size = Some(px as f32);
+        }
+        let out = self
+            .host
+            .as_mut()
+            .map_or_else(not_booted, |h| h.set_root_font_size(px));
+        self.emit(out)
+    }
+
+    /// The display's scale (LLP 1115.000 D10.3): a relayout where a row is a
+    /// hairline.
+    pub fn set_display_scale(&mut self, scale: f64) -> u32 {
+        if self.host.is_none() {
+            if !scale.is_finite() || !(scale as f32).is_finite() || scale <= 0.0 {
+                return self.refuse("display scale must be finite and positive");
+            }
+            self.launch_layout.display_scale = Some(scale as f32);
+        }
+        let out = self
+            .host
+            .as_mut()
+            .map_or_else(not_booted, |h| h.set_display_scale(scale));
+        self.emit(out)
+    }
+}

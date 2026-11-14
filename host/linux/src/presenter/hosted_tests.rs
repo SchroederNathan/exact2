@@ -132,7 +132,7 @@ struct Told {
     seq: i32,
     value: String,
     look: Vec<i32>,
-    strings: [String; 3],
+    strings: [String; 4],
 }
 
 fn string(words: &[i32], at: usize) -> (String, usize) {
@@ -153,7 +153,8 @@ fn read(words: &[i32]) -> Vec<Told> {
         let (value, look) = string(words, at + 13);
         let (placeholder, next) = string(words, look + 18);
         let (autocomplete, next) = string(words, next);
-        let (family, end) = string(words, next);
+        let (family, next) = string(words, next);
+        let (axes, end) = string(words, next);
         out.push(Told {
             id: words[at] as ViewId,
             generation: words[at + 1],
@@ -163,7 +164,7 @@ fn read(words: &[i32]) -> Vec<Told> {
             seq: words[at + 12],
             value,
             look: words[look..look + 18].to_vec(),
-            strings: [placeholder, autocomplete, family],
+            strings: [placeholder, autocomplete, family, axes],
         });
         at = end;
     }
@@ -237,6 +238,7 @@ fn a_hosted_field_is_measured_by_the_shell_during_layout() {
         bold_text: false,
         high_contrast: false,
         touch: true,
+        tv: false,
         touch_slop: 8.0,
         dates: String::new(),
     };
@@ -275,7 +277,12 @@ fn the_reader_is_told_each_field_its_box_and_its_keyboard() {
     assert_eq!(name.look[12], 400);
     assert_eq!(
         name.strings,
-        ["Name".to_string(), String::new(), String::new()]
+        [
+            "Name".to_string(),
+            String::new(),
+            String::new(),
+            String::new()
+        ]
     );
     // An email's keyboard, Done, and autofill's hint.
     assert_eq!(&fields[1].look[..4], &[128 | 256, 1, 0, 2]);
@@ -595,4 +602,67 @@ fn scroll_end_distinguishes_field_navigation_from_keyboard_insets() {
         );
         assert_eq!(p.window(), Some(&typing));
     }
+}
+
+#[test]
+fn a_hosted_field_accepts_agent_arrows_without_painted_geometry() {
+    let (_shell, _hosting) = shell();
+    let mut p = boot(FORM);
+    let notes = id(&p, "notes");
+    p.set_focus(Some(notes), 0.);
+    for name in ["a", "b", "c", "ArrowLeft", "X"] {
+        p.type_key(notes, name, name, true, false).unwrap();
+        p.type_key(notes, name, name, false, false).unwrap();
+    }
+    assert!(!p.brush.field_text.contains_key(&notes));
+    assert_eq!(p.field_text(notes), "abXc");
+    for (name, at) in [("ArrowRight", 4), ("Home", 0), ("End", 4)] {
+        p.type_key(notes, name, name, true, false).unwrap();
+        p.type_key(notes, name, name, false, false).unwrap();
+        assert_eq!(p.field_selection(notes).start, at, "{name}");
+    }
+    p.hold_modifier("ShiftLeft", true);
+    p.type_key(notes, "ArrowLeft", "ArrowLeft", true, false)
+        .unwrap();
+    p.type_key(notes, "ArrowLeft", "ArrowLeft", false, false)
+        .unwrap();
+    p.hold_modifier("ShiftLeft", false);
+    assert_eq!(
+        (p.field_selection(notes).start, p.field_selection(notes).end),
+        (3, 4)
+    );
+}
+
+#[test]
+fn a_hosted_field_keeps_scalar_steps_for_agent_edits() {
+    let (_shell, _hosting) = shell();
+    let mut p = boot(FORM);
+    for name in ["name", "notes"] {
+        let field = id(&p, name);
+        p.type_text(field, "e\u{301}").unwrap();
+        for (key, at) in [("ArrowLeft", 1), ("Home", 0)] {
+            p.type_key(field, key, key, true, false).unwrap();
+            p.type_key(field, key, key, false, false).unwrap();
+            assert_eq!(p.field_selection(field).start, at, "{name} {key}");
+        }
+        p.type_key(field, "Delete", "Delete", true, false).unwrap();
+        p.type_key(field, "Delete", "Delete", false, false).unwrap();
+        assert_eq!(p.field_text(field), "\u{301}", "{name}");
+    }
+}
+
+#[test]
+fn a_finger_on_a_hosted_field_puts_android_back_in_touch_mode() {
+    let (_shell, _hosting) = shell();
+    let mut p = boot(FORM);
+    p.serve_requests();
+    p.reader_fields(1.0);
+    (p.brush.touch_mode, p.brush.keyless) = (true, false);
+    p.set_pointer_kind(crate::presenter::PointerKind::Touch);
+    p.reader_field_focused(id(&p, "name"), 0, true, 1.0);
+    assert!(p.brush.keyless);
+    // The app moving the focus from the field shows no ring there.
+    let jump = id(&p, "jump");
+    assert!(p.set_focus(Some(jump), 2.0).is_none());
+    assert_eq!(p.brush.ringless, Some(jump));
 }

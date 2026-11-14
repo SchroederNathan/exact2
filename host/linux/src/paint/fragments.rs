@@ -38,11 +38,7 @@ impl Painter {
             // A fitted paragraph's line box is at its runs' scale (LLP 1116.001 D1.4).
             let strut = exact_kernel::TextStyle::from_style(&computed).scaled(node.fit_scale());
             spec.strut = Run::from_style("", strut);
-            spec.runs = node
-                .text_runs()
-                .iter()
-                .map(|run| Run::from_style(&run.text, run.style))
-                .collect();
+            spec.runs = node.text_runs().iter().map(Run::from_kernel).collect();
             spec.shown(node.props.str(PropId::Markup) == Some("markdown"))
         };
         let paragraph = if let Some(stamp) = node.paragraph_stamp() {
@@ -68,7 +64,7 @@ impl Painter {
         };
         let mut palette = Vec::new();
         text_palette(kernel, node, self.dark, walk.reveal, &mut palette);
-        presented_text_colors(walk, node, &paragraph, &mut palette);
+        presented_text_colors(walk, node, &paragraph, &mut palette, self.dark);
         let shown_before = self.accepted_text.get(&node.key);
         let roll = (self.numerals)
             .roll(node.key, s.content_transition, shown_before, &paragraph)
@@ -78,6 +74,20 @@ impl Painter {
             self.row_refuse();
         }
         walk.text.insert(node.key, paragraph.clone());
+        if let Some(inline) = inline_frame::Captured::new(kernel, node, &paragraph, &palette) {
+            let origin = (
+                content.0,
+                content.1
+                    + if frags.is_empty() {
+                        kernel.text_line_offset(node)
+                    } else {
+                        0.
+                    },
+            );
+            let inline = inline.place(origin, frags, ts);
+            self.row_inline(node.id, &inline);
+            walk.inline.insert(node.id, inline);
+        }
         // The canvas recorder leases the same paragraph the paint drew.
         self.row_text(node.key, &paragraph);
         // CSS `text-overflow: ellipsis` in a clipping box: an over-wide line
@@ -89,14 +99,32 @@ impl Painter {
             .unwrap_or_else(|| paragraph.clone());
         // An ellipsized line changes in place.
         let roll = roll.filter(|_| Rc::ptr_eq(&shown, &paragraph));
-        let mut backgrounds = Vec::new();
-        text_backgrounds(kernel, node, None, self.dark, walk.reveal, &mut backgrounds);
+        let backgrounds = text_backgrounds(kernel, node, self.dark, walk.reveal);
+        let backgrounds = shown.inline_backgrounds(&backgrounds, &kernel.env());
+        let focus = walk
+            .scene
+            .focus
+            .filter(|id| self.ringless != Some(*id))
+            .and_then(|id| kernel.node(id))
+            .filter(|n| {
+                n.node_type == NodeType::Text
+                    && n.props.bool(PropId::Disabled) != Some(true)
+                    && !control::ringless(n)
+            });
+        let focus = focus.map(|focused| {
+            (
+                inline::focus_fragments(kernel, &shown, &palette, focused.id),
+                control::ring(&focused, self.dark),
+            )
+        });
         let reveal = walk.reveal;
         let at = |painter: &mut Self, origin: (f32, f32)| {
             // Inline backgrounds, under the glyphs, per line fragment.
-            for (r, color) in shown.run_backgrounds(&backgrounds) {
-                let shape = Shape::rect((origin.0 + r.0, origin.1 + r.1, r.2, r.3));
-                painter.backend.fill(&shape, color, ts);
+            for (shape, color) in &backgrounds {
+                let mut shape = *shape;
+                shape.rect.0 += origin.0;
+                shape.rect.1 += origin.1;
+                painter.backend.fill(&shape, *color, ts);
             }
             painter.text_decorations(kernel, &shown, &palette, origin, ts, reveal);
             match &roll {
@@ -107,9 +135,18 @@ impl Painter {
                     painter.text_paint(node, kernel, &shown, &palette, origin, rect, ts, reveal)
                 }
             }
+            if let Some((fragments, accent)) = &focus {
+                for shape in fragments {
+                    let mut shape = *shape;
+                    shape.rect.0 += origin.0;
+                    shape.rect.1 += origin.1;
+                    painter.field_ring(&shape, *accent, ts);
+                }
+            }
         };
         if frags.is_empty() {
-            return at(self, (content.0, content.1));
+            // A flex text's lines go down its box as CSS's anonymous flex item.
+            return at(self, (content.0, content.1 + kernel.text_line_offset(node)));
         }
         for g in frags {
             let clip = Shape::rect((rect.0 + g.x, rect.1 + g.y, g.width, g.height));

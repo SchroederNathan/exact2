@@ -15,50 +15,7 @@ import UIKit
 
 /// A text node's or run's shadow and stroke rows as they crossed, colours
 /// still light/dark pairs: resolved per appearance by `resolve`.
-struct RunPaintRows: Equatable {
-    /// Offset x, y and blur in points; nil is `none`.
-    var shadow: [Double]?
-    /// The shadow's colour; nil is `currentcolor`.
-    var shadowColor: BatchValue?
-    var strokeWidth: Double = 0
-    /// The stroke's colour; nil is `currentcolor`.
-    var strokeColor: BatchValue?
 
-    init() {}
-    init(_ style: NodeStyle) {
-        for key in ["text_shadow", "text_stroke_width", "text_stroke_color"] {
-            if let value = style[key] { set(key, value) }
-        }
-    }
-
-    /// Whether a colour here is a `light-dark()` pair.
-    var paired: Bool { shadowColor?.isSchemeColor == true || strokeColor?.isSchemeColor == true }
-    /// Whether a colour here is the view's tint (LLP 1095 D8).
-    var namesTint: Bool { shadowColor?.namesTint == true || strokeColor?.namesTint == true }
-
-    /// One row off the wire; false when `key` is not one of these rows.
-    @discardableResult
-    mutating func set(_ key: String, _ value: BatchValue) -> Bool {
-        switch key {
-        case "text_shadow":
-            guard case .object(let o) = value, let offset = o["o"]?.numbers, offset.count == 2 else { shadow = nil; return true }
-            shadow = offset + [max(0, o["b"]?.number ?? 0)]
-            shadowColor = o["c"]
-        case "text_stroke_width": strokeWidth = value.number ?? 0
-        case "text_stroke_color": strokeColor = value.string == nil ? value : nil
-        default: return false
-        }
-        return true
-    }
-
-    /// The shadow (offset x, y, blur, r g b a) and stroke (width, r g b a)
-    /// for an appearance, `currentcolor` being `color`, the text's own.
-    func resolve(dark: Bool, contrast: Bool? = nil, elevated: Bool = false, tint: PlatformColor? = nil, color: [Double]) -> (shadow: [Double]?, stroke: [Double]?) {
-        let shade = shadow.map { $0 + (shadowColor?.textChannels(dark: dark, contrast: contrast, elevated: elevated, tint: tint) ?? color) }
-        let stroke = strokeWidth > 0 ? [strokeWidth] + (strokeColor?.textChannels(dark: dark, contrast: contrast, elevated: elevated, tint: tint) ?? color) : nil
-        return (shade, stroke)
-    }
-}
 
 extension Spec {
     /// Each run's shadow is the paragraph's when they all agree (the cheap
@@ -67,7 +24,8 @@ extension Spec {
     mutating func gatherShadows() {
         let painted = runs.filter { !$0.text.isEmpty }
         guard let first = painted.first else { shadow = nil; return }
-        if painted.allSatisfy({ $0.shadow == first.shadow }) {
+        let tokenShadow = lineClamp > 0 ? (strut ?? first).shadow : first.shadow
+        if tokenShadow == first.shadow, painted.allSatisfy({ $0.shadow == first.shadow }) {
             shadow = first.shadow
             for i in runs.indices { runs[i].shadow = nil }
         } else {
@@ -272,15 +230,43 @@ extension TextLinePaint {
     static func drawShadowed(_ line: CTLine, in ctx: CGContext, scale: CGFloat, pass: Pass = .all) -> Bool {
         let runs = CTLineGetGlyphRuns(line) as! [CTRun]
         var shadows = runs.map(TextRunShadow.of)
+        let advances = runs.map(extent).reduce(CGRect.null) { $0.union($1) }
         func hidden(_ run: CTRun) -> Bool { (CTRunGetAttributes(run) as NSDictionary)[NSAttributedString.Key.exactHidden] as? Bool == true }
+        func draw(_ shown: [CTRun]) {
+            guard !shown.isEmpty else { return }
+            var clips = shown.map(extent)
+            // Decorations occupy advances; italic ink and stroke can pass
+            // the line's edges. Admit that ink in the same clip operation,
+            // so a fractional edge is not composited twice.
+            for run in shown {
+                let attributes = CTRunGetAttributes(run) as NSDictionary
+                let font = attributes[kCTFontAttributeName] as! CTFont
+                let stroke = abs((attributes[NSAttributedString.Key.strokeWidth] as? NSNumber)?.doubleValue ?? 0) * CTFontGetSize(font) / 200
+                let ink = CTRunGetImageBounds(run, nil, CFRange()).insetBy(dx: -stroke - 1, dy: -stroke - 1)
+                if ink.minX < advances.minX {
+                    clips.append(CGRect(x: ink.minX, y: ink.minY, width: min(ink.maxX, advances.minX) - ink.minX, height: ink.height))
+                }
+                if ink.maxX > advances.maxX {
+                    clips.append(CGRect(x: max(ink.minX, advances.maxX), y: ink.minY, width: ink.maxX - max(ink.minX, advances.maxX), height: ink.height))
+                }
+                if ink.minY < advances.minY {
+                    clips.append(CGRect(x: ink.minX, y: ink.minY, width: ink.width, height: min(ink.maxY, advances.minY) - ink.minY))
+                }
+                if ink.maxY > advances.maxY {
+                    clips.append(CGRect(x: ink.minX, y: max(ink.minY, advances.maxY), width: ink.width, height: ink.maxY - max(ink.minY, advances.maxY)))
+                }
+            }
+            ctx.saveGState()
+            ctx.clip(to: clips)
+            ctx.textPosition = .zero
+            CTLineDraw(line, ctx)
+            ctx.restoreGState()
+        }
         switch pass {
         case .all: break
         case .ink: shadows = shadows.map { $0.flatMap { ColorRange.isHDR($0.color) ? nil : $0 } }
         case .caster(let cast):
-            for (run, shadow) in zip(runs, shadows) where shadow == cast && !hidden(run) {
-                ctx.textPosition = .zero
-                CTRunDraw(run, ctx, CFRange())
-            }
+            draw(zip(runs, shadows).filter { $0.1 == cast && !hidden($0.0) }.map { $0.0 })
             return true
         }
         guard shadows.contains(where: { $0 != nil }) || runs.contains(where: hidden) else { return false }
@@ -293,13 +279,21 @@ extension TextLinePaint {
                 s.set(on: ctx, scale: scale)
                 ctx.beginTransparencyLayer(auxiliaryInfo: nil)
             }
-            for k in i..<j where !hidden(runs[k]) {
-                ctx.textPosition = .zero
-                CTRunDraw(runs[k], ctx, CFRange())
-            }
+            // Decorations belong to CTLineDraw; clip inside the transparency
+            // layer so the resulting shadow can extend beyond the run stretch.
+            draw(runs[i..<j].filter { !hidden($0) })
             if shadows[i] != nil { ctx.endTransparencyLayer(); ctx.restoreGState() }
             i = j
         }
         return true
+    }
+}
+
+extension RunPaintRows {
+    var namesTint: Bool { shadowColor?.namesTint == true || strokeColor?.namesTint == true }
+    func resolve(dark: Bool, contrast: Bool? = nil, elevated: Bool = false, tint: PlatformColor? = nil, color: [Double]) -> (shadow: [Double]?, stroke: [Double]?) {
+        let shade = shadow.map { $0 + (shadowColor?.textChannels(dark: dark, contrast: contrast, elevated: elevated, tint: tint) ?? color) }
+        let stroke = strokeWidth > 0 ? [strokeWidth] + (strokeColor?.textChannels(dark: dark, contrast: contrast, elevated: elevated, tint: tint) ?? color) : nil
+        return (shade, stroke)
     }
 }

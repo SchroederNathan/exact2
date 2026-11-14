@@ -9,19 +9,18 @@ Each rule is **[check]** (enforced in CI) or **[review]** (enforced by a human).
 ## Budgets — every budget is a trade, not a limit
 
 - **6 blocking checks, 65s total.** A seventh requires deleting one, same PR. **[check]**
-- **15 documents in the working set** (`llp/current/`). A 16th requires archiving one —
-  which is just removing the link. The corpus itself is uncapped. **[check]**
+- **15 documents in the working set** (`llp/current/`). A 16th requires archiving one:
+  removing its link. The corpus itself is uncapped. **[check]**
 - **10 documents in the foundation** (`llp/foundation/`). **[check]**
 - **This file: 700 words.** If it grows, something becomes a check or stops being a rule. **[check]**
-- **1,500 lines per source file.** Generated files are exempt — and generated files are built, not committed. **[check]**
+- **1,500 lines per source file.** Generated files are exempt; they are built, not committed. **[check]**
 
 A limit gets exceptions. A trade doesn't: it forces someone to name what matters less.
 
 ## Loop shape
 
 - **Every check reports all failures in one run.** Fail-fast is banned. A check that
-  surfaces one defect per run turns N bugs into N x runtime — that pattern alone cost
-  the old repo 89 hours on a single work package. **[check]**
+  surfaces one defect per run turns N bugs into N x runtime. **[check]**
 - **Nothing blocks on anything slower than 60 seconds.** Slow verification runs
   asynchronously, per-commit, on fleet hardware, attributed to the breaking commit.
   Run everything; block on almost nothing. **[review]**
@@ -40,7 +39,7 @@ Tracked every commit. A regression is a P0 with a name on it.
 | Full build, warm cache | 5 min |
 | Dev restart, request to present | 100ms p50 |
 | Cold start to interactive first frame | 100ms p50 |
-| App JS executed before first pixel | none |
+| App JS executed before first pixel | none; a launch that presents nothing (a wake, a system tool call) is exempt: LLP 1133.023 |
 
 ## Scope
 
@@ -51,10 +50,10 @@ Tracked every commit. A regression is a P0 with a name on it.
 - **Write the web, ship the platform.** Authors write CSS; what they leave unsaid is the
   platform's, as a hand-built UIKit/SwiftUI app has it (LLP 1115, "no tells"). Author >
   platform > CSS default. **[review]**
-- **The boot path executes and compiles nothing.** No app JS before first pixel; modules
-  ship as bytecode, never source strings transpiled per module at boot. Startup is
-  emergent and cannot be retrofitted, so the boot graph is budgeted from commit one —
-  counted, not timed. The old repo transpiles 5.47MB of ESM on every launch. **[check]**
+- **The boot path executes and compiles nothing.** Modules ship as bytecode, never
+  source strings transpiled per module at boot. Startup is emergent and cannot be
+  retrofitted, so the boot graph is budgeted from commit one — counted, not timed.
+  Every launch pays for boot. **[check]**
 - **A spec needs an implementer and a date, or it isn't written.** Specifying something
   you are about to build is transcription and costs nothing. Specifying something nobody
   is assigned to build is how a corpus reaches 8.2M words. **[review]**
@@ -64,15 +63,17 @@ Tracked every commit. A regression is a P0 with a name on it.
 - **Agents remove apparatus freely and add none.** An agent PR that adds a check,
   script, registry, config file, or design doc needs explicit human approval saying so.
   This asymmetry is the whole game: agents produce governance faster than humans can
-  read it. 675 checks and 450 scripts got there one reasonable addition at a time. **[review]**
+  read it. Governance accretes one reasonable addition at a time. **[review]**
+- **Prose follows `AGENTS.md` "Writing".** Before opening a PR or pushing to main,
+  do an editing pass on the prose you added or changed. **[review]**
 - **The old repo is research, never authority.** Cite it for how something worked.
   Never to block. **[review]**
 
 ## Fleet
 
 - Warm, pre-provisioned worktrees, one lane each. Never clone fresh.
-- **Never `git stash`** — the stash stack is global across worktrees and will apply
-  another lane's work into yours. Use a temporary commit.
+- **Never `git stash`**: the stack is global across worktrees and will apply another
+  lane's work into yours. Use a temporary commit.
 - Kill only PIDs you recorded at launch. Never by name or pattern.
 
 ## The six checks

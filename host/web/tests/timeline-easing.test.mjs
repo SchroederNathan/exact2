@@ -6,23 +6,24 @@
 // progress, as the glue does while a drag is held: delays, iterations,
 // directions and keyframe easing included.
 import { test, expect } from 'bun:test';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { Cdp, open } from '../../../scripts/agent.mjs';
-import { chromium } from '../../../scripts/agent-launch.mjs';
+import { open } from '../../../scripts/agent.mjs';
+import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';
 import { timelineEasing } from '../motion-glue.js';
 import { need } from '../../../scripts/coverage.mjs';
 import { readyPage } from './page.mjs';
 import { glueDeclarations, checkedGlueCall } from './glue-fixture.mjs';
 
 const ROOT = resolve(new URL('../../..', import.meta.url).pathname);
+const compiler = resolve(process.env.CARGO_TARGET_DIR ?? resolve(ROOT, 'target'), 'debug', process.platform === 'win32' ? 'contract.exe' : 'contract');
 const WEB = resolve(new URL('..', import.meta.url).pathname);
 const WEB_JS = resolve(WEB, '../web-js');
 const GLUE = readFileSync(resolve(WEB, 'glue.js'), 'utf8');
-const commitSource = glueDeclarations(GLUE, ['apply', 'applyBatch', 'wakeLock', 'holdWake']);
+const commitSource = glueDeclarations(GLUE, ['apply', 'applyBatch', 'wakeLock', 'holdWake', 'orientationLock', 'holdOrientation']);
 // The wasm host's real operation switch and commit tail, with the unrelated
 // host pieces inert. Keeping both functions in this one closure matters:
 // the `timelines` operation sets the flag that the commit tail consumes.
@@ -36,12 +37,12 @@ const hostCommitBody = `
   const prepareContexts = () => {}, runFocusCommands = () => {}, inertAncestor = () => false, refreshSymbols = () => {};
   const focusAutofocus = () => {}, inputHandlers = null, positionContexts = () => {}, markScrollDocument = () => {}, syncLists = () => {};
   const followScroll = () => {}, settleFollow = () => {}, settleValue = () => {}, letGo = () => {}, flowBatch = () => {}, noteFit = () => {}, refitTexts = () => {};
-  const navigation = {project() {}, apply() {}}, log = () => {}, inputReady = false, agentMode = false, frameSampler = null, clocks = {sync() {}};
+  const navigation = {project() {}, apply() {}}, log = () => {}, inputReady = false, agentMode = false, agentKeepsStore = false, frameSampler = null, clocks = {sync() {}};
   const viewFor = (_, id) => views.get(id), applyProps = () => {}, attach = () => {}, listView = () => {};
   ${commitSource}
   return (${checkedGlueCall})(applyBatch);
 `;
-const { executable: chrome, unavailable } = chromium();
+const { unavailable } = chromium();
 const check = need('chrome', unavailable);
 
 test('glue fixtures name missing declarations and module bindings', () => {
@@ -234,13 +235,9 @@ check('in Chrome, followers match timeline progress and stop when a consumer res
     res.writeHead(200, { 'content-type': 'text/javascript' }); res.end(readFileSync(file));
   });
   await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
-  const profile = mkdtempSync(resolve(tmpdir(), 'exact-timeline-'));
-  const child = spawn(chrome, ['--headless=new', '--remote-debugging-pipe', `--user-data-dir=${profile}`,
-    '--no-sandbox', '--no-first-run', '--disable-background-networking', 'about:blank'], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+  const suite = await cdpBrowser(), { cdp } = suite;
   try {
-    const cdp = new Cdp(child.stdio[3], child.stdio[4]);
-    const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    const { sessionId } = await suite.page();
     const evaluate = async (expression) => {
       const reply = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
       if (reply.exceptionDetails) throw new Error(reply.exceptionDetails.exception?.description ?? reply.exceptionDetails.text);
@@ -283,9 +280,8 @@ check('in Chrome, followers match timeline progress and stop when a consumer res
       expect(result.frames, `${target} ${change}: only a changed moving resolution enters per-frame seeking`).toBe(['renamed-axis', 'axis', 'range'].includes(change) ? 1 : 0);
     }
   } finally {
-    child.kill();
+    await suite.close();
     server.close();
-    rmSync(profile, { recursive: true, force: true });
   }
 }, 60000);
 
@@ -361,7 +357,7 @@ check('a real commit rebinds a spring follower on the wasm and JS runtimes', asy
   let session;
   try {
     writeFileSync(resolve(tmp, 'follower.contract'), FOLLOWER_SOURCE);
-    run('cargo', ['run', '-q', '-p', 'contract', '--', 'build', resolve(tmp, 'follower.contract'), '-o', plan]);
+    run(compiler, ['build', resolve(tmp, 'follower.contract'), '-o', plan]);
     // Use the lane's prepared Caltrain builds when both paths are set (the plan reads no app data), else build
     // Interaction Gallery's
     const { EXACT_MOTION_DIST: preparedWasm, EXACT_WEB_JS_DIST: preparedJs } = process.env;

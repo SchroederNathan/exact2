@@ -36,6 +36,10 @@ import AppKit
 private final class TableSeparatorRowView: NSTableRowView {
     var separates = true { didSet { if separates != oldValue { needsDisplay = true } } }
     weak var appearanceSource: NodeView? { didSet { if appearanceSource !== oldValue { needsDisplay = true } } }
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard (view(atColumn: 0) as? TableRowCell)?.paintsSelection != false else { return }
+        super.drawSelection(in: dirtyRect)
+    }
     private func drawSystemSeparator(in dirtyRect: NSRect) { super.drawSeparator(in: dirtyRect) }
     override func drawSeparator(in dirtyRect: NSRect) {
         guard separates else { return }
@@ -63,6 +67,18 @@ final class TableRowCell: NSTableCellView {
     /// failing one at whatever text field it finds in the cell (measured on
     /// macOS 27.0: an author's field at the row's end took the separator
     /// with it). So the separator is inset to the row's text, by AppKit.
+    var paintsSelection: Bool {
+        guard let node = row.flatMap({ feed?.row(of: $0) }).flatMap({ feed?.pressing($0) }) else { return true }
+        return !node.authorsPress || !node.pressed
+    }
+    private var paintedSelection = true
+    func syncSelectionPaint() {
+        let paints = paintsSelection
+        guard paints != paintedSelection else { return }
+        paintedSelection = paints
+        superview?.needsDisplay = true
+        row?.rowEmphasisChanged(paints && backgroundStyle == .emphasized)
+    }
     private let lead = NSTextField(labelWithString: "")
     init(feed: TableFeed) {
         self.feed = feed
@@ -77,7 +93,7 @@ final class TableRowCell: NSTableCellView {
     /// its window key and the table first responder. What Exact paints in
     /// the row takes the selected item's ink then (TableInkMac.swift).
     override var backgroundStyle: NSView.BackgroundStyle {
-        didSet { if backgroundStyle != oldValue { row?.rowEmphasisChanged(backgroundStyle == .emphasized) } }
+        didSet { if backgroundStyle != oldValue { row?.rowEmphasisChanged(paintsSelection && backgroundStyle == .emphasized) } }
     }
 
     /// Take `node` in. It is placed when the cell is in its row's view
@@ -85,6 +101,7 @@ final class TableRowCell: NSTableCellView {
     func adopt(_ node: NodeView) {
         if row !== node { sendHome(); textMoved = true }
         row = node
+        syncSelectionPaint()
         if node.superview !== self {
             // Where the presenter has it: layout's frame, in the document.
             kernel = (node.superview as? TableRowCell)?.kernel ?? node.frame
@@ -93,7 +110,7 @@ final class TableRowCell: NSTableCellView {
             feed?.moved()
             textMoved = true
             node.rowDisclosure(hidden: true)
-            if backgroundStyle == .emphasized { node.rowEmphasisChanged(true) }
+            if backgroundStyle == .emphasized { node.rowEmphasisChanged(paintsSelection) }
         }
         place()
     }
@@ -482,7 +499,7 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // Provenance may change without a new row count, frame or collection
         // revision. Refresh the row and its predecessor even on that path.
         defer { syncSeparators() }
-        let pixel = 1 / (table.window?.backingScaleFactor ?? 1)
+        let pixel = 1 / (table.pixelScale ?? 1)
         let port = self.port
         // A batch that changed no row, no frame of one and nothing of the port's width leaves the table as it is.
         var (items, next, now) = read(presenter)
@@ -769,24 +786,8 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     // MARK: Selection and the row's press
 
-    /// The node a row's click presses: its authored root, when that has a
-    /// press (a `press`, or a link's `href`). Else, where the root is a
-    /// swipe container (`swipeContent`, the row the list-rows recipe
-    /// writes: a snap scroller holding the row and its swipe action), the
-    /// content it names, when that has one. Nil for a row of text.
-    func pressing(_ row: Row) -> NodeView? {
-        guard let presenter, let root = presenter.views[row.root] else { return nil }
-        if root.pressable { return root }
-        guard let name = root.props["swipeContent"], !name.isEmpty else { return nil }
-        func find(_ view: NSView) -> NodeView? {
-            for case let node as NodeView in (view as? NodeView)?.container.subviews ?? view.subviews {
-                if node.props["id"] == name { return node.pressable ? node : nil }
-                if let found = find(node) { return found }
-            }
-            return nil
-        }
-        return find(root)
-    }
+    /// The node a row's click presses: its authored root's `rowPress`.
+    func pressing(_ row: Row) -> NodeView? { presenter?.views[row.root]?.rowPress }
     /// A row is selected, by a click or a key, when it presses and is not
     /// disabled. Any other row is a row of text, as in SwiftUI's list with
     /// no selection. A row that is not mounted may be reached by a key (the
@@ -879,7 +880,7 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         while let current = view, !(current is TableRowCell), !(current is NSTableView) {
             if let node = current as? NodeView, presenter.views[node.id] === node, node.answersContextMenu, !node.formDisabled, !node.inert {
                 contextEvent = event.eventNumber
-                return presenter.contextMenu(node, at: point)
+                return presenter.contextMenu(node, at: point, click: event)
             }
             view = current.superview
         }
@@ -922,6 +923,27 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         table.dataSource = nil
         table.delegate = nil
         table.removeFromSuperview()
+    }
+}
+
+extension NodeView {
+    /// The node a click on this row presses, this being a list's row's
+    /// authored root: itself, when it has a press (a `press`, or a link's
+    /// `href`). Else, where it is a swipe container (`swipeContent`, the row
+    /// the list-rows recipe writes: a snap scroller holding the row and its
+    /// swipe action), the content it names, when that has one. Nil for a
+    /// row of text.
+    var rowPress: NodeView? {
+        if pressable { return self }
+        guard let name = props["swipeContent"], !name.isEmpty else { return nil }
+        func find(_ view: NSView) -> NodeView? {
+            for case let node as NodeView in (view as? NodeView)?.container.subviews ?? view.subviews {
+                if node.props["id"] == name { return node.pressable ? node : nil }
+                if let found = find(node) { return found }
+            }
+            return nil
+        }
+        return find(self)
     }
 }
 #endif

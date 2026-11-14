@@ -17,16 +17,19 @@ impl DataSource for Nothing {
 }
 
 /// Every command the channel carries, a link of each kind that leaves the
-/// app, a pressable with a press haptic, two fields and a second route.
+/// app, a pressable with a press haptic, two fields and a second route. The
+/// unknown haptic is computed: a literal one is refused at compile time
+/// (`type-haptic`), a kind read from state reaches the host.
 const APP: &str = r#"routes nav
   home "/"
     detail "/detail"
 component App
   state name = ""
+  state unknown = "purr"
   action buzz
     haptic("success")
   action purr
-    haptic("purr")
+    haptic(unknown)
   action copy
     copyText("Copied from a test")
   action web
@@ -37,8 +40,6 @@ component App
     share(title="A post", text="Read this", url="https://example.com/post/1")
   action words
     share(text="héllo")
-  action note
-    showNotification(title="Stretch")
   action open
     nav = push(nav, "/detail")
   action rename(value)
@@ -62,8 +63,6 @@ component App
               text "Send"
             button press=words testId="words" height=30
               text "Words"
-            button press=note testId="note" height=30
-              text "Note"
             button press=open testId="open" height=30
               text "Open"
             link href="mailto:someone@example.com" testId="mail" height=30
@@ -151,9 +150,7 @@ fn says(p: &Presenter<Nothing>, what: &str) -> usize {
 #[test]
 fn desktop_linux_has_no_shell_and_keeps_what_each_command_did() {
     let mut p = boot();
-    for name in [
-        "buzz", "purr", "copy", "web", "send", "note", "mail", "thump",
-    ] {
+    for name in ["buzz", "purr", "copy", "web", "send", "mail", "thump"] {
         tap(&mut p, name);
     }
     p.tell_shell();
@@ -171,7 +168,6 @@ fn desktop_linux_has_no_shell_and_keeps_what_each_command_did() {
         ),
         1
     );
-    assert_eq!(says(&p, "showNotification: refused: unavailable"), 1);
     assert_eq!(says(&p, "does not carry it yet"), 0);
     assert_eq!(
         says(&p, "is not one this platform plays"),
@@ -264,16 +260,6 @@ fn each_request_is_queued_taken_once_and_answered_by_its_id() {
     );
     p.pointer_cancel(110.).unwrap();
     assert_eq!(p.take_requests(), None);
-    // What the channel does not carry yet says so beside the refusal.
-    tap(&mut p, "note");
-    assert_eq!(says(&p, "showNotification: refused: unavailable"), 1);
-    assert_eq!(
-        says(
-            &p,
-            "showNotification: the host's channel to the platform (LLP 1115.001 D5) does not carry it yet"
-        ),
-        1
-    );
     assert_eq!(p.take_requests(), None);
 }
 

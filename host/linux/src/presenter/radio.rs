@@ -1,8 +1,8 @@
 //! `input type="radio"` (x2apps survey #2), as Chrome runs one: a click
-//! checks it and unchecks the rest of its group (`Kernel::radio_group`) at
+//! checks it and unchecks the rest of its available group at
 //! once, firing `input` then `change` with its value; a checked one takes
 //! no click. With one focused, the arrows move the focus and the check to
-//! `Kernel::radio_step`, and Space checks it. Controlled as the checkbox is:
+//! the next enabled member, and Space checks it. Controlled as the checkbox is:
 //! a bound radio draws its `checked` after the commit, so an action that
 //! writes nothing snaps the group back; an unbound one keeps its state in
 //! `controls`, exclusive within its group.
@@ -10,6 +10,16 @@ use super::*;
 use exact_kernel::ControlKind;
 
 impl<D: DataSource> Presenter<D> {
+    /// The open authored box excludes the page from radio navigation and changes.
+    fn radio_group(&self, id: ViewId) -> Vec<ViewId> {
+        self.host
+            .kernel()
+            .radio_group(id)
+            .into_iter()
+            .filter(|id| self.alert_allows(*id))
+            .collect()
+    }
+
     /// Whether `id` is a radio.
     pub(crate) fn is_radio(&self, id: ViewId) -> bool {
         self.host
@@ -32,16 +42,21 @@ impl<D: DataSource> Presenter<D> {
     /// disabled; else its group's unbound radios show it alone checked, and
     /// its `input` then `change` carry its value.
     pub(crate) fn check_radio(&mut self, id: ViewId, now_ms: f64) {
+        self.activate_radio(id, now_ms, None);
+    }
+
+    pub(super) fn activate_radio(&mut self, id: ViewId, now_ms: f64, press: Option<ViewId>) {
         let disabled = self
             .host
             .kernel()
             .node(id)
             .is_none_or(|n| n.props.bool(PropId::Disabled) == Some(true));
-        if disabled || self.radio_checked(id) {
+        let changed = !self.radio_checked(id);
+        if !self.alert_allows(id) || disabled || (press.is_none() && !changed) {
             return;
         }
         let kernel = self.host.kernel();
-        for member in kernel.radio_group(id) {
+        for member in self.radio_group(id).into_iter().filter(|_| changed) {
             let bound = kernel
                 .node(member)
                 .is_some_and(|n| n.props.bool(PropId::Checked).is_some());
@@ -50,12 +65,18 @@ impl<D: DataSource> Presenter<D> {
             }
         }
         let value = kernel.radio_value(id);
-        self.dirty = true;
-        let mut dispatched = false;
+        self.dirty |= changed;
+        let mut dispatched = self.dispatch_control_press(press, now_ms, true);
         for (event, kind) in [
             (Event::Input(value.as_str().into()), EventKind::Input),
             (Event::Change(value.as_str().into()), EventKind::Change),
-        ] {
+        ]
+        .into_iter()
+        .filter(|_| changed)
+        {
+            if let Some(e) = dispatched.then(|| self.blur_disabled_now()).flatten() {
+                eprintln!("exact: {e}");
+            }
             if self.host.runner().handlers_of(id).contains(&kind) {
                 if let Some(e) = self.host.dispatch_at(id, event, now_ms) {
                     eprintln!("exact: {e}");
@@ -87,7 +108,28 @@ impl<D: DataSource> Presenter<D> {
             "ArrowUp" | "ArrowLeft" => false,
             _ => return false,
         };
-        if let Some(next) = self.host.kernel().radio_step(id, forward) {
+        let group = self.radio_group(id);
+        let next = group
+            .iter()
+            .position(|member| *member == id)
+            .and_then(|at| {
+                let n = group.len();
+                (1..n)
+                    .map(|i| {
+                        group[if forward {
+                            (at + i) % n
+                        } else {
+                            (at + n - i) % n
+                        }]
+                    })
+                    .find(|id| {
+                        self.host
+                            .kernel()
+                            .node(*id)
+                            .is_some_and(|n| n.props.bool(PropId::Disabled) != Some(true))
+                    })
+            });
+        if let Some(next) = next {
             if let Some(e) = self.set_focus(Some(next), now_ms) {
                 eprintln!("exact: {e}");
             }
@@ -103,7 +145,7 @@ impl<D: DataSource> Presenter<D> {
             return true;
         }
         let kernel = self.host.kernel();
-        let group = kernel.radio_group(id);
+        let group = self.radio_group(id);
         match group.iter().find(|r| self.radio_checked(**r)) {
             Some(checked) => *checked == id,
             None => group

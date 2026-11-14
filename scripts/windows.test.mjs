@@ -21,6 +21,63 @@ import {gameShells} from '../game/app/shells.mjs';
 import {formatProofError, proofFailureRow} from '../game/proof.mjs';
 import {readManifest} from './app.mjs';
 
+test('TypeScript captures accept physical path aliases and reject declarations outside them', async () => {
+  const {check, configure} = await import('../js/bake/src/typescript.mjs');
+  const {parseSync} = await import('rolldown/utils');
+  const {dirname} = await import('node:path');
+  const {fileURLToPath} = await import('node:url');
+  const root=mkdtempSync(resolve(tmpdir(),'exact captured paths café '));
+  const stage=resolve(root,'capture'), alias=resolve(root,'alias'), sibling=resolve(root,'capture-other');
+  const libraries=resolve(dirname(fileURLToPath(import.meta.resolve(`@typescript/typescript-${process.platform}-${process.arch}/package.json`))),'lib');
+  const libraryAlias=resolve(root,'libraries'), linkType=process.platform==='win32'?'junction':'dir';
+  try {
+    mkdirSync(stage); mkdirSync(sibling);
+    symlinkSync(stage,alias,linkType);
+    symlinkSync(libraries,libraryAlias,linkType);
+    writeFileSync(resolve(stage,'__exact_entry.ts'),"export const word: string = 'inside';\n");
+    configure(stage,false,parseSync);
+    await check(alias,resolve(libraries,'tsc'),libraryAlias);
+    await check(stage,resolve(libraries,'tsc'),libraries);
+    writeFileSync(resolve(sibling,'outside.d.ts'),'export type Outside = string;\n');
+    writeFileSync(resolve(stage,'__exact_entry.ts'),"import type { Outside } from '../capture-other/outside';\nexport const word: Outside = 'outside';\n");
+    await expect(check(alias,resolve(libraries,'tsc'),libraryAlias)).rejects.toThrow('module outside captured app');
+    symlinkSync(sibling,resolve(stage,'escape'),linkType);
+    writeFileSync(resolve(stage,'__exact_entry.ts'),"import type { Outside } from './escape/outside';\nexport const word: Outside = 'outside';\n");
+    await expect(check(alias,resolve(libraries,'tsc'),libraryAlias)).rejects.toThrow('module outside captured app');
+  } finally {
+    rmSync(root,{recursive:true,force:true});
+  }
+});
+
+test('captured package imports and replay use the same physical stage paths', async () => {
+  const {dataBundle, replayCaptured} = await import('../js/bake/src/typescript.mjs');
+  const {rolldown} = await import('rolldown');
+  const root=mkdtempSync(resolve(tmpdir(),'exact package paths café '));
+  const stage=resolve(root,'stage'), app=resolve(root,'app'), alias=resolve(root,'alias');
+  const packageDir=resolve(app,'node_modules/fixture-word');
+  const bundle=async options=>{
+    const build=await rolldown({cwd:alias,input:'__exact_entry.ts',...options});
+    try { return (await build.generate({format:'esm'})).output[0].code; }
+    finally { await build.close(); }
+  };
+  try {
+    mkdirSync(stage); mkdirSync(packageDir,{recursive:true});
+    symlinkSync(stage,alias,process.platform==='win32'?'junction':'dir');
+    writeFileSync(resolve(stage,'__exact_paths.json'),JSON.stringify({app,mounts:[]}));
+    writeFileSync(resolve(stage,'__exact_entry.ts'),"export { word } from './nested';\n");
+    writeFileSync(resolve(stage,'nested.ts'),"export { word } from 'fixture-word';\n");
+    writeFileSync(resolve(packageDir,'package.json'),JSON.stringify({name:'fixture-word',version:'1.0.0',main:'index.js'}));
+    writeFileSync(resolve(packageDir,'index.js'),"export const word = 'captured word';\n");
+    expect(await bundle(dataBundle(alias))).toContain('captured word');
+    writeFileSync(resolve(packageDir,'index.js'),"export const word = 'changed after capture';\n");
+    const replay=await bundle({plugins:[replayCaptured(alias).rolldown]});
+    expect(replay).toContain('captured word');
+    expect(replay).not.toContain('changed after capture');
+  } finally {
+    rmSync(root,{recursive:true,force:true});
+  }
+});
+
 test('JS build trees serve native paths without admitting private or escaping files', async () => {
   const owned=realpathSync(mkdtempSync(resolve(tmpdir(),'exact JS tree café ')));
   const root=resolve(owned,'dist'), outside=resolve(owned,'outside');
@@ -40,8 +97,10 @@ test('JS build trees serve native paths without admitting private or escaping fi
         res.on('end',()=>done({status:res.statusCode,body:Buffer.concat(chunks).toString()}));
       }).on('error',fail);
     });
-    for(const [path,body] of [['/','shell'],['/index.html','shell'],['/app.js','entry'],['/nested%20caf%C3%A9/data.js','unicode'],['/nested%20caf%C3%A9/','nested'],['/app-route','shell']])
+    for(const [path,body] of [['/','shell'],['/index.html','shell'],['/app.js','entry'],['/nested%20caf%C3%A9/data.js','unicode'],['/nested%20caf%C3%A9/','nested']])
       expect(await request(path)).toEqual({status:200,body});
+    // A path no file holds is a page only by the build's route table (545eb7a063), which this tree has none of.
+    expect(await request('/app-route')).toEqual({status:404,body:''});
     for(const path of ['/.private.js','/%2e%2e/outside/secret.js','/nested%20caf%C3%A9/../../outside/secret.js','/nested%5cdata.js','/%00','/outside/secret.js'])
       expect(await request(path)).toEqual({status:404,body:''});
     // An explicitly selected volume root already ends in its native separator.
@@ -441,7 +500,7 @@ test('browser contextmenu reaches an off-center point and refuses invalid or cov
     expect(events.map(event=>event[0]).sort()).toEqual(['contextmenu','pointerdown','pointerup']);
     expect(events.every(event=>event[1]===45 && event[2]===105 && event[3]===2 && event[4]===true)).toBe(true);
     for(const at of [null,[],[25],[25,75,0],['25',75],[NaN,75],[25,Infinity],[-1,75],[100,75],[25,100],[5,5]]) {
-      await assert.rejects(session.tap('world',{contextmenu:true,at}), /contextmenu|covers/);
+      await assert.rejects(session.tap('world',{contextmenu:true,at}), /contextmenu|covers|tap at needs two finite numbers/);
     }
     expect((await session.carrier.ask({op:'state'})).events).toEqual(events);
     await session.tap('world',{down:true,at:[25,75]});
@@ -467,7 +526,7 @@ test('explicit primary mouse replaces a touch history and preserves real mouse i
     const {events}=await s.carrier.ask({op:'state'});
     expect(events.slice(0,2).every(e=>e[0]==='touch' && e[1]>1)).toBe(true);
     expect(events.slice(2)).toEqual([1,0,2,0].map((buttons,i)=>['mouse',1,i%2?'pointerup':'pointerdown',45,105,buttons,true]));
-    for(const at of [null,[],[25],[25,75,0],['25',75],[NaN,75],[25,Infinity],[-1,75],[100,75],[25,100],[5,5]]) await assert.rejects(s.tap('world',{mouse:true,at}), /mouse|covers/);
+    for(const at of [null,[],[25],[25,75,0],['25',75],[NaN,75],[25,Infinity],[-1,75],[100,75],[25,100],[5,5]]) await assert.rejects(s.tap('world',{mouse:true,at}), /mouse|covers|tap at needs two finite numbers/);
     for(const opts of [{down:true},{contextmenu:true},{wheel:[0,1]},{drag:{dx:1,dy:1}}]) await assert.rejects(s.tap('world',{mouse:true,...opts}), /another input mode|one of mouse, dblclick, contextmenu/);
     expect((await s.carrier.ask({op:'state'})).events).toEqual(events);
     await s.tap('world',{down:true,at:[25,75]});
@@ -751,9 +810,10 @@ test('SDK CLI entrypoint executes with spaces in its real file path', () => {
 
 test('caps command really runs from a checkout path containing spaces', () => {
   const root=resolve(import.meta.dir,'..');
-  const result=spawnSync(process.execPath,[resolve(import.meta.dir,'caps.mjs')],{cwd:root,encoding:'utf8'});
+  const result=spawnSync(process.execPath,[resolve(import.meta.dir,'caps.mjs')],{cwd:root,encoding:'utf8',env:{...process.env,EXACT_CAPS_WASM:'0'}}); // the wasm32 check is wasm-check.test's
   expect(result.stdout).toContain('caps — budgets declared');
-  expect(result.status).toBe(runCaps(root).problems.length ? 1 : 0);
+  const kept=process.env.EXACT_CAPS_WASM; process.env.EXACT_CAPS_WASM='0';
+  try { expect(result.status).toBe(runCaps(root).problems.length ? 1 : 0); } finally { if (kept===undefined) delete process.env.EXACT_CAPS_WASM; else process.env.EXACT_CAPS_WASM=kept; }
 });
 
 test('filesystem errors distinguish Windows access denial from Unix IO failure', () => {

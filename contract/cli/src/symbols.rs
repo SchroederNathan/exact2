@@ -261,6 +261,8 @@ pub fn symbols_json(path: &Path, name: Option<&str>) -> Result<String, CompileEr
             Kind::Component => &["component"],
             Kind::Call => &["shape", "fn"],
             Kind::Style => &["style"],
+            Kind::Decoration => &["decoration"],
+            Kind::Atom => &["atom"],
             Kind::Keyframes => &["keyframes"],
             Kind::Timeline => &[],
         };
@@ -306,6 +308,19 @@ impl<'a> Resolver<'a> {
         for style in &self.file.styles {
             self.graph
                 .define("style", &style.name, names.name(style.span), None, None);
+        }
+        for decoration in &self.file.decorations {
+            self.graph.define(
+                "decoration",
+                &decoration.name,
+                names.name(decoration.span),
+                None,
+                None,
+            );
+        }
+        for atom in &self.file.atoms {
+            self.graph
+                .define("atom", &atom.name, names.name(atom.span), None, None);
         }
         for keyframes in &self.file.keyframes {
             self.graph.define(

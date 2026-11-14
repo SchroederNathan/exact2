@@ -17,6 +17,9 @@ test('external shells use the SDK toolchain and refresh stale generated pins', (
     const pin = readFileSync(resolve(import.meta.dir, '../../rust-toolchain.toml'), 'utf8');
     generate();
     expect(readFileSync(generated, 'utf8')).toBe(pin);
+    const manifest = Bun.TOML.parse(readFileSync(resolve(dir, '.shells/Cargo.toml'), 'utf8'));
+    expect(realpathSync(resolve(dir, '.shells', manifest.patch['crates-io'].accesskit_windows.path)))
+      .toBe(realpathSync(resolve(import.meta.dir, '../../vendor/accesskit-windows')));
     writeFileSync(generated, '[toolchain]\nchannel = "stale"\n');
     generate();
     expect(readFileSync(generated, 'utf8')).toBe(pin);
@@ -39,6 +42,8 @@ test('a level-only game bakes its declared type without an art directory', () =>
     expect(build).not.toContain('bake_art(');
     expect(readFileSync(resolve(dir, '.shells/gpu/Cargo.toml'), 'utf8')).not.toContain('exact-game-bake.workspace = true');
     expect(readFileSync(resolve(dir, '.shells/web/Cargo.toml'), 'utf8')).not.toContain('exact-data-host');
+    const windows = Bun.TOML.parse(readFileSync(resolve(dir, '.shells/windows/Cargo.toml'), 'utf8'));
+    expect(windows.dependencies['exact-linux'].workspace).toBe(true);
   } finally { rmSync(dir, {recursive:true, force:true}); }
 });
 
@@ -176,4 +181,13 @@ test('the bake writes the render crate its assembled shader inventory, engine pr
     expect(readFileSync(resolve(dir, '.shells/shaders/sky.wgsl'), 'utf8')).toBe(`${frame}\n// sky body\n`);
     expect(readFileSync(resolve(dir, '.shells/.cargo/config.toml'), 'utf8')).toContain(`EXACT_GAME_SHADERS = ${JSON.stringify(resolve(realpathSync(dir), '.shells/shaders'))}`);
   } finally { rmSync(dir, {recursive:true, force:true}); }
+});
+
+test('starter and Beacons retarget glow through the row handle', () => {
+  for (const file of ['../new/logic/src/lib.rs', '../games/beacons/logic/src/lib.rs']) {
+    const source = readFileSync(resolve(import.meta.dir, file), 'utf8');
+    expect(source).toContain('beacon.glow_to(1.0, 0.5)');
+    expect(source).toContain('beacon.name()');
+    expect(source).not.toMatch(/require_mut::<Glow>|\.0\.to\(|tick_end\(/);
+  }
 });

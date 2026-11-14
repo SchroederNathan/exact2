@@ -107,6 +107,25 @@ fn aria_disabled_is_accepted_on_a_button_and_focusable_role() {
     assert_eq!(disabled(&r, "role"), Some(true));
 }
 
+/// A bool ARIA state takes the WAI-ARIA token as written in HTML, `aria-hidden="true"`, as
+/// it takes `aria-hidden=true`.
+#[test]
+fn a_bool_aria_state_takes_its_token_in_quotes() {
+    let r = boot(
+        "component App\n  view\n    column\n      view aria-hidden=\"true\" testId=\"hidden\"\n      view aria-hidden=\"false\" testId=\"shown\"\n      column role=\"dialog\" aria-modal=\"true\" testId=\"sheet\"\n",
+    );
+    let prop = |id: &str, prop| r.kernel().node(view_of(&r, id)).unwrap().props.bool(prop);
+    assert_eq!(
+        prop("hidden", PropId::AccessibilityElementsHidden),
+        Some(true)
+    );
+    assert_eq!(
+        prop("shown", PropId::AccessibilityElementsHidden),
+        Some(false)
+    );
+    assert_eq!(prop("sheet", PropId::AccessibilityModal), Some(true));
+}
+
 /// `aria-modal` (LLP 1080.003) lowers to `accessibilityModal` and follows
 /// its state; Signal Clone's call screen and menus had no way to say it.
 #[test]
@@ -224,6 +243,39 @@ fn aria_current_lowers_by_its_aria_name() {
     );
 }
 
+/// A sortable table's `aria-sort` (the agent framework benchmark's move
+/// tables): one of its four words, following state; it takes no bool.
+#[test]
+fn aria_sort_lowers_by_its_aria_name() {
+    let mut r = boot(
+        "component App\n  state up = true\n  action flip\n    up = !up\n  view\n    column role=\"table\"\n      row role=\"row\"\n        button role=\"columnheader\" press=flip aria-sort=(up ? \"ascending\" : \"descending\") testId=\"name\"\n          text \"Name\"\n",
+    );
+    assert_eq!(
+        prop(&r, "name", PropId::AccessibilitySort).as_deref(),
+        Some("ascending")
+    );
+    let name = view_of(&r, "name");
+    r.dispatch(name, Event::Press).unwrap();
+    assert_eq!(
+        prop(&r, "name", PropId::AccessibilitySort).as_deref(),
+        Some("descending")
+    );
+    for (value, says) in [
+        (
+            "\"up\"",
+            "`aria-sort` takes \"ascending\", \"descending\", \"none\" or \"other\"",
+        ),
+        ("true", "aria-sort"),
+    ] {
+        let e = contract::compile(&format!(
+            "component App\n  view\n    text \"Name\" role=\"columnheader\" aria-sort={value}\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains(says), "aria-sort={value}: {e}");
+    }
+}
+
 /// An `aria-*` name Contract refuses says whether ARIA has it, and lists
 /// the ones Contract carries (Depot met `aria-current` with no list).
 #[test]
@@ -235,12 +287,15 @@ fn an_unknown_aria_name_lists_the_carried_ones() {
         .unwrap_err()
         .to_string()
     };
-    let sort = refused("aria-sort");
+    let count = refused("aria-rowcount");
     assert!(
-        sort.contains("`aria-sort` is ARIA's, and Contract does not carry it yet; Contract carries aria-atomic, aria-busy, aria-checked, "),
-        "{sort}"
+        count.contains("`aria-rowcount` is ARIA's, and Contract does not carry it yet; Contract carries aria-atomic, aria-busy, aria-checked, "),
+        "{count}"
     );
-    assert!(sort.contains("aria-current"), "{sort}");
+    assert!(
+        count.contains("aria-current") && count.contains("aria-sort"),
+        "{count}"
+    );
     let typo = refused("aria-curent");
     assert!(
         typo.contains("`aria-curent` is not ARIA's (did you mean `aria-current`?)"),
@@ -310,5 +365,32 @@ fn aria_range_values_are_carried_as_htmls_numbers() {
     assert_eq!(
         values(&r, "bar"),
         [some("42.5"), some("0"), some("100"), some("42.5 of 100")]
+    );
+}
+
+/// euxy's Note row, a `button` holding its Listen pill (FRICTION 11): the
+/// inner button is named (`lower-nested-button`), once, through an `if`;
+/// two buttons side by side are not. A press is the inner one's alone.
+#[test]
+fn a_button_in_a_button_is_named_and_presses_alone() {
+    let app = |view: &str| {
+        let view: String = view.lines().map(|l| format!("      {l}\n")).collect();
+        format!("component App\n  state rows = 0\n  state listens = 0\n  action row\n    rows = rows + 1\n  action listen\n    listens = listens + 1\n  view\n    column\n{view}")
+    };
+    let nested = app("button press=row testId=\"row\"\n  text \"Note\"\n  if rows >= 0\n    button press=listen testId=\"listen\"\n      text \"Listen\"");
+    assert_eq!(
+        crate::warnings::warned(&nested),
+        [("lower-nested-button".to_string(), 13)]
+    );
+    let (_, warnings) = contract::compile_warned(&nested);
+    assert!(warnings[0].message.contains("side by side"), "{warnings:?}");
+    let beside = app("row\n  button press=row flex=1\n    text \"Note\"\n  button press=listen\n    text \"Listen\"");
+    assert_eq!(crate::warnings::warned(&beside), []);
+    let mut r = boot(&nested);
+    let listen = view_of(&r, "listen");
+    r.dispatch(listen, Event::Press).unwrap();
+    assert_eq!(
+        (r.slot("rows"), r.slot("listens")),
+        (Some(&Value::Number(0.0)), Some(&Value::Number(1.0)))
     );
 }

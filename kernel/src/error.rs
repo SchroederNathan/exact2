@@ -60,6 +60,8 @@ pub enum DecodeError {
     BadSymbolPalette,
     /// Invalid or unsupported CSS `text-shadow` (LLP 1077 D3).
     BadTextShadow,
+    /// Invalid CSS `font-variation-settings`, or more than eight axes (LLP 1019 D9).
+    BadFontVariations,
     /// Invalid or unsupported CSS `mask-image` (LLP 1077 D2).
     BadMaskImage,
     /// Invalid CSS `corner-shape` (LLP 1077 D1).
@@ -159,6 +161,10 @@ pub enum DecodeError {
     ReservedMaskBits,
     /// A child list exceeds the bound.
     TooManyChildren(u32),
+    /// A `SetLooks` carried more than one look a state.
+    TooManyLooks(u8),
+    /// A look's state is unknown, repeated or out of order.
+    LookState(u8),
     /// A string field is not UTF-8.
     InvalidUtf8,
     /// A string field exceeds the bound.
@@ -257,8 +263,9 @@ pub enum ApplyError {
         id: ViewId,
         node_type: NodeType,
     },
-    /// A `Text` was given a child that is not a `Text`. A text node's children
-    /// are its inline runs; anything else has no place in a measured leaf.
+    /// A `Text` was given a child that is neither a `Text` nor an `Image`. A
+    /// text node's children are its inline runs and images (LLP 1011.002);
+    /// anything else has no place in a measured leaf.
     InlineRunNotText {
         op_index: usize,
         parent: ViewId,
@@ -267,6 +274,9 @@ pub enum ApplyError {
     },
     /// A style row carried an infinite or NaN number.
     NonFiniteStyle { op_index: usize, style: StyleId },
+    /// A state look set a row no look may (LLP 1121 D8), or a look's
+    /// state is unknown or repeated.
+    LookRow { op_index: usize, state: u8 },
     /// `auto` was supplied for a dimension row whose grammar does not admit it.
     AutoNotAdmitted { op_index: usize, style: StyleId },
     /// A percentage, alone or in a calculation, was supplied for a row CSS
@@ -520,6 +530,10 @@ pub enum StyleValueError {
     BadTextShadow {
         style: StyleId,
     },
+    /// Not `normal` or up to eight `"tag" <number>` axes (LLP 1019 D9).
+    BadFontVariations {
+        style: StyleId,
+    },
     /// Not `none` or one gradient mask (LLP 1077 D2).
     BadMaskImage {
         style: StyleId,
@@ -544,7 +558,7 @@ pub enum StyleValueError {
     BadTimelineScope {
         style: StyleId,
     },
-    /// Not none or a list of flip-block/flip-inline combinations.
+    /// Not none or a list of flip-block/flip-inline/flip-start combinations.
     BadPositionTryFallbacks {
         style: StyleId,
     },

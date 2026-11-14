@@ -93,7 +93,7 @@ app's directory can't discover:
   `rust-toolchain.toml`, forced-offline `.cargo/config.toml`, and `exact.mjs`
   are rewritten by `bun exact.mjs update`.
 
-> **Amended by LLP 1115 D7.** `docs/start-here.md` is the only required reading; the long
+> **Amended by LLP 1115 D7.** `docs/start-here.md` (a website: `docs/start-here-site.md`) is the only required reading; the long
 > guides are lookup.
 
 The generated text sits between `<!-- exact:begin -->` and `<!-- exact:end -->`
@@ -119,6 +119,11 @@ are 0 and the page is unchanged.
 > **Amended by LLP 1115 D7.** The template writes no colour, no font size and no safe-area
 > padding; it says structure and leaves the rest to the platform.
 
+> **Amended by LLP 1153 D1 (2026-10-30).** `exact new` writes eight files and no host crate; a
+> native verb names its platform in app.json the first time it runs and builds in a workspace
+> generated under the app's `.exact/`. The paragraph below describes an app that authored its
+> crates, which `update` still serves.
+
 The app's workspace holds three host crates: `apple/`, `web/` and, since
 2026-10-07 (Charlie, toward Android bench cells, LLP 1107), `linux/`, in the
 shape of the repo's own (`apps/duo-lab/linux`: one executable with the runner,
@@ -128,6 +133,18 @@ and `test linux` / `agent linux …` drive it on any machine. The Android host i
 the same crate built for Android: `bun exact.mjs android`
 (`scripts/agent-android.mjs build`). `--update` adds `linux/` to an app made
 before, unless the app has its own.
+
+> **Amended (2026-10-17, the euxy port: removing Linux by hand took app.json, the
+> workspace and Cargo.lock, about 20 minutes).** `bun exact.mjs update --without linux`
+> removes the crate, its workspace member and app.json's `linux` keys, and re-resolves
+> Cargo.lock. `--update` adds `linux/` only to an app whose app.json names
+> `deploy.store.linux`, which the scaffold writes, so a removal stays removed.
+
+> **Amended (2026-10-17, the euxy port: the bundle id renamed after the first build
+> made the next build a cold 46 s and orphaned the installed app).** `exact new <path>
+> --name <name> --bundle-id <id>` writes app.json's `app.name`, `name` and `short_name`,
+> its `app.id` and `id`, app.ts's `appId` and the template's heading; the component keeps
+> the folder's name. `AGENTS.md` says to set the two before the first build.
 
 An app, and a game outside the checkout, also gets `.vscode/tasks.json`
 (2026-10-07, Doug Lowder: VS Code support, "declarative first"; this is the
@@ -555,7 +572,8 @@ Mutation sources throw `refused(why)`. The compiler emits mutation source names
 from the plan; the Snapback bake constrains their bool `ok` result fields to
 `true` through TypeScript, so returned failures are refused with that rewrite. The refusal’s
 code and message remain separate, including in the web agent’s mutation failures.
-Roster scaffolds write explicit-id seed rows for `insert <- deny` tables and use
+Roster scaffolds write explicit-id seed rows for `insert <- deny` tables (including
+the default deny when no `insert` rule is present) and use
 `fresh "seed.json"`; unsupported field types require an authored backend seed.
 A failed unseeded test with authorization refusals names that repair. The driver
 warns when its epoch and a development backend’s clock differ by more than a day.
@@ -563,6 +581,18 @@ Healthy rebuilds name resolved virtual mounts on one line. The README retest
 command runs every complete documented app twice against a selected registry;
 only a successful run publishes the pin, dated claims and input-hashed receipt.
 The checker refuses a version edit or changed tested source without that rerun.
+
+**EX10 amendment (Charlie’s wave-15 W1–W12/H6 task, 2026-10-18; implementer Codex):**
+The author explicitly requests the dialect migrator and upgrade note as an exception
+to the pre-1.0 rule against migration paths. `contract migrate` applies parser-backed
+edits for retired syntax; builds report those spellings together, and
+`--json --errors-only` filters advisory warnings. Apps expose `lock`, while `update`
+reports stale locks. Backend diagnostics name the selected origin and its source;
+a bake warns when a saved origin shadows an edited literal. Tests assert expected
+mutation refusals explicitly; other refusals remain wiring problems. Roster seed
+inference runs within scaffold rollback. Guest sessions require logout before account
+sign-in, and secret keys use the grant grammar. No runtime compatibility dialect or
+new blocking check is introduced.
 
 ### D13. `fresh`: a test file empties the backend before each test
 
@@ -595,6 +625,17 @@ test's data. Backend rows remain server-owned; `fresh` is dev-only and a
 serve proof provisions uniquely keyed fixtures or logs in to an existing
 test account. Existing managed-auth `E_AUTH` handling forgets the refused
 current token, preserving a newer token after a late old-token refusal.
+
+**Native `--reset-storage` (2026-10-17):** the CLI had asked only Chrome to
+empty a store, so `agent ios --storage s5 --reset-storage` emptied nothing and
+a second drive read the first one's `app:/data` file (the euxy port lost ten
+minutes to it). A native named store is still kept between drives; with
+`--reset-storage` the host empties its whole tree at its first boot (`app:/`
+roots, SQLite, kept state, secrets), refusing a tree with a symbolic link at
+or above it under the cache base (`host/apple/src/picker.rs`,
+`host/linux/src/picker.rs` `unlinked`). The CLI holds a lock per host, device,
+app id and store for the whole drive, so a second drive of a store is refused
+rather than emptying it under the first (`exclusiveNativeStore`).
 
 
 **EX7 visibility (2026-10-14):** before opening any test browser, `test web` prints

@@ -16,11 +16,14 @@
 use exact_runner::{Store, StoreWrite};
 use ibex2::boundary::HostError;
 use ibex2::host::{Bindings, Host, Kv, Secrets};
+#[path = "store_secrets.rs"]
+mod shared_secrets;
+use shared_secrets::{secret_directory, secret_namespace, SecretBackend};
 
 /// The kv scope the runner's kept answers live in (LLP 1027 D4): beside the
 /// Keychain, not in it — a cache of settled data, any resource's name a
 /// key, read in one listing at launch.
-const KEPT: &str = "exact.kept";
+pub(crate) const KEPT: &str = "exact.kept";
 
 /// The kv scope persisted states live in where they are not the app's
 /// `UserDefaults` (LLP 1116 D5, [`Prefs`]).
@@ -45,7 +48,12 @@ impl Prefs {
         let agent = std::env::var_os("EXACT_AGENT").is_some();
         let store = std::env::var("EXACT_STORE").unwrap_or_default();
         let memory = (agent && store != "real") || store == "memory";
-        if cfg!(test) || cfg!(not(target_vendor = "apple")) || app_id.is_empty() || memory {
+        if cfg!(test)
+            || cfg!(not(target_vendor = "apple"))
+            || app_id.is_empty()
+            || memory
+            || group_root(app_id).is_some()
+        {
             Prefs::Kv
         } else {
             Prefs::Defaults(app_id.to_string())
@@ -104,7 +112,21 @@ pub fn endow_for(grants: &str, app_id: &str) -> Result<Bindings, String> {
     let mut host = Host::new();
     let agent = std::env::var_os("EXACT_AGENT").is_some();
     let store = std::env::var("EXACT_STORE").unwrap_or_default();
-    if (agent && store != "real") || store == "memory" {
+    let memory = (agent && store != "real") || store == "memory";
+    if let Some(root) = group_root(app_id) {
+        host = host.with_kv_store(Box::new(ibex2::kv::FileStore::new(root.join("kv"))));
+        #[cfg(target_vendor = "apple")]
+        {
+            let secrets = ibex2::secrets::darwin::KeychainStore::new(app_id);
+            let prepared = if cfg!(target_os = "macos") && !memory {
+                secrets.prepare()
+            } else {
+                Ok(())
+            };
+            host = with_shared_secrets(host, Box::new(secrets), prepared);
+        }
+    }
+    if memory {
         host = match crate::picker::agent_secret_root(app_id) {
             Some(root) => host
                 .with_secret_store(Box::new(ibex2::secrets::FileStore::new(
@@ -123,6 +145,18 @@ pub fn endow_for(grants: &str, app_id: &str) -> Result<Bindings, String> {
             .with_kv_store(Box::new(ibex2::kv::MemoryStore::new()));
     }
     endow_in(host, grants)
+}
+
+#[cfg(any(target_vendor = "apple", test))]
+fn with_shared_secrets(
+    host: Host,
+    secrets: Box<dyn ibex2::secrets::SecretStore>,
+    prepared: Result<(), HostError>,
+) -> Host {
+    if let Err(error) = prepared {
+        eprintln!("Keychain migration: {error:?}; retained login items will be retried on the next launch");
+    }
+    host.with_secret_store(secrets)
 }
 
 /// [`endow_for`] for a boot. One that reads the store (`fresh`, not a
@@ -170,8 +204,9 @@ impl ibex2::secrets::SecretStore for Shared {
 fn endow_in(host: Host, grants: &str) -> Result<Bindings, String> {
     // Appended, so an error's line number is the app's own.
     let spec = format!(
-        "{}\nstorage.kv {KEPT}\nstorage.kv {STATE}",
-        exact_runner::io_grants(grants)
+        "{}\nstorage.kv {KEPT}\nstorage.kv {STATE}\n{}",
+        exact_runner::io_grants(grants),
+        crate::presence_secrets::scopes(),
     );
     let set = ibex2::grant::GrantSet::parse(&spec)
         .map_err(|e| format!("the app's grants did not parse: {e}"))?;
@@ -182,15 +217,130 @@ fn endow_in(host: Host, grants: &str) -> Result<Bindings, String> {
 /// platform's stores, behind the I/O link (LLP 1047.001), so an archive that
 /// links no I/O names neither them nor the Keychain and files under them.
 pub trait KeptStore {
+    /// Re-read endowed stores, retaining previous values for failed reads.
+    fn snapshot(&self, previous: Vec<(String, Vec<u8>)>) -> StoreRead;
+    /// Retry only kept names omitted by the byte budget; a new counter needs a full snapshot.
+    fn retry_snapshot(&self, previous: Vec<(String, Vec<u8>)>, _names: &[String]) -> StoreRead {
+        self.snapshot(previous)
+    }
     /// Write one store change.
     fn write(&self, w: &StoreWrite) -> Result<(), String>;
+    /// Seed a newly created private memory backend before activating its source.
+    fn seed_snapshot(&self, _snapshot: &[(String, Vec<u8>)]) {}
+    /// The coordinator for this backend, shared by independent sessions.
+    fn shared_secrets(&self) -> Option<std::sync::Arc<dyn exact_runner::SharedSecrets>> {
+        None
+    }
+    /// Capture an ordinary write's generation before it enters a retry queue.
+    fn stamp(&self, _name: &str) -> Option<exact_data::secrets::Stamp> {
+        None
+    }
+    /// Persist only if no exclusive transaction has superseded the captured generation.
+    fn write_stamped(
+        &self,
+        write: &StoreWrite,
+        _stamp: Option<&exact_data::secrets::Stamp>,
+    ) -> Result<(), String> {
+        self.write(write)
+    }
+    /// Retry asynchronous writes that failed on an earlier turn.
+    fn retry_failed(&self) {}
     /// The kept answers the writer failed to write since the last call.
     fn kept_failures(&self) -> Vec<String>;
 }
 
 impl KeptStore for Platform {
+    fn seed_snapshot(&self, snapshot: &[(String, Vec<u8>)]) {
+        if self.private_memory && !self.seeded.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            for (name, value) in snapshot {
+                if ibex2::secrets::is_valid_name(name) {
+                    let _ = self.secrets.set(name, &String::from_utf8_lossy(value));
+                }
+            }
+        }
+    }
+    fn shared_secrets(&self) -> Option<std::sync::Arc<dyn exact_runner::SharedSecrets>> {
+        let namespace = self.namespace.clone()?;
+        Some(std::sync::Arc::new(exact_data::secrets::Coordinator::new(
+            namespace,
+            std::sync::Arc::new(SecretBackend(
+                self.secrets.clone(),
+                self.secret_directory.clone(),
+            )),
+        )))
+    }
+    fn stamp(&self, name: &str) -> Option<exact_data::secrets::Stamp> {
+        if name.starts_with(Store::KEPT) || name.starts_with(Store::STATE) {
+            return None;
+        }
+        self.namespace
+            .as_ref()
+            .map(|namespace| namespace.stamp(name))
+    }
+    fn write_stamped(
+        &self,
+        write: &StoreWrite,
+        stamp: Option<&exact_data::secrets::Stamp>,
+    ) -> Result<(), String> {
+        match (&self.namespace, stamp) {
+            (Some(namespace), Some(stamp)) => {
+                namespace.write(&write.name, stamp, || KeptStore::write(self, write))
+            }
+            _ => KeptStore::write(self, write),
+        }
+    }
+    fn snapshot(&self, previous: Vec<(String, Vec<u8>)>) -> StoreRead {
+        let mut read = snapshot_parts(&self.secrets, &self.kv, &self.prefs, previous.clone());
+        let failed = self.failed.1.lock().expect("kept");
+        for (name, value) in previous {
+            if name
+                .strip_prefix(Store::KEPT)
+                .is_some_and(|key| failed.contains(key))
+            {
+                read.values.retain(|(key, _)| key != &name);
+                read.values.push((name, value));
+            }
+        }
+        read.values.sort_by(|a, b| a.0.cmp(&b.0));
+        read
+    }
+    fn retry_snapshot(&self, previous: Vec<(String, Vec<u8>)>, names: &[String]) -> StoreRead {
+        flush_kept();
+        let mut read = StoreRead {
+            values: previous,
+            complete: true,
+            omitted: Vec::new(),
+        };
+        let mut values = std::mem::take(&mut read.values).into_iter().collect();
+        read_kept_names(
+            &self.kv,
+            names,
+            &mut values,
+            &mut read.complete,
+            &mut read.omitted,
+        );
+        read.values = values.into_iter().collect();
+        read
+    }
     fn write(&self, w: &StoreWrite) -> Result<(), String> {
         Platform::write(self, w).map_err(|e| e.to_string())
+    }
+    fn retry_failed(&self) {
+        let owed = self.failed.2.lock().expect("kept");
+        let failed = self.failed.1.lock().expect("kept");
+        for key in failed.iter() {
+            if let Some((revision, value)) = owed.values.get(key) {
+                keep(
+                    (std::sync::Arc::as_ptr(&self.failed) as usize, key.clone()),
+                    Kept {
+                        kv: self.kv.clone(),
+                        value: value.clone(),
+                        failed: self.failed.clone(),
+                        revision: *revision,
+                    },
+                );
+            }
+        }
     }
     fn kept_failures(&self) -> Vec<String> {
         Platform::kept_failures(self)
@@ -209,6 +359,11 @@ pub struct Endowed {
     pub secrets: Option<Box<dyn KeptStore>>,
     /// Why the grants bound nothing.
     pub unbound: Option<String>,
+    /// The presence backend, reconciled before boot (LLP 1133.010 D4), and
+    /// the keychain service the host reads its items from (none under the
+    /// agent): the host installs it in the runner it boots. Its occupancy
+    /// is in the snapshot.
+    pub presence: Option<(exact_runner::presence::Backend, Option<String>)>,
 }
 
 impl Endowed {
@@ -219,6 +374,7 @@ impl Endowed {
             snapshot: Vec::new(),
             secrets: None,
             unbound: None,
+            presence: None,
         }
     }
 }
@@ -228,15 +384,37 @@ impl Endowed {
 pub fn endowed(grants: &str, app_id: &str, fresh: bool) -> Endowed {
     let (bindings, unbound) = endow_bound(grants, app_id, fresh);
     let prefs = Prefs::of(app_id);
+    let agent = std::env::var_os("EXACT_AGENT").is_some();
+    // A drive that asks for the platform's stores (`EXACT_STORE=real`) keeps
+    // locked items in the keychain too, behind the platform's check, which it
+    // binds (`--bind local-auth`): the conformance suite's real items.
+    let platform = !agent || std::env::var("EXACT_STORE").as_deref() == Ok("real");
+    let presence = match !platform {
+        true => crate::presence_secrets::agent_backend(bindings.as_ref(), grants, agent)
+            .map(|b| (b, None)),
+        false => crate::presence_secrets::keychain_backend(bindings.as_ref(), grants, app_id)
+            .map(|(b, service)| (b, Some(service))),
+    };
+    let mut snapshot = if fresh {
+        snapshot_in(bindings.as_ref(), &prefs)
+    } else {
+        Vec::new()
+    };
+    if let Some((backend, keystore)) = presence.as_ref().filter(|_| fresh) {
+        let capable = keystore.is_none() || crate::presence_secrets::keychain_capable();
+        snapshot.extend(backend.snapshot_entries(capable));
+    }
     Endowed {
-        snapshot: if fresh {
-            snapshot_in(bindings.as_ref(), &prefs)
-        } else {
-            Vec::new()
-        },
-        secrets: bindings
-            .as_ref()
-            .map(|b| Box::new(Platform::of(b).with_prefs(prefs.clone())) as Box<dyn KeptStore>),
+        snapshot,
+        presence,
+        secrets: bindings.as_ref().map(|b| {
+            Box::new(
+                Platform::of(b)
+                    .with_prefs(prefs.clone())
+                    .with_namespace(secret_namespace(app_id))
+                    .with_secret_directory(secret_directory(app_id)),
+            ) as Box<dyn KeptStore>
+        }),
         bindings,
         unbound,
     }
@@ -246,6 +424,10 @@ pub fn endowed(grants: &str, app_id: &str, fresh: bool) -> Endowed {
 /// platform's secret store, the runner's kept answers to its kv store.
 #[derive(Clone)]
 pub struct Platform {
+    private_memory: bool,
+    seeded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    secret_directory: Option<std::path::PathBuf>,
+    namespace: Option<exact_data::secrets::Namespace>,
     secrets: Secrets,
     kv: Kv,
     /// Where persisted states go (LLP 1116 D5).
@@ -258,11 +440,31 @@ impl Platform {
     /// The stores `bindings` hold.
     pub fn of(bindings: &Bindings) -> Platform {
         Platform {
+            private_memory: false,
+            seeded: Default::default(),
+            secret_directory: None,
+            namespace: None,
             secrets: bindings.secrets.clone(),
             kv: bindings.kv.clone(),
             prefs: Prefs::Kv,
             failed: Default::default(),
         }
+    }
+
+    fn with_secret_directory(mut self, directory: Option<std::path::PathBuf>) -> Self {
+        self.private_memory = self
+            .namespace
+            .as_ref()
+            .is_some_and(|namespace| namespace.is_memory());
+        self.secret_directory = directory;
+        self
+    }
+
+    /// Supply the namespace of a custom backend; clones and independent hosts
+    /// accessing that backend must use the same namespace.
+    pub fn with_namespace(mut self, namespace: exact_data::secrets::Namespace) -> Self {
+        self.namespace = Some(namespace);
+        self
     }
 
     /// This platform, keeping persisted states in `prefs`.
@@ -274,6 +476,9 @@ impl Platform {
     /// Keep or forget one write. A kept answer is handed to the writer and
     /// its failure, if any, is told later (`kept_failures`).
     pub fn write(&self, w: &StoreWrite) -> Result<(), HostError> {
+        if w.durable {
+            return Ok(());
+        }
         // A persisted state: a preference, written now (a setting changes
         // when a person changes it, not every frame).
         if let Some(key) = w.name.strip_prefix(Store::STATE) {
@@ -282,10 +487,17 @@ impl Platform {
         }
         match (w.name.strip_prefix(Store::KEPT), &w.value) {
             (Some(key), value) => {
+                let mut owed = self.failed.2.lock().expect("kept");
+                owed.revision += 1;
+                let revision = owed.revision;
+                owed.values
+                    .insert(key.to_owned(), (revision, value.clone()));
+                self.failed.1.lock().expect("kept").remove(key);
                 let write = Kept {
                     kv: self.kv.clone(),
                     value: value.clone(),
                     failed: self.failed.clone(),
+                    revision,
                 };
                 keep(
                     (
@@ -315,7 +527,17 @@ impl Platform {
 /// reference goes (its host replaced, its writes done) pass to the next
 /// platform that asks.
 #[derive(Default)]
-struct Failures(std::sync::Mutex<Vec<String>>);
+struct Failures(
+    std::sync::Mutex<Vec<String>>,
+    std::sync::Mutex<std::collections::BTreeSet<String>>,
+    std::sync::Mutex<Owed>,
+);
+
+#[derive(Default)]
+struct Owed {
+    revision: u64,
+    values: std::collections::HashMap<String, (u64, Option<Vec<u8>>)>,
+}
 
 static ORPHANED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -336,6 +558,7 @@ impl Drop for Failures {
 /// written. A launch's snapshot and the process's orderly exit wait for the
 /// writer (`flush_kept`). An answer a crash loses is fetched again.
 struct Kept {
+    revision: u64,
     kv: Kv,
     value: Option<Vec<u8>>,
     failed: std::sync::Arc<Failures>,
@@ -411,13 +634,27 @@ fn write_one(key: &str, write: Kept) {
         Some(v) => write.kv.set(KEPT, key, v),
         None => write.kv.delete(KEPT, key),
     }));
+    let mut owed = write.failed.2.lock().expect("kept");
+    let current = owed
+        .values
+        .get(key)
+        .is_some_and(|(revision, _)| *revision == write.revision);
     let why = match done {
-        Ok(Ok(())) => return,
+        Ok(Ok(())) => {
+            if current {
+                owed.values.remove(key);
+                write.failed.1.lock().expect("kept").remove(key);
+            }
+            return;
+        }
         Ok(Err(e)) => e.to_string(),
         Err(_) => "the store panicked".to_string(),
     };
     let line = format!("store {}{key} failed: {why}", Store::KEPT);
     write.failed.0.lock().expect("kept").push(line);
+    if current {
+        write.failed.1.lock().expect("kept").insert(key.to_owned());
+    }
 }
 
 /// Wait until nothing is waiting to be written and the writer is idle.
@@ -439,6 +676,11 @@ fn wait_until_written(
 
 /// What the store holds under the granted names — the runner's snapshot.
 /// A name the store cannot read is absent, as an ungranted one is.
+pub fn snapshot_for(bindings: Option<&Bindings>, app_id: &str) -> Vec<(String, Vec<u8>)> {
+    snapshot_in(bindings, &Prefs::of(app_id))
+}
+
+/// The snapshot with the default preference store.
 pub fn snapshot_of(bindings: Option<&Bindings>) -> Vec<(String, Vec<u8>)> {
     snapshot_in(bindings, &Prefs::Kv)
 }
@@ -448,38 +690,250 @@ pub fn snapshot_in(bindings: Option<&Bindings>, prefs: &Prefs) -> Vec<(String, V
     let Some(b) = bindings else {
         return Vec::new();
     };
-    // What a runner before this one kept is on disk first. No more than the
-    // runner keeps together is read, on the thread that boots it.
+    snapshot_parts(&b.secrets, &b.kv, prefs, Vec::new()).values
+}
+
+/// A partial read keeps the session's previous value; confirmed absence alone deletes.
+pub struct StoreRead {
+    /// Successfully read entries, with unreadable entries retained from memory.
+    pub values: Vec<(String, Vec<u8>)>,
+    /// Kept names the budget omitted, for a targeted retry.
+    pub omitted: Vec<String>,
+    /// Every listing and read succeeded.
+    pub complete: bool,
+}
+
+fn snapshot_parts(
+    secrets: &Secrets,
+    kv: &Kv,
+    prefs: &Prefs,
+    previous: Vec<(String, Vec<u8>)>,
+) -> StoreRead {
+    // This also waits on the running app's owner thread at refresh. A slow
+    // kept writer can delay that turn; moving the read off-owner needs an
+    // ordered snapshot handoff, not a read ahead of its flush.
     flush_kept();
-    let mut left = Store::KEPT_TOTAL_BYTES;
-    let kept =
-        b.kv.keys(KEPT)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|key| {
-                let value = b.kv.get(KEPT, &key).ok().flatten()?;
-                left = left.checked_sub(value.len())?;
-                Some((format!("{}{key}", Store::KEPT), value))
-            })
-            .collect::<Vec<_>>();
-    b.secrets
-        .names()
+    let mut values: std::collections::BTreeMap<_, _> = previous.into_iter().collect();
+    let mut complete = true;
+    let mut omitted = Vec::new();
+    for name in secrets.names() {
+        match secrets.get(name) {
+            Ok(Some(value)) => {
+                values.insert(name.to_owned(), value.into_bytes());
+            }
+            Ok(None) => {
+                values.remove(name);
+            }
+            Err(_) => complete = false,
+        }
+    }
+    read_kv(
+        kv,
+        KEPT,
+        Store::KEPT,
+        &mut values,
+        &mut complete,
+        &mut omitted,
+    );
+    match prefs {
+        Prefs::Kv => read_kv(
+            kv,
+            STATE,
+            Store::STATE,
+            &mut values,
+            &mut complete,
+            &mut omitted,
+        ),
+        Prefs::Defaults(_) => {
+            values.retain(|name, _| !name.starts_with(Store::STATE));
+            values.extend(prefs.read(kv));
+        }
+    }
+    StoreRead {
+        values: values.into_iter().collect(),
+        complete,
+        omitted,
+    }
+}
+
+fn read_kv(
+    kv: &Kv,
+    scope: &str,
+    prefix: &str,
+    values: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    complete: &mut bool,
+    omitted: &mut Vec<String>,
+) {
+    let Ok(keys) = kv.keys(scope) else {
+        *complete = false;
+        return;
+    };
+    values.retain(|name, _| {
+        name.strip_prefix(prefix)
+            .is_none_or(|key| keys.iter().any(|k| k == key))
+    });
+    let names: Vec<_> = keys.iter().map(|key| format!("{prefix}{key}")).collect();
+    read_names(kv, scope, prefix, &names, values, complete, omitted);
+}
+
+fn read_kept_names(
+    kv: &Kv,
+    names: &[String],
+    values: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    complete: &mut bool,
+    omitted: &mut Vec<String>,
+) {
+    read_names(kv, KEPT, Store::KEPT, names, values, complete, omitted);
+}
+
+fn read_names(
+    kv: &Kv,
+    scope: &str,
+    prefix: &str,
+    names: &[String],
+    values: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    complete: &mut bool,
+    omitted: &mut Vec<String>,
+) {
+    let mut bytes: usize = values
         .iter()
-        .filter_map(|n| {
-            b.secrets
-                .get(n)
-                .ok()
-                .flatten()
-                .map(|v| (n.to_string(), v.into_bytes()))
-        })
-        .chain(kept)
-        .chain(prefs.read(&b.kv))
-        .collect()
+        .filter(|(name, _)| name.starts_with(prefix))
+        .map(|(_, value)| value.len())
+        .sum();
+    for name in names {
+        let Some(key) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let name = name.clone();
+        match kv.get(scope, key) {
+            Ok(Some(value)) => {
+                let next = bytes - values.get(&name).map_or(0, Vec::len) + value.len();
+                if scope == KEPT && next > Store::KEPT_TOTAL_BYTES {
+                    omitted.push(name);
+                    continue;
+                }
+                bytes = next;
+                values.insert(name, value);
+            }
+            Ok(None) => {
+                bytes -= values.remove(&name).map_or(0, |v| v.len());
+            }
+            Err(_) => *complete = false,
+        }
+    }
+}
+
+/// Widget builds share one group, explicitly supplied by their signed host.
+/// Other apps keep every existing path and Keychain service.
+pub(crate) fn group_root(app_id: &str) -> Option<std::path::PathBuf> {
+    if std::env::var("EXACT_APP_GROUP_APP").ok().as_deref() != Some(app_id) {
+        return None;
+    }
+    std::env::var_os("EXACT_APP_GROUP_ROOT")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// Stage 1 has one writer: the app. Publish only a counter and a Darwin ping;
+/// another process re-reads the store, never a payload in the notification.
+pub(crate) fn widget_changed(app: &str) {
+    if std::env::var("EXACT_WIDGET_WRITER").ok().as_deref() != Some(app) {
+        return;
+    }
+    let Some(root) = group_root(app) else {
+        return;
+    };
+    static WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<(std::path::PathBuf, String)>> =
+        std::sync::OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (root, app) in receive {
+                publish_widget_change(root, app);
+            }
+        });
+        send
+    });
+    let _ = writer.send((root, app.to_owned()));
+}
+
+#[allow(unsafe_code)]
+fn publish_widget_change(root: std::path::PathBuf, app: String) {
+    // A kept answer reaches disk on its own writer: wait for it, so a refresh
+    // that reads this counter reads the store the counter stands for.
+    flush_kept();
+    let current = root.join("widget-store-generation");
+    let temporary = root.join(format!(".widget-store-{}", std::process::id()));
+    // Until the counter advances, the extension's fallback still matches the
+    // store before this write: retry rather than leave it current.
+    let published = (0..3).find_map(|attempt| {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50 << attempt));
+        }
+        let value = std::fs::read_to_string(&current)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        std::fs::write(&temporary, value.to_string())
+            .and_then(|_| std::fs::rename(&temporary, &current))
+            .ok()
+            .map(|_| value)
+    });
+    let Some(_) = published else {
+        let _ = std::fs::remove_file(&temporary);
+        return;
+    };
+    // WP11 must put both app and extension counter increments under its shared lock.
+    // WP11's extension writer (Q1 B) posts this ping after releasing its
+    // store transaction lock, and reloads its written kinds itself.
+    #[cfg(target_vendor = "apple")]
+    if let Ok(name) = std::ffi::CString::new(format!("{app}.widget-store")) {
+        unsafe extern "C" {
+            fn notify_post(name: *const std::ffi::c_char) -> u32;
+        }
+        // libnotify copies the name; the notification carries no account data.
+        unsafe {
+            notify_post(name.as_ptr());
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = app;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_login_migration_keeps_shared_secrets_and_other_grants_bound() {
+        for reason in [
+            "errSecAuthFailed",
+            "errSecInteractionNotAllowed",
+            "errSecDecode",
+        ] {
+            let secrets = ibex2::secrets::MemoryStore::new();
+            ibex2::secrets::SecretStore::set(&secrets, "app.session", "migrated").unwrap();
+            let host = with_shared_secrets(
+                Host::new().with_kv_store(Box::new(ibex2::kv::MemoryStore::new())),
+                Box::new(secrets),
+                Err(HostError::Failed(reason.into())),
+            );
+            let bindings = endow_in(host, "secret.keep app.session\nstorage.kv library").unwrap();
+            assert_eq!(
+                bindings.secrets.get("app.session").unwrap().as_deref(),
+                Some("migrated")
+            );
+            bindings.secrets.set("app.session", "new session").unwrap();
+            bindings.kv.set_text("library", "book", "saved").unwrap();
+            assert_eq!(
+                bindings.kv.get_text("library", "book").unwrap().as_deref(),
+                Some("saved")
+            );
+            bindings.secrets.forget("app.session").unwrap();
+            assert_eq!(bindings.secrets.get("app.session").unwrap(), None);
+        }
+    }
 
     #[test]
     fn a_launch_reads_no_more_kept_answers_than_the_runner_keeps_together() {
@@ -521,6 +975,7 @@ mod tests {
             endow_in(host, "secret.keep app.token").unwrap()
         };
         let write = |name: &str, value: Option<&str>| StoreWrite {
+            durable: false,
             name: name.into(),
             value: value.map(|v| v.as_bytes().to_vec()),
         };
@@ -530,6 +985,7 @@ mod tests {
         let bytes = vec![5, 0, 0, 0, 0, 0xff, 0x80];
         first
             .write(&StoreWrite {
+                durable: false,
                 name: "exact.kept.crewState".into(),
                 value: Some(bytes.clone()),
             })
@@ -556,6 +1012,7 @@ mod tests {
         assert_eq!(Prefs::of("com.example.tip"), Prefs::Kv);
         let platform = Platform::of(&launch()).with_prefs(Prefs::Kv);
         let tip = StoreWrite {
+            durable: false,
             name: "exact.state.tipPercent".into(),
             value: Some("22".into()),
         };
@@ -574,6 +1031,7 @@ mod tests {
             .with_kv_store(Box::new(ibex2::kv::UnavailableStore));
         let platform = Platform::of(&endow_in(host, "").unwrap());
         let kept = StoreWrite {
+            durable: false,
             name: "exact.kept.feed".into(),
             value: Some("v".into()),
         };
@@ -588,6 +1046,84 @@ mod tests {
             "{failed:?}"
         );
         assert!(platform.kept_failures().is_empty(), "told once");
+        let memory = vec![(kept.name.clone(), kept.value.clone().unwrap())];
+        assert_eq!(
+            platform.snapshot(memory.clone()).values,
+            memory,
+            "a failed kept write is unreadable even after its journal was drained"
+        );
+    }
+
+    #[test]
+    fn failed_asynchronous_answers_retry_and_newer_values_supersede_them() {
+        struct Refusing {
+            memory: std::sync::Arc<ibex2::kv::MemoryStore>,
+            refusing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl ibex2::kv::KvStore for Refusing {
+            fn get(&self, scope: &str, key: &str) -> Result<Option<Vec<u8>>, HostError> {
+                self.memory.get(scope, key)
+            }
+            fn keys(&self, scope: &str) -> Result<Vec<String>, HostError> {
+                self.memory.keys(scope)
+            }
+            fn set(&self, scope: &str, key: &str, value: &[u8]) -> Result<(), HostError> {
+                if self.refusing.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(HostError::Failed("injected full disk".into()));
+                }
+                self.memory.set(scope, key, value)
+            }
+            fn delete(&self, scope: &str, key: &str) -> Result<(), HostError> {
+                self.memory.delete(scope, key)
+            }
+        }
+        let memory = std::sync::Arc::new(ibex2::kv::MemoryStore::new());
+        let refusing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let platform = Platform::of(
+            &endow_in(
+                Host::new()
+                    .with_secret_store(Box::new(ibex2::secrets::MemoryStore::new()))
+                    .with_kv_store(Box::new(Refusing {
+                        memory: memory.clone(),
+                        refusing: refusing.clone(),
+                    })),
+                "",
+            )
+            .unwrap(),
+        );
+        let write = |value: &str| StoreWrite {
+            durable: false,
+            name: "exact.kept.feed".into(),
+            value: Some(value.as_bytes().to_vec()),
+        };
+        platform.write(&write("1")).unwrap();
+        flush_kept();
+        assert!(platform
+            .kept_failures()
+            .iter()
+            .any(|s| s.contains("injected full disk")));
+        refusing.store(false, std::sync::atomic::Ordering::SeqCst);
+        platform.retry_failed();
+        flush_kept();
+        use ibex2::kv::KvStore;
+        assert_eq!(
+            memory.get(KEPT, "feed").unwrap(),
+            Some(b"1".to_vec()),
+            "retry does not need a changed answer"
+        );
+        refusing.store(true, std::sync::atomic::Ordering::SeqCst);
+        platform.write(&write("2")).unwrap();
+        flush_kept();
+        assert!(!platform.kept_failures().is_empty());
+        refusing.store(false, std::sync::atomic::Ordering::SeqCst);
+        platform.write(&write("3")).unwrap();
+        platform.retry_failed();
+        flush_kept();
+        assert_eq!(
+            memory.get(KEPT, "feed").unwrap(),
+            Some(b"3".to_vec()),
+            "an old failure cannot replay over a newer write"
+        );
     }
 
     /// A kv store whose writes wait for a gate, counting them.
@@ -649,6 +1185,7 @@ mod tests {
         }
         let opens = Opens(gated.clone());
         let keep = |value: Option<&str>| StoreWrite {
+            durable: false,
             name: "exact.kept.feed".into(),
             value: value.map(|v| v.as_bytes().to_vec()),
         };
@@ -657,6 +1194,7 @@ mod tests {
             platform.write(&keep(value)).unwrap();
         }
         let other = StoreWrite {
+            durable: false,
             name: "exact.kept.other".into(),
             value: Some("o".into()),
         };
@@ -689,6 +1227,59 @@ mod tests {
         // behind it, are one write per platform and key.
         assert!(gated.sets.load(std::sync::atomic::Ordering::SeqCst) <= 4);
         assert!(platform.kept_failures().is_empty());
+    }
+
+    #[test]
+    fn the_widget_counter_advances_only_after_the_kept_answers_it_announces() {
+        let gated = std::sync::Arc::new(Gated {
+            inner: ibex2::kv::MemoryStore::new(),
+            open: std::sync::Mutex::new(false),
+            opened: std::sync::Condvar::new(),
+            sets: Default::default(),
+        });
+        let platform = Platform::of(
+            &endow_in(
+                Host::new()
+                    .with_secret_store(Box::new(ibex2::secrets::MemoryStore::new()))
+                    .with_kv_store(Box::new(GatedStore(gated.clone()))),
+                "",
+            )
+            .unwrap(),
+        );
+        struct Opens(std::sync::Arc<Gated>);
+        impl Drop for Opens {
+            fn drop(&mut self) {
+                *self.0.open.lock().unwrap() = true;
+                self.0.opened.notify_all();
+            }
+        }
+        let opens = Opens(gated.clone());
+        let root =
+            std::env::temp_dir().join(format!("exact-widget-counter-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let counter = root.join("widget-store-generation");
+        // Account B's answer is kept while the disk is shut.
+        platform
+            .write(&StoreWrite {
+                durable: false,
+                name: "exact.kept.question".into(),
+                value: Some("account B".into()),
+            })
+            .unwrap();
+        let publisher = {
+            let root = root.clone();
+            std::thread::spawn(move || publish_widget_change(root, "com.example.none".into()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !counter.exists(),
+            "a refresh reading this counter would read account A's answer"
+        );
+        drop(opens);
+        publisher.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+        assert_eq!(gated.sets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -742,6 +1333,7 @@ mod tests {
         let grants = "secret.keep platformer.best";
         let launch = || endow_for(grants, app).unwrap();
         let write = |name: &str, value: Option<&str>| StoreWrite {
+            durable: false,
             name: name.into(),
             value: value.map(|v| v.as_bytes().to_vec()),
         };
@@ -782,3 +1374,7 @@ mod tests {
         assert!(!file.exists());
     }
 }
+
+#[cfg(test)]
+#[path = "store_refresh_tests.rs"]
+mod refresh_tests;

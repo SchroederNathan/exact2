@@ -130,6 +130,29 @@ are copied to the web manifest and baked into Apple `Info.plist` as both URL
 schemes and handler templates. They are host metadata, not deploy policy;
 the native session applies LLP 1038 D8's template before delivery.
 
+**Amended 2026-10-20: web links, and two macOS keys** (implemented by
+Claude (Opus 5.5), 2026-10-20). `protocol_handlers` admits `http` and
+`https`, declared as a pair with one template and one `distribution_only`;
+`readManifest` refuses any other form. On macOS the pair is a second URL
+type (`Web site URL`, role `Viewer`), and the build writes the `Web page`
+document type beside it (`public.html`, `public.xhtml`; `Viewer`,
+`Alternate`, marked `ExactWebPage`), because macOS lists an app under
+Default web browser only when it also opens web pages. The pickers and
+`drop` ignore that type. An HTML file Launch Services brings arrives at the
+`https` template as its `file:` URL unless `file_handlers` accept it: one
+delivery path, as the 2026-10-08 ruling keeps. The app makes no call to
+become the default; the person chooses it in System Settings. tvOS refuses
+the pair, and iOS does too unless `host.ios.webBrowser: true` (admitted
+2026-10-26, #1003): then the pair is registered and the build signs Apple's
+managed `com.apple.developer.web-browser` entitlement, failing by name when
+the profile does not grant it. The web manifest drops the pair
+(HTML's protocol handler safelist), and Linux, Windows and Android register
+no protocol handler. `host.macos.oneTimeCodeAutofill: "marked"` writes
+`NSAutoFillRequiresTextContentTypeForOneTimeCodeOnMac`; absent, the key is
+not written and macOS keeps its default. As with App Transport Security
+below, both are typed fields: there is no `Info.plist` pass-through. The
+Local Network prompt is a grant, LLP 1069.008's `device.local-network`.
+
 **Amended 2026-10-16: a launch picture.** `host.ios.launchImage`
 (`src`, a PNG in the app's directory, and `width` in points) is baked
 into the asset catalog as an image set at 1x, 2x and 3x and named by
@@ -172,6 +195,8 @@ artifact of the app and is not managed here (D6).
 **Desktop window consumer (2026-09-07):** `host.macos.window` optionally declares
 `width`, `height`, `minWidth`, and `minHeight` in points, baked into the existing
 Info.plist as `ExactWindow`. Fieldnotes uses 1100×760 with a 760×560 minimum.
+`keepRunning` (2026-10-20) is baked there too: the app outlives its one window
+(LLP 1069.010 D8); a window may declare it with no size.
 The standalone adapter reads its title from the baked display name and restores
 a configured app's frame under its bundle identity. Bare development executables
 read the existing adjacent Info.plist. Agent/smoke runs skip restoration and use
@@ -187,15 +212,54 @@ their hashes enter the bake receipt and asset cache, and packaging refuses
 changed sources. tvOS keeps asset catalogs and never inherits this selection.
 The web keeps `icons`, also the Apple raster fallback without a selection.
 
-**App Transport Security (2026-10-06, issue #106):** `host.macos.appTransportSecurity`
-and `host.ios.appTransportSecurity` are typed, not a pass-through: one key,
-`allowsArbitraryLoadsInWebContent`, baked as `NSAppTransportSecurity ›
-NSAllowsArbitraryLoadsInWebContent`, so an `iframe` loads `http://` from a named
-host as a browser does while a module's `URLSession` stays under ATS. Absent, no
-key; iOS merges it with `localNetworking`'s `NSAllowsLocalNetworking`. ATS reads
-only a bundle's `Info.plist`, so the agent's bare executable is not under it either
-way: a drive loads such a frame with or without the field, and one with
-`EXACT_MAC_BIN` naming the `.app`'s `Contents/MacOS/ExactMac` shows what a user sees.
+**App Transport Security (2026-10-06, issue #106; `allowsArbitraryLoads`
+2026-10-30):** `host.macos.appTransportSecurity` and
+`host.ios.appTransportSecurity` are typed, not a pass-through. Each key is off
+when absent.
+
+- `allowsArbitraryLoadsInWebContent`, baked as `NSAppTransportSecurity ›
+  NSAllowsArbitraryLoadsInWebContent`: an `iframe` loads `http://` from a named
+  host as a browser does, while the app's own `fetch` (`URLSession`) stays
+  under ATS. iOS merges it with `localNetworking`'s `NSAllowsLocalNetworking`;
+  tvOS, which has no WebKit, leaves it out.
+- `allowsArbitraryLoads`, baked as `NSAllowsArbitraryLoads`: ATS is off for
+  every connection the app makes. Its own `fetch` reaches `http:` at any host
+  its grants admit, for a server the person names at run time (T3 Code pairs
+  with an environment at `http://<any host>`), and its frames load as with the
+  key above. It is written alone: ATS ignores it when
+  `NSAllowsArbitraryLoadsInWebContent`, `NSAllowsLocalNetworking` or
+  `NSAllowsArbitraryLoadsForMedia` is present
+  ([Apple](https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity/nsallowsarbitraryloads)),
+  and it already allows what each of them would. tvOS takes it from
+  `host.ios`.
+
+On macOS 27.2 (2026-10-30, an app bundle that fetches, frames and opens a
+WebSocket to `localtest.me`, a public name for 127.0.0.1): with no key the
+`fetch` and the frame fail with ATS's error and the `ws:` WebSocket opens;
+with `allowsArbitraryLoads` all three succeed. A bundle edited to hold
+`NSAllowsArbitraryLoads` beside `NSAllowsArbitraryLoadsInWebContent` refuses
+the `fetch` and loads the frame; beside `NSAllowsLocalNetworking` it refuses
+both.
+
+Either key is in every build, store builds too, and App Store review asks the
+app to justify each
+([Apple](https://developer.apple.com/documentation/security/preventing-insecure-network-connections),
+"Provide justification for exceptions"). ATS reads only a bundle's
+`Info.plist`, so it governs an executable inside a `.app` and not one outside:
+a macOS drive launches the assembled bundle and is under the app's policy as a
+user is.
+
+No other host reads either key. Linux and Windows have no such policy: the
+app's `fetch` and WebSocket are the Rust transport's own sockets, which reach
+any host the grants admit. Android's shell has the same transport and sets no
+cleartext policy, because Android's
+[`usesCleartextTraffic`](https://developer.android.com/guide/topics/manifest/application-element#usesCleartextTraffic)
+binds the platform's own stacks, not these sockets. Its WebView, an `iframe`
+there, does follow that attribute, which is false by default at the shell's
+targetSdk 36, so a frame of `http:` is refused; no app asks for one yet. On the
+web the browser decides: mixed content refuses `http:` and `ws:` from an
+`https:` page (Chrome and Firefox let loopback through; WebKit does not, LLP
+1020).
 
 **The macOS design (2026-10-02):** AppKit draws its macOS 26 design (Liquid
 Glass bezels, new control metrics) by the SDK the executable records in
@@ -460,7 +524,13 @@ dev connection remain available. Linux takes an optional adapter; its
 selected-asset resolver preserves complete-roster tombstones and boot-time
 integrity fallback without a dependency on the store. L=0 compatibility
 metadata contains no verification keys, trust epoch, store codec or accepted
-bundle kinds, and no update origin. The publisher emits a binary row for it
+bundle kinds, and no update origin. The build's resolved trust is recorded
+once outside the cohort inputs, as `embedded.trust` beside the GPU cards, and
+every production policy reads that one field (agent mode, LLP 1069.007 D2;
+the module override, LLP 1024 D5; collection, LLP 1079), so an L=0 production
+binary is production while its cohort id stays its development twin's (#948).
+`host/apple/build.mjs` bakes production trust whenever it stamps a build
+`release` or `archive`. The publisher emits a binary row for it
 without discovering or reading retired streams when all selected platforms are
 L=0; in a mixed run, retired records identified as an L=0 platform are omitted.
 Binary publication remains the separate unbuilt

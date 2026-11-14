@@ -7,16 +7,14 @@ import AppKit
 #endif
 
 extension ExactSession {
-    // @ref LLP 1043.000 §3 D8, §6 ruling 5 — one advance per display frame,
-    // or one distant wake. Runner retains ordered catch-up and its 4096-commit cap.
+    // Only explicitly requested frame work keeps the display link running.
     func scheduleClock(due: Double?) {
-        let agent = ExactEnv.agentMode || clock != nil
-        let wake = SessionClockTimer.wake(due: due, now: now(), agent: agent, hidden: PageFacts.hidden)
-        // A frame task (LLP 1073 D5) keeps the link running; the agent's clock fires its virtual frames.
-        frames.timerSoon = wake == .frame || (frames.tasks && !agent)
-        // Keep a timer already armed for this deadline; most batches leave it unchanged.
+        let agent = ExactEnv.agentFreezes || clock != nil
+        let wake = SessionClockTimer.wake(due: due, now: now(), agent: agent)
+        frames.timerSoon = (frames.tasks || timerAdmissions.wantsFrame) && !agent
+        // Keep a timer already armed for this deadline; most batches leave it unchanged
         if case .timeout = wake, let armed = clockTimer, armed.isValid, clockDue == due {
-            frames.run(frames.motion || frames.timerSoon || canvases.wantsFrames)
+            frames.run(frames.hasWork)
             return
         }
         clockTimer?.invalidate()
@@ -24,14 +22,30 @@ extension ExactSession {
         clockDue = nil
         if case .timeout(let delay) = wake {
             clockDue = due
-            clockTimer = SessionClockTimer.schedule(after: delay / 1000) { [weak self] _ in
-                guard let self, state != .destroyed else { return }
-                clockTimer = nil
-                // Queued behind a slice, the driver may have taken the clock since
-                whenIdle { [weak self] in guard let self, state != .destroyed, clock == nil, !ExactEnv.agentMode else { return }; followOffset(); applyUnlessEmpty(runtime.advance(now: now())) }
-            }
+            clockTimer = SessionClockTimer.schedule(after: delay / 1000, tolerance: 0) { [weak self] _ in self?.fireClock() }
         }
-        frames.run(frames.motion || frames.timerSoon || canvases.wantsFrames)
+        frames.run(frames.hasWork)
+    }
+
+    /// `clockTimer`'s advance. One the owner cannot take now (it waits on
+    /// a callback on this thread, LLP 1072 T5) is asked again a frame
+    /// later, as a frame's would be on the next: nothing else arms the
+    /// clock while timers show nothing.
+    private func fireClock() {
+        guard state != .destroyed else { return }
+        clockTimer = nil
+        // Queued behind a slice, the driver may have taken the clock since
+        whenIdle { [weak self] in
+            guard let self, state != .destroyed, clock == nil, !ExactEnv.agentFreezes else { return }
+            timerAdmissions.check()
+            followOffset()
+            // Posted, not waited for; one in flight re-arms the clock as it lands.
+            if ExactSession.asyncFills { if !advanceInFlight { sendAdvance(now: now()) }; return }
+            let batch = runtime.advance(now: now())
+            guard batch.busy else { applyUnlessEmpty(batch); return }
+            guard clockTimer == nil else { return } // a batch since armed its own
+            clockTimer = SessionClockTimer.schedule(after: 1.0 / 60) { [weak self] _ in self?.fireClock() }
+        }
     }
 
     /// A deadline already due when a batch lands advances now, in the same
@@ -43,12 +57,39 @@ extension ExactSession {
     /// the driver owns the clock, a frame task's display link drives the
     /// session, a slice is in flight, or earlier slices are landing ahead of
     /// a batch (the batch, then the advance); those advance as before.
+    /// Where timer advances are posted (LLP 1072.000 §4 B), main waits only
+    /// for a `then`, a queue's `next` or an answer that is the earliest work
+    /// due; what is due after it is posted.
     func advanceIfDue() {
-        guard !advancingDue, !applying, !landing, !holdingReports, state != .destroyed, clock == nil, !ExactEnv.agentMode,
-              !frames.tasks, !(fillInFlight || tickInFlight || canvasInFlight), let due = timerDue, due <= now() else { return }
+        guard !advancingDue, !applying, !landing, !holdingReports, state != .destroyed, clock == nil, !ExactEnv.agentFreezes,
+              !frames.tasks, !ownerInFlight, let due = timerDue, due <= now() else { return }
         advancingDue = true
         defer { advancingDue = false }
         followOffset()
-        applyUnlessEmpty(runtime.advance(now: now()))
+        guard ExactSession.asyncFills else { applyUnlessEmpty(runtime.advance(now: now())); return }
+        let then = runtime.landThenFirst()
+        guard !then.held else { return } // (over a reset: ResetGate replays it)
+        applyUnlessEmpty(then)
+        if state != .destroyed, !ownerInFlight, let due = timerDue, due <= now() { sendAdvance(now: now()) }
+    }
+
+    /// A timer advance on the owner, not waited for (LLP 1072.000 §4 B):
+    /// its batch lands in the owner's order, a main-queue turn after the
+    /// owner made it, and until then a frame shows the last batch applied.
+    /// One is in flight at a time. `frame`: a display frame's, with its
+    /// frame tasks (LLP 1073 D5). The commit samples the live clock when the
+    /// owner runs it, as one main waited for does.
+    func sendAdvance(now: Double, frame: Double? = nil) {
+        advanceInFlight = true
+        let captured = generation
+        runtime.advanceAsync(now: now, frame: frame, admitted: timerAdmissions.enabled, capture: frameHealth.captureID, measureFrame: frameHealth.enabled && clock == nil) { [weak self] batch in self?.publish(.advance, batch, captured) }
+    }
+
+    /// A frame's tick on the owner, not waited for: motion sampled at this
+    /// frame lands with the next main-queue turn (LLP 1072 §7.1).
+    func sendTick(now: Double, frame: Double? = nil) {
+        tickInFlight = true
+        let captured = generation
+        runtime.tickAsync(now: now, frame: frame, capture: frameHealth.captureID, measureFrame: frameHealth.enabled && clock == nil) { [weak self] batch in self?.publish(.tick, batch, captured) }
     }
 }

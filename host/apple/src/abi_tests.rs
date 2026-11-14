@@ -4,6 +4,13 @@ use exact_plan::{TypeKind, Value};
 use exact_runner::{Answer, DataError, Store};
 use std::sync::{Arc, Mutex};
 
+#[path = "abi_entry_tests.rs"]
+mod entries;
+#[path = "abi_longpoll_tests.rs"]
+mod long_poll;
+#[cfg(unix)]
+#[path = "abi_native_settle_tests.rs"]
+mod native_settle;
 #[path = "abi_refusal_tests.rs"]
 mod refusals;
 
@@ -23,6 +30,36 @@ fn plan(resource: Option<&str>) -> Vec<u8> {
         None,
     );
     builder.finish().unwrap().encode()
+}
+
+#[test]
+fn plan_covers_viewport_reads_only_the_first_roots_literal_without_booting() {
+    let mut bridge = Bridge::<StorageModule>::new();
+    for (source, covers) in [
+        (
+            "component App\n  view\n    main viewport-fit=\"cover\"\n",
+            true,
+        ),
+        (
+            "component App\n  view\n    main\n      column viewport-fit=\"cover\"\n",
+            false,
+        ),
+        (
+            "component App\n  view\n    main viewport-fit=\"auto\"\n",
+            false,
+        ),
+        (
+            "component App\n  state fit = \"cover\"\n  view\n    main viewport-fit=fit\n",
+            false,
+        ),
+    ] {
+        let plan = contract::compile(source).unwrap().encode();
+        let len = bridge.input_write(&plan);
+        assert_eq!(bridge.plan_covers_viewport(len, &[]), covers, "{source}");
+        assert!(bridge.host.is_none());
+    }
+    assert!(!bridge.plan_covers_viewport(usize::MAX, &[]));
+    assert!(!bridge.plan_covers_viewport(0, b"invalid"));
 }
 
 #[test]
@@ -53,11 +90,19 @@ fn the_launch_place_is_the_last_valid_one_told() {
     let mut bridge = Bridge::<StorageModule>::new();
     let told = |bridge: &mut Bridge<StorageModule>, text: &str| {
         bridge.input_write(text.as_bytes());
-        bridge.set_launch_place(text.len());
+        bridge.set_launch_place(text.len())
     };
-    told(&mut bridge, "fr-FR\0Europe/Paris\x007");
-    told(&mut bridge, "\0Europe/Paris\x007");
-    told(&mut bridge, "de-DE\0Europe/Berlin");
+    assert_eq!(told(&mut bridge, "fr-FR\0Europe/Paris\x007"), 0);
+    for invalid in [
+        "\0Europe/Paris\x007",
+        "de-DE\0Europe/Berlin",
+        "en-US\0UTC\x004294967296",
+    ] {
+        assert!(told(&mut bridge, invalid) > 0);
+        assert!(std::str::from_utf8(&bridge.output)
+            .unwrap()
+            .contains("invalid launch place"));
+    }
     let place = bridge.launch_facts.place.clone().unwrap();
     assert_eq!(
         (place.locale.as_str(), place.time_zone.as_str(), place.seed),
@@ -131,12 +176,12 @@ fn plan_and_module_reloads_keep_the_document_owner() {
                     exact_data::documents::Resolved::Real {
                         directory,
                         path,
-                        selected_file: true,
-                    } => DocumentLease::selected_file(directory, path, guard),
+                        selected_file: Some(name),
+                    } => DocumentLease::selected_file_named(directory, path, name, guard),
                     exact_data::documents::Resolved::Real {
                         directory,
                         path,
-                        selected_file: false,
+                        selected_file: None,
                     } => DocumentLease::directory(directory, path, guard),
                 }
             }),
@@ -278,9 +323,29 @@ fn pending_native_preparation_keeps_the_running_app_and_carries_later_input() {
         844.0,
     );
     assert!(bridge.prepared.is_some());
+    let kernel = bridge.host.as_ref().unwrap().runner().kernel();
+    let button = kernel
+        .node_by_key(kernel.find_by_test_id("increment")[0])
+        .unwrap()
+        .id;
+    bridge.dispatch(button, 0, 0, 0.0);
+    let latest = bridge.host.as_ref().unwrap().carry();
+    assert_ne!(latest.slots, carried.slots);
+    let length = bridge.commit_plan();
+    let batch = String::from_utf8_lossy(bridge.output_bytes(length as usize));
+    assert!(batch.contains("\"pending\":true"), "{batch}");
+    assert_eq!(bridge.host.as_ref().unwrap().carry().slots, latest.slots);
+    bridge.input_write(&bytes);
+    bridge.prepare_module(
+        [bytes.len(), 0, 0],
+        source.clone(),
+        Hooks::none(),
+        390.0,
+        844.0,
+    );
     bridge.commit_plan();
-    assert_eq!(bridge.host.as_ref().unwrap().carry().slots, carried.slots);
-    assert_eq!(*source.calls.lock().unwrap(), ["validate"]);
+    assert_eq!(bridge.host.as_ref().unwrap().carry().slots, latest.slots);
+    assert_eq!(*source.calls.lock().unwrap(), ["validate", "validate"]);
 }
 
 #[test]

@@ -147,15 +147,13 @@ async function compile() {
   // Generated output is not a captured input. Remove it before resolution,
   // so an app's ./app.js import follows the same TS substitution as one-shot.
   rmSync(resolve(stage,'app.js'),{force:true});
-  const { configure, check, assertCapturedModule, ambientRefusals, packageImports } = await import(resolve(stage,'__exact_config.mjs'));
+  const { configure, check, dataBundle } = await import(resolve(stage,'__exact_config.mjs'));
   configure(stage, true, parseSync);
   const checking=check(stage,tsc,libraries).then(()=>null,error=>error);
   let failed;
   try {
-  const bundle=await rolldown({cwd:stage,input:resolve(stage,'__exact_entry.ts'),platform:'neutral',
-    tsconfig:config,
-    plugins:[{name:'captured-sources',resolveId:packageImports(stage),load(id){assertCapturedModule(stage,id);return null;},
-      transform(code,id){const why=ambientRefusals(stage,id,code,(c,o)=>this.parse(c,o));if(why.length)throw new Error(why.join('\n'));return null;}}]});
+  const bundle=await rolldown({...dataBundle(stage),cwd:stage,input:resolve(stage,'__exact_entry.ts'),
+    tsconfig:config});
   try { await bundle.write({file:resolve(stage,'app.js'),format:'iife',name:'exact'}); }
   finally { await bundle.close(); }
   process.stdout.write('{"phase":"bundled"}\n');
@@ -175,6 +173,45 @@ for await(const line of createInterface({input:process.stdin,crlfDelay:Infinity}
 /// captured configuration; the producer still owns the stage.
 pub(super) const CONFIG: &str = include_str!("typescript.mjs");
 
+/// The module binding's generator, which `CONFIG` imports from beside it.
+pub(super) const BINDING: &str = include_str!("__exact_binding.mjs");
+
+/// The settings' reader (`import.meta.env`), which `CONFIG` imports from beside it.
+pub(super) const ENV: &str = include_str!("__exact_env.mjs");
+
+/// The target a module binding answers `supports` for (LLP 1133.006 D7), as
+/// an implementation's `targets` names it: Cargo's `CARGO_CFG_TARGET_OS` in
+/// an app's build script, else the OS of `TARGET`'s triple, which is all a
+/// bake run outside Cargo (`exact-js-bake --cargo`) is told. None where
+/// neither says, as in a development loop that serves several targets.
+pub(super) fn binding_target() -> Option<String> {
+    let os = std::env::var("CARGO_CFG_TARGET_OS").ok();
+    os.or_else(|| target_os(&std::env::var("TARGET").ok()?).map(str::to_owned))
+}
+
+/// The OS of a Rust target triple, in Cargo's `target_os` words, for the
+/// targets an implementation names.
+fn target_os(triple: &str) -> Option<&'static str> {
+    [
+        ("-apple-tvos", "tvos"),
+        ("-apple-ios", "ios"),
+        ("-apple-darwin", "macos"),
+        ("-android", "android"),
+        ("-windows", "windows"),
+        ("-linux", "linux"),
+    ]
+    .into_iter()
+    .find(|(part, _)| triple.contains(part))
+    .map(|(_, os)| os)
+}
+
+/// `CONFIG` and the modules it imports written into `stage`, each only when changed.
+pub(super) fn write_config(stage: &Path) -> Result<(), String> {
+    super::write_changed(&stage.join("__exact_config.mjs"), CONFIG.as_bytes())?;
+    super::write_changed(&stage.join("__exact_binding.mjs"), BINDING.as_bytes())?;
+    super::write_changed(&stage.join("__exact_env.mjs"), ENV.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +226,8 @@ mod tests {
         write("lib/word.ts", "export const word = 'mapped';");
         write("__exact_entry.ts", "export { word } from '@/word';");
         write("__exact_config.mjs", CONFIG);
+        write("__exact_binding.mjs", BINDING);
+        write("__exact_env.mjs", ENV);
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut compiler = Compiler::new(&root, &stage.0).unwrap();
         let tools = Tools::default();
@@ -277,12 +316,22 @@ mod tests {
         std::fs::create_dir(stage.0.join(".exact")).unwrap();
         write(".exact/backend-origin", "http://127.0.0.1:4412");
         assert!(resident().unwrap().contains("4412"));
+        let warning = || {
+            serde_json::from_str::<Option<String>>(
+                &std::fs::read_to_string(stage.0.join("__exact_backend_warning.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(warning()
+            .unwrap()
+            .contains("overriding the app.ts origin literal"));
         compile_once(&stage.0, &tools).unwrap();
         assert!(std::fs::read_to_string(stage.0.join("app.js"))
             .unwrap()
             .contains("4412"));
         std::fs::remove_file(stage.0.join(".exact/backend-origin")).unwrap();
         assert!(resident().unwrap().contains("4400"));
+        assert_eq!(warning(), None);
         compile_once(&stage.0, &tools).unwrap();
         assert!(std::fs::read_to_string(stage.0.join("app.js"))
             .unwrap()

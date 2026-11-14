@@ -25,8 +25,12 @@ fn main() {
         "src/shim.cc",
         "src/pure.js",
         "src/standard.js",
+        "src/binary.js",
         "src/prelude.js",
+        "src/process.js",
         "src/intl.js",
+        "tests/fixtures/harden-probe.js",
+        "../packages/oauth/index.ts",
     ] {
         println!("cargo:rerun-if-changed={source}");
     }
@@ -59,6 +63,10 @@ fn main() {
         shim.flag("-isysroot")
             .flag(String::from_utf8(sdk.stdout).expect("SDK path").trim());
     }
+    // The shim is compiled against ibex2's headers: a vendored Ibex bump
+    // that changes a struct the shim fills (`InstallOptions`) must compile
+    // it again, or ibex2 reads the new layout from the old one's bytes.
+    println!("cargo:rerun-if-changed={}", ibex.join("include").display());
     shim.cpp(true)
         .file("src/shim.cc")
         .include(ibex.join("include"))
@@ -75,9 +83,16 @@ fn main() {
     shim.compile("exact_js_shim");
     println!("cargo:rustc-cfg=exact_js_engine");
 
+    // The bake's flags (`compile_bytecode`, js/bake/src/lib.rs).
     let compile = |script: &Path, bytecode: &Path| {
         let status = Command::new(&hermesc)
-            .args(["-O", "-emit-async-break-check", "-emit-binary", "-out"])
+            .args([
+                "-O",
+                "-emit-async-break-check",
+                "-Xes6-block-scoping",
+                "-emit-binary",
+                "-out",
+            ])
             .arg(bytecode)
             .arg(script)
             .status()
@@ -95,7 +110,9 @@ fn main() {
     let prelude = [
         "src/pure.js",
         "src/standard.js",
+        "src/binary.js",
         "src/prelude.js",
+        "src/process.js",
         "src/intl.js",
     ]
     .iter()
@@ -104,6 +121,14 @@ fn main() {
     .join("\n");
     let prelude = if target_os == "windows" {
         "globalThis.__exact_windows_storage = true;\n".to_owned() + &prelude
+    } else {
+        prelude
+    };
+    // The hosts that start programs for data code (LLP 1133.007 §8):
+    // `js/src/process.js` binds `@exact/child-process` to them, and every
+    // other target answers NotSupportedError.
+    let prelude = if matches!(target_os.as_str(), "macos" | "linux") {
+        format!("globalThis.__exact_process_host = \"{target_os}\";\n{prelude}")
     } else {
         prelude
     };
@@ -119,6 +144,26 @@ fn main() {
     let leaked_path = out.join("prelude-with-abort-hook.js");
     std::fs::write(&leaked_path, leaked_abort_hooks).expect("write abort-hook fixture prelude");
     compile(&leaked_path, &out.join("prelude-with-abort-hook.hbc"));
+    // The hooks published behind a Proxy whose `get` trap hides them: only a
+    // descriptor read finds them.
+    let hidden_abort_hooks = prelude.replacen(
+        "  delete global.__exact_ibex2_abort_hooks;\n",
+        "  global.__exact_hidden_hooks = new Proxy({ hooks: global.__exact_ibex2_abort_hooks }, { get: function () { return undefined; } });\n  delete global.__exact_ibex2_abort_hooks;\n",
+        1,
+    );
+    let hidden_path = out.join("prelude-with-hidden-abort-hook.js");
+    std::fs::write(&hidden_path, hidden_abort_hooks)
+        .expect("write hidden abort-hook fixture prelude");
+    compile(
+        &hidden_path,
+        &out.join("prelude-with-hidden-abort-hook.hbc"),
+    );
+    let probe = std::fs::read_to_string(manifest.join("tests/fixtures/harden-probe.js"))
+        .expect("harden probe fixture");
+    let probe_path = out.join("prelude-with-harden-probe.js");
+    std::fs::write(&probe_path, prelude.clone() + "\n" + &probe)
+        .expect("write harden probe prelude");
+    compile(&probe_path, &out.join("prelude-with-harden-probe.hbc"));
 
     let rolldown = env::var("EXACT_ROLLDOWN")
         .map(PathBuf::from)
@@ -128,6 +173,10 @@ fn main() {
         "exact-js: rolldown not found at {} (run `bun install`, or set EXACT_ROLLDOWN)",
         rolldown.display()
     );
+    // The fixtures bundle as an app's data module does: `async` lowered and
+    // stepped by the answer-context helper (LLP 1133.002 D14).
+    let bake = manifest.join("bake/src/typescript.mjs");
+    println!("cargo:rerun-if-changed={}", bake.display());
     for name in [
         "caltrain",
         "castle",
@@ -140,11 +189,39 @@ fn main() {
         "spin",
         "shared-load",
         "overlay",
+        "overlay-none",
+        "overlay-some",
+        "overlay-odd",
+        "overlay-throws",
+        "overlay-getter",
         "socket",
+        "listen",
+        "process",
+        "heap",
+        "snapshot",
+        "context",
+        "walk",
+        "presence",
+        "timers",
+        "outlive",
+        "kept-json",
     ] {
         let source = manifest.join(format!("tests/fixtures/{name}.ts"));
         println!("cargo:rerun-if-changed={}", source.display());
         let script = out.join(format!("{name}.js"));
+        let config = out.join(format!("{name}.bundle.mjs"));
+        std::fs::write(
+            &config,
+            format!(
+                "import {{ asyncContext, bundleOptions, lowered }} from {:?};\n\
+                 export default {{ input: {:?}, output: {{ format: 'iife', file: {:?} }},\n\
+                 transform: {{ ...bundleOptions.transform, ...lowered }}, plugins: [asyncContext()] }};\n",
+                bake.to_str().expect("a UTF-8 path"),
+                source.to_str().expect("a UTF-8 path"),
+                script.to_str().expect("a UTF-8 path"),
+            ),
+        )
+        .expect("write the fixture bundle config");
         let mut header = [0; 128];
         let len = std::fs::File::open(&rolldown)
             .and_then(|mut file| file.read(&mut header))
@@ -164,9 +241,9 @@ fn main() {
             Command::new(&rolldown)
         };
         let status = bundler
-            .arg(&source)
-            .args(["--format", "iife", "--file"])
-            .arg(&script)
+            .arg("--config")
+            .arg(&config)
+            .args(["--configLoader", "native"])
             .status()
             .unwrap_or_else(|error| panic!("exact-js: cannot run {}: {error}", rolldown.display()));
         assert!(

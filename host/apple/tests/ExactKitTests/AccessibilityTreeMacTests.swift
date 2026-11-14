@@ -18,6 +18,26 @@ private extension NSView {
 final class AccessibilityTreeMacTests: XCTestCase {
     private var window: NSWindow!
 
+    func testToggleButtonsReportFalseTrueAndMixedFromThePlatform() throws {
+        let p = try fixture()
+        for value in ["false", "true", "mixed"] {
+            p.apply(wireBatch([["op": "props", "id": 2, "set": ["accessibilityPressed": value]]]))
+            p.syncAccessibility()
+            let ax = p.axElements(roots: [p.viewport])
+            let button = try XCTUnwrap(elements(ax).first { $0["testId"] as? String == "named" })
+            XCTAssertEqual(button["role"] as? String, "button")
+            let states = try XCTUnwrap(button["states"] as? [String: Any])
+            if value == "mixed" { XCTAssertEqual(states["pressed"] as? String, "mixed") }
+            else { XCTAssertEqual(states["pressed"] as? Bool, value == "true") }
+            XCTAssertNil(states["checked"])
+            XCTAssertTrue((ax["observes"] as? [String] ?? []).contains("pressed"))
+        }
+        p.apply(wireBatch([["op": "props", "id": 2, "clear": ["accessibilityPressed"]]]))
+        let ax = p.axElements(roots: [p.viewport])
+        let button = try XCTUnwrap(elements(ax).first { $0["testId"] as? String == "named" })
+        XCTAssertNil((button["states"] as? [String: Any])?["pressed"])
+    }
+
     /// `painted`: a dialog and a popover in the page's top layer, the
     /// driver's own chrome, which is what the page's own projection of a
     /// modal is about; the last case here holds a dialog in AppKit's sheet.
@@ -43,7 +63,54 @@ final class AccessibilityTreeMacTests: XCTestCase {
     }
     private func elements(_ ax: [String: Any]) -> [[String: Any]] { ax["elements"] as? [[String: Any]] ?? [] }
 
+    /// A native control is named by `aria-labelledby` as by `aria-label`
+    /// (accname), and follows the text it names.
+    func testANativeCheckboxIsNamedByTheTextItsLabelledbyNames() throws {
+        let p = try fixture()
+        p.apply(wireBatch([
+            ["op": "create", "id": 20, "kind": "control", "props": ["type": "checkbox", "accessibilityLabelledBy": "notify"], "handlers": ["change"]],
+            ["op": "create", "id": 21, "kind": "text", "props": ["id": "notify", "text": "Notify me"]],
+            ["op": "children", "id": 1, "ids": [2, 3, 20, 21]],
+            ["op": "frame", "id": 20, "x": 110.0, "y": 0.0, "w": 22.0, "h": 22.0],
+            ["op": "frame", "id": 21, "x": 140.0, "y": 0.0, "w": 100.0, "h": 22.0],
+        ]))
+        let control = try XCTUnwrap(p.controls.controls[20])
+        XCTAssertEqual(control.accessibilityLabel(), "Notify me")
+        p.apply(wireBatch([["op": "props", "id": 21, "set": ["text": "Email me"]]]))
+        XCTAssertEqual(control.accessibilityLabel(), "Email me")
+    }
+
+    func testViewportWalkOmitsHiddenAndInertSubtreesAndNamesRestoredCells() throws {
+        let p = try fixture()
+        p.apply(wireBatch([
+            ["op": "create", "id": 20, "kind": "view", "props": ["accessibilityElementsHidden": "true"]],
+            ["op": "create", "id": 21, "kind": "control", "props": ["type": "checkbox", "accessibilityLabel": "Hidden checkbox", "testId": "hidden-check"], "handlers": ["change"]],
+            ["op": "create", "id": 22, "kind": "view", "props": ["inert": "true"]],
+            ["op": "create", "id": 23, "kind": "input", "props": ["type": "password", "accessibilityLabel": "Password", "testId": "inert-password"]],
+            ["op": "children", "id": 20, "ids": [21]],
+            ["op": "children", "id": 22, "ids": [23]],
+            ["op": "children", "id": 1, "ids": [2, 3, 20, 22]],
+            ["op": "frame", "id": 20, "x": 0, "y": 100, "w": 200, "h": 40],
+            ["op": "frame", "id": 21, "x": 0, "y": 0, "w": 100, "h": 30],
+            ["op": "frame", "id": 22, "x": 0, "y": 150, "w": 200, "h": 40],
+            ["op": "frame", "id": 23, "x": 0, "y": 0, "w": 100, "h": 30],
+        ]))
+        func named(_ name: String) -> [String: Any]? {
+            elements(p.axElements(roots: [p.viewport])).first { $0["testId"] as? String == name }
+        }
+        XCTAssertNil(named("hidden-check"))
+        XCTAssertNil(named("inert-password"))
+        p.apply(wireBatch([
+            ["op": "props", "id": 20, "clear": ["accessibilityElementsHidden"]],
+            ["op": "props", "id": 22, "clear": ["inert"]],
+        ]))
+        XCTAssertEqual(named("hidden-check")?["name"] as? String, "Hidden checkbox")
+        XCTAssertEqual(named("inert-password")?["name"] as? String, "Password")
+    }
+
     /// From `start` (a view, or an element such as a field's cell) up to the viewport, each parent serves its child.
+    /// A dialog's web area (`DialogWebArea`) is its parent and serves it, and is served by no one: the
+    /// view above serves the dialog in its place.
     private func assertModalParentChain(_ start: Any, presenter p: Presenter, file: StaticString = #filePath, line: UInt = #line) throws {
         var child = start as AnyObject
         var visited: Set<ObjectIdentifier> = []
@@ -51,9 +118,17 @@ final class AccessibilityTreeMacTests: XCTestCase {
             guard visited.insert(ObjectIdentifier(child)).inserted else { return XCTFail("parent cycle", file: file, line: line) }
             guard visited.count < 20 else { return XCTFail("parent chain never reaches viewport", file: file, line: line) }
             let element = try XCTUnwrap(child as? NSAccessibilityProtocol, file: file, line: line)
-            let parent = try XCTUnwrap(element.accessibilityParent() as? NSView, file: file, line: line)
+            var served = child
+            if let area = element.accessibilityParent() as? DialogWebArea {
+                XCTAssertTrue((area.accessibilityChildren() ?? []).count == 1 && area.accessibilityChildren()?.first as AnyObject === child, "the web area serves the dialog alone", file: file, line: line)
+                XCTAssertTrue((child as? NSObject)?.accessibilityAttributeValue(.parent) as AnyObject === area, "legacy AXParent agrees", file: file, line: line)
+                served = area
+            }
+            let parent = try XCTUnwrap((served as? NSAccessibilityProtocol)?.accessibilityParent() as? NSView, file: file, line: line)
             XCTAssertTrue((parent.accessibilityChildren() ?? []).contains { ($0 as AnyObject) === child }, "AXParent points back through AXChildren", file: file, line: line)
-            XCTAssertTrue(((child as? NSObject)?.accessibilityAttributeValue(.parent) as? NSView) === parent, "legacy AXParent agrees", file: file, line: line)
+            if served === child {
+                XCTAssertTrue(((child as? NSObject)?.accessibilityAttributeValue(.parent) as? NSView) === parent, "legacy AXParent agrees", file: file, line: line)
+            }
             XCTAssertFalse(elements(p.axElements(roots: [parent])).contains { $0["testId"] as? String == "named" }, "moving to a container cannot reach Play", file: file, line: line)
             child = parent
         }
@@ -216,7 +291,7 @@ final class AccessibilityTreeMacTests: XCTestCase {
         let unmodal = p.axElements(roots: [p.viewport])
         XCTAssertEqual((unmodal["modal"] as? [String: Any])?["present"] as? Bool, false)
         XCTAssertTrue(elements(unmodal).contains { $0["testId"] as? String == "named" })
-        XCTAssertTrue((p.views[10]?.accessibilityParent() as? NSView) === p.views[1], "clearing modality restores the authored parent")
+        XCTAssertTrue(((p.views[10]?.accessibilityParent() as? DialogWebArea)?.accessibilityParent() as? NSView) === p.views[1], "clearing modality restores the authored parent")
 
         p.dialogs.show(try XCTUnwrap(p.views[10]))
         let shown = p.axElements(roots: [p.viewport])
@@ -250,13 +325,14 @@ final class AccessibilityTreeMacTests: XCTestCase {
         NSView.hiddenGetterCalls = 0
         let children = p.viewport.accessibilityChildren() as? [NSView]
         let contents = p.viewport.accessibilityAttributeValue(.contents) as? [NSView]
-        let parent = dialog.accessibilityAttributeValue(.parent) as? NSView
+        let area = dialog.accessibilityAttributeValue(.parent) as? DialogWebArea
+        let parent = area?.accessibilityParent() as? NSView
         _ = ok.accessibilityParent()
         method_exchangeImplementations(getter, counting)
         XCTAssertEqual(NSView.hiddenGetterCalls, 0, "serving AXChildren, AXContents and AXParent calls no isAccessibilityHidden()")
         XCTAssertTrue(children?.count == 1 && children?.first === dialog, "the viewport's child is exactly the modal")
         XCTAssertTrue(contents?.count == 1 && contents?.first === dialog)
-        XCTAssertTrue(parent === p.viewport)
+        XCTAssertTrue(parent === p.viewport, "the dialog's web area is the viewport's")
         wrapper.setAccessibilityHidden(true)
         XCTAssertNil(p.macAccessibilityModal, "an ancestor the host hid from accessibility still hides the modal")
         wrapper.setAccessibilityHidden(false)
@@ -513,6 +589,44 @@ final class AccessibilityTreeMacTests: XCTestCase {
         XCTAssertEqual([ring["role"] as? String, ring["name"] as? String], ["image", "33% done"])
         let sound = try one("sound")
         XCTAssertEqual([sound["role"] as? String, (sound["states"] as? [String: Any])?["checked"] as? Bool], ["switch", true] as [AnyHashable?])
+    }
+
+    func testFormStateWritesFollowPropsAndInheritedAvailability() throws {
+        let p = try fixture()
+        p.apply(wireBatch([
+            ["op": "create", "id": 20, "kind": "view", "props": ["accessibilityHint": "Help", "accessibilityRequired": "true"]],
+            ["op": "create", "id": 21, "kind": "view", "props": ["accessibilityDisabled": "true"]],
+            ["op": "create", "id": 22, "kind": "view", "props": ["title": "Tip"]],
+            ["op": "children", "id": 1, "ids": [20, 21, 22]],
+        ]))
+        let titled = try XCTUnwrap(p.views[22])
+        XCTAssertTrue(titled.isAccessibilityEnabled(), "a new NSView's default must be explicitly enabled")
+        XCTAssertEqual(titled.toolTip, "Tip")
+        XCTAssertNil(titled.accessibilityHelp(), "a tooltip must not replace the authored accessibility description")
+        p.apply(wireBatch([["op": "props", "id": 22, "set": ["title": "New tip"]]]))
+        XCTAssertNil(titled.accessibilityHelp())
+        let node = try XCTUnwrap(p.views[20])
+        XCTAssertEqual(node.accessibilityHelp(), "Help")
+        XCTAssertTrue(node.isAccessibilityRequired())
+        XCTAssertTrue(node.isAccessibilityEnabled())
+        p.apply(wireBatch([["op": "props", "id": 20, "set": ["testId": "described"]]]))
+        XCTAssertEqual(node.accessibilityHelp(), "Help", "unrelated props keep the form states")
+        XCTAssertTrue(node.isAccessibilityRequired())
+        p.apply(wireBatch([
+            ["op": "children", "id": 1, "ids": [21]],
+            ["op": "children", "id": 21, "ids": [20]],
+        ]))
+        XCTAssertFalse(node.isAccessibilityEnabled(), "aria-disabled is inherited after reparenting")
+        p.apply(wireBatch([
+            ["op": "props", "id": 21, "clear": ["accessibilityDisabled"]],
+            ["op": "props", "id": 20, "clear": ["accessibilityHint", "accessibilityRequired"]],
+        ]))
+        XCTAssertTrue(node.isAccessibilityEnabled())
+        XCTAssertNil(node.accessibilityHelp())
+        XCTAssertFalse(node.isAccessibilityRequired())
+        p.apply(wireBatch([["op": "props", "id": 20, "set": ["accessibilityHint": "Again", "accessibilityRequired": "true"]]]))
+        XCTAssertEqual(node.accessibilityHelp(), "Again")
+        XCTAssertTrue(node.isAccessibilityRequired())
     }
 
     /// Onboarding F22, spreadsheet F20: a field's `aria-describedby` text is

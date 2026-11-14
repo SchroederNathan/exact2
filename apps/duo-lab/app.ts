@@ -100,5 +100,13 @@ const sources: Sources = {
   imageRows: () => imageRows(),
   document: () => document(),
   feed: () => feed(),
+  keyboardRows: (): { id: number }[] => Array.from({ length: 40 }, (_, id): { id: number } => ({ id })),
+  arrangementSupport: (): { available: boolean } => ({ available: false }),
 };
-export const answer: Answer = (source, args, store, storage) => sources[source](args, store, storage);
+export const answer: Answer = (source, args, store, storage, native): ReturnType<Answer> => {
+  if (source === 'arrangementSupport' && native?.available) {
+    try { return native.call({ op: 'arrangementSupport' }) as { available: boolean }; }
+    catch { return { available: false }; }
+  }
+  return sources[source](args, store, storage);
+};

@@ -2,7 +2,12 @@ use crate::{bin, Actions, Data, DataError, Event, Input, InputEvent, Value, Vec2
 use crate::{Args, ArgumentKind, PointerPhase};
 use std::{collections::VecDeque, marker::PhantomData};
 
+mod assets;
+mod diagnostics;
+mod origin;
+mod pads;
 mod paranoid;
+mod queue;
 mod snapshot;
 
 /// One immutable simulation instant; Copy keeps world borrows short in game code.
@@ -21,6 +26,14 @@ impl Now {
 }
 /// A stateless game; components and resources hold every bit of simulation state.
 pub trait Game: 'static {
+    /// Scene sampling, fixed for the GPU renderer's lifetime.
+    const SAMPLES: crate::SceneSamples = crate::SceneSamples::Four;
+    /// Camera depth before colour, for opaque overdraw. Requires one scene sample.
+    const DEPTH_PREPASS: bool = false;
+    /// Diffuse-only model lighting: Lambert sun/local lights and environment irradiance.
+    /// Keeps shadows, textures, emission, fog and rim; ignores metallic/specular response.
+    /// Fixed for the renderer's lifetime; primitive and custom materials are unaffected.
+    const MATTE_MODELS: bool = false;
     /// Surface name in Contract.
     const NAME: &'static str = "world";
     /// Stable save identity, independent of the shared surface name.
@@ -34,14 +47,45 @@ pub trait Game: 'static {
     const STREAMED: &'static [&'static str] = &[];
     /// One typed JSON value required before setup; declares its own asset name.
     const LEVEL: Option<crate::asset::Level> = None;
+    /// Complete tuning records, delivered before setup and mutable at tick boundaries.
+    const TABLES: &'static [crate::asset::Table] = &[];
     /// Canvas argument declarations in positional order; also declares exact arity.
     type Args: Args;
+    /// Presented world raster relative to device pixels; does not change layout.
+    /// Finite (0, 1]; the compositor scales to the canvas box. The default,
+    /// [`AUTO_RENDER_SCALE`](crate::AUTO_RENDER_SCALE), leaves it to the quality
+    /// ladder (full size on `High`); any value returned here, 1 included, stands
+    /// on every rung.
+    fn render_scale(_args: &Self::Args) -> f32 {
+        crate::AUTO_RENDER_SCALE
+    }
+    /// The renderer's rung of the quality ladder, read once, from the first
+    /// arguments the canvas binds, before the renderer is made:
+    /// [`Quality::Auto`](crate::Quality::Auto) follows the device's GPU tier.
+    /// A later value takes effect when the canvas is made again (unmounted and
+    /// mounted); under the agent, `prefer gpu-tier` remakes the renderer.
+    fn quality(_args: &Self::Args) -> crate::Quality {
+        crate::Quality::Auto
+    }
     /// Discoverable controls.
     fn actions() -> Actions {
         Actions::default()
     }
+    /// The player's stored bindings (`Bindings::parse`'s text), copied into the
+    /// `Bindings` resource when a new game starts. Bind a `#[live]` argument
+    /// from app storage here, so a changed preference never restarts the game.
+    fn bindings(_args: &Self::Args) -> String {
+        String::new()
+    }
     /// Refuse domain-invalid arguments before any simulation mutation.
     fn validate(_args: &Self::Args) -> Result<(), String> {
+        Ok(())
+    }
+    /// Accept or refuse a decoded save before it replaces the running world. A
+    /// game whose saved shape changed under the same `ID` names the difference
+    /// here (a save-contract resource it inserts in setup and checks), so an
+    /// older save is refused by name instead of failing on a later tick.
+    fn restorable(_saved: &World) -> Result<(), String> {
         Ok(())
     }
     /// Register types that vary with setup arguments, without gameplay side effects.
@@ -85,7 +129,7 @@ struct Queued {
     world_us: Option<i64>,
     event: InputEvent,
 }
-#[derive(Default, Data)]
+#[derive(Default)]
 struct Saved {
     game: String,
     world: Vec<u8>,
@@ -97,6 +141,8 @@ struct Saved {
     journal_next: u64,
     overflow_logged: bool,
     published: std::collections::BTreeMap<String, crate::values::Stored>,
+    // The least privileged origin posted into the world, 0 for the app's (`origin.rs`).
+    origin: u8,
 }
 // Host-only phase: one tick is 1_000_000 units. Only the bounded remainder is
 // floating point; neither elapsed world time nor the slew grows in an f64.
@@ -174,12 +220,18 @@ pub struct Sim<G: Game> {
     // The last tick's pointer motion, for presentation between ticks only.
     last_motion: crate::Vec2,
     paranoid: Option<fn(&mut Self)>,
+    pub(crate) paranoid_mode: Paranoid,
+    pub(crate) paranoid_checked: u64,
     // A paranoid sample deferred while a shown asset was in flight: the next
     // tick takes it. Skipped samples are counted for the proof's report.
     paranoid_owed: bool,
     paranoid_skipped: u64,
     // An edit through world_mut since the last present: the next advance presents.
     present_owed: bool,
+    pub(crate) development_edits: bool,
+    pub(crate) edits_admitted: bool,
+    // The least privileged origin posted since the fresh start (`origin.rs`).
+    origin: u8,
     game: PhantomData<G>,
 }
 const QUEUE_LIMIT: usize = 1024;
@@ -197,39 +249,11 @@ impl<G: Game> Sim<G> {
         sim.load_assets(loader).map_err(|e| e.to_string())?;
         Ok(sim)
     }
-    /// Assert a test hash against the game's single pins.json (included by its test).
-    /// Unknown metadata fields are skipped by Data; no generated Rust is needed.
-    pub fn assert_pin(&self, pins: &str) {
-        let (game, tick, got) = (G::ID, self.world.tick(), self.world.hash());
-        #[derive(Default, crate::Data)]
-        struct Pins {
-            game: String,
-            ticks: std::collections::BTreeMap<String, String>,
-        }
-        let pins: Pins = crate::json::from_str(pins).unwrap_or_else(|error| {
-            panic!("pins.json game <invalid>, expected `{game}`: {error}; run bun game/prove.mjs {game}")
-        });
-        assert!(
-            pins.game == game,
-            "pins.json game `{}`, expected `{game}`; run bun game/prove.mjs {game}",
-            if pins.game.is_empty() {
-                "<missing>"
-            } else {
-                &pins.game
-            }
-        );
-        let expected = pins
-            .ticks
-            .get(&tick.to_string())
-            .unwrap_or_else(|| panic!("pin {tick} missing; run bun game/prove.mjs {game}"));
-        let got = format!("0x{got:016x}");
-        assert!(expected == &got,
-            "pin {tick} differs (expected {expected}, got {got}); if the change is intended: bun game/prove.mjs {game} --repin");
-    }
-
     /// Override EXACT_GAME_PARANOID for this simulation.
     pub fn paranoid(mut self, mode: Paranoid) -> Self {
         self.paranoid = Self::reconstruction(mode);
+        self.paranoid_mode = mode;
+        self.paranoid_checked = 0;
         self
     }
 
@@ -252,12 +276,15 @@ impl<G: Game> Sim<G> {
             .map(|((name, _), value)| (*name, value))
             .collect();
         G::register(world, &fields);
+        if !G::TABLES.is_empty() {
+            world.register_resource::<crate::asset::table::TableValues>();
+        }
     }
     fn build(args: &G::Args, assets: crate::asset::AssetStore) -> World {
         let mut world = World::new(G::HZ, 0);
         world.assets = assets;
         world.assets.restart_generated();
-        if !G::ASSETS.is_empty() || G::LEVEL.is_some() {
+        if !G::ASSETS.is_empty() || G::LEVEL.is_some() || !G::TABLES.is_empty() {
             for name in crate::asset::level::names::<G>() {
                 if !world.assets.declared.contains(name) {
                     world.assets.declared.insert(name.into());
@@ -274,6 +301,11 @@ impl<G: Game> Sim<G> {
             return world;
         }
         Self::register(&mut world, args);
+        world.setup_tables();
+        let bindings = G::bindings(args);
+        if !bindings.trim().is_empty() {
+            crate::input::seed(&mut world, &G::actions(), &bindings);
+        }
         G::setup(&mut world, args);
         if let Some(name) = world.presentation_written() {
             panic!("Game::setup wrote presentation component `{name}`; write presentation state in Game::present, which runs right after setup");
@@ -316,295 +348,6 @@ impl<G: Game> Sim<G> {
     pub fn paranoid_samples(&self) -> Option<(u64, bool)> {
         self.paranoid
             .map(|_| (self.paranoid_skipped, self.paranoid_owed))
-    }
-    /// Whether setup is waiting for declared model bytes.
-    pub fn is_loading(&self) -> bool {
-        self.setup_pending
-    }
-    /// Drain first-sight model requests. Nondeclared meshes may pop in after tick zero.
-    pub fn take_assets(&mut self) -> Vec<String> {
-        if self.setup_pending && !self.assets_pending() {
-            return Vec::new();
-        }
-        for name in G::STREAMED {
-            self.world.assets.request(name);
-        }
-        let revision = self.world.revision::<crate::Mesh>();
-        let sprites_changed =
-            crate::sprite::texture_names_changed(&self.world, &mut self.asset_sprite_names);
-        if revision != self.asset_mesh_revision || sprites_changed {
-            let names: Vec<_> = self
-                .world
-                .query::<&crate::Mesh>()
-                .iter()
-                .filter_map(|(_, mesh)| {
-                    if let crate::Mesh::Asset(name) = mesh {
-                        Some((name.clone(), ".model"))
-                    } else {
-                        None
-                    }
-                })
-                .chain(
-                    self.world
-                        .query::<&crate::Sprite>()
-                        .iter()
-                        .map(|(_, s)| (s.texture.clone(), ".tex")),
-                )
-                .collect();
-            let mut roots: std::collections::BTreeSet<_> =
-                names.iter().map(|(n, _)| n.clone()).collect();
-            // Declared and streamed assets stay resident: one that leaves the
-            // screen and returns is still Loaded, so a save never refuses for it.
-            // Undeclared cosmetics retire when unshown, bounding their memory.
-            roots.extend(G::ASSETS.iter().map(|n| (*n).to_owned()));
-            roots.extend(G::STREAMED.iter().map(|n| (*n).to_owned()));
-            roots.extend(self.world.assets.declared.iter().cloned());
-            if let Some(level) = G::LEVEL {
-                roots.insert(level.name.into());
-            }
-            self.world.assets.retire(&roots);
-            self.textures
-                .retain(|n, _| self.world.assets.states.contains_key(n));
-            for (name, suffix) in names {
-                self.world.assets.request(&name);
-                if !name.ends_with(suffix) {
-                    self.asset_failed(&name, &format!("component requires a {suffix} name"));
-                }
-            }
-            self.asset_mesh_revision = revision;
-        }
-        let assets = &mut *self.world.assets;
-        let mut names: Vec<_> = assets
-            .states
-            .iter()
-            .filter(|(n, s)| {
-                (**s == crate::asset::AssetState::Pending || assets.redelivery.contains(*n))
-                    && !assets.requested.contains(*n)
-            })
-            .map(|(n, _)| n.clone())
-            .collect();
-        // What setup and the first frame wait for goes first; streamed names last.
-        names.sort_by_key(|n| {
-            (
-                G::STREAMED.contains(&n.as_str()),
-                !assets.required.contains(n),
-            )
-        });
-        assets.requested.extend(names.iter().cloned());
-        names
-    }
-    /// Drain names whose last cosmetic mesh reference disappeared.
-    pub fn take_retired_assets(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.world.assets.retired)
-    }
-    /// Device-backed surfaces retain arriving texture payloads until upload.
-    pub fn defer_assets(&mut self, defer: bool) {
-        self.defer_assets = defer;
-    }
-    /// Renderer-only model feed; games receive World, whose reads enforce declarations.
-    pub fn presentation_models(&self) -> impl Iterator<Item = (&str, &crate::asset::Model)> {
-        self.world
-            .assets
-            .models
-            .iter()
-            .filter(|(n, _)| self.world.assets.states.contains_key(n))
-            .map(|(n, m)| (n.as_str(), m.model.as_ref()))
-    }
-    /// Content remains Loaded after loss; only device preparation is invalidated.
-    pub fn invalidate_device_assets(&mut self) -> Vec<String> {
-        let assets = &mut *self.world.assets;
-        assets.prepared.clear();
-        let mut retry = Vec::new();
-        for (name, state) in &assets.states {
-            if *state == crate::asset::AssetState::Pending {
-                assets.requested.remove(name);
-            }
-            if name.ends_with(".tex") && *state == crate::asset::AssetState::Loaded {
-                assets.requested.remove(name);
-                assets.redelivery.insert(name.clone());
-                retry.push(name.clone());
-                // The module must reopen this answered name even if the replacement
-                // attached and prepared assets before failing again.
-                assets.retired.push(name.clone());
-            }
-        }
-        retry
-    }
-    /// Names still awaiting bytes, including recovery uploads.
-    pub fn assets_pending(&self) -> bool {
-        if self.setup_pending
-            && self.world.assets.required.iter().any(|n| {
-                matches!(
-                    self.world.assets.states.get(n),
-                    Some(crate::asset::AssetState::Failed(_))
-                )
-            })
-        {
-            return false;
-        }
-        self.world
-            .assets
-            .states
-            .values()
-            .any(|s| *s == crate::asset::AssetState::Pending)
-            || !self.world.assets.redelivery.is_empty()
-    }
-    /// Every retained model and dependency prepared for the current device.
-    pub fn device_assets_ready(&self) -> bool {
-        self.world.assets.states.iter().all(|(n, s)| {
-            *s != crate::asset::AssetState::Loaded
-                || n.ends_with(".level.json")
-                || n.ends_with(".sound")
-                || self.world.assets.prepared.contains(n)
-        })
-    }
-    /// Move texture payloads to the renderer; no CPU mip copy survives upload.
-    pub fn take_textures(
-        &mut self,
-    ) -> std::collections::BTreeMap<String, crate::asset::TextureData> {
-        std::mem::take(&mut self.textures)
-    }
-    /// A named preparation/upload completed, or failed without poisoning the surface.
-    pub fn asset_prepared(&mut self, name: &str, result: Result<(), String>) {
-        use crate::asset::AssetState;
-        match result {
-            Ok(()) => {
-                self.world.assets.prepared.insert(name.into());
-            }
-            Err(reason) => {
-                self.world.assets.states.insert(
-                    name.into(),
-                    AssetState::Failed(format!("asset `{name}`: {reason}")),
-                );
-            }
-        }
-        self.finish_assets(name);
-    }
-    /// A model's state follows its textures': re-derive only the model
-    /// `touched` (a delivered or prepared name) is, and the models naming it
-    /// as a texture (`Assets::dependents`). Re-deriving every model on every
-    /// delivery made a world of hundreds of models quadratic to load (garden's
-    /// 202: ~4 s of a web load).
-    fn finish_assets(&mut self, touched: &str) {
-        use crate::asset::AssetState;
-        let assets = &mut *self.world.assets;
-        let mut models = assets.dependents.get(touched).cloned().unwrap_or_default();
-        if assets.dependencies.contains_key(touched) {
-            models.push(touched.into());
-        }
-        for name in models {
-            let Some(textures) = assets.dependencies.get(&name) else {
-                continue;
-            };
-            if matches!(assets.states.get(&name), None | Some(AssetState::Failed(_))) {
-                continue;
-            }
-            let failed = textures.iter().find_map(|n| match assets.states.get(n) {
-                Some(AssetState::Failed(e)) => Some(e.clone()),
-                _ => None,
-            });
-            let next = if let Some(reason) = failed {
-                AssetState::Failed(reason)
-            } else if textures
-                .iter()
-                .all(|n| assets.states.get(n) == Some(&AssetState::Loaded))
-            {
-                AssetState::Loaded
-            } else {
-                continue;
-            };
-            // Write only a change: a rewrite moves the states' revision.
-            if assets.states.get(&name) != Some(&next) {
-                assets.states.insert(name, next);
-            }
-        }
-        if self.setup_pending && self.required_ready() {
-            self.world = Self::build(&self.args, self.world.assets.clone());
-            self.setup_pending = false;
-            self.asset_mesh_revision = u64::MAX;
-        }
-    }
-    /// `Assets::ready` resumed from the last required name found not ready:
-    /// the names before it were ready when passed, so a load costs one pass
-    /// over the required set, not one per delivery. A state can move back
-    /// (a retired, re-requested name), so the whole set is checked once more
-    /// before setup.
-    fn required_ready(&mut self) -> bool {
-        use crate::asset::AssetState;
-        let assets = &self.world.assets;
-        let unready = |n: &&String| {
-            assets
-                .states
-                .get(n)
-                .is_some_and(|s| *s != AssetState::Loaded)
-        };
-        let from = self.ready_hint.take();
-        let next = match &from {
-            Some(hint) => assets
-                .required
-                .range::<String, _>(hint.clone()..)
-                .find(unready),
-            None => assets.required.iter().find(unready),
-        };
-        if let Some(name) = next {
-            self.ready_hint = Some(name.clone());
-            return false;
-        }
-        from.is_none() || assets.ready()
-    }
-    /// Transport failure after the host's bounded retries.
-    pub fn asset_failed(&mut self, name: &str, reason: &str) {
-        self.world.assets.request(name);
-        self.world.assets.redelivery.remove(name);
-        self.world.assets.requested.insert(name.into());
-        self.asset_prepared(name, Err(reason.into()));
-    }
-    /// Install a validated content result. Decoding belongs to the model adapter.
-    pub fn deliver_asset(
-        &mut self,
-        name: &str,
-        result: Result<crate::asset::Content, String>,
-    ) -> Result<(), String> {
-        use crate::asset::{AssetState, Content};
-        self.world.assets.request(name);
-        self.world.assets.requested.insert(name.into());
-        self.world.assets.redelivery.remove(name);
-        let result = result.and_then(|content| match content {
-            Content::Level(text) => self.deliver_level(name, text).map(|()| None),
-            Content::Sound(sound) => self.deliver_sound(name, sound).map(|()| None),
-            other => Ok(Some(other)),
-        });
-        match result {
-            Ok(None) => {}
-            Ok(Some(Content::Level(_) | Content::Sound(_))) => unreachable!(),
-            Ok(Some(Content::Texture(texture))) => {
-                self.world
-                    .assets
-                    .states
-                    .insert(name.into(), AssetState::Loaded);
-                if self.defer_assets {
-                    self.textures.insert(name.into(), texture);
-                }
-            }
-            Ok(Some(Content::Model(model))) => {
-                for texture in &model.textures {
-                    self.world.assets.request(texture);
-                    if self.world.assets.declared.contains(name) {
-                        self.world.assets.required.insert(texture.clone());
-                    }
-                }
-                self.world
-                    .assets
-                    .set_dependencies(name, model.textures.clone());
-                self.world.assets.models.insert(name.into(), model.into());
-            }
-            Err(reason) => {
-                self.asset_failed(name, &reason);
-                return Err(format!("asset `{name}`: {reason}"));
-            }
-        }
-        self.finish_assets(name);
-        Ok(())
     }
     fn decode_args(values: &[Value]) -> Result<G::Args, String> {
         crate::args::arity(values, G::Args::FIELDS)?;
@@ -673,9 +416,14 @@ impl<G: Game> Sim<G> {
             last_motion: crate::Vec2::ZERO,
             ready_hint: None,
             paranoid: Self::reconstruction(Paranoid::environment()),
+            paranoid_mode: Paranoid::environment(),
+            paranoid_checked: 0,
             paranoid_owed: false,
             paranoid_skipped: 0,
             present_owed: false,
+            development_edits: true,
+            edits_admitted: false,
+            origin: 0,
             game: PhantomData,
         })
     }
@@ -700,15 +448,12 @@ impl<G: Game> Sim<G> {
         let args_json = crate::json::to_string(&args).map_err(|e| e.to_string())?;
         let changed = self.args_json != args_json;
         // Decoding is complete before seeking under the old arguments.
-        let restart = if !self.args.setup_changed(&args) {
-            None
-        } else {
-            Some(Self::build(&args, self.world.assets.clone()))
-        };
+        let restart = self.args.setup_changed(&args);
         if let Some(at) = at_ms {
             self.advance_with(at, Clock::Seekable, after);
         }
-        if let Some(mut world) = restart {
+        if restart {
+            let mut world = Self::build(&args, self.world.assets.clone());
             let old_values = self.args.values();
             let new_values = args.values();
             let changes: Vec<_> = G::Args::FIELDS
@@ -746,6 +491,8 @@ impl<G: Game> Sim<G> {
             self.setup_pending = !world.assets.ready();
             self.ready_hint = None;
             self.asset_mesh_revision = u64::MAX;
+            self.edits_admitted |= self.world.set_seen.get();
+            world.set_seen.set(self.edits_admitted);
             self.world = world;
             self.world_us = 0;
             self.live_time = None;
@@ -756,6 +503,7 @@ impl<G: Game> Sim<G> {
             self.input.viewport = viewport;
             self.overflow_logged = false;
             self.posts_logged = false;
+            self.origin = 0;
             self.restored = false;
             self.world
                 .log(format_args!("world restarted: {}", changes.join(", ")));
@@ -798,168 +546,6 @@ impl<G: Game> Sim<G> {
     /// Validate host input without mutating the simulation or panicking.
     pub fn validate_input(&self, event: &InputEvent) -> Result<(), String> {
         self.input.validate(event)
-    }
-    /// Queue a raw event in stamp order, preserving arrival order at equal stamps.
-    /// Paused input updates held state directly, without edges or queued wheel deltas.
-    pub fn input(&mut self, event: InputEvent) {
-        if let Err(error) = self.validate_input(&event) {
-            self.world.log(error);
-            return;
-        }
-        self.invalidate();
-        // A posted message waits for the next tick, paused or not.
-        if G::paused(&self.args) && !matches!(event, InputEvent::Message { .. }) {
-            self.input.apply_paused(event);
-            return;
-        }
-        let host_us = micros(event.at_ms());
-        let e = Queued {
-            host_us,
-            world_us: self
-                .last_us
-                .filter(|last| host_us <= *last)
-                .map(|_| self.world_us),
-            event,
-        };
-        let position = self
-            .queue
-            .partition_point(|old| self.projected(old) <= self.projected(&e));
-        if let InputEvent::Key { code, down, .. } = &e.event {
-            let previous = self
-                .queue
-                .range(..position)
-                .rev()
-                .find_map(|old| match &old.event {
-                    InputEvent::Key {
-                        code: key, down, ..
-                    } if key == code => Some(*down),
-                    InputEvent::Blur { .. } => Some(false),
-                    _ => None,
-                })
-                .unwrap_or_else(|| self.input.keys.contains(code));
-            if previous == *down {
-                return;
-            }
-        }
-        // Only coalesce across other moves/wheels: contact and key edges retain
-        // the positions and device state that were current when they arrived.
-        let boundary = self.boundary(&e);
-        for i in (0..position).rev() {
-            if self.boundary(&self.queue[i]) != boundary {
-                break;
-            }
-            match (&mut self.queue[i].event, &e.event) {
-                (old, new) if old.same_motion(new) => {
-                    let mut e = e;
-                    e.event.add_motion(old);
-                    self.queue.remove(i);
-                    self.queue.insert(position - 1, e);
-                    return;
-                }
-                (InputEvent::Wheel { dx, dy, .. }, InputEvent::Wheel { dx: x, dy: y, .. }) => {
-                    *dx += x;
-                    *dy += y;
-                    return;
-                }
-                (
-                    InputEvent::Pointer {
-                        phase: PointerPhase::Move,
-                        ..
-                    }
-                    | InputEvent::Control {
-                        phase: PointerPhase::Move,
-                        ..
-                    }
-                    | InputEvent::Wheel { .. },
-                    _,
-                ) => {}
-                _ => break,
-            }
-        }
-        let (mut position, mut e) = (position, e);
-        if self.queue.len() < QUEUE_LIMIT {
-            // Below the limit an overflow episode is over: the next one journals again.
-            self.overflow_logged = false;
-            self.posts_logged = false;
-        }
-        if self.queue.len() == QUEUE_LIMIT {
-            // A posted message is never dropped silently: a full queue refuses
-            // the new post, by name, and a device event never displaces one.
-            let message = |e: &Queued| matches!(e.event, InputEvent::Message { .. });
-            let drop = (!message(&e))
-                .then(|| {
-                    let moves = self.queue.iter().position(|e| e.event.is_move());
-                    moves.or_else(|| self.queue.iter().position(|e| !message(e)))
-                })
-                .flatten();
-            let Some(drop) = drop else {
-                self.refused_posts += u64::from(message(&e));
-                // Once per overflow episode for each kind; state counts each post.
-                let logged = if message(&e) {
-                    &mut self.posts_logged
-                } else {
-                    &mut self.overflow_logged
-                };
-                if !*logged {
-                    *logged = true;
-                    self.world.log(if message(&e) {
-                        "postMessage refused: the input queue holds 1024 events; post less often (state input.refusedPosts counts them)"
-                    } else {
-                        "input queue overflow: every queued event is a posted message; dropped the new event"
-                    });
-                }
-                return;
-            };
-            let was_move = self.queue[drop].event.is_move();
-            let dropped = self.queue.remove(drop).expect("a queued event");
-            position -= usize::from(drop < position);
-            // A dropped move's motion joins that pointer's next event, so a
-            // flood of moves loses positions, never the turn they add up to.
-            if let InputEvent::Pointer { id, .. } = dropped.event {
-                let same =
-                    |ev: &InputEvent| matches!(ev, InputEvent::Pointer { id: n, .. } if *n == id);
-                let (mut before, mut after) = (drop..position, position..self.queue.len());
-                if let Some(i) = before.find(|&i| same(&self.queue[i].event)) {
-                    self.queue[i].event.add_motion(&dropped.event);
-                } else if same(&e.event) {
-                    e.event.add_motion(&dropped.event);
-                } else if let Some(i) = after.find(|&i| same(&self.queue[i].event)) {
-                    self.queue[i].event.add_motion(&dropped.event);
-                }
-            }
-            if !self.overflow_logged {
-                self.world.log(if was_move {
-                    "input queue overflow: dropped oldest move"
-                } else {
-                    "input queue overflow: dropped oldest event"
-                });
-                self.overflow_logged = true;
-            }
-        }
-        self.queue.insert(position, e);
-    }
-    fn flush_paused(&mut self, now: i64) {
-        let mut held = VecDeque::new();
-        while self
-            .queue
-            .front()
-            .is_some_and(|e| e.world_us.is_some() || e.host_us <= now)
-        {
-            let e = self.queue.pop_front().unwrap();
-            if let InputEvent::Message { .. } = e.event {
-                // Restamped at the pause's end, so it reaches the first tick after.
-                held.push_back(Queued {
-                    world_us: None,
-                    host_us: now,
-                    ..e
-                });
-            } else {
-                self.input.apply_paused(e.event);
-            }
-        }
-        held.append(&mut self.queue);
-        self.queue = held;
-        self.input.clear_edges();
     }
     /// Host display period in milliseconds; zero means not yet known. Applied
     /// only by the next accepted live advance, never by a backwards sample.
@@ -1173,8 +759,11 @@ impl<G: Game> Sim<G> {
             self.world.observe(&mut self.observations[0]);
         }
         while self.world.tick() < target {
+            self.world.spans.borrow_mut().begin(self.world.tick() + 1);
             self.world.begin_tick();
             self.input.clear_edges();
+            self.sync_input();
+            self.world.deliver_events(&mut self.input);
             let end = (self.world.tick() as u128 + 1) * 1_000_000;
             let mut delivered = false;
             while self.queue.front().is_some_and(|e| {
@@ -1183,11 +772,22 @@ impl<G: Game> Sim<G> {
                     stamp < end || (clock == Clock::Live && stamp == end)
                 })
             }) {
-                self.input.apply(self.queue.pop_front().unwrap().event);
+                let e = self.queue.pop_front().unwrap();
+                let edit = matches!(&e.event, InputEvent::Message { text, .. }
+                    if crate::world::edit::command(text).is_some()
+                        && self.world.apply_set(text, self.development_edits));
+                if edit {
+                    self.edits_admitted = true;
+                } else {
+                    self.deliver(e.event, e.world_us.unwrap_or(self.world_us), false);
+                }
                 delivered = true;
             }
+            // Holds mature on world time, whether or not an event arrived.
+            self.mature_input(end);
             self.restored = false;
             self.restored_from = None;
+            delivered |= self.world.activate_tables();
             G::tick(&mut self.world, &self.input, &self.args);
             self.last_motion = self.input.pointer().map_or(crate::Vec2::ZERO, |p| p.delta);
             crate::scene::follow(&self.world);
@@ -1196,6 +796,7 @@ impl<G: Game> Sim<G> {
             self.world.reap_orphans();
             self.world.propagate();
             self.world.step_clock();
+            self.world.spans.borrow_mut().end();
             // Present only what can be observed: the last two ticks of an advance
             // (the renderer interpolates between them). It is pure, so skipping
             // the rest of a long seek changes nothing; paranoid modes present
@@ -1299,7 +900,8 @@ impl<G: Game> Sim<G> {
     }
     /// Drain only explicit string events, in emission order.
     pub fn take_messages(&mut self) -> Vec<String> {
-        std::mem::take(&mut *self.world.messages.borrow_mut())
+        let messages = std::mem::take(&mut *self.world.messages.borrow_mut());
+        self.marked(messages)
     }
     fn invalidate(&mut self) {
         self.world.unobserve();
@@ -1350,14 +952,82 @@ impl<G: Game> Sim<G> {
             code: code.into(),
             down,
             at_ms: self.last_us.unwrap_or(0) as f64 / 1000.0,
+            player: 0,
         });
     }
     /// Post a message into the world at the current clock, as Contract's
-    /// `postMessage(text, surface)` does; the next tick reads it in `Input::messages`.
+    /// `postMessage(text, surface)` and the driver's `post [<surface>] <text>`
+    /// do; the next tick reads it in `Input::messages`. It is input, saved with
+    /// the queue until a tick reads it; a paused world holds it for the first
+    /// tick after the pause. For staging and scripting a scene the game already
+    /// listens to, never a way into state the game does not handle.
+    ///
+    /// ```
+    /// use exact_game::*;
+    /// #[derive(Default, Args)]
+    /// pub struct Options {
+    ///     #[live]
+    ///     pub paused: bool,
+    /// }
+    /// #[derive(Default, Component)]
+    /// pub struct Gulper;
+    /// pub struct Tank;
+    /// impl Game for Tank {
+    ///     const ID: &'static str = "tank";
+    ///     type Args = Options;
+    ///     fn setup(_: &mut World, _: &Options) {}
+    ///     fn paused(args: &Options) -> bool {
+    ///         args.paused
+    ///     }
+    ///     fn tick(w: &mut World, input: &Input, _: &Options) {
+    ///         for m in input.messages() {
+    ///             if m == "spawn-gulper" {
+    ///                 w.spawn(Gulper);
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// let gulpers = |s: &Sim<Tank>| s.world().count::<Gulper>(|_| true);
+    /// let mut sim = Sim::<Tank>::new(Options { paused: true }).unwrap();
+    /// sim.run(0.);
+    /// sim.post("spawn-gulper");
+    /// sim.run(500.);
+    /// assert_eq!(gulpers(&sim), 0, "paused: held");
+    /// // Saved before its tick, it is read exactly once after a restore.
+    /// let saved = sim.save().unwrap();
+    /// let mut fresh = Sim::<Tank>::new(Options { paused: true }).unwrap();
+    /// fresh.restore(&saved).unwrap();
+    /// for s in [&mut sim, &mut fresh] {
+    ///     s.bind(&[Value::Bool(false)], None).unwrap();
+    ///     s.run(1000.);
+    ///     assert_eq!(gulpers(s), 1);
+    /// }
+    /// assert_eq!(fresh.world().hash(), sim.world().hash());
+    /// ```
     pub fn post(&mut self, text: impl Into<String>) {
         self.input(InputEvent::Message {
             text: text.into(),
             at_ms: self.last_us.unwrap_or(0) as f64 / 1000.0,
+            player: 0,
+        });
+    }
+    /// Queue a sample of `sensor` at the current clock, as a canvas input
+    /// (`startSensorInput`) delivers one: `values` are x, y, z and w.
+    pub fn sensor(&mut self, sensor: crate::SensorKind, values: [f32; 4]) {
+        self.input(InputEvent::Sensor {
+            sensor,
+            values,
+            dropped: 0,
+            at_ms: self.last_us.unwrap_or(0) as f64 / 1000.0,
+            player: 0,
+        });
+    }
+    /// Queue the end of `sensor`'s input at the current clock.
+    pub fn sensor_ended(&mut self, sensor: crate::SensorKind) {
+        self.input(InputEvent::SensorEnded {
+            sensor,
+            at_ms: self.last_us.unwrap_or(0) as f64 / 1000.0,
+            player: 0,
         });
     }
     /// Queue both key edges at the current clock.
@@ -1411,9 +1081,12 @@ impl<G: Game> Sim<G> {
     /// Pending input and unobserved mutations prevent rest unless time is paused.
     pub fn quiescent(&self) -> bool {
         self.check_epoch();
+        // A pending hold or tap window changes the world on its own (I2).
         let settled = !self.setup_pending
             && self.queue.is_empty()
-            && (G::paused(&self.args) || self.world.quiescent());
+            && (G::paused(&self.args) || self.world.table_pending_tick().is_none())
+            && (G::paused(&self.args)
+                || (self.world.quiescent() && self.input.next_deadline().is_none()));
         if settled {
             self.settle_delay.set(100);
         }
@@ -1424,18 +1097,33 @@ impl<G: Game> Sim<G> {
             return vec!["loading".into()];
         }
         if G::paused(&self.args) {
-            return if self.queue.is_empty() {
-                vec!["paused".into()]
-            } else {
-                vec!["paused".into(), "input queued".into()]
-            };
+            let mut reasons = vec!["paused".into()];
+            if !self.queue.is_empty() {
+                reasons.push("input queued".into());
+            }
+            if self.world.table_pending_tick().is_some() {
+                reasons.push(format!(
+                    "table input awaiting resume: {}",
+                    self.world.pending_table_names()
+                ));
+            }
+            return reasons;
         }
         if quiescent {
             return vec![];
         }
         let mut reasons = self.world.changing();
+        if self.world.table_pending_tick().is_some() {
+            reasons.push(format!(
+                "table input queued: {}",
+                self.world.pending_table_names()
+            ));
+        }
         if !self.queue.is_empty() && reasons.len() < 8 {
             reasons.push("input queued".into());
+        }
+        if let Some((_, action)) = self.input.next_deadline().filter(|_| reasons.len() < 8) {
+            reasons.push(format!("input trigger {action}"));
         }
         reasons
     }
@@ -1445,16 +1133,26 @@ impl<G: Game> Sim<G> {
         let tick_us = |tick: u64| {
             i64::try_from((tick as u128 * 1_000_000).div_ceil(G::HZ as u128)).unwrap_or(i64::MAX)
         };
-        let deadline = self
-            .world
-            .settle_tick()
-            .filter(|tick| *tick > self.world.tick());
+        // A pending trigger's tick (it fires before that tick's end) is a
+        // deadline as the world's own are: settling goes straight to it.
+        let trigger = self
+            .input
+            .next_deadline()
+            .map(|(due, _)| (due.max(0) as u128 * G::HZ as u128 / 1_000_000) as u64 + 1);
+        let deadline = [self.world.settle_tick(), trigger]
+            .into_iter()
+            .flatten()
+            .filter(|tick| *tick > self.world.tick())
+            .min();
         let delay = self.settle_delay.get();
         let mut next = deadline.map_or(self.world_us.saturating_add(delay as i64 * 1000), tick_us);
         if let Some(event) = self.queue.front() {
             // Events on an exact boundary belong to the following tick.
             let tick =
                 (self.projected(event).max(0) as u128 * G::HZ as u128 / 1_000_000) as u64 + 1;
+            next = next.min(tick_us(tick));
+        }
+        if let Some(tick) = self.world.table_pending_tick() {
             next = next.min(tick_us(tick));
         }
         next = next.max(tick_us(self.world.tick() + 1));
@@ -1470,7 +1168,7 @@ impl<G: Game> Sim<G> {
         }
         let mut input = self.input.clone();
         for queued in &self.queue {
-            input.apply_paused(queued.event.clone());
+            input.apply_paused(queued.event.clone(), self.projected(queued));
         }
         std::borrow::Cow::Owned(input)
     }

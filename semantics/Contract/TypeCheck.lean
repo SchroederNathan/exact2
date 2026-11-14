@@ -66,6 +66,15 @@ theorem boundedTy_some {p : Program} {o : Option Ty} {t : Ty} (h : boundedTy p o
     · simp at h
   · simp at h
 
+/-- `formatNumber`'s literal parameters (`type-format-style`). The
+embedding fills an omitted code with `""`; only non-currency styles take
+that default. `Format.currencies` has the roster's admitted code literals. -/
+def numberFormatArgs : List Expr → Bool
+  | [_, .str style, .str code] =>
+    if style == "currency" then Format.currencies.any (fun c => c.1 == code)
+    else ["compact", "decimal", "percent"].contains style && code == ""
+  | _ => false
+
 mutual
 
 /-- The type of `e`, or `none` when the judgments give it none. -/
@@ -97,7 +106,10 @@ def infer (p : Program) (G : Scope) : Scope → Expr → Option Ty
         | .none => .none
       | .none => .none
     | _ => .none
-  | Γ, .call name args => inferCall p G Γ name args (inferList p G Γ args)
+  | Γ, .call name args =>
+    if name != "formatNumber" || p.fns.any (·.name == name) || numberFormatArgs args then
+      inferCall p G Γ name args (inferList p G Γ args)
+    else .none
   | Γ, .record s .none written =>
     match inferNamed p G Γ written with
     | .some wts =>
@@ -165,7 +177,7 @@ def infer (p : Program) (G : Scope) : Scope → Expr → Option Ty
     | .some t => Ty.unify ty t
     | .none => .none
 
-/-- A call, given its arguments' types (`ts?`): a `fn`, `map`/`filter`
+/-- A call, given its arguments' types (`ts?`): a `fn`, `map`/`filter`/`sortBy`
 with a callback, `pending`/`failed`/`failure` of a name, or a roster entry. -/
 def inferCall (p : Program) (G : Scope) : Scope → String → List Expr → Option (List Ty) → Option Ty
   | Γ, name, [l, .arrow ps body], ts? =>
@@ -190,10 +202,31 @@ def inferCall (p : Program) (G : Scope) : Scope → String → List Expr → Opt
             | .none => .none
           | _ => .none
         else .none
+      else if name = "sortBy" then
+        if ps.length ≤ 2 then
+          match infer p G Γ l with
+          | .some (.list a) =>
+            match infer p G (bindTy ps a Γ) body with
+            | .some k => if k.sortKey then .some (.list a) else .none
+            | .none => .none
+          | _ => .none
+        else .none
       else
         match ts? with
         | .some ts => boundedTy p (rosterTy name ts)
         | .none => .none
+  | Γ, name, [l, .arrow ps body, d], _ =>
+    match p.fns.find? (·.name == name) with
+    | .some _ => .none
+    | .none =>
+      if name = "sortBy" ∧ ps.length ≤ 2 ∧ (sortDir [d]).toBool = true then
+        match infer p G Γ l with
+        | .some (.list a) =>
+          match infer p G (bindTy ps a Γ) body with
+          | .some k => if k.sortKey then .some (.list a) else .none
+          | .none => .none
+        | _ => .none
+      else .none
   | Γ, name, args, ts? =>
     match p.fns.find? (·.name == name) with
     | .some fd =>
@@ -301,6 +334,7 @@ def checkElement (p : Program) (G Γ : Scope) (tag : String) (pos : List Expr)
   (match lookupField "testId" props with
     | .some e => inferShows p G Γ e
     | .none => true) &&
+  (tabProps props).all (fun (_, e) => (infer p G Γ e).isSome) &&
   hs.all (checkHandler p G Γ)
 
 def checkNodes (p : Program) (G : Scope) : Scope → List Node → Bool
@@ -352,10 +386,28 @@ def checkState (p : Program) (i : Nat) : Bool :=
   | .none => true
 
 def checkDerive (p : Program) (d : DeriveDecl) : Bool := inferLe p (settleScope p) [] d.body d.ty
+/-- A resource's arguments, and over a list its list and key (a string,
+number or bool: the compiler's `type-resource-for-key`), and its source's
+one signature. -/
 def checkResource (p : Program) (r : ResourceDecl) : Bool :=
-  match inferList p (settleScope p) [] r.args with
-  | .some ts => sourceOk p r.source ts r.ty
-  | .none => false
+  match r.each with
+  | .none =>
+    match inferList p (settleScope p) [] r.args with
+    | .some ts => sourceOk p r.source ts r.ty
+    | .none => false
+  | .some e =>
+    match infer p (settleScope p) [] e.list with
+    | .some (.list te) =>
+      let keyed : Ty → Bool := fun
+        | .string | .number | .bool => true
+        | _ => false
+      (match e.key with
+        | .some k => (infer p (settleScope p) [(e.item, te)] k).any keyed
+        | .none => keyed te) &&
+      match inferList p (settleScope p) [(e.item, te)] r.args with
+      | .some ts => sourceOk p r.source ts r.answer
+      | .none => false
+    | _ => false
 def checkAction (p : Program) (a : ActionDecl) : Bool := checkStmts p (compScope p) a.params.reverse a.body
 /-- A task's action exists and takes no parameters. -/
 def taskAction (p : Program) (t : TaskDecl) : Bool :=
@@ -411,15 +463,18 @@ def checkFailure (p : Program) : Option String := ((checkParts p).find? (!·.2))
 
 /-! ## Soundness of the checker -/
 
-/-- A call whose arguments are not `(list, callback)`: a `fn`, `pending`,
-`failed` or `failure` of a name, or a roster entry. -/
+/-- A call whose arguments are not `(list, callback)` or `(list, callback,
+direction)`: a `fn`, `pending`, `failed` or `failure` of a name, or a roster
+entry. -/
 theorem inferCall_rest {p : Program} {G Γ : Scope} {name : String} {args : List Expr}
     {ts? : Option (List Ty)} {t : Ty} (hne : ∀ l ps body, args ≠ [l, .arrow ps body])
+    (hne3 : ∀ l ps body d, args ≠ [l, .arrow ps body, d])
     (hts : ∀ ts, ts? = .some ts → ListTy p G Γ args ts) (h : inferCall p G Γ name args ts? = .some t) :
     HasTy p G Γ (.call name args) t := by
   unfold inferCall at h
   split at h
   · next l ps body => exact absurd rfl (hne l ps body)
+  · next l ps body d => exact absurd rfl (hne3 l ps body d)
   · split at h
     · next fd hfd =>
       split at h
@@ -532,7 +587,9 @@ theorem infer_sound {p : Program} {G : Scope} : ∀ {Γ : Scope} (e : Expr) {t :
     · simp at h
   | Γ, .call name args, t, h => by
     simp only [infer] at h
-    exact inferCall_sound name args (fun ts hts => inferList_sound args hts) h
+    split at h
+    · exact inferCall_sound name args (fun ts hts => inferList_sound args hts) h
+    · simp at h
   | Γ, .record s .none written, t, h => by
     simp only [infer] at h
     split at h
@@ -668,12 +725,56 @@ theorem inferCall_sound {p : Program} {G : Scope} : ∀ {Γ : Scope} (name : Str
               · simp at h
             · simp at h
           · split at h
-            · next ts => exact .roster hfd (hts ts rfl) (boundedTy_some h)
+            · next hn =>
+              subst hn
+              split at h
+              · next hps =>
+                split at h
+                · next a ha =>
+                  split at h
+                  · next k hk =>
+                    split at h
+                    · next hkk =>
+                      simp at h; subst h
+                      exact .sortBy hfd hps (infer_sound l ha) (infer_sound body hk) hkk (d := false) rfl
+                    · simp at h
+                  · simp at h
+                · simp at h
+              · simp at h
+            · split at h
+              · next ts => exact .roster hfd (hts ts rfl) (boundedTy_some h)
+              · simp at h
+    | _ => exact inferCall_rest (by simp) (by simp) hts h
+  | Γ, name, [l, m, dir], ts?, t, hts, h => by
+    cases m with
+    | arrow ps body =>
+      simp only [inferCall] at h
+      split at h
+      · simp at h
+      · next hfd =>
+        split at h
+        · next hc =>
+          obtain ⟨rfl, hps, hd⟩ := hc
+          obtain ⟨d', hd'⟩ : ∃ d', sortDir [dir] = .ok d' := by
+            cases h' : sortDir [dir] with
+            | ok d' => exact ⟨d', rfl⟩
+            | error e => rw [h'] at hd; simp [Except.toBool] at hd
+          split at h
+          · next a ha =>
+            split at h
+            · next k hk =>
+              split at h
+              · next hkk =>
+                simp at h; subst h
+                exact .sortBy hfd hps (infer_sound l ha) (infer_sound body hk) hkk hd'
+              · simp at h
             · simp at h
-    | _ => exact inferCall_rest (by simp) hts h
-  | Γ, name, [], ts?, t, hts, h => inferCall_rest (by simp) hts h
-  | Γ, name, [_], ts?, t, hts, h => inferCall_rest (by simp) hts h
-  | Γ, name, _ :: _ :: _ :: _, ts?, t, hts, h => inferCall_rest (by simp) hts h
+          · simp at h
+        · simp at h
+    | _ => exact inferCall_rest (by simp) (by simp) hts h
+  | Γ, name, [], ts?, t, hts, h => inferCall_rest (by simp) (by simp) hts h
+  | Γ, name, [_], ts?, t, hts, h => inferCall_rest (by simp) (by simp) hts h
+  | Γ, name, _ :: _ :: _ :: _ :: _, ts?, t, hts, h => inferCall_rest (by simp) (by simp) hts h
 
 theorem inferList_sound {p : Program} {G : Scope} : ∀ {Γ : Scope} (es : List Expr) {ts : List Ty},
     inferList p G Γ es = .some ts → ListTy p G Γ es ts
@@ -780,8 +881,8 @@ theorem checkArm_sound {p : Program} {G Γ owner} (h : checkArm p G Γ owner = t
 theorem checkElement_sound {p : Program} {G Γ tag pos props hs}
     (h : checkElement p G Γ tag pos props hs = true) : ElementTy p G Γ tag pos props hs := by
   simp only [checkElement, Bool.and_eq_true] at h
-  obtain ⟨⟨htext, hid⟩, hh⟩ := h
-  refine ⟨fun ht e he => ?_, fun e he => ?_, fun hd hd' => ?_⟩
+  obtain ⟨⟨⟨htext, hid⟩, hnav⟩, hh⟩ := h
+  refine ⟨fun ht e he => ?_, fun e he => ?_, fun prop hp => ?_, fun hd hd' => ?_⟩
   · simp only [ht, Bool.not_true, Bool.false_or] at htext
     cases pos with
     | nil => simp at he
@@ -789,6 +890,9 @@ theorem checkElement_sound {p : Program} {G Γ tag pos props hs}
   · simp only [Option.mem_def] at he
     rw [he] at hid
     exact inferShows_sound hid
+  · have hn := (List.all_eq_true.mp hnav) prop hp
+    obtain ⟨t, ht⟩ := Option.isSome_iff_exists.mp hn
+    exact ⟨t, infer_sound _ ht⟩
   · simp only [List.all_eq_true] at hh
     have := hh hd hd'
     simp only [checkHandler] at this
@@ -865,8 +969,29 @@ theorem check_sound {p : Program} (h : check p = true) : WellTyped p := by
     have := hres r hr
     simp only [checkResource] at this
     split at this
-    · next ts hts => exact ⟨ts, inferList_sound _ hts, this⟩
-    · simp at this
+    · next he =>
+      split at this
+      · next ts hts =>
+        refine ⟨ts, ?_, ?_⟩
+        · simp only [ResTy, he]; exact inferList_sound _ hts
+        · simpa [ResourceDecl.answer, he] using this
+      · simp at this
+    · next e he =>
+      split at this
+      · next te hl =>
+        simp only [Bool.and_eq_true] at this
+        obtain ⟨hk, this⟩ := this
+        split at this
+        · next ts hts =>
+          refine ⟨ts, ?_, this⟩
+          simp only [ResTy, he]
+          refine ⟨te, infer_sound _ hl, inferList_sound _ hts, fun k hkey => ?_⟩
+          rw [hkey] at hk
+          simp only [Option.any_eq_true] at hk
+          obtain ⟨u, hu, -⟩ := hk
+          exact ⟨u, infer_sound _ hu⟩
+        · simp at this
+      · simp at this
   · intro a ha; exact checkStmts_sound _ (hacts a ha)
   · intro t ht
     simp only [checkTask, Bool.and_eq_true] at htasks
@@ -916,5 +1041,26 @@ theorem check_sound {p : Program} (h : check p = true) : WellTyped p := by
     split at this
     · next ad had => exact ⟨ad, had, by simpa using this⟩
     · simp at this
+
+-- Reduced from the seed-7 `number-styled.contract` mutant, which drops USD from `usd`.
+-- The emitter fills an omitted code with the roster's empty-string default.
+private def numberFormatProgram (args : List Expr) : Program :=
+  { fns := [{ name := "usd", params := [("x", .number), ("s", .string)], ret := .string,
+              body := .call "formatNumber" args }] }
+
+#guard !check (numberFormatProgram [.var "x", .str "currency", .str ""])
+#guard Format.currencies.all fun c =>
+  check (numberFormatProgram [.var "x", .str "currency", .str c.1])
+#guard ["compact", "decimal", "percent"].all fun style =>
+  check (numberFormatProgram [.var "x", .str style, .str ""]) &&
+  !check (numberFormatProgram [.var "x", .str style, .str "USD"])
+#guard !check (numberFormatProgram [.var "x", .str "unknown", .str ""])
+#guard !check (numberFormatProgram [.var "x", .var "s", .str "USD"])
+#guard !check (numberFormatProgram [.var "x", .str "currency", .var "s"])
+#guard ["usd", "XXX", "US"].all fun code =>
+  !check (numberFormatProgram [.var "x", .str "currency", .str code])
+#guard !check (numberFormatProgram [.str "1", .str "currency", .str "USD"])
+#guard !check (numberFormatProgram [.var "x", .str "currency"])
+#guard !check (numberFormatProgram [.var "x", .str "currency", .str "USD", .str "EUR"])
 
 end Contract

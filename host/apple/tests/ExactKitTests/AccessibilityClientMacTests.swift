@@ -13,6 +13,9 @@ private final class AXClient: @unchecked Sendable {
     private let lock = NSLock()
     private var heard: [(name: String, info: [String: Any], element: AXUIElement)] = []
     private var observer: AXObserver?
+    private var names = Set<String>()
+    private var readiness = ""
+    private var ready = false
     private let app = AXUIElementCreateApplication(getpid())
     private let queue = DispatchQueue(label: "ax-client")
 
@@ -29,18 +32,50 @@ private final class AXClient: @unchecked Sendable {
             let callback: AXObserverCallbackWithInfo = { _, element, name, info, context in
                 let client = Unmanaged<AXClient>.fromOpaque(context!).takeUnretainedValue()
                 client.lock.lock(); defer { client.lock.unlock() }
-                client.heard.append((name as String, info as? [String: Any] ?? [:], element))
+                let info = info as? [String: Any] ?? [:]
+                if info["AXAnnouncementKey"] as? String == client.readiness { client.ready = true }
+                else if client.names.contains(name as String) { client.heard.append((name as String, info, element)) }
             }
             guard AXObserverCreateWithInfoCallback(getpid(), callback, &observer) == .success, let observer else { return false }
-            for name in names where AXObserverAddNotification(observer, app, name as CFString, Unmanaged.passUnretained(self).toOpaque()) != .success { return false }
+            self.names = Set(names)
+            for name in Set(names + ["AXAnnouncementRequested"]) where AXObserverAddNotification(observer, app, name as CFString, Unmanaged.passUnretained(self).toOpaque()) != .success { return false }
             return true
         }
         guard ok, let observer else { throw XCTSkip("no AX observer on this process") }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        try checkReady()
     }
-    /// What was heard once the main run loop has turned for `seconds`:
-    /// by default, until a dialog drawn in the page has been named.
-    func notifications(after seconds: TimeInterval = Presenter.dialogNameDelay + 0.2) -> [(name: String, info: [String: Any], element: AXUIElement)] {
+    /// A notification round trip proves that registration and delivery are ready.
+    func checkReady() throws {
+        let token = UUID().uuidString
+        lock.lock(); readiness = token; ready = false; lock.unlock()
+        // AppKit may drop the first notification while its AX endpoint starts.
+        // Only this readiness probe is retried; the test action runs once.
+        let probe = Timer(timeInterval: 0.1, repeats: true) { _ in
+            NSAccessibility.post(element: NSApp!, notification: .announcementRequested,
+                                 userInfo: [.announcement: token, .priority: NSAccessibilityPriorityLevel.low.rawValue])
+        }
+        RunLoop.main.add(probe, forMode: .default)
+        defer { probe.invalidate() }
+        probe.fire()
+        let deadline = Date().addingTimeInterval(10)
+        func delivered() -> Bool { lock.lock(); defer { lock.unlock() }; return ready }
+        while !delivered(), Date() < deadline { RunLoop.main.run(mode: .default, before: deadline) }
+        XCTAssertTrue(delivered(), "the AX observer received its readiness notification")
+        if !delivered() { throw CocoaError(.coderInvalidValue) }
+    }
+    func notifications(until expected: [String]) -> [(name: String, info: [String: Any], element: AXUIElement)] {
+        func snapshot() -> [(name: String, info: [String: Any], element: AXUIElement)] {
+            lock.lock(); defer { lock.unlock() }; return heard
+        }
+        let deadline = Date().addingTimeInterval(10)
+        while !expected.allSatisfy({ name in snapshot().contains { $0.name == name } }), Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        return snapshot()
+    }
+    /// What was heard once the main run loop has turned for `seconds`.
+    func notifications(after seconds: TimeInterval = 0.5) -> [(name: String, info: [String: Any], element: AXUIElement)] {
         RunLoop.main.run(until: Date(timeIntervalSinceNow: seconds))
         lock.lock(); defer { lock.unlock() }
         return heard
@@ -52,12 +87,12 @@ private final class AXClient: @unchecked Sendable {
         var value: CFTypeRef?
         return AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success ? value : nil
     }
-    /// The element whose AXIdentifier is `identifier`, found from the application down.
-    private static func find(_ identifier: String, in element: AXUIElement, depth: Int = 0) -> AXUIElement? {
-        if value(element, "AXIdentifier") as? String == identifier { return element }
+    /// Find an element by an attribute, usually its AXIdentifier.
+    private static func find(_ identifier: String, in element: AXUIElement, depth: Int = 0, attribute: String = "AXIdentifier") -> AXUIElement? {
+        if value(element, attribute) as? String == identifier { return element }
         guard depth < 40 else { return nil }
         for child in value(element, "AXChildren") as? [AXUIElement] ?? [] {
-            if let hit = find(identifier, in: child, depth: depth + 1) { return hit }
+            if let hit = find(identifier, in: child, depth: depth + 1, attribute: attribute) { return hit }
         }
         return nil
     }
@@ -66,14 +101,42 @@ private final class AXClient: @unchecked Sendable {
         let app = app
         return onClient { Self.find(identifier, in: app) }
     }
-    /// Its attributes among `names`, each as text; nil when no element has the identifier.
-    func attributes(of identifier: String, _ names: [String]) -> [String: String]? {
+    /// Its attributes among `names`, each as text; nil when no element matches.
+    func attributes(of identifier: String, _ names: [String], matching attribute: String = "AXIdentifier") -> [String: String]? {
         let app = app
         return onClient {
-            guard let element = Self.find(identifier, in: app) else { return nil }
+            guard let element = Self.find(identifier, in: app, attribute: attribute) else { return nil }
             var out: [String: String] = [:]
             for name in names { if let v = Self.value(element, name) { out[name] = "\(v)" } }
             return out
+        }
+    }
+    /// Its ancestors as a client walks `AXParent` up to the window, each its
+    /// role, subrole and name, and a web area the identifiers of its children.
+    func ancestry(of identifier: String, matching attribute: String = "AXIdentifier") -> [String] {
+        let app = app
+        return onClient {
+            var out: [String] = []
+            var next = Self.find(identifier, in: app, attribute: attribute).flatMap { Self.value($0, "AXParent") }.map { $0 as! AXUIElement }
+            while let element = next, out.count < 20 {
+                let role = Self.value(element, "AXRole") as? String ?? "?"
+                if role == "AXWindow" { break }
+                let children = role == "AXWebArea" ? (Self.value(element, "AXChildren") as? [AXUIElement] ?? []).map { Self.value($0, "AXIdentifier") as? String ?? "?" } : nil
+                out.append(([role, Self.value(element, "AXSubrole") as? String ?? "", Self.value(element, "AXDescription") as? String ?? ""]
+                    + (children.map { ["\($0)"] } ?? [])).filter { !$0.isEmpty }.joined(separator: " "))
+                next = Self.value(element, "AXParent").map { $0 as! AXUIElement }
+            }
+            return out
+        }
+    }
+    /// The roles of the page scroll view's children, as a client is served them.
+    func scrollAreaChildRoles() -> [String] {
+        let app = app
+        return onClient {
+            func role(_ e: AXUIElement) -> String { Self.value(e, "AXRole") as? String ?? "?" }
+            let window = (Self.value(app, "AXChildren") as? [AXUIElement])?.first { role($0) == "AXWindow" }
+            let scroll = (window.flatMap { Self.value($0, "AXChildren") as? [AXUIElement] } ?? []).first { role($0) == "AXScrollArea" }
+            return (scroll.flatMap { Self.value($0, "AXChildren") as? [AXUIElement] } ?? []).map(role)
         }
     }
     /// Its attribute, read on the client's thread.
@@ -169,6 +232,42 @@ final class AccessibilityClientMacTests: XCTestCase {
         return p
     }
 
+    func testTheAccessibilityFixturesHiddenContentAndNativeCellNamesAtTheClient() throws {
+        let p = try fixture([
+            ["op": "create", "id": 20, "kind": "text", "props": ["text": "•", "accessibilityElementsHidden": "true", "testId": "decoration"]],
+            ["op": "create", "id": 21, "kind": "view", "props": ["inert": "true", "testId": "inert-box"]],
+            ["op": "create", "id": 22, "kind": "button", "handlers": ["press"], "props": ["accessibilityLabel": "Hidden", "testId": "inert-button"]],
+            ["op": "create", "id": 23, "kind": "control", "handlers": ["change"],
+             "props": ["type": "checkbox", "accessibilityLabel": "Checked", "testId": "check"]],
+            ["op": "create", "id": 24, "kind": "input", "props": ["type": "password", "accessibilityLabel": "Secret", "value": "hunter2", "testId": "secret"]],
+            ["op": "children", "id": 21, "ids": [22]],
+            ["op": "children", "id": 1, "ids": [2, 20, 21, 23, 24]],
+            ["op": "frame", "id": 20, "x": 0, "y": 35, "w": 100, "h": 20],
+            ["op": "frame", "id": 21, "x": 0, "y": 60, "w": 200, "h": 40],
+            ["op": "frame", "id": 22, "x": 0, "y": 0, "w": 100, "h": 30],
+            ["op": "frame", "id": 23, "x": 0, "y": 110, "w": 100, "h": 30],
+            ["op": "frame", "id": 24, "x": 0, "y": 150, "w": 100, "h": 30],
+        ])
+        let client = AXClient()
+        // Absence means nothing until a visible control is reachable from
+        // the application's AX root, outside the driver's viewport walk.
+        guard client.element("page-button") != nil else { return XCTFail("the AX client cannot reach this window's visible control") }
+        let ids = client.identifiers()
+        XCTAssertFalse(ids.contains("decoration"))
+        XCTAssertFalse(ids.contains("inert-button"))
+        let keys = ["AXRole", "AXTitle", "AXDescription", "AXValue"]
+        let check = try XCTUnwrap(client.attributes(of: "check", keys))
+        XCTAssertEqual(check["AXRole"], "AXCheckBox")
+        XCTAssertTrue([check["AXTitle"], check["AXDescription"]].contains("Checked"))
+        // Read the secure cell by its native subrole so its name remains an assertion.
+        let secret = try XCTUnwrap(client.attributes(of: "AXSecureTextField", keys, matching: "AXSubrole"))
+        XCTAssertEqual(secret["AXRole"], "AXTextField")
+        XCTAssertTrue([secret["AXTitle"], secret["AXDescription"]].contains("Secret"))
+        XCTAssertNotEqual(secret["AXValue"], "hunter2")
+        XCTAssertEqual(p.views[20]?.props["accessibilityElementsHidden"], "true")
+        XCTAssertEqual(p.views[21]?.props["inert"], "true", "naming is checked while suppression stays in force")
+    }
+
     /// A `role="menu"` box is AppKit's menu and its rows (`menuitem`, a
     /// box's `menuitemcheckbox`) are menu items, as WebKit serves them
     /// (Core-AAM), so VoiceOver says "menu" and "menu item" where it said
@@ -245,10 +344,9 @@ final class AccessibilityClientMacTests: XCTestCase {
 
     /// VoiceOver lands on the element the opening commit's `focus()`
     /// chose, once the commit's commands have run, not on the alertdialog
-    /// the batch left with no focus in it; then the dialog's title and
-    /// message are queued after the button's words, at low priority, so
-    /// neither cuts the other off, as an `NSAlert` is read by its title and
-    /// message.
+    /// the batch left with no focus in it. The dialog is served in a web
+    /// area of its own (`DialogWebArea`), so VoiceOver reads it as Chrome's:
+    /// the button, then the dialog's title, role and message.
     func testAnAlertDialogLandsVoiceOverOnTheButtonItsCommitFocused() throws {
         let p = try fixture([])
         let client = AXClient()
@@ -270,10 +368,8 @@ final class AccessibilityClientMacTests: XCTestCase {
         XCTAssertTrue(p.focusedNode === p.views[12], "focus() took the focus")
         let heard = client.notifications().map { "\($0.name) \(client.value(of: $0.element, "AXIdentifier") ?? "")"
             + ((($0.info["AXUIElementsKey"] as? [AXUIElement])?.compactMap { AXClient.value($0, "AXIdentifier") as? String }).map { " \($0)" } ?? "") }
-        XCTAssertEqual(heard, ["AXLayoutChanged confirm [\"cancel\"]", "AXFocusedUIElementChanged cancel", "AXAnnouncementRequested confirm"])
-        let named = try XCTUnwrap(client.notifications(after: 0).last)
-        XCTAssertEqual(named.info["AXAnnouncementKey"] as? String, "Remove Lane Third from this device?, dialog, This forgets its pairing.")
-        XCTAssertEqual(named.info["AXPriorityKey"] as? Int, NSAccessibilityPriorityLevel.low.rawValue)
+        XCTAssertEqual(heard, ["AXLayoutChanged confirm [\"cancel\"]", "AXFocusedUIElementChanged cancel"], "the host announces nothing")
+        XCTAssertEqual(client.ancestry(of: "cancel"), ["AXGroup AXApplicationAlertDialog Remove Lane Third from this device?", "AXWebArea [\"confirm\"]", "AXScrollArea"])
         let dialog = try XCTUnwrap(client.attributes(of: "confirm", ["AXRole", "AXSubrole", "AXRoleDescription", "AXDescription", "AXHelp"]))
         XCTAssertEqual(dialog, ["AXRole": "AXGroup", "AXSubrole": "AXApplicationAlertDialog", "AXRoleDescription": "dialog",
                                 "AXDescription": "Remove Lane Third from this device?", "AXHelp": "This forgets its pairing."])
@@ -283,9 +379,8 @@ final class AccessibilityClientMacTests: XCTestCase {
     /// drawn in the page) sends VoiceOver to the focus its closing commit
     /// gave back, in the modal now in front, as AppKit's sheet over a sheet
     /// ends with the focus change of the first responder under it
-    /// (measured), and the sheet, named as it opened, is not named again.
-    /// Chosen before that `focus()` ran, VoiceOver went to the page behind
-    /// the sheet.
+    /// (measured). Chosen before that `focus()` ran, VoiceOver went to the
+    /// page behind the sheet.
     func testADialogClosedOverAModalSendsVoiceOverToTheFocusGivenBack() throws {
         let p = try fixture([
             ["op": "create", "id": 20, "kind": "view", "props": ["accessibilityRole": "dialog", "accessibilityModal": "true", "accessibilityLabel": "Right panel", "testId": "sheet"]],
@@ -387,9 +482,9 @@ final class AccessibilityClientMacTests: XCTestCase {
             ["op": "frame", "id": 12, "x": 0.0, "y": 35.0, "w": 200.0, "h": 30.0],
         ]))
         p.syncAccessibility()
-        func heard() -> [String] {
+        func heard(_ expected: [String]) -> [String] {
             defer { client.clear() }
-            return client.notifications().map { "\($0.name) \(client.value(of: $0.element, "AXIdentifier") ?? "")" }
+            return client.notifications(until: expected).map { "\($0.name) \(client.value(of: $0.element, "AXIdentifier") ?? "")" }
         }
         // The trigger opens the menu.
         XCTAssertTrue(window.makeFirstResponder(p.views[2]))
@@ -397,16 +492,16 @@ final class AccessibilityClientMacTests: XCTestCase {
         p.menus.show(try XCTUnwrap(p.views[20]), from: try XCTUnwrap(p.views[2]))
         p.syncAccessibility()
         XCTAssertEqual(client.identifiers(of: "menu", "AXSelectedChildren"), [], "no row is highlighted yet")
-        XCTAssertEqual(heard(), ["AXMenuOpened menu"])
+        XCTAssertEqual(heard(["AXMenuOpened"]), ["AXMenuOpened menu"])
 
         // ↓: the app moves the focus to a row.
         XCTAssertTrue(window.makeFirstResponder(p.views[11]))
-        XCTAssertTrue(heard().contains("AXSelectedChildrenChanged menu"))
+        XCTAssertTrue(heard(["AXSelectedChildrenChanged"]).contains("AXSelectedChildrenChanged menu"))
         XCTAssertEqual(client.identifiers(of: "menu", "AXSelectedChildren"), ["icon"])
         XCTAssertEqual(client.attributes(of: "icon", ["AXSelected"])?["AXSelected"], "1")
         XCTAssertEqual(client.attributes(of: "rename", ["AXSelected"])?["AXSelected"], "0")
         XCTAssertTrue(window.makeFirstResponder(p.views[12]))
-        XCTAssertTrue(heard().contains("AXSelectedChildrenChanged menu"))
+        XCTAssertTrue(heard(["AXSelectedChildrenChanged"]).contains("AXSelectedChildrenChanged menu"))
         XCTAssertEqual(client.identifiers(of: "menu", "AXSelectedChildren"), ["rename"])
 
         // Escape: the popover closes and gives the focus back to the trigger.
@@ -414,7 +509,7 @@ final class AccessibilityClientMacTests: XCTestCase {
         _ = p.menus.key(escape(window, up: true))
         p.syncAccessibility()
         XCTAssertTrue(window.firstResponder === p.views[2], "the focus is the trigger's again")
-        let closing = heard()
+        let closing = heard(["AXMenuClosed", "AXFocusedUIElementChanged"])
         XCTAssertEqual(closing.filter { $0.hasPrefix("AXMenu") }.map { $0.split(separator: " ").first.map(String.init) }, ["AXMenuClosed"], "\(closing)")
         let closed = try XCTUnwrap(closing.firstIndex { $0.hasPrefix("AXMenuClosed") })
         XCTAssertEqual(closing[(closed + 1)...].last, "AXFocusedUIElementChanged page-button", "\(closing)")
@@ -426,13 +521,13 @@ final class AccessibilityClientMacTests: XCTestCase {
         // the trigger.
         p.menus.show(try XCTUnwrap(p.views[20]), from: try XCTUnwrap(p.views[2]))
         p.syncAccessibility()
-        XCTAssertEqual(heard(), ["AXMenuOpened menu"])
+        XCTAssertEqual(heard(["AXMenuOpened"]), ["AXMenuOpened menu"])
         let shownMenu = try XCTUnwrap(client.element("menu"))
         XCTAssertTrue(p.menus.key(escape(window)))
         _ = p.menus.key(escape(window, up: true))
         p.syncAccessibility()
         XCTAssertTrue(window.firstResponder === p.views[2])
-        let escaped = client.notifications()
+        let escaped = client.notifications(until: ["AXMenuClosed"])
         client.clear()
         XCTAssertEqual(escaped.map(\.name), ["AXMenuClosed"])
         XCTAssertTrue(escaped.first.map { CFEqual($0.element, shownMenu) } ?? false, "on the menu")
@@ -444,11 +539,11 @@ final class AccessibilityClientMacTests: XCTestCase {
         p.syncAccessibility()
         XCTAssertTrue(window.makeFirstResponder(p.views[11]))
         let pageMenu = try XCTUnwrap(client.element("menu"))
-        _ = heard()
+        _ = heard(["AXSelectedChildrenChanged"])
         XCTAssertTrue(window.makeFirstResponder(p.views[2]))
         p.apply(wireBatch([["op": "children", "id": 1, "ids": [2]]]))
         p.syncAccessibility()
-        let removed = client.notifications().filter { $0.name != "AXSelectedChildrenChanged" }
+        let removed = client.notifications(until: ["AXMenuClosed", "AXFocusedUIElementChanged"]).filter { $0.name != "AXSelectedChildrenChanged" }
         client.clear()
         XCTAssertEqual(removed.map(\.name), ["AXMenuClosed", "AXFocusedUIElementChanged"])
         XCTAssertTrue(removed.first.map { CFEqual($0.element, pageMenu) } ?? false, "on the menu, not the page")
@@ -458,7 +553,7 @@ final class AccessibilityClientMacTests: XCTestCase {
         p.apply(wireBatch([["op": "children", "id": 1, "ids": [2, 10]]]))
         XCTAssertTrue(window.makeFirstResponder(p.views[11]))
         p.syncAccessibility()
-        XCTAssertEqual(heard().filter { !$0.hasPrefix("AXFocused") }, ["AXMenuOpened menu", "AXSelectedChildrenChanged menu"])
+        XCTAssertEqual(heard(["AXMenuOpened", "AXSelectedChildrenChanged"]).filter { !$0.hasPrefix("AXFocused") }, ["AXMenuOpened menu", "AXSelectedChildrenChanged menu"])
     }
 
 
@@ -576,39 +671,22 @@ final class AccessibilityClientMacTests: XCTestCase {
     }
 
     /// A dialog drawn in the page whose field takes the focus sends
-    /// VoiceOver to the field, then is named, queued after the field's
-    /// words: AppKit tells a sheet by its creation, then the focus in it
-    /// (measured here), and the sheet's title is read from its window,
-    /// which a group in the page does not have. Announced before the focus,
-    /// at high priority, the dialog's name cut the field's off.
-    func testADialogIsNamedAfterTheFocusInIt() throws {
+    /// VoiceOver to the field, and VoiceOver names the dialog first, as it
+    /// does Chrome's: the dialog's parent is a web area of its own
+    /// (`DialogWebArea`), which the scroll view does not serve as a child.
+    /// The host announces nothing.
+    func testADialogDrawnInThePageIsServedInAWebAreaOfItsOwn() throws {
         let p = try fixture([])
         let client = AXClient()
-        try client.listen(["AXAnnouncementRequested", "AXLayoutChanged", "AXFocusedUIElementChanged", "AXSheetCreated"])
-        func heard() -> [String] {
+        try client.listen(["AXAnnouncementRequested", "AXLayoutChanged", "AXFocusedUIElementChanged"])
+        func heard(_ expected: [String]) -> [String] {
             defer { client.clear() }
-            return client.notifications().map { note in
+            return client.notifications(until: expected).map { note in
                 let named = (note.info["AXUIElementsKey"] as? [AXUIElement])?.compactMap { AXClient.value($0, "AXDescription") as? String } ?? []
                 return ([note.name, client.value(of: note.element, "AXRole") ?? "", client.value(of: note.element, "AXDescription") ?? ""] + named)
                     .filter { !$0.isEmpty }.joined(separator: " ")
             }
         }
-        // AppKit's own: a sheet whose field is its first responder.
-        let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered, defer: false)
-        let field = NSTextField(frame: NSRect(x: 10, y: 10, width: 150, height: 24))
-        field.setAccessibilityLabel("Sheet field")
-        sheet.contentView?.addSubview(field)
-        sheet.initialFirstResponder = field
-        client.clear()
-        window.beginSheet(sheet)
-        let appKit = heard()
-        window.endSheet(sheet)
-        let created = try XCTUnwrap(appKit.firstIndex { $0.hasPrefix("AXSheetCreated") }, "\(appKit)")
-        let fieldFocus = try XCTUnwrap(appKit.lastIndex { $0 == "AXFocusedUIElementChanged AXTextField Sheet field" }, "\(appKit)")
-        XCTAssertLessThan(created, fieldFocus, "AppKit says the sheet, then the focus in it: \(appKit)")
-        XCTAssertFalse(appKit.contains { $0.hasPrefix("AXAnnouncementRequested") }, "\(appKit)")
-        _ = heard()
-
         p.apply(wireBatch([
             ["op": "create", "id": 10, "kind": "view",
              "props": ["accessibilityRole": "dialog", "accessibilityModal": "true", "accessibilityLabel": "Rename project", "testId": "rename"]],
@@ -620,16 +698,19 @@ final class AccessibilityClientMacTests: XCTestCase {
         ]))
         p.syncAccessibility()
         XCTAssertTrue(p.focusedNode === p.views[11], "the field took the focus")
-        let opened = client.notifications()
-        XCTAssertEqual(heard(), ["AXLayoutChanged AXGroup Rename project Project title", "AXFocusedUIElementChanged AXTextField Project title",
-                                 "AXAnnouncementRequested AXGroup Rename project"])
-        XCTAssertEqual(opened.last?.info["AXAnnouncementKey"] as? String, "Rename project, dialog")
-        XCTAssertEqual(opened.last?.info["AXPriorityKey"] as? Int, NSAccessibilityPriorityLevel.low.rawValue)
+        _ = client.notifications(until: ["AXLayoutChanged", "AXFocusedUIElementChanged"])
+        try client.checkReady()
+        XCTAssertEqual(heard([]), ["AXLayoutChanged AXGroup Rename project Project title", "AXFocusedUIElementChanged AXTextField Project title"])
+        XCTAssertEqual(client.ancestry(of: "Project title", matching: "AXDescription"), ["AXGroup AXApplicationDialog Rename project", "AXWebArea [\"rename\"]", "AXScrollArea"])
+        XCTAssertEqual(client.scrollAreaChildRoles(), ["AXGroup"], "the web area is no element's child")
+        let area = try XCTUnwrap(p.views[10]?.accessibilityParent() as? DialogWebArea)
+        XCTAssertTrue(area.accessibilityParent() as? NSView === p.viewport)
+        XCTAssertTrue(p.views[10]?.accessibilityAttributeValue(.parent) as AnyObject === area, "legacy AXParent agrees")
+        XCTAssertTrue(p.views[10]?.accessibilityParent() as AnyObject === area, "one web area while the dialog stays one")
 
         // An alert dialog over it with no focus in it is read where VoiceOver
-        // lands, on it, and not named again; closed, the field is told
-        // again as the modal it is in comes back, and that dialog, still
-        // up, is not named again.
+        // lands, on it; closed, the field is told again as the modal it is
+        // in comes back.
         p.apply(wireBatch([
             ["op": "create", "id": 30, "kind": "view",
              "props": ["accessibilityRole": "alertdialog", "accessibilityModal": "true", "accessibilityLabel": "Discard this environment?"]],
@@ -637,9 +718,16 @@ final class AccessibilityClientMacTests: XCTestCase {
             ["op": "frame", "id": 30, "x": 80.0, "y": 80.0, "w": 200.0, "h": 80.0],
         ]))
         XCTAssertTrue(p.macAccessibilityModal === p.views[30], "the alert dialog is the modal")
-        XCTAssertEqual(heard(), ["AXLayoutChanged AXScrollArea Discard this environment?"], "no focus in it: VoiceOver goes to the dialog")
+        XCTAssertEqual(heard(["AXLayoutChanged"]), ["AXLayoutChanged AXScrollArea Discard this environment?"], "no focus in it: VoiceOver goes to the dialog")
         p.apply(wireBatch([["op": "children", "id": 1, "ids": [2, 10]]]))
-        XCTAssertEqual(heard(), ["AXLayoutChanged AXGroup Rename project Project title", "AXFocusedUIElementChanged AXTextField Project title"])
+        _ = client.notifications(until: ["AXLayoutChanged", "AXFocusedUIElementChanged"])
+        try client.checkReady()
+        XCTAssertEqual(heard([]), ["AXLayoutChanged AXGroup Rename project Project title", "AXFocusedUIElementChanged AXTextField Project title"])
+
+        // No longer a dialog, it has no web area; nor has a group.
+        p.apply(wireBatch([["op": "props", "id": 10, "set": ["accessibilityRole": "group"]]]))
+        p.syncAccessibility(changed: [10])
+        XCTAssertFalse(p.views[10]?.accessibilityParent() is DialogWebArea)
     }
 
     /// AppKit posts the focus change itself as a view becomes the first
@@ -679,7 +767,7 @@ final class AccessibilityClientMacTests: XCTestCase {
         p.syncAccessibility()
         XCTAssertFalse(NSApp.isActive)
         XCTAssertTrue(p.focusedNode === p.views[11], "the field took the focus")
-        XCTAssertEqual(heard().filter { !$0.hasPrefix("AXAnnouncement") },
+        XCTAssertEqual(heard(),
                        ["AXLayoutChanged AXGroup Rename project Project title", "AXFocusedUIElementChanged AXTextField Project title"])
         // Closed, its commit's `focus()` gives the trigger the focus back.
         p.apply(wireBatch([["op": "children", "id": 1, "ids": [2]]]))
@@ -688,14 +776,14 @@ final class AccessibilityClientMacTests: XCTestCase {
     }
 
     /// A dialog in a popover whose field autofocuses (the font picker),
-    /// opened by VO-Space on its trigger, sends VoiceOver to the field and
-    /// names the dialog after it. The layout change is posted on the dialog:
+    /// opened by VO-Space on its trigger, sends VoiceOver to the field, and
+    /// VoiceOver names the dialog by its web area. The layout change is posted on the dialog:
     /// posted on the page's scroll view, VoiceOver went to the scroll view's
     /// child that holds the field, the dialog, said "Interface font family,
     /// dialog" and stayed there (realinput-1016i H-10; measured beside
     /// AppKit's `NSPopover`, which VoiceOver reads as "Search fonts, search
-    /// text field", then "In …, popover"). AppKit's popover names itself as
-    /// the focus enters it, so the host names only one painted in the page.
+    /// text field", then "In …, popover"). VoiceOver names AppKit's popover
+    /// by its window, so only one painted in the page has a web area.
     func testAPopoverDialogSendsVoiceOverToTheFieldItFocused() throws {
         let p = try fixture([
             ["op": "create", "id": 20, "kind": "view",
@@ -726,25 +814,19 @@ final class AccessibilityClientMacTests: XCTestCase {
         p.menus.show(picker, from: trigger)
         XCTAssertTrue(p.focusedNode === p.views[22], "the field took the focus")
         XCTAssertTrue(p.macAccessibilityModal === picker, "the picker is the modal")
-        let low = NSAccessibilityPriorityLevel.low.rawValue
-        XCTAssertEqual(heard(), ["AXLayoutChanged AXGroup Interface font family Search fonts", "AXFocusedUIElementChanged AXTextField Search fonts",
-                                 "AXAnnouncementRequested AXGroup Interface font family \"Interface font family, dialog\" priority \(low)"])
+        XCTAssertEqual(heard(), ["AXLayoutChanged AXGroup Interface font family Search fonts", "AXFocusedUIElementChanged AXTextField Search fonts"])
+        XCTAssertEqual(client.ancestry(of: "Search fonts", matching: "AXDescription"), ["AXGroup Search", "AXGroup AXApplicationDialog Interface font family", "AXWebArea [\"picker\"]", "AXScrollArea"])
         // Closed with the focus given back: VoiceOver goes to the trigger, from the page.
         p.menus.close(picker)
         XCTAssertEqual(heard(), ["AXLayoutChanged AXScrollArea More actions", "AXFocusedUIElementChanged AXButton More actions"])
 
-        // Closed before it is named: it is not named.
-        p.menus.show(picker, from: trigger)
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
-        p.menus.close(picker)
-        XCTAssertFalse(heard().contains { $0.hasPrefix("AXAnnouncementRequested") }, "a dialog gone is not named")
-
-        // AppKit's popover: VoiceOver names it as the focus enters it, so the host does not.
+        // AppKit's popover: VoiceOver names it by its window, so it has no web area.
         p.menus.painted = false
         p.menus.show(picker, from: trigger)
         XCTAssertTrue(p.focusedNode === p.views[22], "the field took the focus")
         XCTAssertTrue(picker.window.map(p.menus.hosts) ?? false, "the picker is in AppKit's popover")
         XCTAssertEqual(heard(), ["AXLayoutChanged AXGroup Interface font family Search fonts", "AXFocusedUIElementChanged AXTextField Search fonts"])
+        XCTAssertFalse(picker.accessibilityParent() is DialogWebArea)
         p.menus.close(picker)
     }
 
@@ -843,5 +925,53 @@ final class AccessibilityClientMacTests: XCTestCase {
         NSEvent.keyEvent(with: up ? .keyUp : .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
             windowNumber: window.windowNumber, context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53)!
     }
+}
+// AX reads initialize AppKit's accessibility machinery. Keep them in a process
+// apart from the observer tests, which measure its initial native notifications.
+final class ComboboxAccessibilityClientMacTests: XCTestCase {
+    func testAComboboxInputServesItsRoleValueAndExpandedStateToVoiceOver() throws {
+        guard AXIsProcessTrusted() else { throw XCTSkip("this process is not trusted for accessibility") }
+        _ = NSApplication.shared
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.finishLaunching()
+        for type in ["search", "text"] {
+            let label = "Book (\(type))"
+            let p = Presenter()
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = p.viewport
+            defer { window.close() }
+            p.apply(wireBatch([
+                ["op": "create", "id": 1, "kind": "view"],
+                ["op": "roots", "ids": [1]],
+                ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 400.0, "h": 300.0],
+                ["op": "create", "id": 11, "kind": "input", "handlers": ["input"],
+                 "props": ["type": type, "value": "Pira", "accessibilityRole": "combobox", "accessibilityLabel": label, "accessibilityExpanded": "false", "testId": "book-combo"]],
+                ["op": "children", "id": 1, "ids": [11]],
+                ["op": "frame", "id": 11, "x": 10.0, "y": 40.0, "w": 280.0, "h": 24.0],
+            ]))
+            p.syncAccessibility()
+            window.orderFront(nil)
+            window.layoutIfNeeded()
+            let client = AXClient(), attributes = ["AXRole", "AXRoleDescription", "AXDescription", "AXValue", "AXExpanded"]
+            let field = try XCTUnwrap(p.views[11]?.field)
+            XCTAssertEqual(field is NSSearchField, type == "search")
+            XCTAssertEqual(field.accessibilityRole(), .comboBox)
+            XCTAssertEqual(field.cell?.accessibilityAttributeValue(.role) as? String, "AXComboBox")
+            let collapsed = try XCTUnwrap(client.attributes(of: label, attributes, matching: "AXDescription"), "the \(type) input")
+            XCTAssertEqual(collapsed["AXRole"], "AXComboBox")
+            XCTAssertEqual(collapsed["AXRoleDescription"], NSAccessibility.Role.comboBox.description(with: nil))
+            XCTAssertEqual(collapsed["AXDescription"], label)
+            XCTAssertEqual(collapsed["AXValue"], "Pira")
+            XCTAssertEqual(collapsed["AXExpanded"], "0")
+            p.apply(wireBatch([["op": "props", "id": 11, "set": ["accessibilityExpanded": "true", "value": "Piranesi"]]]))
+            let expanded = try XCTUnwrap(client.attributes(of: label, attributes, matching: "AXDescription"))
+            XCTAssertEqual(expanded["AXExpanded"], "1")
+            XCTAssertEqual(expanded["AXValue"], "Piranesi")
+            p.apply(wireBatch([["op": "props", "id": 11, "clear": ["accessibilityRole", "accessibilityExpanded"]]]))
+            XCTAssertEqual(client.attributes(of: label, attributes, matching: "AXDescription")?["AXRole"], "AXTextField")
+        }
+    }
+
 }
 #endif

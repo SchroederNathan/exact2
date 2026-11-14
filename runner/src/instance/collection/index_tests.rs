@@ -406,7 +406,7 @@ fn a_list_at_its_start_shows_rows_inserted_above() {
     prepended.insert(0, "new".into());
     index.replace_keys(prepended).unwrap();
     assert_eq!(index.restore_anchor(&top, 20.0).unwrap(), 0.0);
-    assert!(!index.kept_row(&top, 20.0, 0.0), "the start stays absolute");
+    assert!(!index.kept_row(&top, 20.0), "the start stays absolute");
     short.replace_keys(keys(6)).unwrap();
     assert!(short.restore_anchor(&transcript, 20.0).unwrap() > 0.0);
     assert_eq!(
@@ -453,6 +453,70 @@ fn end_follow_only_when_requested_and_already_at_end() {
     let anchor = empty.capture_anchor(0.0, 20.0, true).unwrap();
     empty.replace_keys(keys(3)).unwrap();
     assert_eq!(empty.restore_anchor(&anchor, 20.0).unwrap(), 0.0);
+}
+
+/// A port pulled past the end (a rubber band under a finger or a fling)
+/// keeps its overshoot: restored where it was, it owes no correction that
+/// would pull the band back, and a row before it that grows moves it by as
+/// much, from there. With no row to anchor (a list shorter than its port,
+/// padded or not, or a port in the padding after the rows, past the end or
+/// not) it stays where it was, though the rows below it grow.
+#[test]
+fn an_anchor_past_the_end_keeps_its_overshoot() {
+    let mut index = index(&[100.0, 100.0, 100.0, 100.0]);
+    let viewport = 150.0;
+    let max = index.max_offset(viewport);
+    let pulled = max + 19.0;
+    let anchor = index.capture_anchor(pulled, viewport, false).unwrap();
+    assert_eq!(index.restore_anchor(&anchor, viewport).unwrap(), pulled);
+    assert!(index.kept_row(&anchor, viewport));
+    let token = index.measurement_token("k0").unwrap();
+    assert!(index.set_measured_height("k0", token, 110.0).unwrap());
+    assert_eq!(
+        index.restore_anchor(&anchor, viewport).unwrap(),
+        pulled + 10.0
+    );
+    // An end it follows keeps it too, past the end the rows now have
+    let following = index.capture_anchor(pulled + 10.0, viewport, true).unwrap();
+    assert!(SizeIndex::follows_end(&following));
+    assert_eq!(
+        index.restore_anchor(&following, viewport).unwrap(),
+        pulled + 10.0
+    );
+    let token = index.measurement_token("k3").unwrap();
+    assert!(index.set_measured_height("k3", token, 125.0).unwrap());
+    assert_eq!(
+        index.restore_anchor(&following, viewport).unwrap(),
+        pulled + 35.0
+    );
+    let mut short = self::index(&[100.0]);
+    let mut padded = self::index(&[100.0; 5]);
+    padded.set_leading(92.0);
+    padded.set_trailing(83.0);
+    let mut after = self::index(&[100.0; 2]);
+    after.set_trailing(300.0);
+    for (list, port, at) in [
+        (&short, viewport, 19.0),
+        (&padded, 600.0, 0.0),
+        (&padded, 600.0, 19.0),
+        (&after, 100.0, 450.0),
+        (&after, 100.0, 300.0),
+    ] {
+        let anchor = list.capture_anchor(at, port, false).unwrap();
+        assert_eq!(
+            list.restore_anchor(&anchor, port).unwrap(),
+            at,
+            "{at} in {port}"
+        );
+    }
+    let anchor = short.capture_anchor(19.0, viewport, false).unwrap();
+    let token = short.measurement_token("k0").unwrap();
+    assert!(short.set_measured_height("k0", token, 400.0).unwrap());
+    assert_eq!(
+        short.restore_anchor(&anchor, viewport).unwrap(),
+        19.0,
+        "its row grew below the port's top"
+    );
 }
 
 #[test]
@@ -812,7 +876,12 @@ fn twenty_25k_traversals_with_zero_samples_keep_selection_and_metadata_bounded()
             // Work scales with selected rows and tree depth, never the zero run.
             assert!(index.tree.visits.get() <= (12 + 4 * selected.len()) * (depth + 1));
             let anchor = index.capture_anchor(offset, 100.0, false).unwrap();
-            assert_eq!(index.restore_anchor(&anchor, 100.0).unwrap(), window.offset);
+            // Past the end the port keeps its overshoot (a rubber band).
+            let beyond = (offset - index.max_offset(100.0)).max(0.0);
+            assert_eq!(
+                index.restore_anchor(&anchor, 100.0).unwrap(),
+                window.offset + beyond
+            );
             assert!(Rc::ptr_eq(&anchor.order, &order));
         }
     }
@@ -1008,4 +1077,109 @@ fn a_short_list_ends_in_the_padding_before_its_rows() {
     i.set_leading(92.);
     i.set_trailing(83.);
     near(i.max_offset(600.), -92.);
+}
+
+#[test]
+fn reorder_anchor_keeps_signed_offsets_and_clamps_when_no_other_row_is_visible() {
+    for (offset, port, expected) in [
+        (200., 100., 180.),
+        (207., 100., 187.),
+        (200., 20., 200.),
+        (207., 10., 207.),
+        (0., 100., 0.),
+    ] {
+        let mut i = index(&[20.; 30]);
+        let a = i
+            .capture_anchor_excluding(offset, port, false, Some("k10"))
+            .unwrap();
+        let mut order = keys(30);
+        let source = order.remove(10);
+        order.insert(14, source);
+        i.replace_keys(order).unwrap();
+        assert_eq!(i.restore_anchor(&a, port).unwrap(), expected);
+    }
+    let mut i = index(&[20.; 30]);
+    let a = i
+        .capture_anchor_excluding(200., 100., false, Some("k10"))
+        .unwrap();
+    i.replace_keys(vec![
+        "k11".into(),
+        "k12".into(),
+        "k13".into(),
+        "k14".into(),
+        "k15".into(),
+        "k16".into(),
+    ])
+    .unwrap();
+    assert_eq!(i.restore_anchor(&a, 100.).unwrap(), 0.);
+    assert!(!i.kept_row(&a, 100.));
+    let mut i = index(&[20., 20., 0., 20., 20., 20.]);
+    let a = i
+        .capture_anchor_excluding(20., 40., false, Some("k1"))
+        .unwrap();
+    i.replace_keys(vec![
+        "k0".into(),
+        "k2".into(),
+        "k3".into(),
+        "k4".into(),
+        "k1".into(),
+        "k5".into(),
+    ])
+    .unwrap();
+    assert_eq!(i.restore_anchor(&a, 40.).unwrap(), 0.);
+}
+
+#[test]
+fn drop_anchor_requires_a_move_among_surviving_keys() {
+    let mut i = index(&[20.; 30]);
+    let a = i
+        .capture_anchor_excluding(200., 100., false, Some("k10"))
+        .unwrap();
+    let mut order = keys(30);
+    order.insert(10, "new".into());
+    i.replace_keys(order.clone()).unwrap();
+    assert!(!i.moved_since(&a, "k10"));
+    order.remove(9);
+    i.replace_keys(order).unwrap();
+    assert!(!i.moved_since(&a, "k10"));
+}
+
+#[test]
+fn pending_drop_with_unchanged_order_does_not_scan_keys() {
+    let i = index(&vec![20.; 10_000]);
+    let a = i.capture_anchor(199_800., 100., false).unwrap();
+    assert!(!i.moved_since(&a, "k9990"));
+    assert_eq!(i.anchor_key_visits.get(), 0);
+}
+
+#[test]
+fn anchor_at_exact_start_keeps_a_relative_correction() {
+    let mut i = index(&[20.; 30]);
+    let a = i.capture_anchor(200., 100., false).unwrap();
+    i.replace_keys(keys(30).into_iter().skip(10).collect())
+        .unwrap();
+    let restored = i.restore_anchor(&a, 100.).unwrap();
+    assert_eq!(restored, 0.);
+    assert!(i.kept_row(&a, 100.));
+}
+
+#[test]
+fn relative_anchor_corrections_include_boundaries_but_exclude_clamping() {
+    let mut i = index(&[20.; 30]);
+    i.set_leading(20.);
+    for (offset, kept, restored) in [
+        (-21., false, -20.),
+        (-20., true, -20.),
+        (0., true, 0.),
+        (500., true, 500.),
+        (501., false, 500.),
+    ] {
+        let anchor = i.anchor_at("k0", offset).unwrap();
+        assert_eq!(i.restore_anchor(&anchor, 100.).unwrap(), restored);
+        assert_eq!(i.kept_row(&anchor, 100.), kept, "offset={offset}");
+    }
+    let end = i.capture_anchor(500., 100., true).unwrap();
+    assert!(!i.kept_row(&end, 100.));
+    let start = i.capture_anchor(0., 100., false).unwrap();
+    assert!(!i.kept_row(&start, 100.));
 }

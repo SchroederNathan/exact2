@@ -11,10 +11,21 @@ import { nativeManifestMetadata } from '../../scripts/app.mjs';
 const root = resolve(import.meta.dir, '../..');
 const now = new Date('2026-10-08T10:00:00Z');
 
+test('frame health collects on demand in production and follows the manifest independently of the menu', () => {
+  const stamp = (manifest, options = {}) => buildInfo({ dir: root, manifest }, { root, now, env: {}, ...options });
+  expect(stamp({}).ExactFrameHealthMode).toBe('core');
+  expect(stamp({}, { production: true }).ExactFrameHealthMode).toBe('demand');
+  expect(stamp({}, { env: { EXACT_UPDATE_TRUST: 'production' } }).ExactFrameHealthMode).toBe('demand');
+  expect(stamp({ frame_health: { mode: 'off' } }).ExactFrameHealthMode).toBe('off');
+  expect(stamp({ frame_health: { mode: 'core' } }, { production: true }).ExactFrameHealthMode).toBe('core');
+  expect(nativeManifestMetadata({ app: { id: 'com.example.health' }, frame_health: { mode: 'off' } }, 'ios').frame_health).toEqual({ mode: 'off' });
+});
+
 test('native binary identity includes protocol handler registration and templates', () => {
   const manifest = { app: { id: 'com.exact.links' }, protocol_handlers: [{ protocol: 'exacttest', url: '/open?u=%s' }] };
   const first = nativeManifestMetadata(manifest, 'macos');
   expect(first.protocol_handlers).toEqual(manifest.protocol_handlers);
+  for (const platform of ['macos', 'ios']) expect(nativeManifestMetadata({ ...manifest, protocol_handlers: [{ ...manifest.protocol_handlers[0], distribution_only: true }] }, platform)).not.toEqual(nativeManifestMetadata(manifest, platform));
   expect(nativeManifestMetadata({ ...manifest, protocol_handlers: [{ protocol: 'exacttest', url: '/callback?u=%s' }] }, 'macos')).not.toEqual(first);
 });
 

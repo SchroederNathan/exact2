@@ -34,7 +34,7 @@ struct Leaving {
     parent: ViewId,
     animations: exact_motion::Animations,
     /// The style it last showed: its paint moves over it.
-    style: String,
+    style: std::rc::Rc<str>,
     /// The view and everything under it the presenter knew.
     members: Vec<ViewId>,
     /// Whether the engine has its exit, and the clock time that ends, once
@@ -54,12 +54,17 @@ pub(crate) struct Presence {
     layout: LayoutMotion,
     /// A resize lays out next: positions are taken, not animated.
     pub(super) snap: bool,
+    /// This operation lays out for a host's fact, not an app's commit (an
+    /// inset, the text size, a native size): a box it moves takes its place
+    /// unless it is moving already, as on the web, where a layout transition
+    /// plays only what a commit moved. `finish` clears it.
+    pub(super) unauthored: bool,
     /// The presented frame a motion tick is for (LLP 1003.001 D5): every
     /// present while it is set starts what waits for it.
     pub(super) frame: Option<f64>,
     /// Each virtualized list's data generation, and whether it runs along
     /// x, at the last layout.
-    generations: Vec<(ViewId, u64, bool)>,
+    pub(super) generations: Vec<(ViewId, u64, bool)>,
     /// The lists whose data this layout's commit did not change: their rows'
     /// moves are the list's own (`LayoutMotion::observe_unauthored`).
     settled: IdSet<ViewId>,
@@ -99,7 +104,10 @@ impl<D: DataSource> Host<D> {
                 key: exit.key,
                 parent,
                 animations: exit.animations.clone(),
-                style: self.mirror.get(&view).map_or("{}", |m| &m.style).to_owned(),
+                style: self
+                    .mirror
+                    .get(&view)
+                    .map_or_else(|| "{}".into(), |m| m.style.clone()),
                 members,
                 played: false,
                 end: None,
@@ -157,7 +165,8 @@ impl<D: DataSource> Host<D> {
         if let Some(l) = self.presence.leaving.iter().find(|l| l.view == view) {
             let shown = self.shown_paint(motion_node(l.key));
             let env = self.runner.kernel().env();
-            batch.style(view, &style::restyle_presented(&l.style, &env, &shown));
+            let own = l.animations.properties().contains(&Property::Color);
+            batch.style(view, &style::restyle_presented(&l.style, &env, &shown, own));
         }
     }
 
@@ -167,6 +176,42 @@ impl<D: DataSource> Host<D> {
         }
         self.engine.remove(motion_node(leaving.key));
         batch.destroy(leaving.view);
+    }
+
+    /// An agent's jump to `to`, stopping after a timer that sends
+    /// ([`exact_runner::Runner::advance_until_request`]). The engine hears
+    /// each commit of a jump at its timer's due time (LLP 1002 D3), but the
+    /// kernel holds only the jump's last tree, laid out at its end: a box a
+    /// timer moved inside the jump would start its layout transition there,
+    /// and the first read after `clock +N` showed it where it was. While a
+    /// node declares a layout transition, the jump lays out at each due time,
+    /// as real frames would, in one batch; only a request stops it short of
+    /// `to`, so these stops spend none of the agent's request stops.
+    pub(super) fn advance_in_layout_steps(&mut self, to: f64) -> String {
+        if self.engine.starts_on_frame() || self.presence.layout.is_empty() {
+            let a = self.runner.advance_until_request(to);
+            return self.advanced(a);
+        }
+        let (mut batch, mut error) = (Batch::new(), None);
+        for _ in 0..LAYOUT_STOPS {
+            let step = layout_step(&self.runner, to);
+            let a = self.runner.advance_until_request(step);
+            self.now_ms = a.now_ms.max(self.now_ms);
+            self.runner.canvas_frame();
+            // A commit that sent stops the jump: the next send would drop
+            // its reply (LLP 1016 D5).
+            let stopped = a.error.is_some() || a.stopped_on_request || step >= to;
+            let failed = error.or(a.error.map(|e| format!("{e:?}")));
+            (batch, error) = self.commit_tree(&a.receipts, failed, batch);
+            if let Some(e) = self.arrange_after_commit(&mut batch) {
+                error.get_or_insert(e);
+            }
+            self.group_after_commit(&mut batch);
+            if stopped || self.presence.layout.is_empty() {
+                break;
+            }
+        }
+        self.commit_finish(batch, error)
     }
 
     /// Before a commit's layout: each node the commit gave the row starts
@@ -265,13 +310,14 @@ impl<D: DataSource> Host<D> {
         let settled = |id: Option<ViewId>| id.is_some_and(|id| self.presence.settled.contains(&id));
         let wraps =
             |n: exact_kernel::NodeRef| n.props.str(exact_kernel::PropId::ListItemKey).is_some();
-        let unauthored = !self.presence.settled.is_empty()
-            && kernel.node_by_key(key).is_some_and(|n| {
-                (wraps(n) && settled(n.parent))
-                    || n.parent
-                        .and_then(|p| kernel.node(p))
-                        .is_some_and(|p| wraps(p) && settled(p.parent))
-            });
+        let unauthored = self.presence.unauthored
+            || (!self.presence.settled.is_empty()
+                && kernel.node_by_key(key).is_some_and(|n| {
+                    (wraps(n) && settled(n.parent))
+                        || n.parent
+                            .and_then(|p| kernel.node(p))
+                            .is_some_and(|p| wraps(p) && settled(p.parent))
+                }));
         let retired = if unauthored {
             self.presence
                 .layout
@@ -299,7 +345,7 @@ impl<D: DataSource> Host<D> {
     fn retire_layout(&self, retired: Vec<NodeKey>, batch: &mut Batch) {
         for key in retired {
             if let Some(&view) = self.keys.get(&key) {
-                batch.present4(view, "layout", [0.0, 0.0, 1.0, 1.0]);
+                batch.present4(view, "layout", [0.0; 4]);
             }
         }
     }
@@ -332,6 +378,22 @@ impl<D: DataSource> Host<D> {
         }
         self.holds.retain(|_, token| self.engine.has_hold(*token));
         let mut colored: Vec<(ViewId, bool)> = Vec::new();
+        // Before sampling: a transition handed over presents its target.
+        // Under the agent's clock (no first-frame rule) motion is sampled:
+        // nothing new is handed over, and what was comes back.
+        if self.svg.play_transitions {
+            let new = self.engine.starts_on_frame() && !self.native_mode();
+            let runs = &self.inline_runs;
+            for view in super::svg_lower::hand_over_transitions(
+                self.runner.kernel(),
+                &mut self.engine,
+                &|v| runs.contains_key(&v),
+                &|v| !self.runner.handlers_of(v).is_empty(),
+                new,
+            ) {
+                self.svg.played(view);
+            }
+        }
         let frame = self.engine.frame();
 
         for p in frame {
@@ -371,7 +433,8 @@ impl<D: DataSource> Host<D> {
 
     /// One presented value of a box as a `present` op, unless it is the
     /// property's identity and the presenter starts the view there (at
-    /// boot, or in the batch that creates it).
+    /// boot, or in the batch that creates it, before that batch presents it
+    /// elsewhere: [`Batch::at_identity`]).
     pub(super) fn present_value(
         &mut self,
         view: ViewId,
@@ -382,8 +445,8 @@ impl<D: DataSource> Host<D> {
         batch: &mut Batch,
     ) {
         // A layout box is presented as its offset from the laid-out
-        // origin and its scale of the laid-out size; identity is
-        // `0 0 1 1`. The other three are one or two numbers.
+        // origin and its size's difference from the laid-out size;
+        // identity is `0 0 0 0`. The other three are one or two numbers.
         let values = match property {
             Property::Layout => layout_presented(&self.engine, node, value),
             Property::Translate => [value.x, value.y, value.z, value.w],
@@ -391,9 +454,9 @@ impl<D: DataSource> Host<D> {
         };
         let identity = match property.identity() {
             Some(identity) => identity == value,
-            None => values == [0.0, 0.0, 1.0, 1.0],
+            None => values == [0.0; 4],
         };
-        if (boot && identity) || (identity && batch.creates(view)) {
+        if identity && (boot || batch.at_identity(view, property.name())) {
             return;
         }
         if self.inline_runs.contains_key(&view) || self.svg.presented(view) {
@@ -412,4 +475,14 @@ impl<D: DataSource> Host<D> {
             batch.present(view, property.name(), values[0], values[1]);
         }
     }
+}
+
+/// The most layout stops one agent call makes: a frame task's every frame
+/// across ten minutes. The agent's loop calls again past it.
+const LAYOUT_STOPS: usize = 60 * 60 * 10;
+
+/// The next due time of `runner`'s timers, from its clock, at most `to`.
+fn layout_step<D: DataSource>(runner: &exact_runner::Runner<D>, to: f64) -> f64 {
+    let due = runner.timer_due_ms().unwrap_or(to);
+    due.max(runner.now_ms()).min(to)
 }

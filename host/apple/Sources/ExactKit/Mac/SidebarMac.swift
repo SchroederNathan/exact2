@@ -187,11 +187,12 @@ final class SidebarHost {
             decide("kept as authored: the root tablist #\(host.tablist.id) is placed by the app (not a row in flow in the root's flex column)")
             return
         }
+        for tab in host.tabs { tab.rejectNativeActiveProperties(on: "NSOutlineView sidebar row") }
         decide("the root tablist #\(host.tablist.id) is the window's sidebar (\(host.tabs.count) tabs)")
         let hidden = host.tablist.style["display"]?.string == "none"
-        // A tab's face is read from the kernel for a native button: only
-        // when a batch touched the tablist's subtree.
-        let touched = batch.map { $0.ops.contains { op in op.op != .frame && op.op != .present && op.nodeID.map(watched.contains) == true } } ?? true
+        // Native button faces are viewless. Rebuild rows for every controls batch,
+        // including unrelated buttons, and for changes in the tablist subtree.
+        let touched = batch.map { $0.controls || $0.ops.contains { op in op.op != .frame && op.op != .present && op.nodeID.map(watched.contains) == true } } ?? true
         if let now = shown, now.tablist === host.tablist, now.rows.map(\.tab) == host.tabs.map(\.id), !watched.isEmpty, !touched {
             shown?.selected = root.at
             shown?.hidden = hidden
@@ -283,7 +284,7 @@ final class SidebarHost {
         return ["installed": true, "tablist": Int(shown.tablist.id), "collapsed": controller.collapsed, "hiddenByApp": shown.hidden,
                 "width": Agent.r2(controller.sidebarWidth), "selected": shown.selected ?? NSNull(),
                 "rows": shown.rows.map { row -> [String: Any] in
-                    ["tab": Int(row.tab), "testId": row.testId ?? NSNull(), "title": row.face.title, "symbol": row.face.base ?? NSNull(),
+                    ["tab": Int(row.tab), "testId": row.testId ?? NSNull(), "title": row.face.title, "symbol": FaceSymbol.observed(row.face.base, icon: row.face.icon) ?? NSNull(),
                      "badge": row.face.badge ?? NSNull(), "enabled": !row.face.disabled]
                 }]
     }

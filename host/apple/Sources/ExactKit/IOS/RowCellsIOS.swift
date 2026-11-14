@@ -30,7 +30,7 @@
 // the next row's top edge (`none` is written too), has no separator there;
 // a row with a ground of its own is its author's card, whose press is a
 // custom pressable's (the dim); a row's own press (`-exact-press-scale`,
-// `pointerdown`, `pointerup`) replaces the highlight.
+// its pressed paint, `pointerdown`, `pointerup`) replaces the highlight.
 #if os(iOS) || os(tvOS)
 import UIKit
 
@@ -92,10 +92,13 @@ extension NodeView {
         return false
     }
     /// The first paragraph in the row, in the order it is written: where a
-    /// cell's separator begins.
+    /// cell's separator begins. What lies wholly beside the box is not in
+    /// the row (a `delete=` row's Delete parked past its trailing edge, which
+    /// a row mounted again as the list scrolls back can hold before its
+    /// content).
     fileprivate var firstText: NodeView? {
         if kind == "text" { return self }
-        for case let child as NodeView in container.subviews where !child.isHidden {
+        for case let child as NodeView in container.subviews where !child.isHidden && child.frame.maxX > 0 && child.frame.minX < bounds.width {
             if let found = child.firstText { return found }
         }
         return nil
@@ -104,21 +107,34 @@ extension NodeView {
 
 /// One list's separators: a shape over its rows, in the list's content, in
 /// UIKit's separator colour for the appearance it is shown in.
+/// A list's separators' appearance: an empty view in the list that hears
+/// its appearance change and draws its rows' lines again in the new colour.
 final class RowLinesView: UIView {
-    override class var layerClass: AnyClass { CAShapeLayer.self }
-    var shape: CAShapeLayer { layer as! CAShapeLayer } // swiftlint:disable:this force_cast
+    var retint: (() -> Void)?
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false
         isAccessibilityElement = false
-        layer.zPosition = 1
-        tint()
-        registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) { (view: RowLinesView, _: UITraitCollection) in view.tint() }
+        isHidden = true
+        registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) { (view: RowLinesView, _: UITraitCollection) in view.retint?() }
     }
     required init?(coder: NSCoder) { nil }
-    private func tint() { shape.fillColor = RowCells.separator.resolvedColor(with: traitCollection).cgColor }
+    var color: CGColor { RowCells.separator.resolvedColor(with: traitCollection).cgColor }
     /// Never a hit: a touch on a separator is the row's.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+}
+
+/// A row's separators, in its own layer, so a row that moves between
+/// batches (a layout transition, an exit, a reorder drag) carries its line,
+/// as a UIKit cell carries its separator view.
+final class RowLineLayer: CAShapeLayer {
+    override init() {
+        super.init()
+        zPosition = 1
+    }
+    override init(layer: Any) { super.init(layer: layer) }
+    required init?(coder: NSCoder) { nil }
+    override func action(forKey event: String) -> (any CAAction)? { NSNull() }
 }
 
 /// The ground of the row that is pressed or selected, under the list's rows.
@@ -140,9 +156,7 @@ final class RowCells {
     /// A separator's thickness: a point, as measured on iOS 27 (earlier
     /// systems drew a hairline).
     static let thickness: CGFloat = 1
-    /// How far short of the trailing edge a separator ends, and where one
-    /// starts in a row with no text: a cell's layout margin at an iPhone's
-    /// width (an iPad's wider margin was not measured).
+    /// A cell's layout margin before a list reports its own (`margins`).
     static let margin: CGFloat = 16
     /// The ground of a highlighted or selected cell of a plain list. (tvOS
     /// has no such grey and draws no row of this: its focus is the feedback.)
@@ -160,6 +174,13 @@ final class RowCells {
 
     private weak var presenter: Presenter?
     private var lines: [UInt32: RowLinesView] = [:]
+    /// Each row's line layer, by the row, while it draws one.
+    private var rowLines: [ObjectIdentifier: (row: Weak<NodeView>, layer: RowLineLayer)] = [:]
+    final class Weak<T: AnyObject> { weak var value: T?; init(_ value: T) { self.value = value } }
+    /// The margins each list's rows were last sampled at (LLP 1138), which
+    /// its separators follow, and those the kernel was last sent.
+    private var told: [UInt32: [CGFloat]] = [:]
+    private var sent: [UInt32: [CGFloat]] = [:]
     /// The row whose ground shows, its list, and whether it is selected (a
     /// tap landed on it) or only held down.
     private var shown: (row: NodeView, list: UInt32, ground: RowGroundView, selected: Bool, since: CFTimeInterval)?
@@ -170,6 +191,10 @@ final class RowCells {
     func reset() {
         for view in lines.values { view.removeFromSuperview() }
         lines.removeAll()
+        for entry in rowLines.values { entry.layer.removeFromSuperlayer() }
+        rowLines.removeAll()
+        told.removeAll()
+        sent.removeAll()
         shown?.ground.removeFromSuperview()
         shown = nil
     }
@@ -185,9 +210,71 @@ final class RowCells {
             view.removeFromSuperview()
             lines[id] = nil
         }
-        if let held = shown, presenter.views[held.row.id] !== held.row || held.row.window == nil { drop() } else if let held = shown { held.ground.frame = held.row.frame }
-        for (id, list) in presenter.listViews where list.hasRowCells && (changed?.contains(id) != false || lines[id] == nil) { draw(list) }
+        // A row gone, or no longer a list's, takes its line with it. One out
+        // of the window keeps it: the line is on the row's own layer, and a
+        // screen a push covered comes back with its rows unchanged.
+        for (key, entry) in rowLines where entry.row.value?.rowCell == nil {
+            entry.layer.removeFromSuperlayer()
+            rowLines[key] = nil
+        }
+        // The selected row stays so under the screen it pushed, out of the
+        // window, for its fade as that screen pops (`appearing`).
+        if let held = shown {
+            let nativePress = held.row.rowPress.map { usesGround($0, in: held.row) } == true
+            if presenter.views[held.row.id] !== held.row || (!held.selected && !nativePress) { drop() }
+            else { held.row.moveOrPlace { held.ground.frame = held.row.frame } }
+        }
+        // The margins first, so a list's separators end at the one it now has.
+        let moved = tell()
+        for (id, list) in presenter.listViews where list.hasRowCells && (changed?.contains(id) != false || lines[id] == nil || moved.contains(id)) { draw(list) }
         #endif
+    }
+
+    /// @ref LLP 1138 — the margin UIKit's cell gives a plain list's rows: its
+    /// view controller's system minimum layout margins (16 on an iPhone
+    /// upright, 20 in landscape and on the Duo; measured on iOS 27 beside a
+    /// `UICollectionView` plain list), at its left and right. Exact's layout
+    /// already clears the safe area.
+    private func margins(_ list: NodeView) -> [CGFloat] {
+        guard let controller = sequence(first: list as UIResponder, next: \.next).first(where: { $0 is UIViewController }) as? UIViewController else {
+            return [Self.margin, Self.margin]
+        }
+        let m = controller.systemMinimumLayoutMargins
+        return list.effectiveUserInterfaceLayoutDirection == .rightToLeft ? [m.trailing, m.leading] : [m.leading, m.trailing]
+    }
+
+    /// Each cells list's margins to the kernel when they change, which lays
+    /// its rows out again; a list gone is forgotten. The lists whose margins
+    /// changed.
+    private func tell() -> Set<UInt32> {
+        guard let presenter else { return [] }
+        var changes: [(UInt32, [CGFloat]?)] = []
+        for (id, list) in presenter.listViews where list.hasRowCells && list.window != nil {
+            let m = margins(list)
+            if told[id] != m { told[id] = m; changes.append((id, m)) }
+        }
+        for id in Array(told.keys) where presenter.listViews[id]?.hasRowCells != true {
+            told[id] = nil
+            if presenter.views[id] != nil { changes.append((id, nil)) }
+        }
+        guard !changes.isEmpty else { return [] }
+        presenter.afterBatch { [weak self] in
+            guard let session = self?.presenter?.session else { return }
+            session.whenIdle { [weak self] in self?.send() }
+        }
+        return Set(changes.map(\.0))
+    }
+
+    /// The latest sample's changes to the kernel. A send queued behind a fill
+    /// can run after a later one, so each sends what the latest sample says
+    /// rather than what its own did.
+    private func send() {
+        guard let presenter, let session = presenter.session else { return }
+        var changes: [(UInt32, [CGFloat]?)] = told.filter { sent[$0.key] != $0.value }.map { ($0.key, $0.value) }
+        for id in sent.keys where told[id] == nil && presenter.views[id] != nil { changes.append((id, nil)) }
+        sent = told
+        guard !changes.isEmpty else { return }
+        session.apply(session.runtime.listMargins(changes))
     }
 
     private func isSpacer(_ row: NodeView) -> Bool { row.props["accessibilityElementsHidden"] == "true" }
@@ -210,43 +297,64 @@ final class RowCells {
         let content = list.container
         let view = lines[list.id] ?? RowLinesView(frame: .zero)
         if view.superview !== content { content.addSubview(view) }
+        if view.retint == nil { view.retint = { [weak self, weak list] in if let list { self?.draw(list) } } }
         lines[list.id] = view
         let rows = rows(of: list)
         let lit = shown.flatMap { $0.list == list.id && !fading ? $0.row : nil }
-        let path = CGMutablePath()
-        /// A line at a height of `row`'s box, from where its text starts.
-        func line(_ row: NodeView, at y: CGFloat) {
-            let frame = row.frame
+        let inset = told[list.id] ?? margins(list)
+        let color = view.color
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, row) in rows.enumerated() {
+            let next = index + 1 < rows.count ? rows[index + 1] : nil
+            let bounds = row.bounds, path = CGMutablePath()
             // From the row's text, as a cell's separator is from its label's
             // leading edge and not under a leading image: where the text's
             // glyphs start, inside any padding of its own (a row that is
             // itself a padded text). A row with no text, from the cell's margin.
-            let lead = row.firstText.map { row.convert(CGPoint(x: $0.contentBox().minX, y: 0), from: $0).x } ?? Self.margin
-            let from = frame.minX + max(0, min(lead, frame.width)), to = frame.maxX - Self.margin
-            if to > from { path.addRect(CGRect(x: from, y: y, width: to - from, height: Self.thickness)) }
-        }
-        for (index, row) in rows.enumerated() {
-            let next = index + 1 < rows.count ? rows[index + 1] : nil
+            let lead = row.firstText.map { row.convert(CGPoint(x: $0.contentBox().minX, y: 0), from: $0).x } ?? inset[0]
+            let from = max(0, min(lead, bounds.width)), to = bounds.width - inset[1]
+            func line(at y: CGFloat) { if to > from { path.addRect(CGRect(x: from, y: y, width: to - from, height: Self.thickness)) } }
             // The first row has one above it too, in its own top point: the
             // first of the list, so not after a windowed list's spacer.
-            if index == 0, !isSpacer(row), !wroteTop(row), row !== lit { line(row, at: row.frame.minY) }
+            if index == 0, !isSpacer(row), !wroteTop(row), row !== lit { line(at: 0) }
             // A highlighted or selected row hides the one above it and its own.
-            if separated(row, next: next), row !== lit, next == nil || next !== lit { line(row, at: row.frame.maxY - Self.thickness) }
+            if separated(row, next: next), row !== lit, next == nil || next !== lit { line(at: bounds.height - Self.thickness) }
+            let key = ObjectIdentifier(row)
+            if path.isEmpty {
+                rowLines[key]?.layer.removeFromSuperlayer()
+                rowLines[key] = nil
+                continue
+            }
+            let layer = rowLines[key]?.layer ?? RowLineLayer()
+            if layer.superlayer !== row.layer { row.layer.addSublayer(layer) }
+            rowLines[key] = (Weak(row), layer)
+            layer.frame = bounds
+            layer.path = path
+            layer.fillColor = color
         }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        view.shape.path = path
         CATransaction.commit()
     }
     private func redraw(_ list: UInt32) { if let view = presenter?.listViews[list], view.hasRowCells { draw(view) } }
 
     // MARK: The press
 
+    #if os(iOS)
+    private func usesGround(_ node: NodeView, in row: NodeView) -> Bool {
+        node.platformPressDims && row.rowPress === node && !row.hasOwnGround(pressing: node)
+    }
+    #endif
+
     /// `node`'s `pressed` changed. True when it is a row's press, and its
     /// cell's ground stands in for the dim.
     func press(_ node: NodeView, _ down: Bool) -> Bool {
         #if os(iOS)
-        guard let (row, list) = node.rowCell.map({ ($0.row, $0.list) }), row.rowPress === node, !row.hasOwnGround(pressing: node) else { return false }
+        guard let (row, list) = node.rowCell.map({ ($0.row, $0.list) }) else { return false }
+        guard usesGround(node, in: row) else {
+            if let held = shown, held.row === row, !held.selected { drop() }
+            return false
+        }
+        node.dimPress(false, instantly: true)
         if down {
             show(row, in: list, selected: false)
         } else if let held = shown, held.row === row, !held.selected {
@@ -263,7 +371,7 @@ final class RowCells {
     /// ground stays while the press runs. Returns the row, for `ran`.
     func select(_ node: NodeView) -> NodeView? {
         #if os(iOS)
-        guard node.platformPressDims, let (row, list) = node.rowCell.map({ ($0.row, $0.list) }), row.rowPress === node, !row.hasOwnGround(pressing: node) else { return nil }
+        guard let (row, list) = node.rowCell.map({ ($0.row, $0.list) }), usesGround(node, in: row) else { return nil }
         show(row, in: list, selected: true)
         return row
         #else
@@ -282,7 +390,7 @@ final class RowCells {
 
     /// The screen a view is on, read before its press can change it.
     func screen(of view: UIView) -> UIViewController? {
-        sequence(first: view as UIResponder, next: { $0.next }).lazy.compactMap { $0 as? UIViewController }.first
+        ViewPresentation.controller(for: view)
     }
 
     /// A route's screen is coming back into view: the row its list kept
@@ -336,7 +444,7 @@ final class RowCells {
 
     /// What a list or one of its rows shows as a cell: `layout <node>`.
     func observation(_ node: NodeView) -> [String: Any]? {
-        if node.hasRowCells { return ["rows": "cells", "separators": lines[node.id].map { $0.shape.path?.boundingBoxOfPath.isNull == false } ?? false] }
+        if node.hasRowCells { return ["rows": "cells", "separators": rows(of: node).contains { rowLines[ObjectIdentifier($0)] != nil }] }
         guard let (row, list) = node.rowCell.map({ ($0.row, $0.list) }), row === node else { return nil }
         let rows = rows(of: list)
         let at = rows.firstIndex { $0 === row }

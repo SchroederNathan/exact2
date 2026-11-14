@@ -15,7 +15,7 @@ import UIKit
 #endif
 
 /// One node's press factor, eased from `from` to `to` since `start`.
-struct PressFeedback {
+package struct PressFeedback {
     var from: CGFloat = 1, to: CGFloat = 1, start: CFTimeInterval = 0
     /// A release that came before the press was ever on screen, held until
     /// the press has eased all the way in (D2): UIKit's delayed touches hand
@@ -30,15 +30,22 @@ struct PressFeedback {
     var dimmedAt: CFTimeInterval?
     #endif
     /// In and back alike: a fast settle that reads as a physical give.
-    static let duration: CFTimeInterval = 0.12
-    #if os(iOS) || os(tvOS)
+    package static let duration: CFTimeInterval = 0.12
     /// `ease` as Core Animation's curve, for the render server's ease.
-    static let timing = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
-    #endif
+    package static let timing = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
     /// Shorter than one 60 Hz frame: a press this young was never presented.
     static let unseen: CFTimeInterval = 1.0 / 60
 
     var idle: Bool { from == 1 && to == 1 }
+    /// As a node that was never pressed holds it.
+    var atRest: Bool { rests(at: 1) }
+    /// Held at `value` since time 0, with nothing pending.
+    func rests(at value: CGFloat) -> Bool {
+        #if os(iOS) || os(tvOS)
+        if easedAbout != nil || dimmedAt != nil { return false }
+        #endif
+        return from == value && to == value && start == 0 && !releaseHeld
+    }
     func factor(at t: CFTimeInterval) -> CGFloat {
         let p = min(1, max(0, (t - start) / Self.duration))
         return from + (to - from) * CGFloat(Self.ease(p))
@@ -91,34 +98,66 @@ extension NodeView {
         #endif
     }
 
-    /// `pressed` changed: ease toward the pressed scale, or back to 1; a
-    /// node that declares none shows the platform's press instead: iOS's dim
-    /// (LLP 1115, `dimPress`), the Mac's pressed effect (LLP 1115.000 D6,
-    /// `tintPress`, Mac/PressLookMac.swift).
+    /// `pressed` changed: ease toward the pressed scale and paint (LLP 1061
+    /// D7, PressPaint.swift), or back; a node that declares neither shows
+    /// the platform's press instead: iOS's dim (LLP 1115, `dimPress`), the
+    /// Mac's pressed effect (LLP 1115.000 D6, `tintPress`,
+    /// Mac/PressLookMac.swift).
     func pressChanged() {
-        if pressed { pressHaptic() }
+        if !pressed { pressPaint.outside = false }
+        // A press held (HeldState.swift) shows as long as it is held: a real
+        // press down on the node as it was held is taken over, and its
+        // release shows nothing (the click is still its own).
+        if holds("active") { return }
+        if pressed, defaultLink == nil { pressHaptic() }
+        showPress(pressed)
+    }
+    /// The press shown (`down`), or taken off: the scale and the paint, or
+    /// the platform's own. A held press (HeldState.swift) shows it as a
+    /// real press does, with no haptic.
+    func showPress(_ down: Bool) {
+        #if os(iOS)
+        if presenter?.groupedLists?.press(self, down: down) == true {
+            paintPress(false, instantly: true); aimPress(false, release: true); dimPress(false, instantly: true)
+            return
+        }
+        #endif
+        if isNativeButton { heldHighlight(); return }
+        let down = down && defaultLink == nil
+        // What a press shows goes at its release whatever the style says now:
+        // an authored look the style dropped while held included.
+        if !down || !authorsPress { paintPress(false, instantly: down); aimPress(false, release: true) }
         #if os(iOS)
         // A list's row is its cell: the cell's ground, not the dim (LLP 1115.000 D16).
-        if platformPressDims, presenter?.rowCells.press(self, pressed) == true { return }
-        if platformPressDims { dimPress(pressed); return }
-        if !pressed { dimPress(false) }
+        if presenter?.rowCells.press(self, down) == true { return }
+        if platformPressDims { dimPress(down); return }
+        dimPress(false, instantly: down)
         #elseif os(macOS)
-        if platformPressTints { tintPress(pressed); return }
-        if !pressed { tintPress(false) }
+        if platformPressTints { tintPress(down); return }
+        tintPress(false)
         #endif
-        aimPress(pressed, release: !pressed)
+        guard down else { return }
+        paintPress(true)
+        aimPress(true)
     }
     /// The pointer moved while pressed: the feedback follows whether it is
-    /// still inside, as the tap's own acceptance does on release.
+    /// still inside, as the tap's own acceptance does on release (a press
+    /// held stays as it is).
     func pressFollows(inside: Bool) {
         guard pressed else { return }
+        pressPaint.outside = !inside
+        if defaultLink != nil { showPress(false); return }
+        if holds("active") { return }
+        if !inside { paintPress(false); aimPress(false) }
         #if os(iOS)
-        if platformPressDims, presenter?.rowCells.press(self, inside) == true { return }
+        if presenter?.rowCells.press(self, inside) == true { return }
         if platformPressDims { dimPress(inside); return }
         #elseif os(macOS)
         if platformPressTints { tintPress(inside); return }
         #endif
-        aimPress(inside)
+        guard inside else { return }
+        paintPress(true)
+        aimPress(true)
     }
 
     private func aimPress(_ down: Bool, release: Bool = false) {
@@ -241,6 +280,10 @@ extension NodeView {
     /// `transform-origin` in the box's own coordinates (LLP 1061 D6): each
     /// axis points or `{"pct": n}` of the border box; the centre when unset.
     var transformOriginPoint: CGPoint {
+        Self.resolveTransformOrigin(style, in: bounds)
+    }
+
+    package static func resolveTransformOrigin(_ style: NodeStyle, in bounds: CGRect) -> CGPoint {
         let axes = style["transform_origin"]?.array ?? []
         func axis(_ i: Int, _ size: CGFloat) -> CGFloat {
             guard axes.count == 2 else { return size / 2 }
@@ -272,6 +315,7 @@ extension NodeView {
             // A 3D rotation or a z translation (LLP 1077 D8): the layer's own
             // transform, the view's affine one left at identity.
             if transform != .identity { transform = .identity }
+            if CATransform3DIsIdentity(layer.transform) { Self.textGeometry &+= 1 } // as `transform`'s (TextIndexIOS.swift)
             layer.transform = CATransform3DConcat(space, CATransform3DMakeAffineTransform(outer))
             return
         }
@@ -282,31 +326,36 @@ extension NodeView {
     /// transform: a layout transition's offset, a sticky box's scroll offset
     /// (LLP 1083), a keyboard toolbar's lift and a context preview's projection.
     var hostPlacement: CGAffineTransform {
-        CGAffineTransform(translationX: layoutOffset.x + stickyOffset.x, y: layoutOffset.y - keyboardLift + stickyOffset.y).concatenating(contextTransform)
+        CGAffineTransform(translationX: layoutOffset.x + stickyOffset.x, y: layoutOffset.y - keyboardLift + stickyOffset.y + controlRide).concatenating(contextTransform)
     }
     /// The border box in `viewport`'s visible space as an open top-layer box
     /// is told to the runner: before its own transform, which the runner
     /// applies, and after the host's placement, which the runner cannot know.
     /// UIKit transforms a view about its center.
-    func topLayerFrame(in viewport: UIScrollView) -> CGRect {
+    func topLayerFrame(in viewport: UIScrollView, containingBlock: CGRect? = nil) -> CGRect {
         guard let parent = superview else { return .zero }
-        let box = CGRect(x: -bounds.width / 2, y: -bounds.height / 2, width: bounds.width, height: bounds.height)
+        let box = (containingBlock ?? CGRect(origin: .zero, size: bounds.size))
+            .offsetBy(dx: -bounds.width / 2, dy: -bounds.height / 2)
             .applying(hostPlacement).offsetBy(dx: center.x, dy: center.y)
-        return parent.convert(box, to: viewport).offsetBy(dx: -viewport.bounds.minX, dy: -viewport.bounds.minY)
+        return NativeGeometry.convert(box, from: parent, to: viewport).offsetBy(dx: -viewport.pageOrigin.x, dy: -viewport.pageOrigin.y)
     }
     /// Whether a touch is inside the box as it stands unpressed. The pressed
     /// box is smaller, so testing against it would release a finger resting
     /// between the two edges, which re-grows the box under it, which presses
     /// again: a flicker. The unpressed point is the pressed one scaled back
     /// out about the origin.
-    func pressInside(_ touch: UITouch) -> Bool {
-        let p = local(touch.location(in: nil)), f = pressModelFactor, o = transformOriginPoint
+    func pressInside(_ touch: UITouch) -> Bool { pressInside(at: touch.location(in: nil)) }
+    /// The same for a point in the window (the agent's recognized finger).
+    func pressInside(at windowPoint: CGPoint) -> Bool {
+        let p = local(windowPoint), f = pressModelFactor, o = transformOriginPoint
         return bounds.contains(CGPoint(x: o.x + (p.x - o.x) * f, y: o.y + (p.y - o.y) * f))
     }
     #else
     package func applyTransform() {
         // A backdrop mirrors its box as the transform moves and scales it.
         defer { if !backdropOperations.isEmpty { applyBackdrop() } }
+        // A frame's web view takes its scale by geometry (`FrameScaleMac.swift`).
+        defer { if web != nil { placeWeb() } }
         // Flying scaled whole in its clip (LLP 1013.000 D4.4): the flight's
         // scale only, about the layer's origin, the clip's top left.
         if let s = flightLook?.scale {
@@ -327,7 +376,7 @@ extension NodeView {
         }
         // The layer turns about its own origin: move `transform-origin`
         // there, turn, move it back. A press folds into the scale.
-        let o = transformOriginPoint, s = scale * pressFactor
+        let o = transformOriginPoint, s = scale / frameGeometryScale * pressFactor
         if let space = spaceTransform(origin: o, scale: s, shift: lift) {
             // A 3D rotation or a z translation (LLP 1077 D8).
             layer?.transform = CATransform3DConcat(space, CATransform3DMakeTranslation(layoutOffset.x, layoutOffset.y, 0))
@@ -345,7 +394,8 @@ extension NodeView {
     /// once. An untransformed box has no press in it to undo.
     func pressInside(_ windowPoint: NSPoint) -> Bool {
         let p = local(windowPoint), f = plane == nil ? 1 : pressFactor, o = transformOriginPoint
-        return bounds.contains(CGPoint(x: o.x + (p.x - o.x) * f, y: o.y + (p.y - o.y) * f))
+        let area = drawsRowBezel ? rowBezelRect ?? bounds : bounds
+        return area.contains(CGPoint(x: o.x + (p.x - o.x) * f, y: o.y + (p.y - o.y) * f))
     }
     #endif
 }
@@ -376,14 +426,16 @@ extension NodeView {
     static let dimHold: CFTimeInterval = 0.1
 
     /// Whether a press shows the platform's dim: a node the host presses
-    /// (a `press` handler or a link), with no `-exact-press-scale` written
-    /// (any value, 1 included, is the author's), no `pointerdown` or
-    /// `pointerup` of its own (the author paints its pressed state), and not
-    /// a scrim covering the window (a backdrop that closes a sheet shows
-    /// nothing in UIKit). A native button is UIKit's own and never comes here.
+    /// (a `press` handler or a custom invoker's visual contact),
+    /// with no pressed look written (a
+    /// `-exact-press-scale` or pressed paint, any value, 1 included, is the
+    /// author's: `authorsPress`), no `pointerdown` or `pointerup` of its own
+    /// (the author paints its pressed state), and not a scrim covering the
+    /// window (a backdrop that closes a sheet shows nothing in UIKit). A
+    /// native button is UIKit's own and never comes here.
     var platformPressDims: Bool {
-        guard style["press_scale"] == nil, !isNativeButton, !isSurfaceControl,
-              handlers.contains("press") || defaultLink != nil,
+        guard !authorsPress, !isNativeButton, !isSurfaceControl,
+              handlers.contains("press") || pressContact?.invokerLook == true || overlayHoldsPress,
               !handlers.contains("pointerdown"), !handlers.contains("pointerup") else { return false }
         if let w = window {
             let r = convert(bounds, to: w)
@@ -438,29 +490,57 @@ extension NodeView {
 /// `easePress`): one display link for every session, alive only while some
 /// press is still easing, at the panel's full rate so the 120 ms reads as
 /// motion on ProMotion (LLP 1061 D4).
-final class PressClock: NSObject {
+final class PressClock {
     static let shared = PressClock()
+    private let windows = NSMapTable<NSWindow, WindowPressClock>.weakToStrongObjects()
+    func run(_ view: NodeView) {
+        guard let window = view.window else { return }
+        let clock = windows.object(forKey: window) ?? WindowPressClock(window: window, closed: { [weak self, weak window] in
+            if let window { self?.windows.removeObject(forKey: window) }
+        })
+        windows.setObject(clock, forKey: window)
+        clock.run(view)
+    }
+    static func rate(maximum: Int) -> CAFrameRateRange {
+        let maximum = Float(max(1, maximum))
+        return CAFrameRateRange(minimum: min(80, maximum), maximum: maximum, preferred: maximum)
+    }
+}
+
+/// Each window follows its own display; another window's 60 Hz screen cannot cap it.
+private final class WindowPressClock: NSObject {
+    private weak var window: NSWindow?
     private var link: CADisplayLink?
     private let views = NSHashTable<NodeView>.weakObjects()
-
+    private var observers: [NSObjectProtocol] = []
+    init(window: NSWindow, closed: @escaping () -> Void) {
+        self.window = window
+        super.init()
+        observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification, object: window, queue: .main) { [weak self] _ in self?.updateRate() })
+        observers.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in self?.stop(); closed() })
+    }
     func run(_ view: NodeView) {
         views.add(view)
-        guard link == nil else { return }
-        let l = view.displayLink(target: self, selector: #selector(tick(_:)))
-        l.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
-        l.add(to: .main, forMode: .common)
-        link = l
+        guard link == nil, let window else { return }
+        let link = window.displayLink(target: self, selector: #selector(tick(_:)))
+        self.link = link
+        updateRate()
+        link.add(to: .main, forMode: .common)
+    }
+    private func updateRate() { link?.preferredFrameRateRange = PressClock.rate(maximum: window?.screen?.maximumFramesPerSecond ?? 60) }
+    private func stop() {
+        link?.invalidate(); link = nil
+        for view in views.allObjects { view.press = PressFeedback(); view.applyTransform() }
+        views.removeAllObjects()
     }
     @objc private func tick(_ link: CADisplayLink) {
         let now = CACurrentMediaTime()
         for view in views.allObjects {
-            // A release held for an unseen press goes once the press is in.
+            if view.window !== window { views.remove(view); view.press = PressFeedback(); view.applyTransform(); continue }
             if view.press.releaseHeld, view.press.settled(at: now) {
                 view.press.releaseHeld = false
                 view.press.aim(1, at: now)
             }
-            // A settled release goes back to idle before its last write, so
-            // the transform ends exactly where the engine left it.
             if view.press.settled(at: now), !view.press.releaseHeld {
                 views.remove(view)
                 if view.press.to == 1 { view.press = PressFeedback() }
@@ -469,5 +549,6 @@ final class PressClock: NSObject {
         }
         if views.allObjects.isEmpty { link.invalidate(); self.link = nil }
     }
+    deinit { link?.invalidate(); observers.forEach(NotificationCenter.default.removeObserver) }
 }
 #endif

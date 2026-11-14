@@ -7,8 +7,9 @@
 use crate::PlanError;
 
 /// Most rows, strings, or pool bytes one count may announce; a hostile count
-/// is refused before anything is allocated from it.
-pub const MAX_COUNT: usize = 1 << 24;
+/// is refused before anything is allocated from it. 64 Mi: a large app's code
+/// pool passes 16 MiB, and `count` also refuses any count over the bytes left.
+pub const MAX_COUNT: usize = 1 << 26;
 
 /// Most elements reserved up front from an announced count; a larger count
 /// grows the vector as elements actually decode, so a short payload cannot
@@ -31,6 +32,14 @@ impl<'a> Reader<'a> {
     /// Bytes not yet read.
     pub fn remaining(&self) -> usize {
         self.bytes.len() - self.pos
+    }
+
+    /// How many of `n` announced elements, each at least `each` bytes
+    /// encoded, to reserve up front: what the bytes left could hold, so a
+    /// short payload reserves no more than it fills and a whole one reserves
+    /// exactly, with no slack from growing.
+    pub fn reserve(&self, n: usize, each: usize) -> usize {
+        n.min(self.remaining() / each.max(1))
     }
 
     /// Current offset.
@@ -148,6 +157,16 @@ impl<'a> Sticky<'a> {
             return T::default();
         }
         read(&mut self.r).unwrap_or_else(|error| self.fail(error, T::default()))
+    }
+
+    /// [`Reader::position`].
+    pub fn position(&self) -> usize {
+        self.r.position()
+    }
+
+    /// [`Reader::reserve`].
+    pub fn reserve(&self, n: usize, each: usize) -> usize {
+        self.r.reserve(n, each)
     }
 
     /// [`Reader::count`]; zero after a failure.

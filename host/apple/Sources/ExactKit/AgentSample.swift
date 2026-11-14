@@ -1,6 +1,9 @@
 // @ref LLP 1100 D12 — the agent's `sample`: the pixels under view points,
 // from a float render of the view's layers, in extended linear sRGB, so
 // what an 8-bit sRGB screenshot would clip reads outside 0–1.
+// This is CALayer.render(in:), not the display compositor: on iOS 27 it
+// clips native extended-range gradients and omits layer shadows. Compare
+// those with native layers and the displayed screen (UI Gallery).
 import CoreGraphics
 import QuartzCore
 #if os(iOS) || os(tvOS)
@@ -18,13 +21,19 @@ extension Agent {
             return CGPoint(x: x, y: y)
         }
         guard !points.isEmpty else { return ["malformed": true, "error": "sample needs points: sample <x> <y> [<x> <y>…], in view points"] }
-        let view = presenter.viewport
         #if os(iOS) || os(tvOS)
-        let layer = view.layer
+        let view = presenter.viewport
+        let layer = presenter.documentHost.layer // in the viewport's place (`DocumentMountIOS.swift`)
         #else
+        let view = presenter.navigation.split.agentRoot
         guard let layer = view.layer else { return ["error": "the session's view has no layer"] }
         #endif
-        let size = view.bounds.size
+        #if os(iOS) || os(tvOS)
+        let size = view.pageSize // the page's area, a box's space (LLP 1130)
+        #else
+        let area = presenter.navigation.split.agentCaptureArea
+        let size = area.size
+        #endif
         let (w, h) = (Int(size.width.rounded(.up)), Int(size.height.rounded(.up)))
         guard w > 0, h > 0, let space = CGColorSpace(name: CGColorSpace.extendedLinearSRGB),
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 32, bytesPerRow: w * 16, space: space,
@@ -37,17 +46,23 @@ extension Agent {
         #if os(iOS) || os(tvOS)
         // A presentation mounts beside the viewport (LLP 1123 D2): the
         // viewport's area is read from the window, sheets composited
-        if !presenter.modals.mountRoots.isEmpty, let window = view.window {
+        if presenter.surfaces(includingRetiring: true).contains(where: { $0.kind != .document }), let window = view.window {
             // The viewport's area in the window, which the agent's window
             // size can scale (as `screenshot` maps it)
-            let area = view.convert(view.bounds, to: window)
+            let area = view.convert(view.pageBounds, to: window)
             if area.width > 0, area.height > 0 { ctx.scaleBy(x: size.width / area.width, y: size.height / area.height) }
             ctx.translateBy(x: -area.minX, y: -area.minY)
             window.layer.render(in: ctx)
         } else {
+            ctx.translateBy(x: view.bounds.minX - view.pageBounds.minX, y: view.bounds.minY - view.pageBounds.minY)
             layer.render(in: ctx)
         }
         #else
+        ctx.translateBy(x: -area.minX, y: -area.minY)
+        if presenter.navigation.split.active, !view.isFlipped {
+            ctx.translateBy(x: 0, y: view.bounds.height)
+            ctx.scaleBy(x: 1, y: -1)
+        }
         layer.render(in: ctx)
         #endif
         let px = data.assumingMemoryBound(to: Float.self)

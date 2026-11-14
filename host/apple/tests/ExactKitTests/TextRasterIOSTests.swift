@@ -29,11 +29,13 @@ final class TextRasterIOSTests: XCTestCase {
             ["op": "frame", "id": 2, "x": 0.0, "y": 500.0, "w": 300.0, "h": 40.0],
         ]))
         // First display asks for pixels too; let that settle, then take them
-        // away, so what follows is the pump's alone.
+        // away, and the kept ones that would show them again, so what follows
+        // is the pump's alone.
         window.layoutIfNeeded(); p.viewport.layer.displayIfNeeded()
         p.views[2]?.layer.displayIfNeeded()
         drain(p)
         p.views[2]?.dropTextRaster()
+        p.textRasters.dropKept()
         // The pump the publication woke stays out of it: each test calls it.
         p.scrollPump.reset()
         return session
@@ -107,8 +109,9 @@ final class TextRasterIOSTests: XCTestCase {
         XCTAssertNotEqual(raster.frame, box, "crop exercises the aligned-ink path")
         XCTAssertEqual(raster.frame.minX * 3, (raster.frame.minX * 3).rounded(), accuracy: 1e-9)
         XCTAssertEqual(raster.frame.minY * 3, (raster.frame.minY * 3).rounded(), accuracy: 1e-9)
-        XCTAssertEqual(raster.image.width, Int((raster.frame.width * 3).rounded()))
-        XCTAssertEqual(raster.image.height, Int((raster.frame.height * 3).rounded()))
+        let pixels = try XCTUnwrap(raster.pixels)
+        XCTAssertEqual(pixels.width, Int((raster.frame.width * 3).rounded()))
+        XCTAssertEqual(pixels.height, Int((raster.frame.height * 3).rounded()))
         XCTAssertTrue(raster.covered.contains(raster.frame), "crop keeps the larger covered region")
     }
 
@@ -136,6 +139,42 @@ final class TextRasterIOSTests: XCTestCase {
         XCTAssertTrue(node.textRasterSettled)
     }
 
+    /// A kept raster counts its key's text too: a long paragraph clamped to one line, whose drawing is
+    /// small, is past an entry's allowance and is not kept, so showing it again takes a worker; a short
+    /// one is kept and shows again at once
+    func testAKeptRasterCountsItsTextSoALongClampedParagraphIsNotKept() throws {
+        let session = ExactApp.shared.makeSession(label: "text-kept-long")
+        defer { session.destroy(); RegionTextExecutor.queue.isSuspended = false }
+        let p = session.presenter
+        window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
+        p.viewport.frame = window.bounds
+        window.addSubview(p.viewport)
+        window.makeKeyAndVisible()
+        let long = String(repeating: "Why a magazine measures first. ", count: 2400)
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "view"],
+            ["op": "create", "id": 2, "kind": "text", "props": ["text": "A short paragraph"], "style": ["font_size": 16.0, "line_clamp": 1]],
+            ["op": "create", "id": 3, "kind": "text", "props": ["text": long], "style": ["font_size": 16.0, "line_clamp": 1]],
+            ["op": "children", "id": 1, "ids": [2, 3]],
+            ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 400.0, "h": 2000.0],
+            // Below the 400 pt scrollport, inside the lead.
+            ["op": "frame", "id": 2, "x": 0.0, "y": 500.0, "w": 300.0, "h": 24.0],
+            ["op": "frame", "id": 3, "x": 0.0, "y": 540.0, "w": 300.0, "h": 24.0],
+        ]))
+        let short = try XCTUnwrap(p.views[2]), clamped = try XCTUnwrap(p.views[3])
+        XCTAssertGreaterThan(long.utf8.count, 64 * 1024, "past an entry's allowance")
+        p.refreshVisibleText()
+        drain(p)
+        XCTAssertTrue(short.textRasterReady && clamped.textRasterReady, "both painted once")
+        short.dropTextRaster(); clamped.dropTextRaster()
+        RegionTextExecutor.queue.isSuspended = true
+        p.refreshVisibleText()
+        XCTAssertTrue(short.textRasterReady, "the short paragraph's is kept and shows again")
+        XCTAssertFalse(clamped.textRasterReady, "the long one's is not kept")
+        XCTAssertEqual(p.textRasters.inFlight, 1, "a worker paints it again")
+    }
+
     func testAJobForAParagraphTheListCarriedPastAtSpeedIsDroppedAndOwedAgain() throws {
         let session = fixture("text-passed")
         defer { session.destroy(); RegionTextExecutor.queue.isSuspended = false }
@@ -159,6 +198,203 @@ final class TextRasterIOSTests: XCTestCase {
         RegionTextExecutor.queue.isSuspended = true
         p.refreshVisibleText(velocity: 5000)
         XCTAssertEqual(p.textRasters.inFlight, 1)
+    }
+
+    /// A paragraph taller than 4,096 pt paints a band around the port. A
+    /// worker paints one that leads the port's travel; the port keeps it
+    /// until it comes within half a port of its edge ahead, and then a worker
+    /// paints the next. A paragraph that shows without pixels is painted here.
+    /// An 800 pt port: at 3x only the worker's budget holds two of them.
+    func testATallParagraphsBandsArePaintedAheadOfThePort() throws {
+        let session = ExactApp.shared.makeSession(label: "text-bands")
+        defer { session.destroy(); RegionTextExecutor.queue.isSuspended = false }
+        let p = session.presenter
+        window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 800))
+        p.viewport.frame = window.bounds
+        window.addSubview(p.viewport)
+        window.makeKeyAndVisible()
+        let words = Array(repeating: "Why a magazine measures first and draws second.", count: 600).joined(separator: " ")
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "view"],
+            ["op": "create", "id": 2, "kind": "text", "props": ["text": words], "style": ["font_size": 16.0]],
+            ["op": "children", "id": 1, "ids": [2]],
+            ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 800.0, "h": 6000.0],
+            ["op": "frame", "id": 2, "x": 0.0, "y": 0.0, "w": 800.0, "h": 6000.0],
+        ]))
+        window.layoutIfNeeded()
+        func scroll(_ y: CGFloat) { p.viewport.contentOffset.y = y }
+        // Mid-paragraph, where no edge clamps the band. A scroll paints what
+        // shows at once: let that settle, then take the pixels away.
+        scroll(2000)
+        drain(p)
+        let node = try XCTUnwrap(p.views[2])
+        node.dropTextRaster()
+        RegionTextExecutor.queue.isSuspended = true
+        p.textRasters.ensure(node, urgent: false)
+        XCTAssertEqual(p.textRasters.inFlight, 1, "a worker paints the band")
+        let first = try XCTUnwrap(node.textRasterKey?.clip)
+        let port = p.textPreparationRect(node)
+        XCTAssertTrue(first.contains(port))
+        XCTAssertGreaterThan(first.maxY - port.maxY, port.minY - first.minY, "with more of it ahead of the travel than behind")
+        drain(p)
+        XCTAssertTrue(node.textRasterReady)
+
+        scroll(2050)
+        XCTAssertTrue(p.textRasters.ensure(node, urgent: false))
+        XCTAssertEqual(node.textRasterKey?.clip, first, "well inside the band, the port keeps it")
+        XCTAssertEqual(p.textRasters.inFlight, 0)
+
+        scroll(first.maxY - 150 - port.height)
+        RegionTextExecutor.queue.isSuspended = true
+        p.textRasters.ensure(node, urgent: false)
+        let next = try XCTUnwrap(node.textRasterKey?.clip)
+        XCTAssertEqual(p.textRasters.inFlight, 1, "within half a port of its edge, a worker paints the next")
+        XCTAssertGreaterThan(next.maxY, first.maxY)
+        drain(p)
+
+        scroll(4000)
+        RegionTextExecutor.queue.isSuspended = true
+        node.dropTextRaster()
+        p.textRasters.ensure(node, urgent: true)
+        XCTAssertTrue(node.textRasterReady, "shown without pixels: painted here, the queue held")
+        XCTAssertTrue(try XCTUnwrap(node.textRasterKey?.clip).contains(p.textPreparationRect(node)))
+    }
+
+    /// Two tall paragraphs side by side share one allowance for room ahead
+    /// of the port: while one band holds it, the other's is the port's
+    /// height, and once that paragraph lets its pixels go the other leads.
+    func testTallParagraphsShareTheRoomAheadOfThePort() throws {
+        let session = ExactApp.shared.makeSession(label: "text-bands-shared")
+        defer { session.destroy(); RegionTextExecutor.queue.isSuspended = false }
+        let p = session.presenter
+        window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1600, height: 800))
+        p.viewport.frame = window.bounds
+        window.addSubview(p.viewport)
+        window.makeKeyAndVisible()
+        let words = Array(repeating: "Why a magazine measures first and draws second.", count: 600).joined(separator: " ")
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "view"],
+            ["op": "create", "id": 2, "kind": "text", "props": ["text": words], "style": ["font_size": 16.0]],
+            ["op": "create", "id": 3, "kind": "text", "props": ["text": words], "style": ["font_size": 16.0]],
+            ["op": "children", "id": 1, "ids": [2, 3]],
+            ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 1600.0, "h": 6000.0],
+            ["op": "frame", "id": 2, "x": 0.0, "y": 0.0, "w": 800.0, "h": 6000.0],
+            ["op": "frame", "id": 3, "x": 800.0, "y": 0.0, "w": 800.0, "h": 6000.0],
+        ]))
+        window.layoutIfNeeded()
+        p.viewport.contentOffset.y = 2000
+        drain(p)
+        let left = try XCTUnwrap(p.views[2]), right = try XCTUnwrap(p.views[3])
+        left.dropTextRaster(); right.dropTextRaster()
+        RegionTextExecutor.queue.isSuspended = true
+        p.textRasters.ensure(left, urgent: false)
+        let port = p.textPreparationRect(left).height
+        XCTAssertGreaterThan(try XCTUnwrap(left.textRasterKey?.clip).height, port + 100, "the first leads the port")
+        p.textRasters.ensure(right, urgent: false)
+        XCTAssertEqual(try XCTUnwrap(right.textRasterKey?.clip).height, p.textPreparationRect(right).height, accuracy: 0.5,
+                       "the allowance is taken: the other's band is the port")
+        // Shown, then invalidated: its pixels stay up and still hold the allowance
+        drain(p)
+        XCTAssertNotNil(left.textRaster)
+        right.dropTextRaster()
+        left.invalidateText()
+        RegionTextExecutor.queue.isSuspended = true
+        p.textRasters.ensure(right, urgent: false)
+        XCTAssertEqual(try XCTUnwrap(right.textRasterKey?.clip).height, p.textPreparationRect(right).height, accuracy: 0.5,
+                       "the first's pixels are still up: the other's band is the port")
+        // Its pixels gone but a band of it still to paint: that holds the allowance too
+        p.textRasters.ensure(left, urgent: false)
+        left.dropTextRaster()
+        right.dropTextRaster()
+        p.textRasters.ensure(right, urgent: false)
+        XCTAssertEqual(try XCTUnwrap(right.textRasterKey?.clip).height, p.textPreparationRect(right).height, accuracy: 0.5,
+                       "the first's job is still to paint: the other's band is the port")
+        drain(p)
+        right.dropTextRaster()
+        p.textRasters.ensure(right, urgent: false)
+        XCTAssertGreaterThan(try XCTUnwrap(right.textRasterKey?.clip).height, port + 100, "the first let it go: the other leads")
+    }
+
+    /// A paragraph whose pixels are its words already returns before
+    /// `ensure` asks whether it is urgent or what shows: a batch's display
+    /// pass asks again of every paragraph the batch gave new words.
+    func testEnsureAsksNothingOfAParagraphWhosePixelsAreCurrent() throws {
+        let session = fixture("text-current")
+        defer { session.destroy() }
+        let p = session.presenter
+        let node = try XCTUnwrap(p.views[2])
+        move(p, y: 100)
+        p.paintVisibleText()
+        XCTAssertTrue(node.textRasterReady)
+        var asked = 0
+        func urgent() -> Bool { asked += 1; return true }
+        p.textRasters.ensure(node, urgent: urgent())
+        XCTAssertEqual(asked, 0)
+        node.invalidateText()
+        p.textRasters.ensure(node, urgent: urgent())
+        XCTAssertEqual(asked, 1, "new words are asked about")
+    }
+
+    /// A scroll moves no paragraph in its scroller's content, so the index
+    /// the passes read (`TextIndex`) stands across it: one far from the port
+    /// is not visited, and one the scroll brings in is painted.
+    func testTheIndexSkipsAFarParagraphAndPaintsOneAScrollBringsIn() throws {
+        let session = fixture("text-index-scroll")
+        defer { session.destroy() }
+        let p = session.presenter
+        let node = try XCTUnwrap(p.views[2])
+        p.viewport.contentSize = CGSize(width: 400, height: 2000)
+        move(p, y: 1500)
+        var visited: [UInt32] = []
+        p.textIndex.visit(p.textViews, reach: 400, viewport: p.viewport) { visited.append($0.id); return true }
+        XCTAssertEqual(visited, [], "700 pt below the port's lead")
+        let builds = p.textIndex.builds
+        p.viewport.contentOffset.y = 1300
+        p.paintVisibleText()
+        XCTAssertEqual(p.textIndex.builds, builds, "the scroll left the index standing")
+        XCTAssertTrue(p.textIsVisible(node))
+        XCTAssertTrue(node.textRasterReady, "what the scroll brought in has pixels")
+    }
+
+    /// A document in its mount, under a native container (r27's inbox), is
+    /// indexed by its place in the mount as it is in the viewport: a far
+    /// paragraph is not visited every pass.
+    func testTheIndexSkipsAFarParagraphInTheDocumentsMount() throws {
+        let session = fixture("text-index-mount")
+        defer { session.destroy() }
+        let p = session.presenter
+        window.addSubview(p.documentMount)
+        p.hostDocument(fixed: true)
+        XCTAssertTrue(p.documentFixed)
+        move(p, y: 1500)
+        var visited: [UInt32] = []
+        p.textIndex.visit(p.textViews, reach: 400, viewport: p.viewport) { visited.append($0.id); return true }
+        XCTAssertEqual(visited, [], "1,100 pt below the mount's bounds, past the reach")
+        move(p, y: 300)
+        p.textIndex.visit(p.textViews, reach: 0, viewport: p.viewport) { visited.append($0.id); return true }
+        XCTAssertEqual(visited, [2], "in the mount's bounds")
+    }
+
+    /// The clips a refresh finds once per ancestor (`TextClips`) meet as
+    /// boxes in the viewport's space, which a rotated parent's are not:
+    /// under a transform the walk answers, as it does with none.
+    func testTheMemoAnswersAsTheWalkUnderARotatedClip() throws {
+        let session = fixture("text-rotated-clip")
+        defer { session.destroy() }
+        let p = session.presenter
+        let parent = try XCTUnwrap(p.views[1]), node = try XCTUnwrap(p.views[2])
+        parent.frame = CGRect(x: 100, y: 100, width: 100, height: 100)
+        parent.clipsToBounds = true
+        parent.transform = CGAffineTransform(rotationAngle: .pi / 4)
+        // Below the parent's own bounds, inside their rotated bounding box.
+        node.frame = CGRect(x: 0, y: 120, width: 100, height: 20)
+        let walked = p.textScrollportRect(node)
+        XCTAssertTrue(walked.isEmpty, "\(walked)")
+        p.textClips = TextClips(p.viewport, soon: 0, reach: 0)
+        defer { p.textClips = nil }
+        XCTAssertEqual(p.textScrollportRect(node), walked)
     }
 }
 #endif

@@ -25,6 +25,9 @@ pub struct Device {
     pub high_contrast: bool,
     /// The screen is touched with a finger, which cannot hover.
     pub touch: bool,
+    /// The device is a television, driven by a remote's D-pad (LLP
+    /// 1115.001.003 D2): no pointer at all.
+    pub tv: bool,
     /// How far a finger moves before its contact is a drag and no longer a
     /// tap, in points (Android's scaled touch slop); 0 where the shell
     /// knows none, which keeps the shared one.
@@ -38,6 +41,21 @@ pub struct Device {
 const ROOT_FONT_SIZE: f64 = 16.0;
 
 impl<D: DataSource> Presenter<D> {
+    /// The shell's text-size preference, independent of display DPI. Authored
+    /// absolute fonts keep their sizes; default fields and rem lengths scale.
+    pub fn set_text_scale(&mut self, scale: f32) -> Option<String> {
+        if !scale.is_finite() || scale <= 0.0 || self.text_scale == scale {
+            return None;
+        }
+        self.text_scale = scale;
+        let root = self
+            .host
+            .set_root_font_size(ROOT_FONT_SIZE * f64::from(scale));
+        let field = self.host.set_control_text_scale(scale).err();
+        let applied = self.after_commit();
+        root.or(field).or(applied)
+    }
+
     /// The device's settings, as its shell read them (LLP 1115.001 D3.1,
     /// D3.2). What has a door here goes through it, each one a commit only
     /// when its value changed:
@@ -49,11 +67,14 @@ impl<D: DataSource> Presenter<D> {
     ///   table and its dates;
     /// - "remove animations" is `prefers-reduced-motion`, high contrast is
     ///   `prefers-contrast: more`;
-    /// - a touch screen is `pointer: coarse` and `hover: none`, and its
-    ///   touch slop is how far a contact moves before it is a drag;
-    /// - how the device writes dates is how a date control shows its value.
+    /// - a television is `pointer: none` and `hover: none`; a touch screen
+    ///   is `pointer: coarse` and `hover: none`, and its touch slop is how
+    ///   far a contact moves before it is a drag;
+    /// - how the device writes dates is how a date control shows its value;
+    /// - bold text (Android's font weight adjustment) is Bold Text, which
+    ///   weights the system font (LLP 1115.000 D12.3).
     ///
-    /// The layout direction, the 12 or 24-hour clock and bold text are kept
+    /// The layout direction and the 12 or 24-hour clock are kept
     /// ([`Presenter::device`]) and change nothing yet: the runner has no
     /// door for them.
     pub fn set_device(&mut self, device: &Device) -> Option<String> {
@@ -74,16 +95,23 @@ impl<D: DataSource> Presenter<D> {
             true => exact_runner::Contrast::More,
             false => exact_runner::Contrast::NoPreference,
         };
-        (preferences.pointer, preferences.hover) = match device.touch {
-            true => (exact_runner::Pointer::Coarse, exact_runner::Hover::None),
-            false => (exact_runner::Pointer::Fine, exact_runner::Hover::Hover),
+        preferences.bold_text = device.bold_text;
+        (preferences.pointer, preferences.hover) = match (device.tv, device.touch) {
+            (true, _) => (exact_runner::Pointer::None, exact_runner::Hover::None),
+            (false, true) => (exact_runner::Pointer::Coarse, exact_runner::Hover::None),
+            (false, false) => (exact_runner::Pointer::Fine, exact_runner::Hover::Hover),
         };
+        // The device's locale, and no regional format apart from it: the
+        // shell reports none yet (`Locale.Category.FORMAT`), so
+        // `formatLocale` answers this locale, not the process's launch one.
         let place = exact_runner::time::Place {
             locale: device.locale.clone(),
+            format_locale: String::new(),
             ..runner.place().clone()
         };
         let mut error = self.set_preferences(preferences);
         if device.font_scale.is_finite() && device.font_scale > 0.0 {
+            self.text_scale = device.font_scale;
             let px = ROOT_FONT_SIZE * f64::from(device.font_scale);
             error = error.or(self.set_root_font_size(px));
             // A field the shell hosts starts at the scaled size too (D8).
@@ -129,6 +157,28 @@ impl<D: DataSource> Presenter<D> {
         self.bars_reset();
         self.dirty = true;
     }
+}
+
+/// One open device's pointing class, as [`touch_only`] reads it (the evdev reader's, `input.rs`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Pointing {
+    /// Relative axes: a mouse, a trackball.
+    pub relative: bool,
+    /// Absolute X and Y: a touch screen, a touchpad, a tablet, a KVM's mouse.
+    pub absolute: bool,
+    /// BTN_TOUCH: a finger or stylus contact.
+    pub touch: bool,
+    /// BTN_LEFT: a button that clicks, which a touchpad and a KVM's mouse have.
+    pub left: bool,
+}
+
+/// Whether a touch screen is the only thing that points, CSS's primary
+/// `pointer: coarse` and `hover: none`: an absolute device that reports
+/// touch and no left button, beside no mouse or touchpad.
+pub fn touch_only(devices: &[Pointing]) -> bool {
+    let screen = |d: &Pointing| d.absolute && d.touch && !d.left;
+    let cursor = |d: &Pointing| d.relative || (d.absolute && d.left);
+    devices.iter().any(screen) && !devices.iter().any(cursor)
 }
 
 #[cfg(test)]

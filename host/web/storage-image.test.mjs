@@ -1,9 +1,11 @@
 // `storage.fs.compressImage`'s search on the web (LLP 1069.002 A1.2/A1.7):
 // the trials Bluesky's compress.ts makes, recorded in the same table
-// `exact_data::image::search` is checked against. `bun test ./host/web/storage-image.test.mjs`.
+// `exact_data::image::search` is checked against; and the edit's geometry
+// (LLP 1133.019 D14), case for case as `exact_data::image::edit`'s tests.
+// `bun test ./host/web/storage-image.test.mjs`.
 import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { compress, contain, headerSize, limits, search } from './storage-image.js';
+import { compress, contain, editOptions, geometry, headerSize, limits, resized, search, searchLossless, transform } from './storage-image.js';
 
 const recorded = JSON.parse(readFileSync(new URL('../../scripts/fixtures/picker/compress-trials.json', import.meta.url), 'utf8'));
 const models = {
@@ -34,8 +36,20 @@ test('contain floors, never upscales, and keeps a pixel', () => {
   expect(contain(9000, 2, 2048)).toEqual([2048, 1]);
 });
 
+test('a PNG shrinks by 0.8 until it fits, at most four times (A1.11)', async () => {
+  const trials = [];
+  const found = await searchLossless(1000, 800, 1000, 300_000, async (w, h) => { trials.push([w, h]); return { size: w * h / 2, value: w }; });
+  expect(trials).toEqual([[1000, 800], [800, 640]]);
+  expect(found).toEqual({ value: 800, width: 800, height: 640 });
+  trials.length = 0;
+  expect(await searchLossless(1000, 800, 1000, 1, async (w, h) => { trials.push([w, h]); return { size: 2, value: null }; })).toBe(null);
+  expect(trials).toEqual([[1000, 800], [800, 640], [640, 512], [512, 409], [409, 327]]);
+});
+
 test('limits are integers in range, else a TypeError', () => {
-  expect(limits({ maxDimension: 4000, maxBytes: 2e6 })).toEqual({ maxDimension: 4000, maxBytes: 2000000 });
+  expect(limits({ maxDimension: 4000, maxBytes: 2e6 })).toEqual({ maxDimension: 4000, maxBytes: 2000000, type: 'image/jpeg' });
+  expect(limits({ maxDimension: 8, maxBytes: 9, type: 'image/png' })).toEqual({ maxDimension: 8, maxBytes: 9, type: 'image/png' });
+  for (const type of ['image/webp', 'png', null, 7]) expect(() => limits({ maxDimension: 8, maxBytes: 9, type })).toThrow(TypeError);
   for (const bad of [undefined, null, 7, {}, { maxDimension: 0, maxBytes: 1 }, { maxDimension: 8193, maxBytes: 1 },
     { maxDimension: 1.5, maxBytes: 1 }, { maxDimension: 1, maxBytes: 0 }, { maxDimension: 1, maxBytes: 67108865 }, { maxDimension: '10', maxBytes: 1 }])
     expect(() => limits(bad)).toThrow(TypeError);
@@ -91,4 +105,51 @@ test('a deadline already past decodes nothing', async () => {
     const error = await compress(fixture, 4000, 2_000_000, 0).then(() => null, e => e);
     expect([error?.code, decodes]).toEqual(['timeout', 0]);
   } finally { globalThis.createImageBitmap = before; }
+});
+
+const apply = ([a, b, c, d, e, f], x, y) => [a * x + c * y + e, b * x + d * y + f];
+const near = (p, q) => expect(Math.hypot(p[0] - q[0], p[1] - q[1])).toBeLessThan(1e-9);
+
+test('an edit turns, flips and crops in D14\'s order, as the Rust codec does', () => {
+  const quarter = geometry(48, 64, { rotate: 90 });
+  expect([quarter.turned, quarter.crop]).toEqual([[64, 48], [0, 0, 64, 48]]);
+  near(apply(quarter.toOutput(64, 48), 0, 0), [64, 0]);
+  near(apply(quarter.toOutput(64, 48), 0, 64), [0, 0]);
+  expect(quarter.toOutput(64, 48).slice(0, 4)).toEqual([0, 1, -1, 0]); // exact: nothing resampled
+  expect(geometry(100, 50, { rotate: 30 }).turned).toEqual([112, 94]);
+  near(apply(geometry(100, 50, { rotate: 30 }).toOutput(112, 94), 50, 25), [56, 47]);
+  near(apply(geometry(48, 64, { rotate: 90, flip: 'horizontal' }).toOutput(64, 48), 0, 0), [0, 0]);
+  near(apply(geometry(48, 64, { flip: 'vertical' }).toOutput(48, 64), 0, 0), [0, 64]);
+  const crop = (x, y, width, height) => geometry(48, 64, { crop: { x, y, width, height } }, 'compressImage').crop;
+  expect(crop(0, 0, 24, 64)).toEqual([0, 0, 24, 64]);
+  expect(crop(-10, 60, 30, 30)).toEqual([0, 60, 20, 4]);
+  expect(crop(0.4, 0.6, 10.2, 10.2)).toEqual([0, 1, 11, 10]);
+  expect(crop(47.9, 0, 0.05, 1)).toEqual([47, 0, 1, 1]);
+  const missed = (() => { try { crop(48, 0, 10, 10); } catch (e) { return e; } })();
+  expect([missed.code, missed.message]).toEqual(['outside', 'filesystem: compressImage: outside: the crop misses the 48×64 image']);
+  const turnedCrop = geometry(48, 64, { rotate: 90, crop: { x: 10, y: 0, width: 20, height: 48 } });
+  expect(turnedCrop.size).toEqual([20, 48]);
+  near(apply(turnedCrop.toOutput(10, 24), 0, 64), [-5, 0]);
+});
+
+test('the size is createImageBitmap\'s', () => {
+  expect(resized(64, 48)).toEqual([64, 48]);
+  expect(resized(64, 48, 32)).toEqual([32, 24]);
+  expect(resized(64, 48, undefined, 10)).toEqual([14, 10]);
+  expect(resized(64, 48, 5, 500)).toEqual([5, 500]);
+});
+
+test('an edit\'s options are checked as the prelude checks them', () => {
+  expect(editOptions('t', { rotate: -90, flip: 'vertical', crop: { x: 1, y: 2, width: 3, height: 4 }, resizeWidth: 8, metadata: 'none', quality: 0.5 }, true))
+    .toEqual({ rotate: -90, flip: 'vertical', crop: { x: 1, y: 2, width: 3, height: 4 }, resizeWidth: 8, metadata: 'none', quality: 0.5 });
+  expect(editOptions('t', { maxDimension: 9, resizeWidth: 8 }, false)).toEqual({});
+  for (const bad of [{ rotate: '90' }, { flip: 'both' }, { crop: { x: 0, y: 0, width: 0, height: 1 } }, { crop: [0, 0, 1, 1] },
+    { resizeWidth: 0 }, { resizeHeight: 1.5 }, { quality: 2 }, { metadata: 'some' }, { resizeQuality: 'best' }, { type: 7 }, 7])
+    expect(() => editOptions('t', bad, true)).toThrow(TypeError);
+});
+
+test('a transform past its deadline decodes nothing', async () => {
+  const fixture = new Blob([readFileSync(new URL('../../scripts/fixtures/picker/oriented-gps.jpg', import.meta.url))]);
+  const error = await transform(fixture, { rotate: 90 }, 0).then(() => null, e => e);
+  expect([error?.code, error?.message.startsWith('filesystem: transformImage: timeout: ')]).toEqual(['timeout', true]);
 });

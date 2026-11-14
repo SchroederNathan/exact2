@@ -20,14 +20,54 @@ package final class TextArea: NSTextView {
 
     weak var owner: NodeView?
     package var markup: MarkdownEditing?
+    /// A plain textarea's painted decorations (LLP 1114.007).
+    var decorations: FieldDecorations?
     var nativeOrigin: NSPoint?
+    /// An edit is under way: the selection it moves is the edit's, not the
+    /// person's, and stays where the edit puts it (`MarkupHidden.swift`).
+    var changingText = false
+    /// The host is moving the caret across a hidden link destination.
+    var placingCaret = false
+    /// An input method is marking text: its edit stays the platform's.
+    var markingText = false
+    /// The source's length at the last selection change: a change that
+    /// comes with a new length is an edit's.
+    var markupLength = 0
+    /// Its inline atoms' accessibility elements, which the field's host lists
+    /// after the field, and the window and colour changes their pills are
+    /// drawn again for (FieldAtoms.swift, LLP 1045.000 D8).
+    var atomElements: [AtomElement] = []
+    var atomLook: (window: ObjectIdentifier?, tokens: [NSObjectProtocol]) = (nil, [])
+    /// Where the atom under the pointer starts, and the tracking that finds it, while a kind has `:hover` paint.
+    package var hoveredAtom: Int?
+    var atomHover: (AnyObject, NSTrackingArea)?
+    // A pill is its atom's element where assistive technology points (`atomElement(atScreen:)`).
+    package override func accessibilityHitTest(_ point: NSPoint) -> Any? { atomElement(atScreen: point) ?? super.accessibilityHitTest(point) }
+    // A press on a pill is the atom's (D7); the arrow over one, as over a token.
+    package override func hitTest(_ point: NSPoint) -> NSView? { atomHit(point) ?? super.hitTest(point) }
+    package override func resetCursorRects() { super.resetCursorRects(); addAtomCursorRects() }
+    // A pill is a picture drawn for one appearance: drawn again for another.
+    package override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); if markup != nil { owner?.restyleMarkup() } }
+    package override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); observeAtomLook(!atomElements.isEmpty) }
+    // A new width rewraps the text: the pills' tooltip and cursor rectangles follow.
+    package override func setFrameSize(_ size: NSSize) {
+        let rewraps = size.width != frame.width
+        super.setFrameSize(size)
+        if rewraps, !atomElements.isEmpty { atomsChanged() }
+    }
+    // Typed text never takes a link's marks from the character before the
+    // caret (its closing parenthesis, or its `[`).
+    package override var typingAttributes: [NSAttributedString.Key: Any] {
+        get { super.typingAttributes }
+        set { var shown = newValue; shown[.markupHidden] = nil; shown[.markupOpener] = nil; shown[.markupAtom] = nil; super.typingAttributes = shown }
+    }
     // AppKit asks the first responder for the mask: the native bezel's
     // scroll view, or the bare node's whole authored box.
     package override var focusRingMaskBounds: NSRect {
         guard let owner else { return super.focusRingMaskBounds }
         if !owner.isNativeTextControl { return convert(owner.focusRingMaskBounds, from: owner) }
-        guard let scroll = owner.textAreaScroll else { return super.focusRingMaskBounds }
-        return convert(scroll.bounds, from: scroll)
+        guard let scroll = owner.textAreaScroll else { return uncovered(super.focusRingMaskBounds) }
+        return uncovered(convert(scroll.bounds, from: scroll))
     }
     package override func drawFocusRingMask() {
         guard let owner else { super.drawFocusRingMask(); return }
@@ -44,13 +84,53 @@ package final class TextArea: NSTextView {
         NSGraphicsContext.restoreGraphicsState()
     }
     package override var textContainerOrigin: NSPoint { nativeOrigin ?? super.textContainerOrigin }
+    // A press reaches the node and its ancestors as a web textarea's does
+    // (`tracksPointer`); the selection is AppKit's tracking.
+    package override func mouseDown(with event: NSEvent) {
+        guard let owner else { return super.mouseDown(with: event) }
+        if owner.pressesUntracked(self, event) { return }
+        guard let fields = owner.presenter?.fieldSelections else { return owner.tracksPointer(event) { super.mouseDown(with: event) } }
+        fields.pressing(owner, event) { owner.tracksPointer(event) { super.mouseDown(with: event) } }
+    }
+    // The agent's window is never key: its every click counts, as at a node (`NodeView.everyClickCounts`).
+    package override func acceptsFirstMouse(for event: NSEvent?) -> Bool { NodeView.everyClickCounts || super.acceptsFirstMouse(for: event) }
 
     // The ARIA states AppKit has no property for (`NodeView.ariaAttribute`).
     package override func accessibilityAttributeNames() -> [NSAccessibility.Attribute] {
         super.accessibilityAttributeNames() + NodeView.ariaAttributes.filter { owner?.ariaAttribute($0) != nil }.map { .init(rawValue: $0) }
     }
     package override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
-        owner?.ariaAttribute(attribute.rawValue) ?? super.accessibilityAttributeValue(attribute)
+        if attribute == .value, markup != nil { return accessibilityValue() }
+        return owner?.ariaAttribute(attribute.rawValue) ?? super.accessibilityAttributeValue(attribute)
+    }
+    // VoiceOver reads the text without hidden link destinations (LLP 1045
+    // D1); its ranges stay source ranges, as the selection's are.
+    package override func accessibilityValue() -> String? {
+        guard markup != nil, let storage = textStorage else { return super.accessibilityValue() }
+        return storage.shownText(in: NSRange(location: 0, length: storage.length))
+    }
+    package override func accessibilityString(for range: NSRange) -> String? {
+        guard markup != nil, let storage = textStorage, NSMaxRange(range) <= storage.length else { return super.accessibilityString(for: range) }
+        return storage.shownText(in: range)
+    }
+    package override func accessibilitySelectedText() -> String? {
+        guard markup != nil, let storage = textStorage, NSMaxRange(selectedRange()) <= storage.length else { return super.accessibilitySelectedText() }
+        return storage.shownText(in: selectedRange())
+    }
+    package override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
+        let full = super.accessibilityAttributedString(for: range)
+        guard markup != nil, let storage = textStorage, let full, full.length == range.length, NSMaxRange(range) <= storage.length,
+              storage.hidesSource(in: range) else { return full }
+        let shown = NSMutableAttributedString(attributedString: full)
+        // Hidden runs read as nothing, an atom as its name (LLP 1045.000 D8).
+        storage.enumerateAttributes(in: range, options: .reverse) { attributes, run, _ in
+            let local = NSRange(location: run.location - range.location, length: run.length)
+            if let atom = attributes[.markupAtom] as? MarkupAtom {
+                let label = storage.atomRange(at: run.location)?.location == run.location ? atom.spokenName : ""
+                shown.replaceCharacters(in: local, with: label)
+            } else if attributes[.markupHidden] != nil { shown.deleteCharacters(in: local) }
+        }
+        return shown
     }
 
     package override func resignFirstResponder() -> Bool {
@@ -74,18 +154,77 @@ package final class TextArea: NSTextView {
 
     package override func doCommand(by selector: Selector) {
         let types = ["deleteBackward:": "deleteContentBackward", "deleteForward:": "deleteContentForward", "deleteWordBackward:": "deleteWordBackward", "deleteWordForward:": "deleteWordForward", "deleteToBeginningOfLine:": "deleteSoftLineBackward", "deleteToEndOfLine:": "deleteSoftLineForward", "deleteToBeginningOfParagraph:": "deleteHardLineBackward", "deleteToEndOfParagraph:": "deleteHardLineForward"]
-        if let type = types[NSStringFromSelector(selector)], let fields = owner?.presenter?.fieldSelections {
+        let name = NSStringFromSelector(selector)
+        crossHidden(backward: Self.backwardSteps.contains(name), forward: Self.forwardSteps.contains(name))
+        if let type = types[name], let fields = owner?.presenter?.fieldSelections {
             fields.withIntent(owner, type) { super.doCommand(by: selector) }
         } else { super.doCommand(by: selector) }
     }
+    private static let backwardSteps: Set = ["moveLeft:", "moveBackward:", "moveWordLeft:", "moveWordBackward:", "deleteBackward:", "deleteWordBackward:",
+                                             "deleteBackwardByDecomposingPreviousCharacter:", "deleteToBeginningOfLine:", "deleteToBeginningOfParagraph:"]
+    private static let forwardSteps: Set = ["moveRight:", "moveForward:", "moveWordRight:", "moveWordForward:", "deleteForward:", "deleteWordForward:",
+                                            "deleteToEndOfLine:", "deleteToEndOfParagraph:"]
+    /// A caret at a hidden link destination's edge steps, or deletes, from
+    /// its other edge, so the step is over visible text (LLP 1045 D5).
+    private func crossHidden(backward: Bool, forward: Bool) {
+        guard backward || forward, let markup, !hasMarkedText(), let storage = textStorage, selectedRange().length == 0,
+              let from = markup.crossing(selectedRange().location, backward: backward, in: storage) else { return }
+        placingCaret = true
+        defer { placingCaret = false }
+        let place = { self.setSelectedRange(NSRange(location: from, length: 0)) }
+        if let fields = owner?.presenter?.fieldSelections { fields.quietly(place) } else { place() }
+    }
     package override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        // Asked before `super`, which registers the native edit's undo: the
+        // editor's own edit replaces it and registers its own.
+        if let markup, !markup.applying, !hasMarkedText(), !markingText, let text = replacementString, let storage = textStorage,
+           let rewrite = markup.rewrite(affectedCharRange, with: text, caret: selectedRange().length == 0 ? selectedRange().location : nil, in: storage) {
+            if let owner, owner.presenter?.fieldSelections.shouldEdit(owner, range: affectedCharRange, replacement: text, marked: false) == false { return false }
+            apply(rewrite, markup)
+            return false
+        }
         guard super.shouldChangeText(in: affectedCharRange, replacementString: replacementString) else { return false }
         guard let owner else { return true }
-        return owner.presenter?.fieldSelections.shouldEdit(owner, range: affectedCharRange, replacement: replacementString ?? "", marked: hasMarkedText()) ?? true
+        guard owner.presenter?.fieldSelections.shouldEdit(owner, range: affectedCharRange, replacement: replacementString ?? "", marked: hasMarkedText()) ?? true else { return false }
+        changingText = true
+        DispatchQueue.main.async { [weak self] in self?.changingText = false }
+        return true
+    }
+    /// The Markdown editor's edit in place of the native one, as one undo
+    /// step through native insertion.
+    private func apply(_ rewrite: MarkupRewrite, _ markup: MarkdownEditing) {
+        markup.applying = true
+        breakUndoCoalescing()
+        undoManager?.beginUndoGrouping()
+        // Each part its own native edit: typing coalescing would merge two
+        // apart into one range that undo restores wrongly.
+        for edit in rewrite.edits.reversed() {
+            insertText(edit.text, replacementRange: edit.range)
+            breakUndoCoalescing()
+        }
+        if let caret = rewrite.caret { setSelectedRange(NSRange(location: caret, length: 0)) }
+        undoManager?.endUndoGrouping()
+        breakUndoCoalescing()
+        markup.applying = false
+        if !rewrite.edits.isEmpty { owner?.textDidChange(Notification(name: NSText.didChangeNotification, object: self)) }
     }
     /// AppKit posts no change while text is marked: the owner hears each one
     /// here, and a commit's steps as one (`settlingComposition`).
     package override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        // A composition that starts over a selection holding a hidden link
+        // destination first deletes what the selection shows, as the editor
+        // deletes it, and then composes at the caret.
+        if let markup, !markup.applying, !hasMarkedText(), replacementRange.location == NSNotFound, let storage = textStorage,
+           self.selectedRange().length > 0, let rewrite = markup.rewrite(self.selectedRange(), with: "", caret: nil, in: storage) {
+            // The app hears the deletion as its own input first.
+            let fields = owner?.presenter?.fieldSelections, range = self.selectedRange()
+            let heard = fields.map { fields in fields.withIntent(owner, "deleteByComposition") {
+                fields.shouldEdit(owner!, range: range, replacement: "", marked: false)
+            } } ?? true
+            if heard { apply(rewrite, markup) }
+        }
+        markingText = true
+        defer { markingText = false }
         if let selections = owner?.presenter?.fieldSelections {
             selections.withComposition(owner) { super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange) }
         } else { super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange) }
@@ -94,18 +233,24 @@ package final class TextArea: NSTextView {
     package override func unmarkText() {
         guard let owner else { super.unmarkText(); return }
         owner.settlingComposition(self) { super.unmarkText() }
+        // A commit that changes no text posts no change: paint held back
+        // while it was marked catches up here, and a `direction` that came meanwhile.
+        owner.restyleDecorations()
+        owner.applyBaseDirection(to: self)
     }
 
-    package override func insertTab(_ sender: Any?) {
-        if markup != nil { super.insertTab(sender) } else { window?.selectNextKeyView(self) }
-    }
-    package override func insertBacktab(_ sender: Any?) {
-        if markup != nil { super.insertBacktab(sender) } else { window?.selectPreviousKeyView(self) }
-    }
+    /// Tab and Shift-Tab move the focus, the Markdown editor's too, as the
+    /// web's textarea does; an app that wants a tab or an indent prevents
+    /// the `key` and calls `setRangeText` (LLP 1045 D6).
+    package override func insertTab(_ sender: Any?) { window?.selectNextKeyView(self) }
+    package override func insertBacktab(_ sender: Any?) { window?.selectPreviousKeyView(self) }
 
+    /// Return: the app's `beforeinput` first, then the Markdown editor's
+    /// list continuation, else a line break (LLP 1045 D6).
     package override func insertNewline(_ sender: Any?) {
-        if markup != nil, !hasMarkedText(), owner?.formatMarkup("newline") == true { return }
-        super.insertNewline(sender)
+        guard markup != nil, !hasMarkedText(), let owner else { super.insertNewline(sender); return }
+        let line = { if !owner.formatMarkup("newline") { super.insertNewline(sender) } }
+        if let fields = owner.presenter?.fieldSelections { fields.nativeEdit(owner, replacement: "\n", marked: false, line) } else { line() }
     }
 
     package override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -151,20 +296,21 @@ package final class TextArea: NSTextView {
     package override func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(undo(_:)) { return isEditable && !hasMarkedText() && undoManager?.canUndo == true }
         if item.action == #selector(redo(_:)) { return isEditable && !hasMarkedText() && undoManager?.canRedo == true }
+        if owner?.pastesFiles(item) == true { return isEditable }
         return super.validateMenuItem(item)
     }
 
     @objc package func copyPlainText(_ sender: Any?) {
         guard markup != nil, selectedRange().length > 0,
-              let plain = MarkdownLink.installed?.plain((string as NSString).substring(with: selectedRange())) else { return }
+              let plain = MarkdownLink.installed?.plain(string, range: selectedRange(), atoms: owner?.props["atoms"] ?? "", faces: owner?.props["atomFaces"] ?? "", spoken: false) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(plain, forType: .string)
     }
     // DOM's clipboard events, before the editor's own (#125, Clipboard.swift).
     package override func copy(_ sender: Any?) {
         NodeView.fieldEdit(owner, #selector(NodeView.copy(_:))) {
-            guard markup != nil else { super.copy(sender); return }
-            let selection = selectedRange()
+            guard let markup, let storage = textStorage else { super.copy(sender); return }
+            let selection = markup.copyRange(selectedRange(), in: storage)
             guard selection.length > 0 else { return }
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString((string as NSString).substring(with: selection), forType: .string)
@@ -172,21 +318,70 @@ package final class TextArea: NSTextView {
     }
 
     package override func cut(_ sender: Any?) { NodeView.fieldEdit(owner, #selector(NodeView.cut(_:))) { super.cut(sender) } }
-    package override func paste(_ sender: Any?) { NodeView.fieldEdit(owner, #selector(NodeView.paste(_:))) { super.paste(sender) } }
+    package override func paste(_ sender: Any?) { NodeView.fieldPaste(owner, self) { super.paste(sender) } }
+    package override func pasteAsPlainText(_ sender: Any?) { NodeView.fieldPaste(owner, self) { super.pasteAsPlainText(sender) } }
 
     var placeholder = "" { didSet { needsDisplay = true } }
     /// The authored `::placeholder` colour (LLP 1104 D3); nil, the platform's.
     var placeholderColor: NSColor? { didSet { if placeholderColor != oldValue { needsDisplay = true } } }
     package override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        decorations?.drawLines(in: self)
         if string.isEmpty, !placeholder.isEmpty {
             let origin = textContainerOrigin
             let rect = NSRect(x: origin.x, y: origin.y, width: textContainer?.containerSize.width ?? bounds.width, height: bounds.height - origin.y)
-            (placeholder as NSString).draw(in: rect, withAttributes: [
+            var attributes: [NSAttributedString.Key: Any] = [
                 .font: font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
                 .foregroundColor: placeholderColor ?? (owner?.isNativeTextControl == true ? ThemeRoles.color("placeholder", in: self, or: NSColor.placeholderTextColor) : (textColor ?? SystemColor.canvasText).withAlphaComponent(0.3)),
-            ])
+            ]
+            // Its lines are typed text's lines, by the line height typing takes.
+            let style = (typingAttributes[.paragraphStyle] as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle ?? NSMutableParagraphStyle()
+            // A Markdown editor's placeholder sits at its first line's start
+            // (LLP 1045 D11), as UIKit's and the web's do: string drawing aligns
+            // natural text by the app's layout direction, not the paragraph's,
+            // so the side is said.
+            if let markup {
+                let direction = markup.direction(at: 0)
+                style.baseWritingDirection = direction
+                style.alignment = direction == .rightToLeft ? .right : .left
+            } else if let owner {
+                // A plain field's at its start, by its own direction (LLP 1001 §1).
+                style.baseWritingDirection = owner.fieldBaseDirection
+                style.alignment = owner.fieldAlignment
+            }
+            attributes[.paragraphStyle] = style
+            drawingAntialiased(owner?.drawsAntialiased == true) { (placeholder as NSString).draw(in: rect, withAttributes: attributes) }
         }
+    }
+}
+
+extension NodeView {
+    /// The node's `direction` as the base of every paragraph of a plain
+    /// field's text, what is typed next and an empty field's, and its side
+    /// where it has one (native, or said), keeping each paragraph's other
+    /// attributes (LLP 1001 §1). Again after what can bring back another's:
+    /// an undo, a composition's end, `markup` going. A Markdown editor says
+    /// its own lines' (LLP 1045 D11). Attributes only: no edit, no event,
+    /// no undo step.
+    func applyBaseDirection(to tv: NSTextView) {
+        guard (tv as? TextArea)?.markup == nil, !tv.hasMarkedText(), let storage = tv.textStorage else { return }
+        let direction = fieldBaseDirection
+        // An input's editor has its field's side always; a text area's where it is native or said.
+        let alignment: NSTextAlignment? = tv !== textArea || isNativeTextControl || style["text_align"] != nil ? fieldAlignment : nil
+        let directed = { (style: NSParagraphStyle?) -> NSParagraphStyle? in
+            guard style?.baseWritingDirection != direction || (alignment != nil && style?.alignment != alignment) else { return nil }
+            let next = style?.mutableCopy() as? NSMutableParagraphStyle ?? NSMutableParagraphStyle()
+            next.baseWritingDirection = direction
+            if let alignment { next.alignment = alignment }
+            return next
+        }
+        storage.beginEditing()
+        storage.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
+            if let next = directed(value as? NSParagraphStyle) { storage.addAttribute(.paragraphStyle, value: next, range: range) }
+        }
+        storage.endEditing()
+        if let next = directed(tv.typingAttributes[.paragraphStyle] as? NSParagraphStyle) { tv.typingAttributes[.paragraphStyle] = next }
+        if let next = directed(tv.defaultParagraphStyle) { tv.defaultParagraphStyle = next }
     }
 }
 
@@ -255,7 +450,13 @@ extension NodeView {
     /// different one is held while text is marked, the last one written,
     /// and applied when the composition ends (`applyHeldValue`,
     /// `FieldComposition.swift`). The write is not typing, so the app does
-    /// not hear it as `input`.
+    /// not hear it as `input`, and a person using VoiceOver hears none of it
+    /// in a focused textarea, as in a browser's (LLP 1045 D5): AppKit posts
+    /// a selection change for it, and VoiceOver, inferring an edit from
+    /// that or from any value change posted, reads the text that went or
+    /// spells what came as typing. AppKit posts nothing for a view that is
+    /// no accessibility element, so the text view is none while the write
+    /// lands.
     func writeValue(_ value: String, into f: NSTextView) {
         if f.string.utf16.elementsEqual(value.utf16) { pendingValue = nil; return }
         if f.hasMarkedText() { pendingValue = value; return }
@@ -268,12 +469,15 @@ extension NodeView {
         f.breakUndoCoalescing()
         f.undoManager?.removeAllActions()
         let selection = f.selectedRange()
+        let quiet = f is TextArea && f.window?.firstResponder === f && f.isAccessibilityElement()
+        if quiet { f.setAccessibilityElement(false) }
         if let storage = f.textStorage, storage.length > 0, edit.range.length < storage.length {
             storage.replaceCharacters(in: edit.range, with: NSAttributedString(string: edit.text, attributes: f.typingAttributes))
         } else {
             f.string = value
         }
         f.setSelectedRange(carrySelection(selection, through: edit))
+        if quiet { f.setAccessibilityElement(true) }
         (f as? TextArea)?.markup?.bookmark = f.selectedRange()
         restyleMarkup()
     }
@@ -286,12 +490,16 @@ extension NodeView {
             editor.detach(storage)
             f.typingAttributes = editor.plainAttributes
             f.markup = nil
+            applyBaseDirection(to: f) // the field's own, which the editor's plain look does not say
+            f.atomsChanged()
         }
     }
     func applyTextArea() {
         guard let f = textArea else { return }
         configureMarkup()
         writeValue(props["value"] ?? "", into: f)
+        restyleMarkupProps()
+        restyleDecorations()
         f.isEditable = !disabled && props["editable"] != "false"
         f.isSelectable = !disabled
         applyTextChecking(f)
@@ -303,11 +511,13 @@ extension NodeView {
     func styleTextArea() {
         guard let f = textArea, let t = text else { return }
         guard !f.hasMarkedText() else { layoutTextArea(); return }
-        f.font = t.font(size: number("font_size", PageFacts.defaultRootFontSize), weight: Int(number("font_weight", 400)), family: Int(number("font_family")), italic: (style["font_style"]?.string) == "italic", numeric: Int(number("font_variant_numeric")))
-        f.textColor = color("text_color", SystemColor.canvasText)
+        f.font = t.font(size: number("font_size", PageFacts.defaultRootFontSize), weight: Int(number("font_weight", 400)), family: Int(number("font_family")), italic: (style["font_style"]?.string) == "italic", numeric: Int(number("font_variant_numeric")),
+            ligatures: Int(number("font_variant_ligatures")), stretch: CGFloat(number("font_stretch", 100)), variations: FontAxis.of(style))
+        f.textColor = fieldInk
         f.insertionPointColor = caretColor
         (f as? TextArea)?.placeholderColor = placeholderColor
-        let native = isNativeTextControl
+        f.drawAntialiased(drawsAntialiased)
+        let native = isNativeTextControl && !fieldInCell
         textAreaScroll?.borderType = native ? .bezelBorder : .noBorder
         textAreaScroll?.focusRingType = native && !outlineNone ? .default : .none
         textAreaScroll?.drawsBackground = native
@@ -316,15 +526,14 @@ extension NodeView {
         f.backgroundColor = ThemeRoles.color("Field", in: self, or: .textBackgroundColor)
         f.focusRingType = outlineNone ? .none : native ? .default : .exterior
         restyleFieldFocus()
-        f.textContainerInset = native ? FieldChromeCache.textareaInset(for: effectiveAppearance, scale: window?.backingScaleFactor ?? 1) : .zero
+        f.textContainerInset = native ? FieldChromeCache.textareaInset(for: effectiveAppearance, scale: pixelScale ?? 1) : .zero
         let paragraph = NSMutableParagraphStyle()
-        if let height = usedLineHeight {
-            paragraph.minimumLineHeight = height
-            paragraph.maximumLineHeight = height
-            if height == 0 { paragraph.lineHeightMultiple = .leastNormalMagnitude }
-        }
+        if let font = f.font { paragraph.setLineHeight(usedLineHeight, font: font, scale: pixelScale ?? 1) }
+        if (f as? TextArea)?.markup == nil { paragraph.baseWritingDirection = fieldBaseDirection }
+        // A native one's unsaid alignment is `start`; one of `appearance: none` aligns each paragraph to the
+        // base's start (natural) unless the author says otherwise.
+        if isNativeTextControl || style["text_align"] != nil { paragraph.alignment = fieldAlignment }
         f.defaultParagraphStyle = paragraph
-        if isNativeTextControl { paragraph.alignment = fieldAlignment }
         var attributes: [NSAttributedString.Key: Any] = [.paragraphStyle: paragraph]
         if isNativeTextControl { attributes[.kern] = number("letter_spacing") }
         f.textStorage?.addAttributes(attributes, range: NSRange(location: 0, length: (f.string as NSString).length))
@@ -349,9 +558,11 @@ extension NodeView {
         f.minSize = NSSize(width: 0, height: scroller.contentSize.height)
         f.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         f.setFrameSize(NSSize(width: scroller.contentSize.width, height: max(f.frame.height, scroller.contentSize.height)))
+        layoutResizeGrip()
     }
     package func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
-        TextInputLimit.allows(textView.string, range: affectedCharRange, replacement: replacementString ?? "", props: props)
+        presenter?.fieldSelections.replacing.contains(id) == true
+            || TextInputLimit.allows(textView.string, range: affectedCharRange, replacement: replacementString ?? "", props: props)
     }
     package func textDidChange(_ notification: Notification) {
         guard let f = textArea else { return }
@@ -363,11 +574,21 @@ extension NodeView {
         if !writingValue { applyHeldValue(to: f) }
         configureMarkup()
         restyleMarkup()
+        applyBaseDirection(to: f) // an undo brings back the attributes of the text it restores
         publishMarkupSelection()
     }
     package func textDidBeginEditing(_ notification: Notification) {
         presenter?.collections.pinsChanged()
         publishMarkupSelection(force: true)
+    }
+    /// A person's selection beside a hidden link destination (LLP 1045 D5).
+    package func textView(_ textView: NSTextView, willChangeSelectionFromCharacterRange old: NSRange, toCharacterRange new: NSRange) -> NSRange {
+        guard let f = textView as? TextArea, let editor = f.markup, let storage = f.textStorage else { return new }
+        let edited = f.markupLength != storage.length
+        f.markupLength = storage.length
+        guard !edited, !editor.applying, !editor.styling, !f.changingText, !f.placingCaret, !f.hasMarkedText(),
+              NSMaxRange(new) <= storage.length else { return new }
+        return editor.place(new, from: old, in: storage)
     }
     package func textViewDidChangeSelection(_ notification: Notification) {
         guard let f = textArea as? TextArea, let editor = f.markup, !editor.applying, !editor.styling, !f.hasMarkedText() else { return }
@@ -377,10 +598,12 @@ extension NodeView {
     }
     package func textDidEndEditing(_ notification: Notification) {
         presenter?.collections.pinsChanged()
-        showFieldFocus(false)
-        textAreaScroll?.noteFocusRingMaskChanged()
-        presenter?.commitEdit(id, textArea?.string ?? "", change: handlers.contains("change"))
-        presenter?.blur(id)
+        leavingFocus {
+            showFieldFocus(false)
+            textAreaScroll?.noteFocusRingMaskChanged()
+            presenter?.commitEdit(id, textArea?.string ?? "", change: handlers.contains("change"))
+            presenter?.blur(id)
+        }
     }
 }
 
@@ -433,16 +656,21 @@ extension NSTextView {
 /// `controlTextDidEndEditing`, which AppKit sends whenever the editor leaves.
 /// Its cell serves the node's ARIA attributes (`FieldCell`, Accessibility.swift).
 final class Field: NSTextField {
+    override func mouseDown(with event: NSEvent) { pressingField(delegate, event, self) { super.mouseDown(with: event) } }
     /// A `type="number"` input's node: the field is AppKit's stepper (incrementor) to accessibility.
     var numberOwner: NodeView? {
         guard let node = delegate as? NodeView, node.props["type"]?.lowercased() == "number" else { return nil }
         return node
     }
-    /// Once overridden, this is the role another process (VoiceOver) is
-    /// served, and `super`'s is `NSView`'s `AXUnknown`: an `NSTextField`'s
-    /// role is its cell's (`AXTextField`), so that is the answer for any
-    /// field but a number's.
-    override func accessibilityRole() -> NSAccessibility.Role? { numberOwner != nil ? .incrementor : cell?.accessibilityRole() ?? super.accessibilityRole() }
+    /// AppKit serves the field's protocol role and its cell's legacy attributes.
+    override func accessibilityRole() -> NSAccessibility.Role? {
+        if comboOwner != nil { return .comboBox }
+        return numberOwner != nil ? .incrementor : cell?.accessibilityRole() ?? super.accessibilityRole()
+    }
+    override func isAccessibilityExpanded() -> Bool {
+        guard let node = comboOwner else { return super.isAccessibilityExpanded() }
+        return node.props["accessibilityExpanded"] == "true"
+    }
     override func accessibilityMinValue() -> Any? {
         guard let owner = numberOwner else { return super.accessibilityMinValue() }
         return NumberStepping(owner.props).min.map { NSDecimalNumber(decimal: $0) }
@@ -455,7 +683,7 @@ final class Field: NSTextField {
     override func accessibilityPerformDecrement() -> Bool { numberOwner?.step(up: false) ?? super.accessibilityPerformDecrement() }
     override class var cellClass: AnyClass? { get { FieldCell.self } set {} }
     override func becomeFirstResponder() -> Bool { focused(delegate) { super.becomeFirstResponder() } }
-    override var focusRingMaskBounds: NSRect { bareFieldMask(self) ?? super.focusRingMaskBounds }
+    override var focusRingMaskBounds: NSRect { uncovered(bareFieldMask(self) ?? super.focusRingMaskBounds) }
     override func drawFocusRingMask() { if !drawBareFieldMask(self) { super.drawFocusRingMask() } }
 }
 /// The editor an `input`'s field edits in (`FieldCell.fieldEditor(for:)`):
@@ -467,6 +695,8 @@ final class Field: NSTextField {
 /// `cut` or `paste` before it happens, for the node or an ancestor that
 /// hears one (#125).
 final class FieldEditor: NSTextView {
+    override func mouseDown(with event: NSEvent) { pressingField(owner, event, self) { super.mouseDown(with: event) } }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { NodeView.everyClickCounts || super.acceptsFirstMouse(for: event) }
     override func doCommand(by selector: Selector) {
         let types = ["deleteBackward:": "deleteContentBackward", "deleteForward:": "deleteContentForward", "deleteWordBackward:": "deleteWordBackward", "deleteWordForward:": "deleteWordForward", "deleteToBeginningOfLine:": "deleteSoftLineBackward", "deleteToEndOfLine:": "deleteSoftLineForward", "deleteToBeginningOfParagraph:": "deleteHardLineBackward", "deleteToEndOfParagraph:": "deleteHardLineForward"]
         if let type = types[NSStringFromSelector(selector)], let fields = owner?.presenter?.fieldSelections {
@@ -495,8 +725,21 @@ final class FieldEditor: NSTextView {
     static func make() -> FieldEditor {
         let editor = FieldEditor(frame: .zero)
         editor.isFieldEditor = true
+        // An undo or redo restores the attributes of the text it brings back after
+        // the change it posts: the field's `direction` again once it is done (LLP 1001 §1).
+        for name in [NSNotification.Name.NSUndoManagerDidUndoChange, .NSUndoManagerDidRedoChange] {
+            editor.undoObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak editor] note in
+                guard Thread.isMainThread else { return } // a text view's undo is on the main thread; another's is not this editor's
+                MainActor.assumeIsolated {
+                    guard let editor, let manager = note.object as? UndoManager, manager === editor.undoManager, let owner = editor.owner else { return }
+                    owner.applyBaseDirection(to: editor)
+                }
+            })
+        }
         return editor
     }
+    private var undoObservers: [NSObjectProtocol] = []
+    deinit { undoObservers.forEach(NotificationCenter.default.removeObserver) }
     var owner: NodeView? { (delegate as? NSTextField)?.delegate as? NodeView }
     override func readSelection(from pasteboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
         guard owner?.props["type"]?.lowercased() == "number" else {
@@ -531,19 +774,60 @@ final class FieldEditor: NSTextView {
     override func unmarkText() {
         guard let owner else { super.unmarkText(); return }
         owner.settlingComposition(self) { super.unmarkText() }
+        self.owner?.styleFieldEditor(self) // a `direction` that came while it composed, for whichever field has it now
     }
     override func copy(_ sender: Any?) { NodeView.fieldEdit(owner, #selector(NodeView.copy(_:))) { super.copy(sender) } }
     override func cut(_ sender: Any?) { NodeView.fieldEdit(owner, #selector(NodeView.cut(_:))) { super.cut(sender) } }
-    override func paste(_ sender: Any?) { NodeView.fieldEdit(owner, #selector(NodeView.paste(_:))) { super.paste(sender) } }
+    override func paste(_ sender: Any?) { NodeView.fieldPaste(owner, self) { super.paste(sender) } }
+    override func pasteAsPlainText(_ sender: Any?) { NodeView.fieldPaste(owner, self) { super.pasteAsPlainText(sender) } }
+    override func validateMenuItem(_ item: NSMenuItem) -> Bool { owner?.pastesFiles(item) == true ? isEditable : super.validateMenuItem(item) }
 }
 final class SecureField: NSSecureTextField {
+    override func mouseDown(with event: NSEvent) {
+        // AppKit's secure editor is its own, not the session's `FieldEditor`:
+        // a press while editing is taken here and handed to it.
+        if let editor = currentEditor() { return pressingField(delegate, event, editor) { editor.mouseDown(with: event) } }
+        pressingField(delegate, event, self) { super.mouseDown(with: event) }
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        // A Control-click is a menu's: AppKit asks the hit view, the editor.
+        guard let down = NSApp.currentEvent, down.type == .leftMouseDown, !down.modifierFlags.contains(.control),
+              let editor = currentEditor() as? NSView, hit === editor || hit?.isDescendant(of: editor) == true else { return hit }
+        return self
+    }
+    // Editing, it has the focus already: the window's click must not begin it again.
+    override var acceptsFirstResponder: Bool { currentEditor() == nil && super.acceptsFirstResponder }
     override class var cellClass: AnyClass? { get { SecureFieldCell.self } set {} }
     override func becomeFirstResponder() -> Bool { focused(delegate) { super.becomeFirstResponder() } }
-    override var focusRingMaskBounds: NSRect { bareFieldMask(self) ?? super.focusRingMaskBounds }
+    override var focusRingMaskBounds: NSRect { uncovered(bareFieldMask(self) ?? super.focusRingMaskBounds) }
     override func drawFocusRingMask() { if !drawBareFieldMask(self) { super.drawFocusRingMask() } }
+}
+extension NSTextField {
+    var comboOwner: NodeView? {
+        guard let node = delegate as? NodeView, node.props["accessibilityRole"] == "combobox" else { return nil }
+        return node
+    }
+    func comboboxAttribute(_ attribute: NSAccessibility.Attribute) -> Any? {
+        guard comboOwner != nil else { return nil }
+        switch attribute {
+        case .role: return NSAccessibility.Role.comboBox.rawValue
+        case .roleDescription: return NSAccessibility.Role.comboBox.description(with: nil)
+        case .expanded: return isAccessibilityExpanded()
+        default: return nil
+        }
+    }
 }
 /// A native search input's field (`SearchFieldCell`, NativeFieldsMac.swift).
 final class SearchField: NSSearchField {
+    override func mouseDown(with event: NSEvent) { pressingField(delegate, event, self) { super.mouseDown(with: event) } }
+    override func accessibilityRole() -> NSAccessibility.Role? {
+        comboOwner != nil ? .comboBox : cell?.accessibilityRole() ?? super.accessibilityRole()
+    }
+    override func isAccessibilityExpanded() -> Bool {
+        guard let node = comboOwner else { return super.isAccessibilityExpanded() }
+        return node.props["accessibilityExpanded"] == "true"
+    }
     override class var cellClass: AnyClass? { get { SearchFieldCell.self } set {} }
     override func becomeFirstResponder() -> Bool { focused(delegate) { super.becomeFirstResponder() } }
 }
@@ -559,6 +843,13 @@ private func drawBareFieldMask(_ field: NSTextField) -> Bool {
     owner.roundedPath(in: owner.bounds).fill()
     NSGraphicsContext.restoreGraphicsState()
     return true
+}
+/// An input's press, from its field or its editor (`tracksPointer`).
+private func pressingField(_ owner: Any?, _ event: NSEvent, _ editor: NSView, _ track: () -> Void) {
+    guard let node = owner as? NodeView else { return track() }
+    if node.pressesUntracked(editor, event) { return }
+    guard let fields = node.presenter?.fieldSelections else { return node.tracksPointer(event, track) }
+    fields.pressing(node, event) { node.tracksPointer(event, track) }
 }
 /// The field editor selects the whole value as it takes a field, which is
 /// no `select` of the person's; a selection a script set while the field

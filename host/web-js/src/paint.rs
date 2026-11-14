@@ -148,7 +148,10 @@ pub fn needed(plan: &Plan, parts: &[Option<exact_web::host::template::Parts>]) -
         (bits & ROOT == 0
             && (bits & (POSITION | STACK | POLICY | CONTROL | WRAP) != 0
                 || p.props.contains_key("data-exact-zi")))
-            || plan.nodes[i]
+            || plan
+                .nodes
+                .get(i)
+                .unwrap()
                 .bindings
                 .iter()
                 .map(|b| plan.binding(b))
@@ -156,8 +159,8 @@ pub fn needed(plan: &Plan, parts: &[Option<exact_web::host::template::Parts>]) -
                     crate::style::literal(plan, plan.code(b.expr)).is_none()
                         && binding(
                             plan,
-                            NodeType::from_wire(plan.nodes[i].node_type).unwrap(),
-                            b,
+                            NodeType::from_wire(plan.nodes.get(i).unwrap().node_type).unwrap(),
+                            &b,
                         )
                         .is_some()
                 })
@@ -177,7 +180,7 @@ pub fn binding(plan: &Plan, kind: NodeType, b: &BindingsRow) -> Option<(String, 
                 "(String(v??\"bordered\").endsWith(\"glass\")?{GLASS}:0)|(![\"bordered\",\"gray\"].includes(String(v??\"bordered\"))?{DIM}:0)")),
             PropId::Disabled if kind == NodeType::Control => flag(DISABLED, "v===true"),
             PropId::ImageSource if kind == NodeType::Image => flag(POLICY, "v!=null&&String(v).startsWith(\"symbol:\")"),
-            PropId::BackgroundMaterial => flag(POLICY, "v!=null"),
+            PropId::BackgroundMaterial => flag(POLICY, "v!=null&&v!==\"none\""),
             PropId::NavigationPresentation => flag(POLICY, "v===\"modal\""),
             PropId::SemanticTag => flag(OUTSIDE, "v===\"dialog\""),
             PropId::Popover => flag(OUTSIDE, "v!=null"),
@@ -193,8 +196,16 @@ pub fn binding(plan: &Plan, kind: NodeType, b: &BindingsRow) -> Option<(String, 
         StyleId::WrapFlow => return flag(WRAP, "v===\"both\""),
         StyleId::TintColor if kind == NodeType::Image => return flag(POLICY, "v!=null"),
         StyleId::Isolation => return flag(ISOLATION | STACK, "v===\"isolate\""),
-        StyleId::LayoutTransition => return flag(LAYOUT | POLICY, "v!=null"),
-        StyleId::ExitAnimation => return flag(POLICY, "v!=null"),
+        // Set where the kernel accepts a value named by the binding.
+        StyleId::LayoutTransition | StyleId::ExitAnimation => {
+            let (bits, values) = if id == StyleId::LayoutTransition {
+                (LAYOUT | POLICY, crate::presence::layout_transitions(plan, plan.code(b.expr)))
+            } else {
+                (POLICY, crate::presence::exit_animations(plan, plan.code(b.expr), false))
+            };
+            let table = serde_json::to_string(&values.held.keys().collect::<Vec<_>>()).unwrap();
+            return flag(bits, &format!("typeof v===\"string\"&&{table}.includes(v)"));
+        }
         StyleId::Transition => {
             let properties: std::collections::BTreeMap<_, _> = exact_motion::Property::ALL
                 .iter()
@@ -245,7 +256,28 @@ pub fn binding(plan: &Plan, kind: NodeType, b: &BindingsRow) -> Option<(String, 
                 ),
             );
         }
-        StyleId::Opacity => "v!=null&&Number(v)<1",
+        // A number token's name (LLP 1121 D7) stands for its value: one that
+        // varies may be below 1; a name no token has is unset, 1.
+        StyleId::Opacity => {
+            let tokens: Vec<String> = plan
+                .theme
+                .iter()
+                .filter(|r| r.kind == 2)
+                .map(|r| {
+                    let value = if r.slices.len > 0 { "0" } else { plan.str(r.value).trim() };
+                    format!("{}:{value}", serde_json::to_string(plan.str(r.name)).unwrap())
+                })
+                .collect();
+            let test = if tokens.is_empty() {
+                "v!=null&&Number(v)<1".to_string()
+            } else {
+                format!(
+                    "v!=null&&(typeof v===\"string\"&&isNaN(v)?({{{}}}[v.trim()]??1)<1:Number(v)<1)",
+                    tokens.join(",")
+                )
+            };
+            return flag(STACK, &test);
+        }
         StyleId::PressScale => "v!=null&&Number(v)!==1",
         StyleId::Perspective => "v!=null&&parseFloat(v)>0",
         StyleId::Translate

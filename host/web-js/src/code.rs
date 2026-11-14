@@ -22,7 +22,7 @@
 
 use exact_plan::{Opcode, Plan, Stdlib};
 use exact_runner::vm::{instructions, Instruction};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What names a body may read, from where it is compiled.
 #[derive(Clone, Default)]
@@ -35,6 +35,8 @@ pub struct Scope {
     /// The JavaScript object holding the row slots in force (LLP 1017 P4c:
     /// a slot owned by a `for` lives on its row), by slot index.
     pub rows: Option<String>,
+    /// Row slots available in this scope, excluding slots owned by descendants.
+    pub row_slots: BTreeSet<usize>,
 }
 
 /// One region frame's getters.
@@ -48,9 +50,19 @@ pub struct Frame {
 /// Runtime names the generated code uses (for the import lists).
 #[derive(Default)]
 pub struct Uses {
+    /// Resource fields read as Markdown, also prepared before an unopened view mounts.
+    pub markdown_paths: BTreeSet<Vec<usize>>,
     pub names: BTreeSet<String>,
     /// budget.js's (LLP 1090 D3).
     pub budget: BTreeSet<String>,
+    /// How many times generated code named one of budget.js's: a body
+    /// that named none cannot trap.
+    pub metered: usize,
+    /// Module-scope constants, by name: JavaScript built once from the plan
+    /// that many sites share (LLP 1071 §7, generated code at scale).
+    pub consts: BTreeMap<String, String>,
+    /// The constants `share` made, by value.
+    pub shared: BTreeMap<String, String>,
 }
 
 impl Uses {
@@ -60,22 +72,43 @@ impl Uses {
     }
 
     pub fn budget(&mut self, name: &str) -> String {
+        self.metered += 1;
         self.budget.insert(name.to_string());
         name.to_string()
     }
+
+    /// `name`, a module-scope constant of `value`'s JavaScript (built once).
+    pub fn constant(&mut self, name: &str, value: impl FnOnce() -> String) -> String {
+        self.consts.entry(name.to_string()).or_insert_with(value);
+        name.to_string()
+    }
+
+    /// `value`'s JavaScript as a module-scope constant, one per distinct
+    /// value (`$$<kind><n>`, a name no other generated code takes).
+    pub fn share(&mut self, kind: char, value: String) -> String {
+        if let Some(name) = self.shared.get(&value) {
+            return name.clone();
+        }
+        let name = format!("$${kind}{}", self.shared.len());
+        self.consts.insert(name.clone(), value.clone());
+        self.shared.insert(value, name.clone());
+        name
+    }
 }
 
-/// The roster entries that build a string past `MAX_STRING`'s reach: budget.js
-/// checks their result at the call's pc.
+/// The roster entries that build a string past `MAX_STRING`'s reach, and
+/// `sortBy`'s list: budget.js checks their result at the call's pc.
 fn checked(f: Stdlib) -> bool {
     matches!(
         f,
         Stdlib::Join
+            | Stdlib::SortBy
             | Stdlib::T
             | Stdlib::EncodeURIComponent
             | Stdlib::EncodeRouteSegment
             | Stdlib::ReplaceAll
             | Stdlib::ToLowerCase
+            | Stdlib::ToUpperCase
     )
 }
 
@@ -90,6 +123,9 @@ fn stepped(f: u64) -> bool {
         Stdlib::Includes,
         Stdlib::IndexOf,
         Stdlib::Split,
+        Stdlib::Sum,
+        Stdlib::Range,
+        Stdlib::Flat,
     ]
     .iter()
     .any(|&g| f == g as u64)
@@ -342,7 +378,14 @@ impl Translator<'_> {
                 Opcode::Bool => self.push(if x.args[0] != 0 { "!0" } else { "!1" }.into()),
                 Opcode::Str => {
                     let s = self.plan.str(exact_plan::StrId(x.args[0] as u32));
-                    self.push(serde_json::to_string(s).unwrap())
+                    let s = serde_json::to_string(s).unwrap();
+                    // A long one (an icon's path) once, however many sites read it.
+                    let s = if s.len() >= LONG_STRING {
+                        self.uses.share('s', s)
+                    } else {
+                        s
+                    };
+                    self.push(s)
                 }
                 Opcode::None | Opcode::Unit => self.push("null".into()),
                 Opcode::Some | Opcode::Unwrap => {}
@@ -728,6 +771,9 @@ impl Translator<'_> {
     }
 }
 
+/// A string literal's length (quoted) from which a module constant holds it.
+const LONG_STRING: usize = 64;
+
 /// A number as a JavaScript literal.
 pub fn number(n: f64) -> String {
     if n.is_nan() {
@@ -747,6 +793,7 @@ pub fn number(n: f64) -> String {
 /// VM's equality for it.
 fn primitive(e: &str) -> bool {
     e.starts_with('"')
+        || e.starts_with("$$s")
         || e == "!0"
         || e == "!1"
         || e.parse::<f64>().is_ok()

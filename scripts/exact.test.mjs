@@ -8,9 +8,10 @@ import { createHash } from 'node:crypto';
 import { cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, relative, resolve } from 'node:path';
-import { codeDigest, signingOrder, signRelease, signedGpuProduct, assertArchiveFrameworks } from '../host/apple/assets.mjs';
+import { codeDigest, signingOrder, signRelease, signedGpuProduct, assertArchiveFrameworks, plistFile, wrapFramework } from '../host/apple/assets.mjs';
 import { appleEmbedOnly, copyAppleGpuProducts, captureAppleProduct, stripForDistribution } from '../host/apple/build.mjs';
 import { assertLinkedSdk } from '../host/apple/link.mjs';
+import { packageWidgets, packageAlarmExtension } from '../host/apple/widgets.mjs';
 
 const plist = (executable) => `<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>CFBundleExecutable</key><string>${executable}</string></dict></plist>\n`;
@@ -62,6 +63,90 @@ test('the signing order holds every Mach-O by its magic and each nested bundle a
 }));
 
 const tools = process.platform === 'darwin' && ['clang', 'codesign'].every((tool) => Bun.which(tool));
+
+test.skipIf(!tools)('widget packaging preserves parent platform and device capabilities in device and simulator extensions', () => inDir(dir => {
+  const library = resolve(dir, 'fixture.dylib');
+  writeFileSync(resolve(dir, 'fixture.c'), 'void fixture(void) {}');
+  const compiled = spawnSync('clang', ['-dynamiclib', resolve(dir, 'fixture.c'), '-o', library], { encoding: 'utf8' });
+  assert.equal(compiled.status, 0, compiled.stderr);
+  const readPlist = path => {
+    const result = spawnSync('plutil', ['-convert', 'json', '-o', '-', path], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+  for (const device of [true, false]) {
+    const platform = device ? 'iphoneos' : 'iphonesimulator';
+    const bundle = resolve(dir, platform, 'Fixture.app'), directory = resolve(dir, platform, 'build');
+    const framework = resolve(bundle, 'Frameworks/ExactCore.framework');
+    mkdirSync(framework, { recursive: true });
+    const parent = { CFBundleVersion: '8', CFBundleShortVersionString: '1.0.0', MinimumOSVersion: '17.0',
+      UIDeviceFamily: [1, 2], CFBundleSupportedPlatforms: [device ? 'iPhoneOS' : 'iPhoneSimulator'], DTPlatformName: platform, ExactWidgetGeneration: 'fixture',
+      ...(device ? { UIRequiredDeviceCapabilities: ['arm64'] } : {}) };
+    writeFileSync(resolve(bundle, 'Info.plist'), plistFile(parent));
+    writeFileSync(resolve(framework, 'Info.plist'), plistFile({ CFBundleIdentifier: 'dev.exact.fixture.runtime' }));
+    let signed = null;
+    packageWidgets({ app: { dir, id: 'dev.exact.fixture', displayName: 'Fixture', manifest: {} }, bundle,
+      shared: { framework, snapshotArchive: resolve(dir, 'snapshot.a') }, directory, sdk: 'fixture-sdk', triple: 'fixture-target',
+      device, production: true, entitlements: plistFile({}),
+      runApple(command, args) {
+        if (command === 'plutil') return { stdout: JSON.stringify(readPlist(args.at(-1))) };
+        assert.equal(command, 'xcrun');
+        assert.equal(args[2], 'swiftc');
+        cpSync(library, args[args.indexOf('-o') + 1]);
+        return { stdout: '' };
+      }, sign(extension) { signed = extension; } });
+    assert.equal(signed, resolve(bundle, 'PlugIns/ExactWidgets.appex'));
+    const info = readPlist(resolve(signed, 'Info.plist'));
+    assert.equal(info.DTPlatformName, platform);
+    assert.deepEqual(info.UIRequiredDeviceCapabilities, parent.UIRequiredDeviceCapabilities);
+    for (const name of ['ExactCore', 'ExactWidgetReload']) {
+      assert.deepEqual(readPlist(resolve(bundle, `Frameworks/${name}.framework/Info.plist`)).UIRequiredDeviceCapabilities, parent.UIRequiredDeviceCapabilities, name);
+    }
+    assert.deepEqual(info.CFBundleSupportedPlatforms, parent.CFBundleSupportedPlatforms);
+    assert.equal(info.CFBundleVersion, parent.CFBundleVersion);
+  }
+}));
+for (const device of [true, false]) {
+  const platform = device ? 'iphoneos' : 'iphonesimulator';
+  for (const [shape, metadata] of [
+    ['array', { DTPlatformName: platform, UIRequiredDeviceCapabilities: ['arm64', 'gps'] }],
+    ['dictionary', { DTPlatformName: platform, UIRequiredDeviceCapabilities: { arm64: true, gps: false } }],
+    ['empty array', { DTPlatformName: platform, UIRequiredDeviceCapabilities: [] }],
+    ['empty dictionary', { DTPlatformName: platform, UIRequiredDeviceCapabilities: {} }],
+    ['omitted capabilities', { DTPlatformName: platform }],
+    ['omitted platform', { UIRequiredDeviceCapabilities: { arm64: true, gps: false } }],
+    ['omitted keys', {}],
+  ]) test.skipIf(process.platform !== 'darwin')(`alarm-only ${platform} extension preserves ${shape} parent metadata`, () => inDir(dir => {
+    const bundle = resolve(dir, 'Fixture.app'), directory = resolve(dir, 'build');
+    mkdirSync(bundle);
+    mkdirSync(directory);
+    const parent = { CFBundleVersion: '8', CFBundleShortVersionString: '1.0.0', MinimumOSVersion: '17.0',
+      UIDeviceFamily: [1, 2], CFBundleSupportedPlatforms: [device ? 'iPhoneOS' : 'iPhoneSimulator'], ...metadata };
+    writeFileSync(resolve(bundle, 'Info.plist'), plistFile(parent));
+    const readPlist = path => {
+      const result = spawnSync('plutil', ['-convert', 'json', '-o', '-', path], { encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout);
+    };
+    let signed = null;
+    packageAlarmExtension({ app: { dir, id: 'dev.exact.fixture', displayName: 'Fixture', manifest: {} }, bundle,
+      directory, sdk: 'fixture-sdk', triple: 'fixture-target', device, entitlements: plistFile({}), alarm: 'ExactAlarms',
+      runApple(command, args) {
+        if (command === 'plutil') return { stdout: JSON.stringify(readPlist(args.at(-1))) };
+        assert.equal(command, 'xcrun');
+        return { stdout: '' };
+      }, sign(extension) { signed = extension; } });
+    assert.equal(signed, resolve(bundle, 'PlugIns/ExactWidgets.appex'));
+    const info = readPlist(resolve(signed, 'Info.plist'));
+    for (const key of ['DTPlatformName', 'UIRequiredDeviceCapabilities', 'CFBundleSupportedPlatforms',
+      'CFBundleVersion', 'CFBundleShortVersionString', 'MinimumOSVersion', 'UIDeviceFamily']) {
+      assert.equal(Object.hasOwn(info, key), Object.hasOwn(parent, key), key);
+      assert.deepEqual(info[key], parent[key], key);
+    }
+    assert.equal(existsSync(resolve(bundle, 'Frameworks')), false);
+  }));
+}
+
 test('release refuses code in content-addressed assets before signing changes its digest', () => inDir(dir => {
   const app = resolve(dir, 'Fixture.app'), helper = resolve(app, 'Contents/Resources/assets/helper');
   mkdirSync(dirname(helper), { recursive: true });
@@ -109,6 +194,59 @@ test.skipIf(!tools)('release preserves baked GPU signatures and rejects changed 
   const changed = readFileSync(gpu); changed[64] ^= 1;
   writeFileSync(gpu, changed);
   assert.throws(() => signingOrder(app, compat), /baked code.*digest/);
+}), 60000);
+
+test.skipIf(!tools)('signed GPU framework upgrades refresh metadata before archive capture', () => inDir(dir => {
+  const run = (command, args) => {
+    const result = spawnSync(command, args, { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  const app = { id: 'test.gpu', manifest: {} }, name = 'ExactGpu';
+  const source = resolve(dir, 'gpu.c'), product = resolve(dir, 'gpu.dylib');
+  writeFileSync(source, 'int gpu_fixture(void){return 42;}\n');
+  run('xcrun', ['--sdk', 'iphoneos', 'clang', '-target', 'arm64-apple-ios17.0', '-dynamiclib', source, '-o', product]);
+  const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
+  const sourceDigest = hash(product), options = { app, framework: name, platform: 'iPhoneOS' };
+  const frameworks = resolve(dir, 'signed/frameworks/gpu.dylib'), container = resolve(frameworks, `${name}.framework`);
+  mkdirSync(frameworks, { recursive: true });
+  cpSync(product, resolve(frameworks, 'gpu.dylib'));
+  wrapFramework(frameworks, 'gpu.dylib', name, app, options.platform);
+  const info = resolve(container, 'Info.plist'), record = `${container}.source`;
+  const oldInfo = JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', info]));
+  delete oldInfo.UIRequiredDeviceCapabilities;
+  writeFileSync(info, plistFile(oldInfo));
+  run('codesign', ['--force', '--sign', '-', '--timestamp=none', container]);
+  run('codesign', ['--verify', '--strict', container]);
+  // The cache key from before the plist was the key: the metadata's inputs, not what was written.
+  const oldKey = JSON.stringify([sourceDigest, '-', false, name,
+    [app.id, '17.0', options.platform, process.env.EXACT_BUILD_NUMBER ?? '1', process.env.EXACT_VERSION ?? '0.1.0']]);
+  writeFileSync(record, oldKey);
+  const code = codeDigest(readFileSync(resolve(container, name)));
+  const signed = signedGpuProduct(product, options);
+  assert.equal(signed, resolve(container, name));
+  const updated = JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', info]));
+  assert.deepEqual(updated, { ...oldInfo, UIRequiredDeviceCapabilities: ['arm64'] });
+  assert.notEqual(readFileSync(record, 'utf8'), oldKey);
+  assert.equal(hash(product), sourceDigest, 'a packaging upgrade leaves Cargo output unchanged');
+  assert.equal(codeDigest(readFileSync(signed)), code, 'a packaging upgrade preserves the baked code digest');
+  run('codesign', ['--verify', '--strict', container]);
+  const digest = hash(signed), inode = statSync(signed).ino;
+  assert.equal(signedGpuProduct(product, options), signed);
+  assert.equal(statSync(signed).ino, inode, 'the upgraded warm cache reuses the signed file');
+  assert.equal(hash(signed), digest);
+  const capture = resolve(dir, 'capture'), captured = resolve(capture, `${name}.framework`, name);
+  cpSync(container, dirname(captured), { recursive: true });
+  rmSync(captured);
+  captureAppleProduct({ products: [{ path: signed, bytes: statSync(signed).size, sha256: digest }] }, signed, captured);
+  const packaged = resolve(dir, 'Payload/Fixture.app/Frameworks');
+  mkdirSync(packaged, { recursive: true });
+  copyAppleGpuProducts(capture, packaged, [{ framework: name }], true);
+  assertArchiveFrameworks(packaged);
+  const copied = resolve(packaged, `${name}.framework`);
+  assert.deepEqual(JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', resolve(copied, 'Info.plist')])), updated);
+  assert.equal(hash(resolve(copied, name)), digest, 'the archive keeps the captured signed bytes');
+  run('codesign', ['--verify', '--deep', '--strict', copied]);
 }), 60000);
 
 test('--archive --embed does not stop after embed staging; plain --embed builds no Swift', () => {
@@ -435,6 +573,12 @@ test('exact hatch writes each target\'s stub, wires it in, and declares the word
     hatch(['--window'], () => {});
     assert.ok(readFileSync(resolve(dir, 'modules/apple/Hatches.swift'), 'utf8').includes('        windowHatch(window)\n        // exact:window\n'));
     assert.ok(readFileSync(resolve(dir, 'modules/web/index.js'), 'utf8').includes('export function window(x) { windowHatch.built(x); }'));
+    // The app hatch reads the root's data-* words, which app.json `data` declares: the verb adds the list and names the accessor.
+    const app = [];
+    hatch(['--app'], line => app.push(line));
+    assert.deepEqual(JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8')).data, []);
+    assert.ok(app.some(line => line.includes('app.data[.booted]')), app.join('\n'));
+    assert.ok(readFileSync(resolve(dir, 'modules/apple/AppHatch.swift'), 'utf8').includes('app.data[.booted]'));
     assert.throws(() => hatch(['Not A Word'], () => {}), /name a word/);
     // A Linux crate gets one hatches file, each word an arm and its functions, and is told what its build.rs owes.
     mkdirSync(resolve(dir, 'linux'));
@@ -576,6 +720,33 @@ test.skipIf(process.platform !== 'darwin')('Icon Composer supplies the primary i
   assert.deepEqual(appIcon(app, mac, 'macos'), { CFBundleIconFile: 'AppIcon' });
 }), 60000);
 
+test.skipIf(process.platform !== 'darwin')('iOS alternate icon sets compile beside raster and Composer primaries for both device families', () => inDir(dir => {
+  const { useXcode } = require('../host/apple/devices.mjs');
+  const { iosAssets } = require('../host/apple/assets.mjs');
+  useXcode();
+  const primary = resolve(dir, 'icon.png');
+  writeFileSync(primary, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64'));
+  const set = resolve(dir, 'modules/apple/Icons.xcassets/Nested/Alternate.appiconset');
+  mkdirSync(set, { recursive: true });
+  const sized = spawnSync('sips', ['-z', '1024', '1024', primary, '--out', resolve(set, 'icon.png')], { encoding: 'utf8' });
+  assert.equal(sized.status, 0, sized.stderr);
+  writeFileSync(resolve(set, 'Contents.json'), JSON.stringify({ info: { author: 'xcode', version: 1 }, images: [{ idiom: 'universal', platform: 'ios', size: '1024x1024', filename: 'icon.png' }] }));
+  const app = composerFixture(dir);
+  app.manifest.icons = [{ src: 'icon.png', sizes: '1024x1024' }];
+  for (const [composer, catalog, device, folder] of [[true, true, false, 'composer'], [false, true, false, 'raster'], [false, false, false, 'development'], [false, true, true, 'device']]) {
+    if (!composer) delete app.manifest.host.ios.icon;
+    const out = resolve(dir, folder); mkdirSync(out);
+    const keys = iosAssets(app, out, device, { catalog });
+    for (const family of ['CFBundleIcons', 'CFBundleIcons~ipad']) {
+      assert.equal(keys[family].CFBundlePrimaryIcon.CFBundleIconName, composer ? 'Primary' : 'AppIcon');
+      assert.deepEqual(keys[family].CFBundleAlternateIcons, { Alternate: { CFBundleIconName: 'Alternate' } });
+    }
+    const inspected = spawnSync('xcrun', ['assetutil', '--info', resolve(out, 'Assets.car')], { encoding: 'utf8' });
+    assert.equal(inspected.status, 0, inspected.stderr);
+    assert.ok(JSON.parse(inspected.stdout).some(asset => asset.Name === 'Alternate'), 'the declared alternate must exist in Assets.car');
+  }
+}), 60000);
+
 test('Apple asset catalogs select platform modules and invalidate native receipts on additions and deletions', () => inDir(dir => {
   const { appleAssetCatalogInventory } = require('../host/apple/assets.mjs');
   const { pendingBuildInputs } = require('./app.mjs');
@@ -602,7 +773,14 @@ test('Apple asset catalogs select platform modules and invalidate native receipt
   assert.equal(appleAssetCatalogInventory(app, 'ios')[0].path, shared[0].path);
   rmSync(resolve(dir, 'modules/apple/Shared.xcassets'), { recursive: true });
   assert.deepEqual(pendingBuildInputs(build), ['Apple asset catalogs']);
-  assert.equal(appleRunBinary(launchApp), paths.binary);
+  assert.equal(appleRunBinary(launchApp), resolve(paths.bundle, 'Contents/MacOS', paths.executable));
+  launchApp.manifest.widgets = [{ kind: 'card', families: ['systemSmall'] }];
+  mkdirSync(paths.products, { recursive: true });
+  writeFileSync(resolve(paths.products, 'receipt.json'), JSON.stringify({ entitlements: null }));
+  assert.equal(appleRunBinary(launchApp), resolve(paths.bundle, 'Contents/MacOS', paths.executable), 'a widget declaration without an identity still launches the bundled app');
+  writeFileSync(resolve(paths.products, 'receipt.json'), JSON.stringify({ entitlements: plistFile({ 'com.apple.security.application-groups': ['TEAM.com.exact.catalog.widgets'] }) }));
+  assert.equal(appleRunBinary(launchApp), resolve(paths.bundle, 'Contents/MacOS', paths.executable));
+  assert.equal(appleRunBinary(launchApp, true), appleArtifacts(launchApp, { host: true }).binary);
   mkdirSync(resolve(dir, 'modules/apple/Linked.xcassets'));
   symlinkSync(resolve(dir, 'outside'), resolve(dir, 'modules/apple/Linked.xcassets/Contents.json'));
   assert.throws(() => appleAssetCatalogInventory(app, 'ios'), /symlinks/);
@@ -617,13 +795,13 @@ test.skipIf(process.platform !== 'darwin')('the iOS launch screen is the app\'s 
     const out = resolve(dir, `app${n++}.app`); mkdirSync(out);
     const keys = iosAssets({ dir, name: 'Launch', manifest }, out, false, options);
     const result = spawnSync('xcrun', ['assetutil', '--info', resolve(out, 'Assets.car')], { encoding: 'utf8' });
-    const colours = keys.UILaunchScreen ? JSON.parse(result.stdout).filter(asset => asset.Name === 'ExactLaunch')
+    const colours = keys.UILaunchScreen ? JSON.parse(result.stdout).filter(asset => asset.Name === keys.UILaunchScreen.UIColorName)
       .map(asset => [asset.Appearance ?? 'light', asset['Color components'].map(c => Math.round(c * 255))]) : [];
     return { keys, colours };
   };
   // Stopwatch, round 13: a first route on the grouped grey, whose launch screen was the system's white.
   const grouped = made({}, { launch: 'grouped' });
-  assert.equal(grouped.keys.UILaunchScreen.UIColorName, 'ExactLaunch');
+  assert.match(grouped.keys.UILaunchScreen.UIColorName, /^ExactLaunch-[0-9a-f]{8}$/);
   assert.deepEqual(grouped.colours, [['light', [242, 242, 247, 255]], ['UIAppearanceDark', [0, 0, 0, 255]]]);
   // A page of the platform's own stays the system's launch screen (`systemBackground`, light and dark).
   for (const options of [{ launch: 'system' }, {}]) assert.deepEqual(made({}, options).keys, {});
@@ -654,7 +832,8 @@ test.skipIf(process.platform !== 'darwin')('Apple asset catalogs retain named im
   const ios = resolve(dir, 'iOS.app'); mkdirSync(ios);
   const keys = iosAssets(app, ios, false, { catalog: true, kept: cache, expected: inventory });
   assert.equal(keys.CFBundleIcons.CFBundlePrimaryIcon.CFBundleIconName, 'AppIcon');
-  assert.equal(keys.UILaunchScreen.UIColorName, 'ExactLaunch');
+  const launch = keys.UILaunchScreen.UIColorName;
+  assert.match(launch, /^ExactLaunch-[0-9a-f]{8}$/);
   assert.equal(keys.NSAccentColorName, undefined, 'no AccentColor set, no accent named');
   const inspect = path => {
     const result = spawnSync('xcrun', ['assetutil', '--info', resolve(path, 'Assets.car')], { encoding: 'utf8' });
@@ -662,8 +841,8 @@ test.skipIf(process.platform !== 'darwin')('Apple asset catalogs retain named im
     return JSON.parse(result.stdout);
   };
   const first = inspect(ios);
-  for (const name of ['Badge', 'Ink', 'AppIcon', 'ExactLaunch']) assert.ok(first.some(asset => asset.Name === name), name);
-  assert.equal(first.filter(asset => asset.Name === 'ExactLaunch').length, 2);
+  for (const name of ['Badge', 'Ink', 'AppIcon', launch]) assert.ok(first.some(asset => asset.Name === name), name);
+  assert.equal(first.filter(asset => asset.Name === launch).length, 2);
   const held = readdirSync(cache.dir).find(name => name.startsWith('assets-ios-'));
   const before = statSync(resolve(cache.dir, held, 'Assets.car'), { bigint: true }).mtimeNs;
   const second = resolve(dir, 'Second.app'); mkdirSync(second);
@@ -703,17 +882,24 @@ test.skipIf(process.platform !== 'darwin')('Apple asset catalogs retain named im
 }), 60000);
 
 // LLP 1116.001 D4.5: `exact contract build` of an app's app.contract rewrites the types its app.ts imports
-// when a source's signature changed, and only then, saying so in one line on stderr; `contract types` agrees.
+// when a source's signature changed, and only then, saying so in one line on stderr (under `--json`, nothing on
+// stderr: the array is the whole reply); `contract types` agrees.
 test('contract build regenerates app.contract.d.ts when a signature changed, and only then', () => inDir(dir => {
   const contract = (shape) => `shape Greeting\n  text: string\n${shape}\ncomponent App\n  resource greeting = greeting("x") as shape Greeting\n  view\n    text greeting.text\n`;
   writeFileSync(resolve(dir, 'app.contract'), contract(''));
   writeFileSync(resolve(dir, 'app.ts'), "export const appId = 'com.example.types';\n");
   const exact = (...args) => spawnSync(process.execPath, [resolve(import.meta.dir, 'exact.mjs'), ...args], { cwd: dir, encoding: 'utf8', timeout: 600_000 });
-  const build = () => exact('contract', 'build', 'app.contract', '--json');
+  const build = () => exact('contract', 'build', 'app.contract');
+  const json = () => exact('contract', 'build', 'app.contract', '--json');
   const types = resolve(dir, 'app.contract.d.ts');
-  let r = build();
+  let r = json();
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout.trim(), '[]', 'the build\'s reply stays JSON');
+  assert.equal(r.stdout, '[]\n', 'the build\'s reply is one JSON value');
+  assert.equal(r.stderr, '', 'and the whole of it');
+  assert.ok(existsSync(resolve(dir, 'app.contract.d.ts')), 'written all the same');
+  rmSync(resolve(dir, 'app.contract.d.ts'));
+  r = build();
+  assert.equal(r.status, 0, r.stderr);
   assert.match(r.stderr, /^app\.contract\.d\.ts: written \(the types app\.ts imports\)$/m);
   assert.equal(readFileSync(types, 'utf8'), exact('contract', 'types', 'app.contract').stdout, 'what contract types prints');
   const written = statSync(types).mtimeMs;
@@ -730,4 +916,128 @@ test('contract build regenerates app.contract.d.ts when a signature changed, and
   assert.match(readFileSync(types, 'utf8'), /"count"/);
   writeFileSync(resolve(dir, 'other.contract'), contract(''));
   assert.doesNotMatch(exact('contract', 'build', 'other.contract').stderr, /app\.contract\.d\.ts/);
+  // In an app's directory (an app.json beside it) the build type-checks app.ts as every host's build does,
+  // its report on stderr, or under `--json` in the array; outside one (above) it does not.
+  writeFileSync(resolve(dir, 'app.contract'), contract(''));
+  writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Types', app: { id: 'com.example.types', name: 'Types' } }));
+  writeFileSync(resolve(dir, 'app.ts'), "export const appId: number = 'com.example.types';\n");
+  r = build();
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /app\.ts\(1,14\): error TS2322/);
+  r = json();
+  assert.equal(r.status, 1, r.stderr);
+  assert.equal(r.stderr, '');
+  // One diagnostic per TypeScript error (the fixture's app.ts also lacks the exports the entry reads).
+  const error = JSON.parse(r.stdout).find((d) => d.file === 'app.ts');
+  assert.deepEqual({ ...error, message: undefined }, { id: 'typescript-TS2322', severity: 'error', message: undefined, file: 'app.ts', line: 1, col: 14, end_col: 14, related: [] });
+  assert.match(error.message, /not assignable to type 'number'/);
 }), 600_000); // The first call may compile the compiler.
+
+// `exact.mjs docs <words>`: the section that holds the words as whole words, most densely, first; printed from its
+// heading when the heading is on the words, else from the paragraph that mentions them. A word may start with `-`.
+test('docs prints the section on its words first, matching whole words', () => {
+  const root = resolve(import.meta.dir, '..');
+  const first = (...words) => {
+    const r = spawnSync(process.execPath, [resolve(root, 'scripts/exact.mjs'), 'docs', ...words], { cwd: root, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    const [where, ...text] = r.stdout.split('\n');
+    return { where, text: text.slice(0, 40).join('\n') };
+  };
+  for (const [words, file, shows] of [
+    [['exit', 'animation'], 'docs/recipes/motion.md', /-exact-exit-animation/],
+    [['-exact-exit-animation'], 'docs/recipes/motion.md', /-exact-exit-animation/],
+    [['call'], 'docs/recipes/native-module.md', /func call/],
+    [['later'], 'docs/recipes/native-module.md', /func later/],
+    [['screenshot'], 'docs/recipes/ios-driving.md', /screenshot\s+\.exact\/x\.png compare/],
+    [['scheme', 'fixed'], 'docs/recipes/theme.md', /scheme=fixed/],
+    [['tabular', 'numbers'], 'docs/contract-for-agents.md', /^### Tabular numbers/],
+    [['grant'], 'docs/recipes/files-and-grants.md', /^# Recipe: files, SQLite and grants/],
+    [['sheet'], 'docs/recipes/navigation-stack.md', /Cancel\/Save sheet/],
+    [['sheets'], 'docs/recipes/navigation-stack.md', /Cancel\/Save sheet/],
+    // A whole word: `logs` is the driver's op, not "catalogs".
+    [['logs'], 'docs/contract-for-agents.md', /^The driver has ten operations[^]*`logs`/],
+    [['colours'], 'docs/recipes/theme.md', /^# Recipe: theme: colours/],
+    // A heading that alone holds the word prints from the heading.
+    [['accessibility'], 'docs/contract-for-agents.md', /^### Native views: accessibility\n+\S/],
+    [['optimistic'], 'docs/contract-for-agents.md', /^### Optimistic writes: the overlay\n+\S/],
+    // What an agent porting an iOS app types. A piece of a longer hyphenated name is not the word (`fonts` is not
+    // `font-variant-numeric`), a plural never stems onto a type keyword (`strings` is app.json's key, not `: string`),
+    // and a query's own section (TOPICS) comes first however it says the words ("dark mode": light and dark).
+    [['fonts'], 'docs/recipes/app-json.md', /a `font` block's/],
+    [['strings'], 'docs/recipes/app-json.md', /`strings` \(string\s+tables\)/],
+    [['push'], 'docs/recipes/navigation-stack.md', /^routes nav$/m],
+    [['deploy'], 'docs/recipes/porting-and-release.md', /Name the port when you make it/],
+    [['haptics'], 'docs/start-here.md', /haptic\("selection"\)/],
+    [['glass'], 'docs/contract-for-agents.md', /glass/],
+    [['detent'], 'docs/contract-for-agents.md', /detent/],
+    [['tab', 'bar'], 'docs/recipes/tabs.md', /tab bar/],
+    [['back', 'button'], 'docs/recipes/navigation-stack.md', /`button id="back"`/],
+    [['search'], 'docs/recipes/list-rows.md', /search/],
+    [['menu'], 'docs/recipes/list-rows.md', /menu/],
+    [['swipe'], 'docs/recipes/list-rows.md', /swipe/],
+    [['list'], 'docs/recipes/list-rows.md', /^# Recipe: list rows/],
+    [['safe', 'area'], 'docs/contract-grammar.md', /safe area/],
+    [['keyboard'], 'docs/recipes/keyboard-and-focus.md', /^# Recipe: the keyboard and focus/],
+    [['dark', 'mode'], 'docs/recipes/theme.md', /follows light, dark/],
+    [['image'], 'docs/recipes/app-json.md', /image "assets\/logo.png"/],
+    [['svg'], 'docs/recipes/symbols.md', /SVG/i],
+    [['animation'], 'docs/recipes/motion.md', /animation/],
+    [['transition'], 'docs/recipes/motion.md', /transition/],
+    [['timer'], 'docs/recipes/timers.md', /^# Recipe: timers/],
+    [['storage'], 'docs/recipes/files-and-grants.md', /storage/],
+    [['share'], 'docs/contract-grammar.md', /`share`/],
+    [['MIDI'], 'docs/contract-grammar.md', /exactMIDI/],
+    // A table of contents names every section's words and is no section's answer.
+    [['sound', 'midi', 'and', 'media'], 'docs/contract-for-agents.md', /^### Sound, MIDI and media/],
+    // A CSS name's words together are the phrase, though its pieces alone are not the words.
+    [['text', 'overflow'], 'docs/agent-pitfalls.md', /text-overflow/],
+    [['background', 'color'], 'docs/recipes/theme.md', /background-color/],
+  ]) {
+    const { where, text } = first(...words);
+    assert.ok(where.startsWith(`${file}:`), `docs ${words.join(' ')}: ${where}`);
+    assert.match(text, shows, `docs ${words.join(' ')} prints from the lines that hold them:\n${text}`);
+  }
+});
+
+
+test.skipIf(!tools)('release keeps Mac widget entitlements, including the provisioned app group (LLP 1126.001 WP16)', async () => {
+  const { macWidgetEntitlements } = await import('../host/apple/widgets.mjs');
+  inDir(dir => {
+    const bundle = resolve(dir, 'Widget.app'), extension = resolve(bundle, 'Contents/PlugIns/ExactWidgets.appex');
+    const app = { id: 'dev.exact.widget', manifest: {} }, team = '0123456789';
+    const run = (command, args, input) => { const r = spawnSync(command, args, { encoding: 'utf8', input }); assert.equal(r.status, 0, r.stderr); return r.stdout; };
+    writeFileSync(resolve(dir, 'main.c'), 'int main(void) { return 0; }');
+    for (const [path, id] of [[bundle, app.id], [extension, app.id + '.widgets']]) {
+      mkdirSync(resolve(path, 'Contents/MacOS'), { recursive: true });
+      run('clang', ['-O', resolve(dir, 'main.c'), '-o', resolve(path, 'Contents/MacOS/Fixture')]);
+      writeFileSync(resolve(path, 'Contents/Info.plist'), plistFile({ CFBundleIdentifier: id, CFBundleExecutable: 'Fixture', CFBundlePackageType: path === bundle ? 'APPL' : 'XPC!' }));
+    }
+    const dump = path => JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', '-'], run('codesign', ['-d', '--entitlements', '-', '--xml', path])));
+    for (const provisioned of [false, true]) {
+      const profiles = provisioned ? { app: { prefix: 'PREFIX' }, keychain: 'PREFIX.' + app.id } : null;
+      writeFileSync(resolve(bundle, 'Contents/Info.plist'), plistFile({ CFBundleIdentifier: app.id, CFBundleExecutable: 'Fixture', CFBundlePackageType: 'APPL',
+        ExactAppGroup: team + '.' + app.id + '.widgets', ...(profiles ? { ExactKeychainAccessGroup: profiles.keychain } : {}) }));
+      if (profiles) writeFileSync(resolve(bundle, 'Contents/embedded.provisionprofile'), 'profile presence: this fixture tests signing, not profile authorization');
+      const ent = resolve(dir, 'widget.plist'); writeFileSync(ent, macWidgetEntitlements({ app, team, profiles, extension: true }));
+      run('codesign', ['--force', '--sign', '-', '--entitlements', ent, extension]);
+      const before = dump(extension);
+      signRelease(bundle, { compat: { reach: { entitlements: ['com.apple.security.device.audio-input'] } }, manifest: {}, identity: '-', id: app.id, scratch: dir, timestamp: ['--timestamp=none'] });
+      assert.deepEqual(dump(extension), before);
+      const own = dump(bundle);
+      assert.deepEqual(own['com.apple.security.application-groups'], [team + '.' + app.id + '.widgets']);
+      assert.equal(own['com.apple.security.device.audio-input'], true);
+      assert.equal(own['com.apple.security.app-sandbox'], undefined);
+      assert.equal(own['com.apple.security.network.client'], undefined);
+      assert.equal(own['com.apple.application-identifier'], profiles?.keychain);
+      assert.deepEqual(own['keychain-access-groups'], profiles ? [profiles.keychain] : undefined);
+      run('codesign', ['--verify', '--deep', '--strict', bundle]);
+    }
+  });
+}, 60000);
+
+test('setup refuses the removed game warmup flag before provisioning', () => {
+  const result=spawnSync(process.execPath,[resolve(import.meta.dir,'exact.mjs'),'setup','--game'],{encoding:'utf8'});
+  assert.notEqual(result.status,0);
+  assert.match(result.stderr,/Usage: exact setup \[--check\]/);
+  assert.doesNotMatch(result.stdout,/warming|cargo fetch|rustup toolchain install/);
+});

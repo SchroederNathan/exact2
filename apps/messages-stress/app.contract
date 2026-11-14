@@ -202,7 +202,7 @@ component MessagesStress
             column padding-left=12 padding-right=12 padding-top=5 padding-bottom=5 width="100%" box-sizing="border-box"
               box testId=`reply-hit-${m.id}` swiperight=replyTo(m.id) touch-action="pan-y" retainFocus=true transition="translate -exact-spring(300, 30, 1)" width="100%" padding=0 border-width=0 background-color="#00000000" text-align="left"
                 MessageBubble(message=m)
-              button press=replyTo(m.id) testId=`reply-${m.id}` padding=4 border-width=0 background-color="#00000000" align-self="flex-end"
+              button tabindex=0 retainFocus=true press=replyTo(m.id) testId=`reply-${m.id}` padding=4 border-width=0 background-color="#00000000" align-self="flex-end"
                 text "Reply" font-size=11 color="#2668d8"
       else
         scroll testId="transcript" flex=1 min-height=80 width="100%" overflow-x="hidden" overscroll-behavior="contain" background-color="#f1f5fa"
@@ -217,7 +217,7 @@ component MessagesStress
               text "Cancel" font-size=12 color="#2668d8"
         text "Composer · 512 Unicode characters max · one local echo retained" font-size=11 color="#53637b"
         row gap=8 width="100%" align-items="center"
-          input appearance="none" value=draft input=editDraft testId="stress-input" aria-label="Type while messages update" placeholder="Type while messages update…" flex=1 min-width=0 padding=10 border-radius=10 border-width=1 border-color="#b7c5da" background-color="#f8faff" color="#17283f" font-size=14
+          input appearance="none" value=draft input=editDraft submit=sendDraft testId="stress-input" aria-label="Type while messages update" placeholder="Type while messages update…" flex=1 min-width=0 padding=10 border-radius=10 border-width=1 border-color="#b7c5da" background-color="#f8faff" color="#17283f" font-size=14
           button press=sendDraft testId="send" padding=10 border-radius=8 background-color="#2668d8"
             text "Local echo" color="#ffffff" font-size=12
         text draft testId="stress-echo" font-size=12 color="#53637b"

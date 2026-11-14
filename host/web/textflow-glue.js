@@ -70,6 +70,7 @@ export function fontStyle(style, mac = false, lang = '') {
   const font = `${style.fontStyle || 'normal'} ${style.fontWeight || '400'} ${style.fontSize} ${family}`;
   const extra = { fontKerning: style.fontKerning || 'auto', fontStretch: style.fontStretch || 'normal',
     fontVariantCaps: style.fontVariantCaps || 'normal', fontVariantNumeric: style.fontVariantNumeric || 'normal',
+    fontVariantLigatures: style.fontVariantLigatures || 'normal',
     textRendering: style.textRendering || 'auto',
     direction: style.direction || 'ltr', lang };
   const spacing = px(style.letterSpacing);
@@ -263,6 +264,8 @@ function replaceNodes(element, nodes) {
   for (const node of nodes) element.append(node); // no argument-stack bound on rich text
 }
 
+const keyForwarders = new WeakMap();
+
 function paintContent(span, fragment, state, lineHeight) {
   const children = [];
   // Binary search avoids scanning all inline runs for every fragment.
@@ -277,12 +280,41 @@ function paintContent(span, fragment, state, lineHeight) {
       clone.removeAttribute('id'); clone.removeAttribute('data-testid');
       // Original listeners remain valid by kernel view identity while detached.
       // Forward authored events only; a plain <a> keeps its native default.
-      for (const event of new Set(original.exactFlowEvents ?? [])) clone.addEventListener(event, e => {
-        e.stopPropagation();
+      const events = new Set(original.exactFlowEvents ?? []);
+      keyForwarders.set(clone, events);
+      for (const event of events) clone.addEventListener(event, e => {
+        const keyboard = e.type === 'keydown' || e.type === 'keyup';
+        if (keyboard) {
+          // Only the innermost forwarding clone sends this dispatch through the authored chain.
+          if (e.composedPath().find(node => keyForwarders.get(node)?.has(e.type)) !== clone) return;
+        }
+        // A capture action can restore the originals; then the copy already reaches live ancestors.
+        if (!keyboard || original.isConnected) e.stopPropagation();
         const forwarded = new e.constructor(e.type, e);
+        if (keyboard) for (const method of ['stopPropagation', 'stopImmediatePropagation']) {
+          // Chrome clears cancelBubble after dispatch, so carry native stops while they happen.
+          forwarded[method] = () => { e[method](); Event.prototype[method].call(forwarded); };
+        }
+        if (keyboard) {
+          // Live ancestors already captured the source event, even if a commit restored these runs.
+          forwarded.exactFlowCapture = run.chain;
+          const cancelBubble = Object.getOwnPropertyDescriptor(Event.prototype, 'cancelBubble');
+          Object.defineProperty(forwarded, 'cancelBubble', {
+            get: () => cancelBubble.get.call(forwarded),
+            set(value) { cancelBubble.set.call(forwarded, value); if (forwarded.cancelBubble) e.stopPropagation(); },
+          });
+        }
         forwarded.exactStopped = e.exactStopped; forwarded.$stopped = e.$stopped;
         if (e.defaultPrevented) forwarded.preventDefault();
-        if (!original.dispatchEvent(forwarded)) e.preventDefault();
+        try {
+          if (!original.dispatchEvent(forwarded)) e.preventDefault();
+        } finally {
+          // A retained copy's next dispatch must capture through its own live ancestors.
+          delete forwarded.exactFlowCapture;
+        }
+        if (keyboard) {
+          e.exactStopped = forwarded.exactStopped; e.$stopped = forwarded.$stopped;
+        }
       });
       if (inner) inner.append(clone); else outer = clone;
       inner = clone;
@@ -297,6 +329,7 @@ function paintContent(span, fragment, state, lineHeight) {
     piece.style.fontStretch = run.font.extra.fontStretch;
     piece.style.fontVariantCaps = run.font.extra.fontVariantCaps;
     piece.style.fontVariantNumeric = run.font.extra.fontVariantNumeric;
+    piece.style.fontVariantLigatures = run.font.extra.fontVariantLigatures;
     piece.style.fontFeatureSettings = run.font.fontFeatureSettings;
     piece.style.fontVariationSettings = run.font.fontVariationSettings;
     piece.exactFlowSourceStart = Math.max(run.start, fragment.paint_start);
@@ -316,7 +349,7 @@ function paintContent(span, fragment, state, lineHeight) {
   span.dataset.hyphen = String(fragment.hyphenated);
 }
 
-export function createTextFlow({ views, request, advance, present, agentMode, log = console.error,
+export function createTextFlow({ views, request, advance, present, admitTimers = null, agentMode, log = console.error,
   now = () => globalThis.exact?.now?.() ?? performance.now(),
   raf = requestAnimationFrame, cancel = cancelAnimationFrame, delay = setTimeout, clearDelay = clearTimeout }) {
   const shapes = new Map(), states = new Map(), calibration = new Map(), autoHeightWarned = new Set();
@@ -357,7 +390,7 @@ export function createTextFlow({ views, request, advance, present, agentMode, lo
     if (!fontsReady || disposed) return;
     for (const s of pinned) if (s.rendered || !pending) unpin(s);
   }
-  const clock = createTimerScheduler({ now, advance, present, agentMode, paint: onFrame, raf, cancel, delay, clearDelay });
+  const clock = createTimerScheduler({ now, advance, present, release: admitTimers, agentMode, paint: onFrame, raf, cancel, delay, clearDelay });
   const observer = new ResizeObserver(() => invalidate());
   const observed = new Set();
   const wake = () => { if (!disposed) clock.requestFrame(); };
@@ -575,10 +608,14 @@ export function createTextFlow({ views, request, advance, present, agentMode, lo
       const key = JSON.stringify([snapshot.width, snapshot.height, snapshot.lineHeight, snapshot.maxLines, snapshot.align,
         snapshot.direction, snapshot.x, snapshot.y, snapshot.exclusions, snapshot.cut]);
       if (s.geometry === key && s.rendered) return { s, unchanged: true };
-      // Canvas has no font-variant-numeric: tabular figures cannot be measured
-      // for the walker, so such a paragraph keeps ordinary layout (LLP 1053 G4).
-      if ([snapshot.font, ...s.runs.map(r => r.font)].some(f => f.extra.fontVariantNumeric !== 'normal'))
+      // Canvas has no font-variant-numeric (LLP 1053 G4) or
+      // font-variant-ligatures: tabular figures and unjoined letters cannot be
+      // measured for the walker, so such a paragraph keeps ordinary layout.
+      const fonts = [snapshot.font, ...s.runs.map(r => r.font)];
+      if (fonts.some(f => f.extra.fontVariantNumeric !== 'normal'))
         return { s, skipped: 'font-variant-numeric cannot be measured by canvas; ordinary text retained' };
+      if (fonts.some(f => f.extra.fontVariantLigatures !== 'normal'))
+        return { s, skipped: 'font-variant-ligatures cannot be measured by canvas; ordinary text retained' };
       if (!prepare(snapshot)) return { ...snapshot, pending: true };
       registerShapes(snapshot.exclusions);
       const facts = request(2, s.id, flowInput(snapshot, snapshot.exclusions));
@@ -760,7 +797,7 @@ export function createTextFlow({ views, request, advance, present, agentMode, lo
       const op = batch.ops?.find(op => op.op === 'textflow');
       if (op) { contexts = op.contexts; reconcile(); }
       for (const s of states.values()) if (batch.ops?.some(op => op.op === 'style' && s.meetingIds?.has(op.id))) s.geometry = null;
-      clock.update(batch.timer_due_ms, batch.frames);
+      clock.update(batch.timer_due_ms, batch.frames, batch.waits, batch.timer_tolerance_ms);
       if (batch.ops?.some(op => ['style', 'props', 'create', 'destroy', 'children', 'textflow'].includes(op.op))) {
         const onlyExclusions = batch.ops.every(op => op.op === 'style' && contexts.some(c => c.exclusions.includes(op.id)));
         invalidate(!onlyExclusions);

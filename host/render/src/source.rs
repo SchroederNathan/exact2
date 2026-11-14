@@ -4,6 +4,13 @@
 //! be written), no files, no SQLite, no key-value storage — so a render
 //! answers what a new anonymous device would see. A render never configures
 //! storage and never replaces the logic it booted with.
+//!
+//! A scheme-wide line (`net.fetch https:`) is not among them: a request's
+//! route can choose what a source fetches, and on the server nothing stands
+//! between that choice and the operator's own network. Such a source keeps
+//! its placeholder, and the client fetches it after adoption. So is
+//! `net.fetch local-network` (LLP 1133.036 D5): with it a visitor could point
+//! the server at the operator's own network.
 use exact_plan::{Plan, Value};
 use exact_runner::{
     Answer, DataError, DataSource, Dispatch, InFlight, Interrupt, Outcome, Placement, Store, Target,
@@ -18,18 +25,46 @@ pub struct Anonymous<D> {
 impl<D: DataSource> Anonymous<D> {
     /// Wrap `inner`; its grants narrow to what a render holds.
     pub fn new(inner: D) -> Self {
-        let grants = inner
-            .grants()
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.split_whitespace().next() == Some("net.fetch"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let grants = held(inner.grants());
         Self { inner, grants }
     }
 }
 
+/// The lines of `spec` a render holds (module doc).
+fn held(spec: &str) -> String {
+    spec.lines()
+        .map(str::trim)
+        .filter(|line| {
+            let mut words = line.split_whitespace();
+            words.next() == Some("net.fetch")
+                && words.next().is_some_and(|target| {
+                    (!target.ends_with(':') || target.contains('/')) && target != "local-network"
+                })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+#[test]
+fn a_render_holds_no_scheme_wide_or_local_network_line() {
+    let spec = "net.fetch https://api.test\nnet.fetch https:\nnet.fetch local-network\n\
+                net.fetch local-network development\nnet.websocket wss://a.test\nfs.read /x";
+    assert_eq!(held(spec), "net.fetch https://api.test");
+}
+
 impl<D: DataSource> DataSource for Anonymous<D> {
+    fn prepare_snapshot(
+        &mut self,
+        module: Option<exact_runner::SnapshotModule<'_>>,
+        deadline: std::time::Instant,
+    ) -> Result<(), DataError> {
+        self.inner.prepare_snapshot(module, deadline)
+    }
+    fn take_storage_changed(&mut self) -> bool {
+        self.inner.take_storage_changed()
+    }
+
     fn query(&mut self, source: &str, args: &[Value]) -> Result<Value, DataError> {
         self.inner.query(source, args)
     }
@@ -159,7 +194,38 @@ impl<D: DataSource> DataSource for Anonymous<D> {
     fn background_state(&self) -> Option<exact_runner::BackgroundState> {
         self.inner.background_state()
     }
+    fn keep_sent(
+        &mut self,
+        store: &Store,
+        let_go: &[exact_runner::InFlight<'_>],
+        refused: bool,
+    ) -> Vec<Option<u64>> {
+        self.inner.keep_sent(store, let_go, refused)
+    }
+    fn timer_before_reply(
+        &mut self,
+        store: &Store,
+        in_flight: InFlight<'_>,
+    ) -> Option<(u64, exact_runner::Request)> {
+        self.inner.timer_before_reply(store, in_flight)
+    }
+    fn module_landed(
+        &mut self,
+        store: &mut Store,
+        token: u64,
+        outcome: Outcome,
+    ) -> Result<(), DataError> {
+        self.inner.module_landed(store, token, outcome)
+    }
     fn take_logs(&mut self) -> Vec<String> {
         self.inner.take_logs()
+    }
+
+    fn take_aborted(&mut self) -> Vec<u64> {
+        self.inner.take_aborted()
+    }
+
+    fn abort_wake(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.inner.abort_wake(wake);
     }
 }

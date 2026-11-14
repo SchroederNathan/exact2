@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { basename, dirname, relative, resolve, isAbsolute } from 'node:path';
-import { chmodSync, closeSync, lstatSync, openSync, readlinkSync, readSync, copyFileSync, realpathSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, lstatSync, openSync, readlinkSync, readSync, copyFileSync, realpathSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 // The build's stamp, which build.mjs merges into Info.plist beside the icon keys.
 export { buildInfo } from './buildinfo.mjs';
 
@@ -121,8 +121,10 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
     const icons = (app.manifest.icons ?? []).map(icon => [icon, existsSync(resolve(app.dir, icon.src)) ? createHash('sha256').update(readFileSync(resolve(app.dir, icon.src))).digest('hex') : null]);
     const key = createHash('sha256').update(JSON.stringify([catalogs, icons, app.manifest.background_color ?? null, app.manifest.background_color_dark ?? null, launch, launchImage,
       app.manifest.host?.[sourcePlatform]?.minimumOS ?? null, platform, device, catalog, kept.stamp,
-      // What the compile itself writes: a cache from before `--accent-color` named no accent
-      'accent-color'])).digest('hex').slice(0, 16);
+      // What the compile itself writes: a cache from before `--accent-color` named no accent,
+      // one from before `ExactLaunchImageSource` no launch image's source or digest,
+      // one from before `digest` launch assets under fixed names
+      'accent-color', 'launch-image-source', 'launch-image-digest', 'launch-names-digest', 'alternate-app-icons'])).digest('hex').slice(0, 16);
     const made = resolve(kept.dir, `assets-${platform}-${key}`);
     if (!existsSync(resolve(made, 'keys.json'))) {
       const making = `${made}.${process.pid}.tmp`;
@@ -154,13 +156,18 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
     if (launchImage) {
       const bytes = readFileSync(resolve(app.dir, launchImage.src));
       if (createHash('sha256').update(bytes).digest('hex') !== launchImage.sha256) throw new Error('the launch image changed while capturing it; rebuild before packaging');
-      picture = { path: resolve(work, 'launch.png'), width: launchImage.width };
+      picture = { path: resolve(work, 'launch.png'), width: launchImage.width, sha256: launchImage.sha256 };
       writeFileSync(picture.path, bytes);
     }
-    const keys = platform === 'ios' ? { ...appIcon(app, dir, 'ios', { catalog: catalog ? assets : false }), ...launchScreen(app, assets, launch, picture) } : {};
+    const alternateIcons = platform === 'ios' ? [...new Set(catalogs.flatMap(entry => entry.files
+      .map(file => /(?:^|\/)([^/]+)\.appiconset\/Contents\.json$/.exec(file.name)?.[1])
+      .filter(name => name && name !== 'AppIcon' && name !== (selected && basename(selected.path, '.icon')))))].sort() : [];
+    // Alternate icons need a compiled primary in development too; actool emits their shared plist dictionary.
+    const keys = platform === 'ios' ? { ...appIcon(app, dir, 'ios', { catalog: catalog || alternateIcons.length ? assets : false }), ...launchScreen(app, assets, launch, picture) } : {};
     const hasIcon = existsSync(resolve(assets, 'AppIcon.appiconset'));
     const iconName = selected ? basename(selected.path, '.icon') : hasIcon ? 'AppIcon' : null;
     if (catalog && platform === 'ios' && !iconName) throw new Error(`host/apple: ${app.name}'s distribution bundle requires an AppIcon; declare host.ios.icon or a square icon of at least 512 px`);
+    if (alternateIcons.length && !iconName) throw new Error(`host/apple: ${app.name}'s alternate icons require a primary; declare host.ios.icon or a square icon of at least 512 px`);
     if (hasIcon || keys.UILaunchScreen) {
       writeFileSync(resolve(assets, 'Contents.json'), JSON.stringify({ info: { author: 'exact', version: 1 } }));
       sources.push(assets);
@@ -177,6 +184,7 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
         '--minimum-deployment-target', app.manifest.host?.[sourcePlatform]?.minimumOS ?? (platform === 'macos' ? '14.0' : '17.0'),
         ...(platform === 'macos' ? [] : ['--target-device', ...(platform === 'tvos' ? ['tv'] : ['iphone', '--target-device', 'ipad'])]),
         ...(iconName ? ['--app-icon', iconName] : []),
+        ...alternateIcons.flatMap(name => ['--alternate-app-icon', name]),
         ...(accent ? ['--accent-color', 'AccentColor'] : []),
         '--output-partial-info-plist', partial, '--output-format', 'human-readable-text'], { stdio: 'ignore' });
       Object.assign(keys, JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', partial], { encoding: 'utf8', stdio: 'pipe' }).stdout));
@@ -199,7 +207,7 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
  * the bake's `launchBackground`, LLP 1116.011 D2.3), `systemGroupedBackground`,
  * which the system shows as #F2F2F7 and black. That is a colour set of its own
  * (a reference to the system colour compiles to its light value alone), so the
- * window under the first frame (`ExactLaunch`, read by the presenter) is the
+ * window under the first frame (`ExactLaunch-…`, read by the presenter) is the
  * same grey and nothing lighter shows between the launch screen and the first
  * frame (stopwatch, round 13: "blank white screen for ~1 s").
  * `UILaunchScreen` names colours and images only from an asset catalog, so
@@ -213,7 +221,8 @@ function launchScreen(app, catalog, launch = 'system', picture = null) {
   const dark = named ? app.manifest.background_color_dark : launch === 'grouped' ? '#000000' : undefined;
   const keys = {};
   if (picture) {
-    const set = resolve(catalog, 'ExactLaunchImage.imageset');
+    keys.UIImageName = `ExactLaunchImage-${digest([picture.sha256, picture.width])}`;
+    const set = resolve(catalog, `${keys.UIImageName}.imageset`);
     mkdirSync(set, { recursive: true });
     const images = [1, 2, 3].map(scale => {
       const filename = `launch@${scale}x.png`;
@@ -221,9 +230,12 @@ function launchScreen(app, catalog, launch = 'system', picture = null) {
       return { idiom: 'universal', filename, scale: `${scale}x` };
     });
     writeFileSync(resolve(set, 'Contents.json'), JSON.stringify({ images, info: { author: 'exact', version: 1 } }));
-    keys.UIImageName = 'ExactLaunchImage';
   }
-  if (!light) return picture ? { UILaunchScreen: keys } : {};
+  // The plan's name for the picture and its bytes' SHA-256, so an image of
+  // those bytes decodes from the catalog (`RasterInput.catalog`) and loads no
+  // ImageIO reader; other bytes under the name (an update's) are decoded.
+  const source = picture ? { ExactLaunchImageSource: app.manifest.host.ios.launchImage.src, ExactLaunchImageSHA256: picture.sha256 } : {};
+  if (!light) return picture ? { UILaunchScreen: keys, ...source } : {};
   const components = (hex, field) => {
     const m = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(hex ?? '');
     if (!m) throw new Error(`${field} must be a #RGB, #RRGGBB or #RRGGBBAA colour, not ${JSON.stringify(hex)}`);
@@ -233,10 +245,18 @@ function launchScreen(app, catalog, launch = 'system', picture = null) {
   };
   const colors = [{ idiom: 'universal', color: components(light, 'background_color') }];
   if (dark) colors.push({ idiom: 'universal', appearances: [{ appearance: 'luminosity', value: 'dark' }], color: components(dark, 'background_color_dark') });
-  mkdirSync(resolve(catalog, 'ExactLaunch.colorset'), { recursive: true });
-  writeFileSync(resolve(catalog, 'ExactLaunch.colorset', 'Contents.json'), JSON.stringify({ colors, info: { author: 'exact', version: 1 } }));
-  return { UILaunchScreen: { UIColorName: 'ExactLaunch', ...keys } };
+  const name = `ExactLaunch-${digest(colors)}`;
+  mkdirSync(resolve(catalog, `${name}.colorset`), { recursive: true });
+  writeFileSync(resolve(catalog, `${name}.colorset`, 'Contents.json'), JSON.stringify({ colors, info: { author: 'exact', version: 1 } }));
+  return { UILaunchScreen: { UIColorName: name, ...keys }, ...source };
 }
+
+/** A launch asset's name ends in a digest of what it draws: iOS keeps the launch
+ * screen it drew for an app's `UILaunchScreen` and draws it again while those keys
+ * are the same, through a reinstall of a new build of the same version, so a new
+ * colour or picture under an unchanged name launched on the old one (the euxy
+ * port's `background_color`, white on a simulator that had launched a white build). */
+const digest = (content) => createHash('sha256').update(JSON.stringify(content)).digest('hex').slice(0, 8);
 
 const NESTED_BUNDLE = /\.(app|appex|bundle|framework|plugin|xpc|systemextension)$/;
 
@@ -348,13 +368,13 @@ function machOType(path) {
  * alone is not enough; a hardened app without the entitlement is silently
  * refused). Runtime exceptions never reach the app's own executable (LLP
  * 1069.008 D9). Null when the app grants no such device. */
-export const macReleaseEntitlements = (compat) => {
+export const macReleaseEntitlements = (compat, widgets = {}) => {
   const names = compat?.reach?.entitlements ?? [];
   // An https auth callback's `webcredentials:` domain (LLP 1069.006 D2),
   // which a Developer ID build signs only with a profile that grants it.
   const domains = compat?.reach?.auth?.associatedDomains ?? [];
-  if (!names.length && !domains.length) return null;
-  return plistFile({ ...Object.fromEntries(names.map((name) => [name, true])),
+  if (!names.length && !domains.length && !Object.keys(widgets).length) return null;
+  return plistFile({ ...widgets, ...Object.fromEntries(names.map((name) => [name, true])),
     ...(domains.length ? { 'com.apple.developer.associated-domains': domains } : {}) });
 };
 
@@ -413,12 +433,26 @@ export function helperEntitlements(bundle, manifest, compat, order) {
 /** The release's signature walk: every path `signingOrder` names, innermost
  *  first, with `identity`, the hardened runtime and `timestamp`. The app
  *  carries `macReleaseEntitlements`, each helper a runtime grant names its
- *  own (`helperEntitlements`), and all other nested code none. The plists
+ *  own (`helperEntitlements`), and a widget extension keeps its signing entitlements. The plists
  *  are written into `scratch`. */
 export function signRelease(bundle, { compat, manifest, identity, id, scratch, timestamp = ['--timestamp'] }) {
   const order = signingOrder(bundle, compat, identity);
   const plists = helperEntitlements(bundle, manifest, compat, order);
-  const own = macReleaseEntitlements(compat);
+  const info = JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', resolve(bundle, 'Contents/Info.plist')], { encoding: 'utf8', stdio: 'pipe' }).stdout);
+  const widgets = info.ExactAppGroup ? { 'com.apple.security.application-groups': [info.ExactAppGroup] } : {};
+  if (info.ExactAppGroup && existsSync(resolve(bundle, 'Contents/embedded.provisionprofile'))) {
+    if (!info.ExactKeychainAccessGroup) throw new Error('Mac widget profile has no restricted Keychain group in the app plist');
+    Object.assign(widgets, { 'keychain-access-groups': [info.ExactKeychainAccessGroup],
+      'com.apple.application-identifier': info.ExactKeychainAccessGroup,
+      'com.apple.developer.team-identifier': info.ExactAppGroup.split('.')[0] });
+  }
+  const extension = resolve(bundle, 'Contents/PlugIns/ExactWidgets.appex');
+  if (info.ExactAppGroup && existsSync(extension)) {
+    const signed = run('codesign', ['-d', '--entitlements', '-', '--xml', extension], { encoding: 'utf8', stdio: 'pipe' }).stdout;
+    if (!signed?.includes('<plist')) throw new Error('Mac widget extension has no entitlements to preserve');
+    plists.set(extension, signed);
+  }
+  const own = macReleaseEntitlements(compat, widgets);
   if (own) plists.set(bundle, own);
   let n = 0;
   for (const path of order) {
@@ -518,6 +552,21 @@ const plist = (value, indent = '  ') => {
 };
 export const plistFile = (dict) => `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">${plist(dict)}</plist>\n`;
 
+/** Mac frameworks use the versioned layout; callers keep root aliases for loading and Swift modules. */
+export const frameworkInstallName = (name, platform) => `@rpath/${name}.framework/${platform === 'MacOSX' ? 'Versions/A/' : ''}${name}`;
+export function frameworkLayout(dir, name, platform) {
+  const version = platform === 'MacOSX' ? resolve(dir, 'Versions/A') : dir;
+  const resources = platform === 'MacOSX' ? resolve(version, 'Resources') : version;
+  mkdirSync(resources, { recursive: true });
+  mkdirSync(resolve(version, 'Modules'), { recursive: true });
+  if (platform === 'MacOSX') {
+    for (const [link, target] of [['Versions/Current', 'A'], [name, `Versions/Current/${name}`], ['Resources', 'Versions/Current/Resources'], ['Modules', 'Versions/Current/Modules']]) {
+      if (!lstatSync(resolve(dir, link), { throwIfNoEntry: false })) symlinkSync(target, resolve(dir, link));
+    }
+  }
+  return { binary: resolve(version, name), modules: resolve(version, 'Modules'), info: resolve(resources, 'Info.plist') };
+}
+
 /** A loose `Frameworks/lib….dylib` as `Frameworks/<name>.framework/<name>`,
  * which is the only form App Store Connect accepts for an embedded library
  * (ITMS-90171, ITMS-90432). The presenter loads either (`embeddedModule` in ExactKit). */
@@ -525,17 +574,24 @@ export function wrapFramework(frameworks, loose, name, app, platform = 'iPhoneOS
   const from = resolve(frameworks, loose);
   if (!existsSync(from)) return;
   const dir = resolve(frameworks, `${name}.framework`);
-  mkdirSync(dir, { recursive: true });
-  renameSync(from, resolve(dir, name));
-  run('install_name_tool', ['-id', `@rpath/${name}.framework/${name}`, resolve(dir, name)], { stdio: 'ignore' });
-  writeFileSync(resolve(dir, 'Info.plist'), plistFile({
-    CFBundleExecutable: name, CFBundleIdentifier: `${app.id}.${name.toLowerCase().replaceAll('_', '-')}`, CFBundleName: name,
-    CFBundlePackageType: 'FMWK', CFBundleVersion: process.env.EXACT_BUILD_NUMBER ?? '1', CFBundleShortVersionString: process.env.EXACT_VERSION ?? '0.1.0',
-    CFBundleSupportedPlatforms: [platform], MinimumOSVersion: app.manifest.host?.ios?.minimumOS ?? '17.0',
-  }));
+  const layout = frameworkLayout(dir, name, platform);
+  renameSync(from, layout.binary);
+  run('install_name_tool', ['-id', frameworkInstallName(name, platform), layout.binary], { stdio: 'ignore' });
+  writeFileSync(layout.info, plistFile(frameworkInfo(name, app, platform)));
 }
 
-/** The bake's GPU digest (bake/src/receipt.rs, `code_digest`): the bytes, less a signed 64-bit
+/** The Info.plist `wrapFramework` writes. `signedGpuProduct` keys its signed copy on it, so
+ * a change to what a framework declares makes the next build package it again. */
+export function frameworkInfo(name, app, platform) {
+  return {
+    CFBundleExecutable: name, CFBundleIdentifier: `${app.id}.${name.toLowerCase().replaceAll('_', '-')}`, CFBundleName: name,
+    CFBundlePackageType: 'FMWK', CFBundleVersion: process.env.EXACT_BUILD_NUMBER ?? '1', CFBundleShortVersionString: process.env.EXACT_VERSION ?? '0.1.0',
+    ...(platform === 'iPhoneOS' ? { UIRequiredDeviceCapabilities: ['arm64'] } : {}),
+    CFBundleSupportedPlatforms: [platform], ...(platform === 'MacOSX' ? { LSMinimumSystemVersion: app.manifest.host?.macos?.minimumOS ?? '14.0' } : { MinimumOSVersion: app.manifest.host?.ios?.minimumOS ?? '17.0' }),
+  };
+}
+
+/** The bake's GPU digest (update/src/gpu.rs, `code_digest`): the bytes, less a signed 64-bit
  *  Mach-O's code signature and the three sizes that follow it, so a re-signer (AppDrop) keeps it. */
 export function codeDigest(bytes) {
   const word = (at) => at + 4 <= bytes.length ? bytes.readUInt32LE(at) : null;
@@ -562,12 +618,12 @@ export function signedGpuProduct(product, { identity = '-', framework = null, ap
   // Cargo puts its own unsigned file back on every build, and a signature
   // carries its signing time: signing in place made the app's bake (which
   // names this product's digest) run on every build. Sign a copy beside it,
-  // again only when Cargo's bytes or the identity change.
+  // again only when its bytes, the signing options or the framework's Info.plist change.
   const directory = resolve(dirname(product), 'signed', ...(framework ? ['frameworks', basename(product)] : []));
   const container = resolve(directory, framework ? `${framework}.framework` : basename(product));
   const signed = framework ? resolve(container, framework) : container, record = `${container}.source`;
   const source = JSON.stringify([createHash('sha256').update(readFileSync(product)).digest('hex'), identity ?? '-',
-    hardened, framework, framework ? [app.id, app.manifest.host?.ios?.minimumOS ?? '17.0', platform, process.env.EXACT_BUILD_NUMBER ?? '1', process.env.EXACT_VERSION ?? '0.1.0'] : null]);
+    hardened, framework, framework ? frameworkInfo(framework, app, platform) : null]);
   // An ad-hoc signature (`-`: every simulator build) names no certificate
   // to require; asked for one, the verification failed, and the copy was
   // signed again by every build, which reran the app's bake and compile.

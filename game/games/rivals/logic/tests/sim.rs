@@ -17,6 +17,11 @@ fn range() -> Sim<Rivals> {
         ..Options::default()
     })
 }
+#[test]
+fn initial_proof_pin() {
+    range().assert_pin(include_str!("../../pins.json"));
+}
+
 fn fighter(sim: &Sim<Rivals>, name: &str) -> Fighter {
     sim.world().require::<Fighter>(name).clone()
 }
@@ -35,6 +40,7 @@ fn mouse(sim: &mut Sim<Rivals>, at_ms: f64, phase: PointerPhase, dx: f32, dy: f3
         dy,
         buttons,
         at_ms,
+        player: 0,
     });
 }
 

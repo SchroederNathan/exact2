@@ -16,6 +16,28 @@ import AppKit
 /// its node's, offered where the node offers it (X84): a `contextPopover`.
 final class NativeButtonCellMac: NSButtonCell {
     private var owner: NodeView? { (controlView as? NativeButtonMac)?.owner }
+    /// AppKit's highlight while the mouse holds it, and a held press's beside it (HeldState.swift).
+    override var isHighlighted: Bool {
+        get { super.isHighlighted || owner?.holds("active") == true }
+        set {
+            super.isHighlighted = newValue
+            (controlView as? NativeButtonMac)?.nativeHighlightChanged()
+        }
+    }
+    override func highlight(_ flag: Bool, withFrame cellFrame: NSRect, in controlView: NSView) {
+        super.highlight(flag, withFrame: cellFrame, in: controlView)
+        (controlView as? NativeButtonMac)?.nativeHighlightChanged()
+    }
+    /// A borderless button's title stands inside the padding the kernel
+    /// applied at each side it names (an author's, or a list row's inset,
+    /// LLP 1138), as UIKit's configuration's content insets place it; a
+    /// bezel's title stays AppKit's, centred in its bezel.
+    override func titleRect(forBounds rect: NSRect) -> NSRect {
+        guard !isBordered, let p = owner?.kernelPadding, p.count == 4 else { return super.titleRect(forBounds: rect) }
+        let left = p[3] ?? 0, right = p[1] ?? 0
+        guard left > 0 || right > 0 else { return super.titleRect(forBounds: rect) }
+        return super.titleRect(forBounds: NSRect(x: rect.minX + left, y: rect.minY, width: max(0, rect.width - left - right), height: rect.height))
+    }
     override func accessibilityPerformShowMenu() -> Bool { owner?.accessibilityPerformShowMenu() ?? false }
     override func isAccessibilitySelectorAllowed(_ selector: Selector) -> Bool {
         selector == #selector(accessibilityPerformShowMenu) ? owner?.isAccessibilitySelectorAllowed(selector) == true : super.isAccessibilitySelectorAllowed(selector)
@@ -40,12 +62,42 @@ final class NativeButtonCellMac: NSButtonCell {
 final class NativeButtonMac: NSButton {
     override class var cellClass: AnyClass? { get { NativeButtonCellMac.self } set {} }
     weak var owner: NodeView?
+    override var focusRingMaskBounds: NSRect { uncovered(super.focusRingMaskBounds) }
     override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
         if attribute.rawValue == "AXEnabled", owner?.ariaUnavailable == true { return false }
         return super.accessibilityAttributeValue(attribute)
     }
+    override var bezelColor: NSColor? {
+        get { super.bezelColor }
+        set {
+            if !applyingActive, activeBezel != nil { activeBezel = Saved(value: newValue); return }
+            super.bezelColor = newValue
+        }
+    }
+    override var contentTintColor: NSColor? {
+        get { super.contentTintColor }
+        set {
+            if !applyingActive, activeTint != nil { activeTint = Saved(value: newValue); return }
+            super.contentTintColor = newValue
+        }
+    }
+    override var attributedTitle: NSAttributedString {
+        get { super.attributedTitle }
+        set {
+            if !applyingActive, activeTitle != nil {
+                activeTitle = newValue
+                let title = NSMutableAttributedString(attributedString: newValue)
+                if let ink = super.contentTintColor { title.addAttribute(.foregroundColor, value: ink, range: NSRange(location: 0, length: title.length)) }
+                super.attributedTitle = title
+                return
+            }
+            super.attributedTitle = newValue
+        }
+    }
+    override var isEnabled: Bool { didSet { if isEnabled != oldValue { nativeHighlightChanged() } } }
     struct Written: Equatable {
         var face: ButtonFace
+        var active: NativeButtonState
         var accent: NSColor?
         var destructive: Bool
         var red: Bool
@@ -59,8 +111,92 @@ final class NativeButtonMac: NSButton {
         var appearance: String
         var interactive: Bool
         var toolTip: String?
+        func draws(as other: Written) -> Bool {
+            var face = face, theirs = other.face
+            face.label = nil; theirs.label = nil
+            face.rows.button["written"] = nil; theirs.rows.button["written"] = nil
+            face.rows.title["written"] = nil; theirs.rows.title["written"] = nil
+            face.rows.subtitle["written"] = nil; theirs.rows.subtitle["written"] = nil
+            face.rows.symbol["written"] = nil; theirs.rows.symbol["written"] = nil
+            return face == theirs && accent == other.accent && destructive == other.destructive && red == other.red
+                && enabled == other.enabled && appearance == other.appearance
+        }
     }
     var written: Written?
+    private struct Saved<Value> { var value: Value }
+    private var activeBezel: Saved<NSColor?>?
+    private var activeTint: Saved<NSColor?>?
+    private var activeTitle: NSAttributedString?
+    private var activeImage: (base: NSImage, shown: NSImage)?
+    private func resetActiveColors() { activeBezel = nil; activeTint = nil; activeTitle = nil; activeImage = nil }
+    private func restoreActiveColors() {
+        if let saved = activeImage {
+            if image === saved.shown { image = saved.base }
+            activeImage = nil
+        }
+        if let saved = activeBezel { bezelColor = saved.value; activeBezel = nil }
+        if let saved = activeTint { contentTintColor = saved.value; activeTint = nil }
+        if let saved = activeTitle {
+            let title = NSMutableAttributedString(attributedString: attributedTitle)
+            title.removeAttribute(.foregroundColor, range: NSRange(location: 0, length: title.length))
+            saved.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: min(saved.length, title.length))) { value, range, _ in
+                if let value { title.addAttribute(.foregroundColor, value: value, range: range) }
+            }
+            attributedTitle = title
+            activeTitle = nil
+        }
+    }
+    private var nativeDown = false
+    func nativeHighlightChanged() {
+        guard !applyingActive, nativeDown != (isEnabled && cell?.isHighlighted == true) else { return }
+        applyActiveState()
+    }
+    func configureBase(_ configure: () -> (look: String, glass: Bool)) -> (look: String, glass: Bool) {
+        applyingActive = true
+        resetActiveColors()
+        defer { applyingActive = false }
+        return configure()
+    }
+    private var applyingActive = false
+    func applyActiveState() {
+        guard let written, let owner, !applyingActive else { return }
+        applyingActive = true
+        defer { applyingActive = false }
+        restoreActiveColors()
+        let down = isEnabled && cell?.isHighlighted == true
+        nativeDown = down
+        if down {
+            let rows = written.active.properties(over: written.face.rows)
+            if let color = ButtonConfigurationMac.color(rows.button["background_color"], appearance: owner.effectiveAppearance, accent: written.accent) {
+                activeBezel = Saved(value: bezelColor)
+                bezelColor = color
+            }
+            if let color = ButtonConfigurationMac.color(rows.title["text_color"], appearance: owner.effectiveAppearance, accent: written.accent) {
+                activeTint = Saved(value: contentTintColor)
+                contentTintColor = color
+                activeTitle = attributedTitle
+                let title = NSMutableAttributedString(attributedString: attributedTitle)
+                title.addAttribute(.foregroundColor, value: color, range: NSRange(location: 0, length: title.length))
+                attributedTitle = title
+            }
+            if let color = ButtonConfigurationMac.color(rows.symbol["tint_color"], appearance: owner.effectiveAppearance, accent: written.accent), let base = image {
+                let path = written.face.symbol.map(FaceSymbol.isPath) == true
+                let shown = path ? FaceSymbol.tinted(base, color)
+                    : base.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [color]))
+                        ?? (base.isTemplate ? FaceSymbol.tinted(base, color) : nil)
+                if let shown {
+                    shown.isTemplate = false
+                    activeImage = (base, shown)
+                    image = shown
+                }
+            }
+        }
+        written.active.present(on: owner, down: down)
+    }
+    override func highlight(_ flag: Bool) {
+        super.highlight(flag)
+        nativeHighlightChanged()
+    }
     /// Whether it draws glass: the glass bezel, in the macOS 26 design.
     var isGlass = false
     /// The look drawn, its name in the table's macOS column.
@@ -99,12 +235,15 @@ final class NativeButtonMac: NSButton {
         // Space presses the focused control. Return is the default button's
         // (LLP 1115.000 D7.3): a dialog's took it before it came here
         // (`DialogHost.key`), and a merely focused button does nothing with
-        // it. A menu's row chooses on it (`choosesOnReturn`).
-        if name == " " || name == "Enter" && owner.choosesOnReturn {
+        // it. A menu's row, or a button its author opted in, presses on it
+        // (`pressesOnReturn`).
+        if name == " " || name == "Enter" && owner.pressesOnReturn {
             performClick(nil)
             return
         }
         if name == "Enter" { return }
+        // An authored radio group's arrows (Radios.swift, `ariaRadioKey`).
+        if owner.presenter?.controls.radioKey(owner, name, held: KeyCodes.held(event.modifierFlags)) == true { return }
         super.keyDown(with: event)
     }
     /// Return's press of a dialog's default button: AppKit's own click, its
@@ -125,6 +264,7 @@ final class NativeButtonMac: NSButton {
     // takes the button's mouse events, so the node hears them here. The up
     // goes before the action the loop sends, DOM's order.
     override func mouseDown(with event: NSEvent) {
+        defer { heldContact = false; cancelsHeldContact = false }
         // A Control-click that a `contextPopover` or `contextmenu` from its
         // node up answers is no click (X85).
         if contextClicked(event) { return }
@@ -135,7 +275,9 @@ final class NativeButtonMac: NSButton {
         refusesFirstResponder = true
         defer { refusesFirstResponder = false }
         clicked = false
+        tracked = event
         super.mouseDown(with: event)
+        tracked = nil
         owner?.pointerReleased(nil)
         // The loop ends a click with the action; the second of two is then
         // a double click, heard from the node up after its press, the web's
@@ -144,7 +286,18 @@ final class NativeButtonMac: NSButton {
     }
     /// The tracking loop sent the action: the click landed.
     private var clicked = false
+    /// The press AppKit is tracking: the click an action sent inside the
+    /// loop is, its release the current event (VoiceOver's press, with no
+    /// loop, has none, whatever click is still current).
+    private var tracked: NSEvent?
+    var trackedClick: NSEvent? { tracked.map { NSApp.currentEvent?.type == .leftMouseUp ? NSApp.currentEvent ?? $0 : $0 } }
+    /// AppKit has no cancelled mouse-up; an agent's cancellation withdraws its action.
+    private var heldContact = false
+    private var cancelsHeldContact = false
+    func beginHeldContact() { heldContact = true }
+    func cancelHeldContact() { if heldContact { cancelsHeldContact = true } }
     override func sendAction(_ action: Selector?, to target: Any?) -> Bool {
+        guard !cancelsHeldContact else { return false }
         clicked = true
         owner?.pointerReleased(nil)
         return super.sendAction(action, to: target)
@@ -180,30 +333,55 @@ extension NodeView {
     /// one), as iOS resolves it. The focus stays where it is, for a click,
     /// for Space on the focused button and for Return's press of a default
     /// button alike (LLP 1115.000 D7.1): the action's own `focus()` is what
-    /// moves it. Then `press` and the canvas's pointer return.
-    func activateNative() {
+    /// moves it. Then `press` and the canvas's pointer return. `mouse`: the
+    /// mouse's press AppKit sent the action for, whose point the press
+    /// carries (`Presenter.pressPoint`); a key's has none.
+    func activateNative(mouse: NSEvent? = nil) {
         guard let presenter, !disabled, !inert else { return }
         let click = convert(NSPoint(x: bounds.midX, y: bounds.midY), to: nil)
-        var target: NodeView?
+        var target: NodeView?, bubbled = false
+        var path = PressPath()
         var at: NSView? = self
         while let view = at {
             if let node = view as? NodeView {
-                if node.disabled || node.inert { break }
+                if node.disabled || (bubbled ? node.authoredInert : node.inert) { break }
+                path.nodes.append(PressNode(node, bubbled: bubbled))
                 // Its own command is a press as its handler is (a close row in a dialog).
                 if node.pressable {
-                    if node.bounds.contains(node.convert(click, from: nil)) { target = node }
+                    if bubbled || node.bounds.contains(node.convert(click, from: nil)) { target = node }
                     break
                 }
             }
-            at = view.superview
+            if let node = view as? NodeView, let parent = presenter.presentationParent(of: node) {
+                bubbled = true
+                path.crossings.append(PressCrossing(node, parent: parent, presenter: presenter))
+                at = parent
+            } else { at = view.superview }
         }
-        guard let target, presenter.views[target.id] === target else { return }
-        presenter.press(target.id)
-        target.finishPointerPress()
+        guard let target else { return }
+        if bubbled {
+            presenter.commitPendingEdit()
+            guard path.isLive else { return }
+        }
+        guard presenter.views[target.id] === target else { return }
+        presenter.menus.activating(from: self, pressing: target) {
+            presenter.nativeClick = mouse; defer { presenter.nativeClick = nil }
+            presenter.press(target.id, bubbled: bubbled)
+        }
+        if !bubbled { target.finishPointerPress() }
     }
 }
 
 extension NodeView {
+    /// A field's text: its own `color`, else the design's `FieldText`, else
+    /// the platform's; an inherited colour never tints a field (LLP 1115 D4,
+    /// LLP 1121 D9).
+    /// A field of the author's own (`appearance="none"`) is their box, and
+    /// inherits as text does.
+    var fieldInk: NSColor {
+        showsOwnTextColor || !isNativeTextControl ? color("text_color", SystemColor.canvasText) : ThemeRoles.color("FieldText", in: self, or: SystemColor.canvasText)
+    }
+
     /// Whether the author wrote the style row `key` on this node (it is false of a value the node only
     /// inherits and of a row the compiler implied), as iOS reads it.
     func wrote(_ key: String) -> Bool {
@@ -217,19 +395,19 @@ extension ControlHost {
         let button = NativeButtonMac(title: "", target: nil, action: nil)
         button.owner = node
         button.refusesFirstResponder = false
-        button.focusRingType = .default
         return button
     }
 
     @objc func nativePressed(_ sender: NSControl) {
         guard let button = sender as? NativeButtonMac else { return }
-        button.owner?.activateNative()
+        button.owner?.activateNative(mouse: button.trackedClick)
     }
 
     /// Its look, face, accent, enabled state and accessibility, written only
     /// when one of them changes.
     func configureNative(_ button: NativeButtonMac, _ owner: NodeView, accent: NSColor?) {
-        let face = presenter.buttonFace?(owner.id) ?? ButtonFace()
+        defer { button.written?.active.present(on: owner, down: button.isEnabled && button.cell?.isHighlighted == true) }
+        let face = self.face(owner.id)
         // A destructive button is the destructive role AppKit draws (`hasDestructiveAction`), in the platform's red as
         // a hand-built pane's is: the accent it only inherits leaves it red, as on iOS, and an accent written on the
         // button itself wins over the red (LLP 1116.008; LLP 1115: what the author writes wins).
@@ -237,7 +415,7 @@ extension ControlHost {
         let red = destructive && !owner.wrote("accent_color")
         let accent = red ? NSColor.systemRed : accent
         let written = NativeButtonMac.Written(
-            face: face, accent: accent, destructive: destructive, red: red, enabled: !owner.disabled,
+            face: face, active: NativeButtonState(owner), accent: accent, destructive: destructive, red: red, enabled: !owner.disabled,
             label: owner.authoredLabel ?? face.title, testId: owner.props["testId"],
             selected: owner.props["accessibilitySelected"] == "true" || owner.checkedRole.map { $0.role == "radio" && $0.checked } == true,
             expanded: owner.props["accessibilityExpanded"],
@@ -250,9 +428,20 @@ extension ControlHost {
         if !face.known, button.written?.face.style != face.style {
             presenter.session?.log("buttonStyle `\(face.style ?? "")` is not a button style; drawing bordered")
         }
+        let redraw = button.written.map { !$0.draws(as: written) } ?? true
         button.written = written
-        let (look, glass) = ButtonConfigurationMac.apply(face, to: button, appearance: owner.effectiveAppearance, accent: accent, destructive: destructive, red: red)
-        button.isEnabled = written.enabled
+        if redraw {
+            let (look, glass) = button.configureBase {
+                button.isEnabled = written.enabled
+                return ButtonConfigurationMac.apply(face, to: button, appearance: owner.effectiveAppearance, accent: accent, destructive: destructive, red: red)
+            }
+            button.drawn = look
+            if button.isGlass != glass {
+                button.isGlass = glass
+                owner.syncGlassSlot()
+            }
+        }
+        button.applyActiveState()
         button.setAccessibilityLabel(written.label)
         button.setAccessibilityIdentifier(written.testId)
         if button.toolTip != written.toolTip { button.toolTip = written.toolTip }
@@ -262,11 +451,6 @@ extension ControlHost {
         button.setAccessibilityToggle(written.pressed, else: written.role)
         // A `radio` is AXRadioButton, its value whether it is checked (a radio group's segment kept as authored).
         if let checked = owner.checkedRole, checked.role == "radio" { button.setAccessibilityChecked(checked.role, checked.checked) }
-        button.drawn = look
-        if button.isGlass != glass {
-            button.isGlass = glass
-            owner.syncGlassSlot()
-        }
     }
 
     /// What the agent's `layout` says of a native button (D10).
@@ -282,10 +466,19 @@ extension ControlHost {
             standIns["accent-color"] = "AppKit applies its disabled bezel tint despite the authored accent"
         }
         return ["view": "NSButton", "style": face.style as Any, "drawn": button.drawn, "title": face.title as Any,
-                "symbol": face.symbol as Any, "enabled": button.isEnabled,
+                "symbol": FaceSymbol.observed(face.symbol, icon: face.symbolIcon) as Any, "enabled": button.isEnabled,
                 "rows": rows, "standIns": standIns, "imagePosition": button.imagePosition.rawValue,
                 "pointerEvents": button.written?.interactive == false ? "none" : "auto",
                 "size": [Agent.r2(button.frame.width), Agent.r2(button.frame.height)]]
+    }
+}
+extension Presenter {
+    func dispatchButtonAncestor(_ source: NodeView, click: NSEvent?) {
+        let point = click.flatMap { [.leftMouseDown, .leftMouseUp].contains($0.type) ? $0.locationInWindow : nil }
+        guard let listener = buttonPressListener(above: source, at: point) else { return }
+        pressClick = click
+        defer { pressClick = nil }
+        onPress?(listener.id)
     }
 }
 #endif

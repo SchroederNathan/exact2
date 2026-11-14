@@ -18,6 +18,12 @@ fn flip(crtc_id: u32, sequence: u32) -> Event {
     })
 }
 fn read_once(last: Option<u32>, result: io::Result<Vec<Event>>) -> io::Result<Option<u32>> {
+    read_timed(last, result).map(|r| r.map(|(sequence, _)| sequence))
+}
+fn read_timed(
+    last: Option<u32>,
+    result: io::Result<Vec<Event>>,
+) -> io::Result<Option<(u32, Duration)>> {
     let mut result = Some(result);
     receive_flip(crtc(7), last, || {
         result
@@ -26,9 +32,14 @@ fn read_once(last: Option<u32>, result: io::Result<Vec<Event>>) -> io::Result<Op
     })
 }
 
+/// The kernel's flip timestamp is returned, not the time the loop read the
+/// event: TTI uses it as the moment the frame was shown.
 #[test]
 fn matching_crtc_read_accepts_the_frame_sequence() {
-    assert_eq!(read_once(None, Ok(vec![flip(7, 30)])).unwrap(), Some(30));
+    assert_eq!(
+        read_timed(None, Ok(vec![flip(7, 30)])).unwrap(),
+        Some((30, Duration::from_millis(16)))
+    );
 }
 
 #[test]
@@ -227,21 +238,12 @@ fn duplicate_event_does_not_release_a_new_submission() {
 
 #[test]
 fn pending_animation_does_not_spin_but_real_timer_deadlines_remain() {
-    assert_eq!(work_timeout(true, true, None, 0., 100., 1000. / 60.), -1);
-    assert_eq!(
-        work_timeout(true, true, Some(250.), 0., 100., 1000. / 60.),
-        150
-    );
-    assert_eq!(
-        work_timeout(true, true, Some(250.), 0., 250., 1000. / 60.),
-        0
-    );
-    assert_eq!(work_timeout(false, true, None, 0., 100., 1000. / 60.), 0);
-    assert_eq!(
-        work_timeout(false, false, Some(250.), 0., 100., 1000. / 60.),
-        150
-    );
-    assert_eq!(work_timeout(false, false, None, 0., 100., 1000. / 60.), -1);
+    assert_eq!(work_timeout(true, true, None, 100.), -1);
+    assert_eq!(work_timeout(true, true, Some(250.), 100.), 150);
+    assert_eq!(work_timeout(true, true, Some(250.), 250.), 0);
+    assert_eq!(work_timeout(false, true, None, 100.), 0);
+    assert_eq!(work_timeout(false, false, Some(250.), 100.), 150);
+    assert_eq!(work_timeout(false, false, None, 100.), -1);
 }
 
 #[test]

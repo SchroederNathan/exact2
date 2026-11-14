@@ -22,7 +22,7 @@
 mod layout;
 mod paint;
 pub use layout::{layout_presented, LayoutMotion};
-pub use paint::PaintMotion;
+pub use paint::{still, PaintMotion};
 
 use crate::generated::{
     BoxSizing, Display, InterpolateSize, NodeType, PropId, StyleId, StyleProps,
@@ -432,6 +432,8 @@ impl Kernel {
         {
             parent = parent.and_then(|p| p.parent).and_then(|p| self.node(p));
         }
+        // A block's root is in its block's space (a popover's, the viewport).
+        let parent = parent.filter(|_| self.host_block(node.id).is_none());
         let (px, py) = parent.map_or((0.0, 0.0), |p| (p.frame.x, p.frame.y));
         let f = node.frame;
         Some(Value::four(

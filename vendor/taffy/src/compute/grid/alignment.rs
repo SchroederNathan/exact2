@@ -13,7 +13,7 @@ use crate::util::sys::f32_max;
 use crate::util::{MaybeMath, MaybeResolve, ResolveOrZero};
 
 #[cfg(feature = "content_size")]
-use crate::compute::common::scrollable_overflow::compute_scrollable_overflow_contribution;
+use crate::compute::common::scrollable_overflow::{compute_scrollable_overflow_contribution, margin_box_contribution};
 use crate::compute::ratio::{floors_height, resolve_through, Ratio};
 use crate::compute::common::sizing_keyword::{resolve_sizing_keyword, SizingKeywordResolution};
 use crate::{AbsoluteAxis, BoxSizing, Direction, LayoutGridContainer};
@@ -96,7 +96,7 @@ pub(super) fn align_and_position_item(
     container_border_box_width: f32,
     container_border: Rect<f32>,
     #[cfg(feature = "content_size")] container_is_scroll_container: bool,
-) -> (Rect<f32>, f32, f32) {
+) -> (Rect<f32>, Rect<f32>, f32, f32) {
     let grid_area_size = Size { width: grid_area.right - grid_area.left, height: grid_area.bottom - grid_area.top };
 
     let style = tree.get_grid_child_style(node);
@@ -145,6 +145,18 @@ pub(super) fn align_and_position_item(
 
     // EXACT PATCH 12: the size styles through the ratio (`compute::ratio`).
     let size_style = style.size();
+    // All percentage margins resolve against the grid area's inline size.
+    let margin =
+        style.margin().map(|margin| margin.resolve_to_option(grid_area_size.width, |val, basis| tree.calc(val, basis)));
+    // EXACT PATCH 58: explicit stretch supplies an independent inline size;
+    // neither the ratio's inline minimum nor its transferred bounds apply.
+    // Auto margins cancel stretch.
+    let stretch_width = (size_style.width.is_auto()
+        && justify_self.or(container_alignment_styles.horizontal) == Some(AlignSelf::STRETCH)
+        && position != Position::Absolute
+        && margin.left.is_some()
+        && margin.right.is_some())
+        .then(|| f32_max(grid_area_size.width.maybe_sub(margin.left).maybe_sub(margin.right), 0.0));
     let ratio = Ratio::of(&style, padding_border_size);
     let raw_min_size = style
         .min_size()
@@ -153,7 +165,8 @@ pub(super) fn align_and_position_item(
     let floors = floors_height(&style, raw_min_size.height);
     let (inherent_size, min_size, max_size) = resolve_through(
         ratio,
-        size_style.maybe_resolve(grid_area_size, |val, basis| tree.calc(val, basis)).maybe_add(box_sizing_adjustment),
+        size_style.maybe_resolve(grid_area_size, |val, basis| tree.calc(val, basis))
+            .maybe_add(box_sizing_adjustment).map_width(|width| stretch_width.or(width)),
         raw_min_size,
         style.max_size().maybe_resolve(grid_area_size, |val, basis| tree.calc(val, basis)).maybe_add(box_sizing_adjustment),
         floors,
@@ -183,11 +196,6 @@ pub(super) fn align_and_position_item(
             }
         }),
     };
-
-    // Note: This is not a bug. It is part of the CSS spec that both horizontal and vertical margins
-    // resolve against the WIDTH of the grid area.
-    let margin =
-        style.margin().map(|margin| margin.resolve_to_option(grid_area_size.width, |val, basis| tree.calc(val, basis)));
 
     drop(style);
 
@@ -358,7 +366,14 @@ pub(super) fn align_and_position_item(
         Size { width, height }
     };
 
-    let ratio_min = crate::compute::ratio::minimum_ratio_width(tree, node, grid_area_size.map(Some));
+    let ratio_min = if stretch_width.is_none() {
+        crate::compute::ratio::minimum_ratio_width(tree, node, grid_area_size.map(Some), None)
+    } else {
+        None
+    };
+    // EXACT PATCH 58: the shared content minimum already respects authored
+    // max-width; keep it above max-height's transfer in the final clamp too.
+    let min_size = min_size.map_width(|width| width.maybe_max(ratio_min));
     let size = size.map_width(|width| width.maybe_max(ratio_min));
     let layout_output = tree.perform_child_layout(
         node,
@@ -400,6 +415,34 @@ pub(super) fn align_and_position_item(
 
     let resolved_margin = Rect { left: x_margin.start, right: x_margin.end, top: y_margin.start, bottom: y_margin.end };
 
+    // EXACT PATCH 69: where the item is placed from, its place without its relative offset,
+    // for a caller that places what the item holds outside it.
+    let origin = if position == Position::Relative {
+        let unmoved = |area, alignment, size, margin, shim, direction| {
+            align_item_within_area(area, alignment, size, Position::Static, Line { start: None, end: None }, margin, shim, direction).0
+        };
+        Point {
+            x: unmoved(
+                Line { start: grid_area.left, end: grid_area.right },
+                justify_self.unwrap_or(alignment_styles.horizontal),
+                width,
+                margin.horizontal_components(),
+                0.0,
+                direction,
+            ),
+            y: unmoved(
+                Line { start: grid_area.top, end: grid_area.bottom },
+                align_self.unwrap_or(alignment_styles.vertical),
+                height,
+                margin.vertical_components(),
+                baseline_shim,
+                Direction::Ltr,
+            ),
+        }
+    } else {
+        Point { x, y }
+    };
+    tree.set_grid_origin(node, origin);
     tree.set_unrounded_layout(
         node,
         &Layout {
@@ -416,27 +459,53 @@ pub(super) fn align_and_position_item(
     );
 
     #[cfg(feature = "content_size")]
-    let contribution = {
+    let (contribution, margin_box) = {
         // Contributions to the container's scrollable overflow rect are measured from the
         // container's padding-box origin (mirrored for RTL), matching the scrollable overflow region.
-        let contribution_location = if direction.is_rtl() {
-            Point { x: container_border_box_width - (x + width) - container_border.right, y: y - container_border.top }
-        } else {
-            Point { x: x - container_border.left, y: y - container_border.top }
+        let to_container = |x: f32, y: f32| {
+            if direction.is_rtl() {
+                Point { x: container_border_box_width - (x + width) - container_border.right, y: y - container_border.top }
+            } else {
+                Point { x: x - container_border.left, y: y - container_border.top }
+            }
         };
-        compute_scrollable_overflow_contribution(
-            contribution_location,
-            Size { width, height },
-            layout_output.scrollable_overflow_rect,
-            overflow,
-            contain,
-            container_is_scroll_container,
+        // EXACT PATCH 67: the margin box where the item sits before its relative offset, as
+        // `align_item_within_area` applies it.
+        let relative = if position == Position::Relative {
+            Point {
+                x: if direction.is_rtl() {
+                    inset_horizontal.end.map(|pos| -pos).or(inset_horizontal.start)
+                } else {
+                    inset_horizontal.start.or(inset_horizontal.end.map(|pos| -pos))
+                }
+                .unwrap_or(0.0),
+                y: inset_vertical.start.or(inset_vertical.end.map(|pos| -pos)).unwrap_or(0.0),
+            }
+        } else {
+            Point::ZERO
+        };
+        let size = Size { width, height };
+        (
+            compute_scrollable_overflow_contribution(
+                to_container(x, y),
+                size,
+                layout_output.scrollable_overflow_rect,
+                overflow,
+                contain,
+                container_is_scroll_container,
+            ),
+            margin_box_contribution(
+                to_container(x - relative.x, y - relative.y),
+                size,
+                resolved_margin,
+                direction.is_rtl(),
+            ),
         )
     };
     #[cfg(not(feature = "content_size"))]
-    let contribution = Rect::ZERO;
+    let (contribution, margin_box) = (Rect::ZERO, Rect::ZERO);
 
-    (contribution, y, height)
+    (contribution, margin_box, y, height)
 }
 
 /// Align and size a grid item along a single axis

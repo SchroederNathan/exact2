@@ -1,4 +1,4 @@
-//! `contract build <file.contract> [-o <file.plan>] [--json] [--map]` — compile, print a
+//! `contract build <file.contract> [-o <file.plan>] [--json] [--errors-only] [--map]` — compile, print a
 //! one-line summary, write the bytes. Baking needs the app's data crate and
 //! happens in the app's own build (see `apps/caltrain`), not here.
 //! `contract types <file.contract> [-o <app.d.ts>] [--check]` — generate TypeScript's
@@ -7,23 +7,34 @@
 //! structs with their `Value` conversions, for a data crate's `build.rs`.
 //! `contract verify <file.contract>` — the app against the Lean semantics
 //! (`verify.rs`; it needs Lean, and nothing else here does).
+//! `contract gallery <app> -o <dir>` — the design tool's variant gallery of the
+//! app's library components, written into `<dir>` (`contract::gallery`).
 
 use std::process::ExitCode;
 
 mod ambient;
 mod build;
 mod diff;
+mod migrate;
 mod tamber;
+mod tamber_contract;
+mod tamber_explain;
 mod tamber_export;
 mod tamber_gen;
 mod tamber_history;
 mod tamber_import;
+mod tamber_import_css;
+mod tamber_ops;
+mod tamber_packages;
+mod tamber_param_lines;
+mod tamber_rows;
 mod tamber_serve;
 mod verify;
 mod vocab;
 
 const USAGE: &str = "usage:
-  contract build <file.contract> [-o <file.plan>] [--json] [--map (requires -o)]
+  contract build <file.contract> [-o <file.plan>] [--json] [--errors-only] [--map (requires -o)]
+  contract migrate <file.contract>
   contract symbols <file.contract> [--name <exact-name>]
   contract sources <file.contract>
   contract fmt [--check | --stdout] <file.contract>
@@ -34,6 +45,7 @@ const USAGE: &str = "usage:
   contract lean <file.contract> [--components] [--name <ident>] [-o <file.lean>]
   contract verify <file.contract> [--types] [--prove <Module>]
   contract vocab [--json] [--all] [<name> …]
+  contract gallery <app> -o <dir>  (<app>: a directory or app.contract; <dir>: a build cache, never the app's tree)
   contract tamber check <app> | eval <app> [--mode <axis>=<value>] | ir <app> [-o <tamber.json>] | fmt <app> [--check]  (<app>: a directory, app.contract or file.tamber; a flag before or after it)";
 
 #[cfg(windows)]
@@ -62,6 +74,7 @@ fn run() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("build") => build::run(&args[1..]),
+        Some("migrate") => migrate::run(&args[1..]),
         Some("symbols") => symbols(&args[1..]),
         Some("sources") => sources(&args[1..]),
         Some("fmt") => fmt(&args[1..]),
@@ -69,6 +82,7 @@ fn run() -> ExitCode {
         Some("lean") => lean(&args[1..]),
         Some("verify") => verify::run(&args[1..]),
         Some("vocab") => vocab::run(&args[1..]),
+        Some("gallery") => gallery(&args[1..]),
         Some("tamber") => tamber::run(&args[1..]),
         // The union of tokens a binding may name follows the design's `exports` (LLP 1121 D7).
         Some("types") => types(&args[1..], "types", "app.d.ts", |plan, path| {
@@ -80,6 +94,62 @@ fn run() -> ExitCode {
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `contract gallery <app> -o <dir>`: a line per cell refused, and a summary.
+fn gallery(args: &[String]) -> ExitCode {
+    const USAGE: &str = "usage: contract gallery <app> -o <dir>";
+    let (input, out) = match args {
+        [flag] if matches!(flag.as_str(), "--help" | "-h") => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        [input, o, out] if o == "-o" => (input, out),
+        [o, out, input] if o == "-o" => (input, out),
+        _ => {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let input = std::path::Path::new(input);
+    let app = if input.is_dir() {
+        input.join("app.contract")
+    } else {
+        input.to_path_buf()
+    };
+    match contract::gallery::generate(&app, std::path::Path::new(out)) {
+        Ok(g) => {
+            for c in g.cells.iter().filter(|c| c.refused.is_some()) {
+                let what = c
+                    .varied
+                    .as_ref()
+                    .map(|(p, v)| format!("{p}={v}"))
+                    .unwrap_or_else(|| "first values".into());
+                println!(
+                    "gallery: {} · {what}: can't place: {}",
+                    c.component,
+                    c.refused.as_deref().unwrap_or("")
+                );
+            }
+            let components = g
+                .cells
+                .iter()
+                .map(|c| &c.identity)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let refused = g.cells.iter().filter(|c| c.refused.is_some()).count();
+            println!(
+                "gallery: {components} components, {} cells ({refused} refused) -> {}",
+                g.cells.len(),
+                g.source.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("gallery: {why}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -306,9 +376,26 @@ fn tests(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match contract::tests(&src) {
-        Ok(t) => {
-            println!("{}", contract::tests_json(&t));
+    match contract::tests(&src).and_then(|t| contract::properties(&src).map(|p| (t, p))) {
+        Ok((t, p)) => {
+            if !p.is_empty() {
+                let test = std::path::Path::new(input);
+                let paired = test.with_file_name(
+                    test.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace(".test.contract", ".contract"),
+                );
+                let app = test.with_file_name("app.contract");
+                let app = if app.is_file() { app } else { paired };
+                if let Err(errors) = contract::check_properties_path(&app, &p) {
+                    for e in errors {
+                        eprintln!("{input}:{e}");
+                    }
+                    return ExitCode::from(1);
+                }
+            }
+            println!("{}", contract::authored_json(&t, &p));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -393,8 +480,18 @@ fn fix_uses(input: &str) -> ExitCode {
                     println!("  {line}");
                 }
             }
-            if written.is_empty() && refused.is_empty() {
+            // A file no `use` reaches is no part of this program, so its
+            // names were not checked (euxy FRICTION 1): say which.
+            let unreached = contract::unreached(std::path::Path::new(input));
+            let names: Vec<String> = unreached
+                .iter()
+                .filter_map(|p| Some(p.file_name()?.to_string_lossy().into_owned()))
+                .collect();
+            if written.is_empty() && refused.is_empty() && names.is_empty() {
                 println!("{input}: every file names what it uses");
+            } else if refused.is_empty() && !names.is_empty() {
+                let are = if names.len() == 1 { "is" } else { "are" };
+                println!("{input}: every file it reaches names what it uses; {} beside it {are} not reached from it (another entry, or a file it uses nothing from)", names.join(", "));
             }
             for e in &refused {
                 eprintln!("{e}");

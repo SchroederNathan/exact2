@@ -5,8 +5,8 @@
 **Systems:** Kernel (measured leaves, intrinsic size, aspect ratio; Taffy patch 5), Contract (`image` tag), Web host, Apple host (C ABI: `exact_intrinsic`), Build (assets)
 **Author:** Claude (Fable 5) for Charlie Cheever
 **Date:** 2026-08-29
-**Revised:** 2026-10-06 (`load`/`error` on the web, macOS and iOS; the remote fetch policy, as built — #121); 2026-09-26 (raster-image `tint-color` on Apple and web); 2026-09-11 (scaled-image scrollable extent and replaced grid sizing; LLP 1035.004 symbol sources, native leaves, tint, units and verification; earlier r2 image decisions retained)
-**Implementer:** Claude (Fable 5), image landing 2026-08-29; Codex, symbol integration 2026-09-10 and replaced-content extent 2026-09-11
+**Revised:** 2026-11-04 (a body that comes with a status that is not 2xx is drawn when it is an image, as HTML's "update the image data" ignores the status, so Google's favicon service's default icon, a 404, shows; one that is not an image fails as its status, §2); 2026-10-25 (remote sources on Linux, Windows and Android, §2); 2026-10-21 (on the web, a symbol over or under its button's title overhangs only toward it, the image padding from it, and a written height there keeps no padding, §3); 2026-10-20 (on the web, a symbol for an SF Symbol is SF's size, §3); 2026-10-06 (`load`/`error` on the web, macOS and iOS; the remote fetch policy, as built — #121); 2026-09-26 (raster-image `tint-color` on Apple and web); 2026-09-11 (scaled-image scrollable extent and replaced grid sizing; LLP 1035.004 symbol sources, native leaves, tint, units and verification; earlier r2 image decisions retained)
+**Implementer:** Claude (Fable 5), image landing 2026-08-29; Codex, symbol integration 2026-09-10 and replaced-content extent 2026-09-11; Claude (Opus 5.5), the web's symbol size 2026-10-20 and the Linux host's remote fetch 2026-10-25
 **Related:** LLP 1001 §1 (the `Image` replaced-element rule and its declared block-flow deviation), §6 (measured leaves), LLP 1007 (the web host: `<img>`), LLP 1008 §5 (the Apple presenter: loading, `object-fit`), LLP 1010 (the sibling spec whose shape this follows), `vendor/taffy/EXACT-PATCHES.md` patch 5, `rules/RULES.md` §The web is the standard
 
 
@@ -42,7 +42,8 @@ tests are the authority.
   platform image's point size. **Configured symbols** (LLP 1035.004) instead
   report the native symbol's point size at its computed font size and weight;
   they are generated glyphs, not density-unaware bitmap assets. The browser's
-  generic SVG fallback has a square intrinsic size equal to `font-size`.
+  generic SVG fallback is a square: `font-size` on a side, times the neutral
+  look's scale for a symbol drawn for an SF Symbol (§3).
 - **`Kernel::set_intrinsic_size(view, Option<(w, h)>)`** sets it. It
   refuses an unknown view (`LayoutError::UnknownView`), a node that is not
   an `Image` (`NotAnImage`), and a size that is not finite and positive on
@@ -129,8 +130,8 @@ which is the declared deviation. One source string works on every host, so a
 data module never tells hosts apart to choose one.
 
 **`load` and `error` (2026-10-06, #121).** An `image` hears HTML `<img>`'s
-two events on the web, macOS and iOS (Linux sends neither yet), each once
-per source: `load=` when the picture is ready, with no payload (`iframe`'s `load` is the same event; the compiler admits `load` on
+two events on every host, each once per source (Linux, Android and Windows
+from 2026-10-28): `load=` when the picture is ready, with no payload (`iframe`'s `load` is the same event; the compiler admits `load` on
 those two tags and on a native module), and `error=` when the source does not
 load, with the error's `message`, as a media element's `error` carries one.
 The message is the host's reason where it has one (§4) and a fixed text where
@@ -145,11 +146,10 @@ size; that is not a second `load`.
 font-size=17 font-weight=600 tint-color="#007aff"` uses one of the seven
 schema roles: back, close, compose, add, microphone, send and search. Literal
 unknown roles are `lower-attr-value`; a dynamic unknown role paints empty,
-clears intrinsic size and logs a refusal. Symbols are decorative: the surrounding
-control carries its accessible name, the symbol does not carry another one.
-Since 2026-10-04 a symbol its author names (`alt` or `aria-label`) keeps that
-name on the web and macOS (LLP 1035.004 D1, amended); iOS still hides every
-symbol from VoiceOver (`NodeViewIOS.swift`), and Linux exposes no image names.
+clears intrinsic size and logs a refusal. An unnamed symbol is decorative:
+its surrounding control carries the accessible name. A symbol with an
+accessible name is an image element on the web, macOS and iOS (LLP 1035.004
+D1, amended). Linux exposes no image names.
 No network or asset load resolves a symbol. Definite dimensions still size its
 box; inherited font size/weight configure its natural glyph dimensions.
 
@@ -175,6 +175,42 @@ For `symbol:` sources, the host supplies the schema's generic SVG path and
 for the glyph. Computed font size/weight update the SVG; `tint-color` supplies
 the mask's colour. The mask follows the content box and `object-fit`; under `fill`, CSS's initial value, it is sized `contain`, keeping the symbol's aspect as the Apple hosts do (§4; amended 2026-10-16, Grok's review). These
 paths express the roles without copying Apple's artwork.
+
+**Size (2026-10-20).** A symbol drawn for an SF Symbol (a role, or an icon with
+an `sf` source) is SF's size at its font size. A role's path keeps to about the
+20-unit live area of its 24-unit box, as Material's icons do, and an SF Symbol's
+glyph fills its point size: a circle is 1em across, in a 1.18em image (AppKit's
+`NSImage(systemSymbolName:)`, medium scale). So the box is 1.2em, the image's
+size on iOS too: the neutral look's `symbol-scale`, written as
+`--exact-symbol-scale`, which the glue reads for the image's natural size. A
+page built ahead of time gives the symbol's transparent source that size too
+(`document.rs`), so nothing moves when the glue paints. On a button's face a
+`UIButton.Configuration` draws the symbol at the large scale, about 1.27 times
+the medium-scale symbol at its title's point size, at every control size, and
+the button is no taller for it (on an iOS 27 simulator a small button's
+15-point title has a 19-point circle, and a medium button is 34.33 points tall
+with its title alone, a circle or a `lock.fill`). There the box is 1.5em
+(`button-symbol-scale`). Beside a title the button lays it out at that width,
+as UIKit lays out its image's, so the title keeps its distance from the ink,
+and the box overhangs its 1em place above and below by half its growth, so the
+button is no taller. A circle's ink then reaches about .125em past that place
+(a lock's, which is taller, .15em), so a titled button's written height, which
+has no padding, keeps .125em. Over or under a title (a column writes
+`--exact-button-stacked: 1`, `button_css.rs`) the box overhangs only toward the
+title, by .125em, the margin a role's live area leaves, so a role's ink is the
+image padding, 8 px, from the title's line (LLP 1069.011.001 D3), and a
+written height keeps no padding.
+A symbol alone overhangs on every side, so its button keeps its size and does
+not clip it, as UIButton does not clip its image, though the symbol takes no
+hits, which stay in the button's own box, as `UIView.hitTest(_:with:)` keeps to
+its bounds. A native button's symbol takes no `width` or `height`
+(`lower-button-style-attr`). A tab's, a radio's and a menu or chooser row's
+keeps the box the look gives it, as iOS draws those outside a button's face: a
+tab bar's or a segmented control's image (at body size) and a menu item's. An
+icon of the app's own, with no `sf`, draws its viewBox at
+1em, as the Apple hosts draw its path (`FaceSymbol.pathImage`). A symbol alone
+on a bar item's face is at the bar's symbol size, whatever size is written on it
+or its item (LLP 1115.000 D4.15).
 
 **Tinted rasters (2026-09-26).** `host_css` (`host/web/src/element.rs`) gives
 an `<img>` whose source is not `symbol:` and whose `tint_color` is set the
@@ -271,22 +307,105 @@ bitmap stays shared and unchanged; no tinted asset enters the image cache.
   kept), no credential storage, and no `Referer`; its `User-Agent` is
   CFNetwork's default (`ExactMac (unknown version) CFNetwork/… Darwin/…` from
   a development build). Redirects are followed as `URLSession` follows them,
-  to any host, within App Transport Security: the build declares no ATS
-  exception but iOS's `localNetworking` (`NSAllowsLocalNetworking`), so a
-  cleartext `http:` source or redirect to a non-local host is ATS's to
-  refuse, and that refusal is the `error` (not driven here; the repro used
-  `127.0.0.1`). Any 2xx response is taken
-  whatever its `Content-Type` (ImageIO reads the bytes); any other status is
-  the `error` `HTTP <status>`. The body is capped at
+  to any host, within App Transport Security: unless the manifest's
+  `appTransportSecurity` sets `allowsArbitraryLoads` (LLP 1030), which turns
+  ATS off, a cleartext `http:` source or redirect to a non-local host is
+  ATS's to refuse, and that refusal is the `error` (neither driven here; the
+  repro used `127.0.0.1`). A response's body
+  is taken whatever its `Content-Type` (ImageIO reads the bytes) and whatever its
+  status: HTML's "update the image data" ignores whether the status was ok, so that
+  a server can answer with an image and an error status and have it shown (Google's
+  favicon service answers a site with no icon with its default icon and a 404). A
+  body with a status that is not 2xx whose header does not read as an image, or an
+  empty one, is the `error` `HTTP <status>`, asked again as that status says
+  ("Retries"), and only a 2xx is stored in the HTTP cache. The body is capped at
   `RasterMetadata.encodedLimit` (64 MiB) from `Content-Length` and again as
   it streams; the request times out at 15 s and the whole load at 30 s. The
   body spools to a temporary file read once for its header (256 KiB) and
-  once to decode. Responses are cached on disk only (`URLCache`, 64 MiB,
+  once to decode. A download runs on URLSession's queue, never on a raster
+  worker (2026-10-21): the process keeps one session for each cache policy,
+  so images share connections (HTTP/2 streams on one) and download at once,
+  up to the 64 sources a session may have waiting for a header; a worker
+  reads the header once the body is spooled, and decodes go on meanwhile.
+  A session per download, waited out on the two workers, fetched two
+  images at a time, each over a new connection: 18 product photos from
+  Brooks' CDN (`AkamaiGHost`, HTTP/2) filled a 3-column grid on an iPhone
+  16 Pro Max in a median 1.53 s (1.30–2.30) after a cold launch with no
+  cached responses; now before the launch animation ends (0.63 s, all five
+  runs), as UIKit with `URLSession.shared` and SwiftUI's `AsyncImage` do;
+  Expo's `expo-image` took 0.85 s (filmed, `~/bench/imagebench`). Responses are cached on disk only (`URLCache`, 64 MiB,
   `Caches/exact-raster-http`, the HTTP cache headers' policy); decoded
-  pixels are the session's raster budget. ImageIO decodes rasters only: an
-  SVG, remote or under `assets/`, does not draw, and is the `error` `not an
-  image format this host decodes`, as is any whole body ImageIO cannot size.
-  Linux loads no remote source.
+  pixels are the session's raster budget. An SVG, remote or under `assets/`,
+  is drawn as a picture at the box's size (LLP 1011.001; the same on Linux);
+  any other whole body ImageIO cannot size is the `error` `not an image
+  format this host decodes`.
+- **The remote fetch on Linux, Windows and Android** (`host/linux`
+  `image/remote.rs`, 2026-10-25): Apple's policy over the executor's
+  transport (ibex2's rustls client, as `net.fetch` uses there, in an
+  instance of its own, with the environment's proxy), asked directly: an
+  image is not the data module's fetch, and the app's `net.fetch` grants do
+  not govern it. No cookie jar, no credentials (a user and password in the
+  URL or a redirect's `Location` are removed) and no `Referer`; `Accept`
+  prefers PNG and SVG, which Linux and Windows decode, though a server may
+  still send another format. Redirects are followed here, up to twenty, to
+  `http:` or `https:` only; cleartext `http:` loads, as no ATS stands in
+  front of it. A body is taken whatever its `Content-Type` and its status, as
+  Apple's is; one with a status that is not 2xx that is not an image this
+  host decodes, or is empty or over the cap, fails as `HTTP <status>` and is
+  not kept. A body is capped at 64 MiB by its `Content-Length` and as it streams. A load
+  fails after 15 s without a response or a read, or 30 s from when it was
+  asked for (the wait for a thread and redirects included); the timeout
+  settles it whatever its thread is blocked in, though a DNS lookup holds
+  that thread until the system answers. Six download threads serve the
+  process, never a raster worker, and share the transport's idle
+  connections; up to 64 downloads wait or run, and a source asked for past
+  that is asked again at the next poll, as one past the raster pipeline's
+  header bound is. A picture that fills the screen (on screen, at least 90%
+  of its width and half its height: a viewer's full-size original) goes
+  ahead of the ordinary downloads waiting, behind any such picture already
+  waiting, and has 120 s for its whole load from its ask (a 12 MB original at
+  3 Mbit/s takes 32 s); a thread takes at most two of them in a row while an
+  ordinary one waits. A picture on screen whose download failed in a way
+  asking again may mend (the network, a lookup, a lost or refused
+  connection, a timeout, a TLS handshake, the spool, a 5xx, 408 or 429, an
+  empty body; not a cancel, another 4xx, a bad URL, too many redirects or
+  one to nowhere, or a body over the cap) is asked again after 1, 2,
+  4, 8, 16 and 30 s, six times a showing, never sooner than a 429's or 503's
+  `Retry-After`, and not again in a showing for one further off than 5
+  minutes, or unreadable (taken as an hour); the wait is kept by URL, so a
+  picture mounted anew meanwhile asks nothing either. Its retries start from
+  nothing once it leaves the screen and shows again (2026-10-28). Apple
+  keeps the same rules (below, "Retries"). The body spools to a file in a directory of the process's
+  own under `exact/images/` in the user's cache (`XDG_CACHE_HOME` or
+  `~/.cache`; `%LOCALAPPDATA%` on Windows), locked for the process's life as
+  Apple's `RasterSpool` is, so the first spool of a launch removes the
+  directories of processes that are gone. A worker reads the file for its
+  header and again to decode, and Android's animated drawable plays a GIF or
+  WebP from it; it is removed with its last holder: its source, a decoded
+  picture of it, or the cache. Dropping a source mid-download (its node's
+  source changed, or the node gone) shuts the download's socket. The old
+  picture stays while a new source loads, and stays if it fails, as Apple's
+  loader keeps it. Up to 256 bodies, 32 MiB with their URLs, stay in an LRU
+  for the process, whatever their cache headers say, as a browser keeps the
+  images a page has loaded, so a list scrolled back fetches nothing while
+  they are there; nothing is kept across launches, and a body this host
+  cannot decode is not kept. Linux, Android and Windows send `load`, once a
+  source assignment, when its first picture is accepted for drawing (one
+  from the cache too), after that pass's sizes, and not again for a re-decode
+  or an unchanged source shown again (one changed and changed back between
+  two of the presenter's image syncs, the commits of one turn, counts as
+  unchanged); the handler runs with nothing the clock owes run before it,
+  on the node and source checked. They send `error` by Apple's rule
+  (below, "Retries"): once a source assignment, when its failure is final,
+  with the reason (`HTTP 404`, the transport's error, `not an image this
+  host decodes`, the core's refusal, Apple's names), never after its `load`,
+  and nothing is asked for that assignment after it. The reason, and the
+  line on stderr (`exact: image <url>: HTTP 404`), quote a link without its
+  query or fragment (a CDN's signature), on every native host; an SVG's
+  parser diagnostics, which quote the file, are counted on stderr, not quoted
+  (a bundled file's are the compiler's to name, LLP 1011.001 D5). Linux and Windows decode PNG and SVG
+  bodies; a JPEG, GIF or WebP body fails there as a bundled one does, and
+  Android's platform decoder reads all three (`image/jpeg.rs`).
 - **Events:** the loader sends a node that hears it the source's `load`
   when its first decode lands, or its `error` with the reason (the HTTP
   status, `URLError`'s description, the raster refusal), each once per
@@ -299,6 +418,37 @@ bitmap stays shared and unchanged; no tinted asset enters the image cache.
   1,000 ms, loading all the while, before it is the `error` `decode failed`
   (`RasterLoader.declineDelays`): a page's `<img>` errs for its file, never
   for a busy machine.
+- **Retries (2026-10-28)**, the Linux, Android and Windows host's rules (§4's
+  remote fetch above), one rule across the native hosts:
+  - A download that failed in a way asking again may mend is asked again
+    while its picture is on screen (`mayShow`), after 1, 2, 4, 8, 16 and
+    30 s, six times a showing (`RasterRetry`). The classes are the Linux
+    host's. It is never asked sooner than a 429's or 503's `Retry-After`
+    (seconds or an HTTP-date; unreadable, an hour), which is kept by URL,
+    so a view mounted anew meanwhile asks nothing either. A wait further
+    off than 5 minutes ends that showing's retries.
+  - Leaving the screen starts the count over; showing again runs a whole
+    ladder.
+  - A picture that fills the screen (on screen, at least 90% of the
+    window's width and half its height) downloads first (the task's high
+    priority, a hint the per-host scheduling honours without starving the
+    others), and its whole load has 120 s from its ask instead of 30 s. One
+    under way when its view grows to fill the screen, or scrolls on to,
+    moves to the longer bound too (Linux moves one still waiting for a
+    thread; one a thread has taken keeps its bound, and its retry asks as
+    urgent). Each response and read keeps 15 s.
+  - **The `error` waits for the retries.** A failure that may still be asked
+    again on screen sends no `error`: it goes out once that showing's
+    retries are spent, or its server's wait passes 5 minutes. A failure
+    asking again cannot mend sends it at once, as before. After an `error`
+    the source assignment is done: no retry, so never a `load` after it.
+  - **Off screen, the `error` waits until it has shown.** A picture that
+    fails while off screen is not asked again, and its `error` waits until
+    it has shown and spent a showing's retries. A browser fires an
+    off-screen `<img>`'s `error` at once. Here, though, a picture off screen
+    never had its retries, and an `error` sent then would be wrong for one
+    the next showing loads; it would also end the assignment. Linux, Android
+    and Windows send `error` by the same rule.
 - **Symbols** use a noninteractive, decorative `UIImageView` / `NSImageView`
   inside the existing kernel-owned image leaf. Native symbol configuration uses
   computed font size and the nearest of nine CSS weights; native tint updates
@@ -337,8 +487,9 @@ bitmap stays shared and unchanged; no tinted asset enters the image cache.
   content box, `contain` and `cover` scale by the smaller/larger ratio,
   `none` is the natural size, `scale-down` the smaller of `none` and
   `contain`, and any other value is the initial `fill`; centered, clipped
-  to the content box and to the border box's rounded path (`border_radius`
-  clips the picture as on the web).
+  to the content edge's curve, each `border_radius` less the border and
+  padding beside it, as the web trims replaced content (CSS Backgrounds 3
+  §5.3): a bordered rounded picture ends at the border's inner curve.
 - **Accessibility:** the label becomes the view's accessibility label;
   `hint`/`role`/`headingLevel` are not applied to images (nor to any node
   yet) — declared in §6.
@@ -413,10 +564,11 @@ symbols (rasters are tinted since 2026-09-27); Linux symbols; a placeholder
 of the host's own while an image loads or after it fails (the kernel measures
 an unknown axis as 0; macOS paints nothing; the browser paints its own
 broken-image icon and the `alt` text — the app draws its own fallback from
-`load` and `error`, §2); SVG sources on Apple (§4); a fetch policy the app
+`load` and `error`, §2); SVG sources on Apple and Linux (§4; built 2026-10-20 as LLP 1011.001: a picture drawn at the box's size, with two declared deviations); a fetch policy the app
 sets — HTML's `referrerpolicy`, a refusal of redirects (`redirect="error"`),
 a byte cap below the host's (`max-bytes`) — each a vocabulary proposal
-(#121), not built; Linux remote sources; a block-flow image at its intrinsic
+(#121), not built; a disk cache for remote images on Linux; JPEG, GIF
+and WebP on Linux and Windows (Android's platform decoder reads them); a block-flow image at its intrinsic
 width (the
 declared deviation, §1); `object-position`; animated images on Linux (it
 decodes PNG only; Apple plays GIF and WebP, LLP 1011.000); `hint`/`role`/`headingLevel` on macOS images; pixel

@@ -1,5 +1,6 @@
 //! The page's environment as the host sets it (LLP 1001 §2; LLP 1078 D4):
-//! the safe-area insets and the viewport segments a fold makes, each a call
+//! the safe-area insets, the layout regions, the title-bar area and the
+//! viewport segments a fold makes, each a call
 //! that re-sends the dictionaries of the nodes whose style reads the
 //! environment and lays out again.
 
@@ -43,6 +44,25 @@ impl<D: DataSource> Host<D> {
             .then(|| std::array::from_fn(|r| std::array::from_fn(|e| insets[r * 4 + e])))
     }
 
+    /// The title-bar area beside the window's controls (Window Controls
+    /// Overlay), what `env(titlebar-area-*)` reads: `None` where the window
+    /// gives none, so each is undefined and its fallback applies. As for
+    /// the insets, every node whose style reads the environment is re-sent
+    /// and laid out again.
+    pub fn set_titlebar_area(&mut self, area: Option<exact_kernel::Rect>) -> String {
+        let env = self.runner.kernel().env().with_titlebar_area(area);
+        self.set_environment(env)
+    }
+
+    /// The title-bar area from the ABI's flat list (`exact_titlebar_area`):
+    /// x, y, width, height; anything else is none.
+    pub fn titlebar_area_from(rect: &[f32]) -> Option<exact_kernel::Rect> {
+        match *rect {
+            [x, y, width, height] => Some(exact_kernel::Rect::new(x, y, width, height)),
+            _ => None,
+        }
+    }
+
     /// The window's own size, whatever is presented in it (LLP 1075.003
     /// §9.11): what every viewport unit (`vw`, `vh`, `vmin`, `vmax` and kin) resolves
     /// against everywhere, root and every sheet, never a sheet's viewport,
@@ -54,7 +74,7 @@ impl<D: DataSource> Host<D> {
 
     pub(super) fn set_environment(&mut self, env: Env) -> String {
         let mut batch = Batch::new();
-        let error = match self.environment_into(env, &mut batch) {
+        let error = match self.environment_into(env, None, &mut batch) {
             Ok(false) => None,
             Ok(true) => self.layout(&mut batch).err(),
             Err(e) => Some(e),
@@ -62,16 +82,29 @@ impl<D: DataSource> Host<D> {
         self.finish(batch, error)
     }
 
-    /// `env` set, and when it changed, what reads it re-sent into `batch`,
-    /// not yet laid out.
-    fn environment_into(&mut self, env: Env, batch: &mut Batch) -> Result<bool, String> {
+    /// `env` set, and the segments' rects on the kernel's grid when given,
+    /// and when either changed, what reads them re-sent into `batch`, not yet
+    /// laid out.
+    fn environment_into(
+        &mut self,
+        env: Env,
+        segments: Option<Vec<exact_kernel::Rect>>,
+        batch: &mut Batch,
+    ) -> Result<bool, String> {
         let _roles = self.runner.bind_roles(); // Its own (LLP 1121 stage 5).
-        let changed = self
-            .runner
-            .kernel_mut()
-            .set_env(env)
-            .map_err(|e| format!("insets: {e:?}"))?;
+        let kernel = self.runner.kernel_mut();
+        let moved = match segments {
+            Some(rects) => {
+                let (cols, rows) = (kernel.env().cols, kernel.env().rows);
+                kernel
+                    .set_segments(cols, rows, rects)
+                    .map_err(|e| format!("view: segments: {e:?}"))?
+            }
+            None => false,
+        };
+        let changed = kernel.set_env(env).map_err(|e| format!("insets: {e:?}"))? || moved;
         if changed {
+            self.presence.unauthored = true;
             self.height_targets_dirty = true;
             for id in self.preorder() {
                 self.update(id, batch);
@@ -83,16 +116,19 @@ impl<D: DataSource> Host<D> {
 
     /// What changed of the view at once, each part only when given: the
     /// window's size (`None` in it clears it), the safe-area insets, the
-    /// layout regions and the viewport, in one batch under one layout, as
-    /// the calls one by one would leave them. An iOS boot's view takes the
-    /// whole window as its tab bar comes (LLP 1123 D1), which changes all
-    /// four (`ExactView.fit`).
+    /// layout regions, the viewport and the segments' rects on the grid the
+    /// kernel has, in one batch under one layout, as the calls one by one
+    /// would leave them. An iOS boot's view takes the whole window as its
+    /// tab bar comes (LLP 1123 D1), which changes the first four
+    /// (`ExactView.fit`); a keyboard changes the viewport and the
+    /// segments' extents together (LLP 1078, the keyboard).
     pub fn set_view(
         &mut self,
         screen: Option<Option<(f32, f32)>>,
         insets: Option<[f32; 4]>,
         regions: Option<Option<[[f32; 4]; 5]>>,
         size: Option<(f32, f32)>,
+        segments: Option<Vec<exact_kernel::Rect>>,
     ) -> String {
         let mut env = self.runner.kernel().env();
         if let Some(screen) = screen {
@@ -104,8 +140,15 @@ impl<D: DataSource> Host<D> {
         if let Some(regions) = regions {
             env = env.with_regions(regions);
         }
+        // Rects off the kernel's grid are refused before anything changes.
+        if let Some(rects) = &segments {
+            let next = env.with_segments(env.cols, env.rows, rects.clone());
+            if !next.segments_consistent() || !next.is_finite() {
+                return self.finish(Batch::new(), Some("view: segments off the grid".into()));
+            }
+        }
         let mut batch = Batch::new();
-        let changed = self.environment_into(env, &mut batch);
+        let changed = self.environment_into(env, segments, &mut batch);
         let error = changed.as_ref().err().cloned();
         match size {
             Some((width, height)) => self.resize_inner(width, height, batch, error),
@@ -144,6 +187,7 @@ impl<D: DataSource> Host<D> {
             Err(e) => return self.finish(batch, Some(format!("segments: {e:?}"))),
         };
         if restyled {
+            self.presence.unauthored = true;
             self.height_targets_dirty = true;
             for id in self.preorder() {
                 self.update(id, &mut batch);
@@ -180,6 +224,17 @@ impl<D: exact_runner::DataSource> crate::Host<D> {
         let fonts = self.runner.kernel().env().button_fonts;
         self.measuring_traits_changed(Some((styles, fonts)))
     }
+    /// The text engine's line boxes round to another scale (LLP 1008 §3):
+    /// every paragraph is measured again, and the auto heights running
+    /// transitions target with them.
+    pub(crate) fn text_scale_changed(&mut self) -> String {
+        self.presence.unauthored = true;
+        self.height_targets_dirty = true;
+        self.runner.kernel_mut().remeasure_text();
+        let mut batch = Batch::new();
+        let error = self.layout(&mut batch).err();
+        self.finish(batch, error)
+    }
     /// The traits text and symbols are measured under changed (a scale, a
     /// content size, legibility, an appearance), with the control fonts they
     /// give when the host has them: everything is laid out again whether or
@@ -197,6 +252,7 @@ impl<D: exact_runner::DataSource> crate::Host<D> {
             env.control_text_styles = Some(styles);
             env.button_fonts = button_fonts;
         }
+        self.presence.unauthored = true;
         self.height_targets_dirty = true;
         let mut batch = Batch::new();
         let error = match self.runner.kernel_mut().set_env(env) {

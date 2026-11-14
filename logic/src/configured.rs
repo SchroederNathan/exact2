@@ -11,6 +11,16 @@ macro_rules! configured {
             }
         }
         impl $crate::exact_runner::DataSource for $name {
+            fn prepare_snapshot(
+                &mut self,
+                module: Option<$crate::exact_runner::SnapshotModule<'_>>,
+                deadline: std::time::Instant,
+            ) -> Result<(), $crate::exact_runner::DataError> {
+                $crate::exact_runner::DataSource::prepare_snapshot(&mut self.0, module, deadline)
+            }
+            fn take_storage_changed(&mut self) -> bool {
+                $crate::exact_runner::DataSource::take_storage_changed(&mut self.0)
+            }
             fn set_document_owner(&mut self, owner: u64) {
                 $crate::exact_runner::DataSource::set_document_owner(&mut self.0, owner)
             }
@@ -124,8 +134,37 @@ macro_rules! configured {
             fn background_state(&self) -> Option<$crate::exact_runner::BackgroundState> {
                 $crate::exact_runner::DataSource::background_state(&self.0)
             }
+            fn keep_sent(
+                &mut self,
+                store: &$crate::exact_runner::Store,
+                let_go: &[$crate::exact_runner::InFlight<'_>],
+                refused: bool,
+            ) -> Vec<Option<u64>> {
+                $crate::exact_runner::DataSource::keep_sent(&mut self.0, store, let_go, refused)
+            }
+            fn timer_before_reply(
+                &mut self,
+                store: &$crate::exact_runner::Store,
+                in_flight: $crate::exact_runner::InFlight<'_>,
+            ) -> Option<(u64, $crate::exact_runner::Request)> {
+                $crate::exact_runner::DataSource::timer_before_reply(&mut self.0, store, in_flight)
+            }
+            fn module_landed(
+                &mut self,
+                store: &mut $crate::exact_runner::Store,
+                token: u64,
+                outcome: $crate::exact_runner::Outcome,
+            ) -> Result<(), $crate::exact_runner::DataError> {
+                $crate::exact_runner::DataSource::module_landed(&mut self.0, store, token, outcome)
+            }
             fn take_logs(&mut self) -> Vec<String> {
                 $crate::exact_runner::DataSource::take_logs(&mut self.0)
+            }
+            fn take_aborted(&mut self) -> Vec<u64> {
+                $crate::exact_runner::DataSource::take_aborted(&mut self.0)
+            }
+            fn abort_wake(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+                $crate::exact_runner::DataSource::abort_wake(&mut self.0, wake)
             }
             fn bind(&mut self, plan: &$crate::exact_plan::Plan) {
                 $crate::exact_runner::DataSource::bind(&mut self.0, plan)

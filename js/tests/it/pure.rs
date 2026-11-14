@@ -7,33 +7,34 @@ use std::process::Command;
 
 #[test]
 fn pure_utilities_match_the_web_executor() {
-    let chrome = std::env::var("CHROME")
-        .unwrap_or_else(|_| "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
-    if !std::path::Path::new(&chrome).exists() {
-        // EXACT_REQUIRED=1 (the async lane): a missing prerequisite fails (scripts/coverage.mjs).
-        assert_ne!(
-            std::env::var("EXACT_REQUIRED").as_deref(),
-            Ok("1"),
-            "missing chrome: Chrome utility oracle unavailable: set CHROME to its executable"
-        );
-        eprintln!("pure utility browser sweep unavailable: set CHROME");
-        return;
-    }
     let script = concat!(env!("OUT_DIR"), "/pure.js");
     let reference = Command::new(std::env::var_os("BUN").unwrap_or_else(|| "bun".into()))
         .args(["--input-type=module", "-e", CHROME_UTILITIES])
         .env("EXACT_PURE_SCRIPT", script)
-        .env("CHROME", chrome)
         .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
         .output()
-        .expect("Bun launches the Chrome utility oracle; set CHROME to its executable");
+        .expect("Bun launches the Chrome utility oracle");
+    if let Some(why) = String::from_utf8_lossy(&reference.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("missing chrome: "))
+        .map(str::to_owned)
+    {
+        // EXACT_REQUIRED=1 (the async lane): a missing prerequisite fails (scripts/coverage.mjs).
+        assert_ne!(
+            std::env::var("EXACT_REQUIRED").as_deref(),
+            Ok("1"),
+            "missing chrome: {why}"
+        );
+        eprintln!("pure utility browser sweep unavailable: {why}");
+        return;
+    }
     assert!(
         reference.status.success(),
         "{}",
         String::from_utf8_lossy(&reference.stderr)
     );
     let expected: Vec<String> = serde_json::from_slice(&reference.stdout).unwrap();
-    let plan = contract::compile("component App\n  resource text = text() as shape string\n  resource url = url() as shape string\n  resource base64 = base64() as shape string\n  resource standard = standard() as shape string\n  resource microtask = microtask() as shape string\n  resource abort = abort() as shape string\n  resource hooks = hooks() as shape string\n  resource intl = intl() as shape string\n  view\n    text text\n").unwrap();
+    let plan = contract::compile("component App\n  resource text = text() as shape string\n  resource url = url() as shape string\n  resource base64 = base64() as shape string\n  resource standard = standard() as shape string\n  resource microtask = microtask() as shape string\n  resource abort = abort() as shape string\n  resource hooks = hooks() as shape string\n  resource intl = intl() as shape string\n  resource abortAny = abortAny() as shape string\n  resource response = response() as shape string\n  view\n    text text\n").unwrap();
     let mut module = Module::loaded(
         include_bytes!(concat!(env!("OUT_DIR"), "/pure.hbc")).to_vec(),
         "test.pure",
@@ -52,6 +53,8 @@ fn pure_utilities_match_the_web_executor() {
         "abort",
         "hooks",
         "intl",
+        "abortAny",
+        "response",
     ]
     .into_iter()
     .zip(expected)
@@ -61,8 +64,8 @@ fn pure_utilities_match_the_web_executor() {
         if source == "hooks" {
             assert_eq!(
                 actual,
-                r#"{"present":false,"own":"undefined","subscribe":"undefined"}"#,
-                "the abort hook handoff and its own/subscribe functions must be unreachable after load"
+                r#"{"present":false,"own":"undefined","subscribe":"undefined","headersHooks":false}"#,
+                "the abort and headers hook handoffs and their functions must be unreachable after load"
             );
         }
         assert_eq!(actual, expected, "{source}");
@@ -71,13 +74,15 @@ fn pure_utilities_match_the_web_executor() {
 
 const CHROME_UTILITIES: &str = r#"
 import { Cdp } from './scripts/agent.mjs';
+import { chromium } from './scripts/agent-launch.mjs';
+const { executable: browserExecutable, unavailable: browserMissing } = chromium();
+if (browserMissing) { console.log(`missing chrome: ${browserMissing}`); process.exit(0); }
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-if (!existsSync(process.env.CHROME)) throw new Error('Chrome utility oracle unavailable: set CHROME to its executable');
 const profile = mkdtempSync(join(tmpdir(), 'exact-pure-browser-'));
-const child = spawn(process.env.CHROME, [
+const child = spawn(browserExecutable, [
   '--headless=new', '--no-sandbox', '--remote-debugging-pipe', '--no-first-run',
   '--disable-background-networking', `--user-data-dir=${profile}`, 'about:blank',
 ], { detached:true, stdio:['ignore','ignore','ignore','pipe','pipe'] });
@@ -93,7 +98,7 @@ try {
   });
   const fixture = readFileSync(process.env.EXACT_PURE_SCRIPT, 'utf8');
   const result = await cdp.send('Runtime.evaluate', {
-    expression:fixture + '\n;Promise.all(["text","url","base64","standard","microtask","abort","hooks","intl"].map(source=>globalThis.exact.answer(source))).then(JSON.stringify)',
+    expression:fixture + '\n;Promise.all(["text","url","base64","standard","microtask","abort","hooks","intl","abortAny","response"].map(source=>globalThis.exact.answer(source))).then(JSON.stringify)',
     returnByValue:true, awaitPromise:true,
   }, sessionId);
   if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);

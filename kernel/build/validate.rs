@@ -1,4 +1,5 @@
 fn validate(schema: &Schema) {
+    validate_controls(schema);
     let mut roles = BTreeSet::new();
     for [role, apple, path] in &schema.symbols {
         // Digits name a skip's seconds (`skip-back-15`, podcast F3), never first.
@@ -27,6 +28,21 @@ fn validate(schema: &Schema) {
         );
     }
     symbol_spellings(schema);
+    let mut glyphs = BTreeSet::new();
+    for (role, platform, path, _) in &schema.symbol_glyphs {
+        assert!(
+            roles.contains(role) && ["fluent", "material"].contains(&platform.as_str()),
+            "schema: symbol glyph {role} on {platform}: no such role or platform"
+        );
+        assert!(
+            glyphs.insert((role, platform)),
+            "schema: duplicate symbol glyph {role} on {platform}"
+        );
+        assert!(
+            drawn_path(path),
+            "schema: invalid symbol glyph path {role} on {platform}"
+        );
+    }
     let mut materials = BTreeSet::new();
     for [name, ios, macos, blur, saturate, ..] in &schema.materials {
         assert!(
@@ -125,9 +141,12 @@ fn validate(schema: &Schema) {
                 "schema: keywords apply to u8 rows defaulting to 0 (`{}`)",
                 row.field
             );
+            // The first value and a `none` take no bit; eight bits are left.
             assert!(
-                schema.enums.get(name).is_some_and(|e| e.values.len() <= 9),
-                "schema: style `{}` keywords `{name}` must name an enum of at most 9 values",
+                schema.enums.get(name).is_some_and(|e| {
+                    e.values.len() - e.values[1..].iter().filter(|v| *v == "none").count() <= 9
+                }),
+                "schema: style `{}` keywords `{name}` must name an enum of at most 8 values besides the first and `none`",
                 row.field
             );
         }
@@ -237,4 +256,61 @@ fn write_validate_domain(w: &mut String, schema: &Schema) {
     }
     writeln!(w, "        Ok(())").unwrap();
     writeln!(w, "    }}").unwrap();
+}
+
+/// The control-role table (LLP 1121 D9): a known control, with a state
+/// part's state where it names one; a parameter `accent-color` or a colour
+/// role; each host a fidelity, `: why` after it; one row a pair.
+fn validate_controls(schema: &Schema) {
+    const CONTROLS: [&str; 10] = ["switch", "checkbox", "radio", "range", "progress", "spinner", "select", "button-prominent", "field", "textarea"];
+    const STATES: [&str; 5] = ["active", "hover", "focus-visible", "disabled", "checked"];
+    let mut seen = BTreeSet::new();
+    for [control, parameter, hosts @ ..] in &schema.controls {
+        let (name, state) = control.split_once(':').map_or((control.as_str(), None), |(n, s)| (n, Some(s)));
+        assert!(CONTROLS.contains(&name), "schema: controls: unknown control {control}");
+        assert!(state.is_none_or(|s| STATES.contains(&s)), "schema: controls: {control}: unknown state");
+        assert!(
+            parameter == "accent-color" || schema.colors.iter().any(|row| row[0] == *parameter),
+            "schema: controls: {control}: {parameter} is neither accent-color nor a colour role"
+        );
+        assert!(seen.insert((control, parameter)), "schema: controls: {control} {parameter} twice");
+        for cell in hosts {
+            let (fidelity, why) = cell.split_once(": ").map_or((cell.as_str(), None), |(f, w)| (f, Some(w)));
+            // `exact` needs no why; the others say what the platform does.
+            assert!(
+                ["exact", "best-effort", "none"].contains(&fidelity)
+                    && match why {
+                        None => fidelity == "exact",
+                        Some(w) => fidelity != "exact" && !w.trim().is_empty(),
+                    },
+                "schema: controls: {control} {parameter}: `{cell}` is no fidelity"
+            );
+        }
+    }
+}
+
+/// A path's `d` that starts with a move and then draws: each command but a
+/// close takes numbers, and one besides the moves and closes draws a segment.
+fn drawn_path(d: &str) -> bool {
+    let mut commands = Vec::new();
+    let mut numbers = 0;
+    for c in d.chars() {
+        if c.is_ascii_alphabetic() {
+            if !"MmLlHhVvCcSsQqTtAaZz".contains(c) {
+                return false;
+            }
+            commands.push((c, numbers));
+        } else if !(c.is_ascii_digit() || " .,-".contains(c)) {
+            return false;
+        } else if c.is_ascii_digit() {
+            numbers += 1;
+        }
+    }
+    let takes_numbers = commands.iter().enumerate().all(|(i, &(c, at))| {
+        let next = commands.get(i + 1).map_or(numbers, |&(_, n)| n);
+        "Zz".contains(c) || next > at
+    });
+    commands.first().is_some_and(|&(c, _)| "Mm".contains(c))
+        && takes_numbers
+        && commands.iter().any(|&(c, _)| !"MmZz".contains(c))
 }

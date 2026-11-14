@@ -130,13 +130,20 @@ pub fn compute_root_layout(tree: &mut impl LayoutPartialTree, root: NodeId, avai
     } else {
         None
     };
-    let (style_size, min_size, max_size) = sizes_through_ratio(
-        &style,
-        padding_border_size,
-        Size { width: style_size.width.or(fill_width), height: style_size.height },
-        min_size,
-        max_size,
-    );
+    // EXACT PATCH 65: only a newly filled width needs another transfer.
+    // Reapplying an explicit width's derived minimum treats it as authored
+    // and turns the content-based height floor into a fixed height.
+    let (style_size, min_size, max_size) = if fill_width.is_some() {
+        sizes_through_ratio(
+            &style,
+            padding_border_size,
+            Size { width: fill_width, height: style_size.height },
+            min_size,
+            max_size,
+        )
+    } else {
+        (style_size, min_size, max_size)
+    };
     let fill_width = if fills {
         parent_size.width.maybe_sub(non_auto_margin.horizontal_axis_sum()).maybe_clamp(min_size.width, max_size.width)
     } else {
@@ -158,7 +165,7 @@ pub fn compute_root_layout(tree: &mut impl LayoutPartialTree, root: NodeId, avai
         Size::NONE
     };
 
-    let ratio_min = crate::compute::ratio::minimum_ratio_width(tree, root, parent_size);
+    let ratio_min = crate::compute::ratio::minimum_ratio_width(tree, root, parent_size, None);
     let known_dimensions = known_dimensions.map_width(|width| width.maybe_max(ratio_min));
 
     let available_space = available_space.maybe_sub(non_auto_margin.sum_axes());

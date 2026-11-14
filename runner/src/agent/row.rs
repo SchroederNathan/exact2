@@ -11,7 +11,8 @@ use super::{num, quote};
 use exact_kernel::{Color, ColorValue, Dimension, Edge, RowValue, StyleId};
 use std::fmt::Write as _;
 
-pub(super) fn row_json(row: StyleId, v: RowValue<'_>, out: &mut String) {
+/// Row `row`'s value `v`, as JSON text, onto `out`.
+pub fn row_json(row: StyleId, v: RowValue<'_>, out: &mut String) {
     // CSS's unbounded maximum is `none`, as the web writes it (LLP 1102 §3.11).
     if matches!(row, StyleId::MaxWidth | StyleId::MaxHeight)
         && matches!(v, RowValue::Dimension(Dimension::Auto))
@@ -138,6 +139,7 @@ pub(super) fn row_json(row: StyleId, v: RowValue<'_>, out: &mut String) {
         RowValue::PositionTryFallbacks(s) => quote(&s.css(), out),
         RowValue::BackgroundImage(g) | RowValue::MaskImage(g) => quote(&g.css(), out),
         RowValue::TextShadow(s) => quote(&s.css(), out),
+        RowValue::FontVariations(v) => quote(&v.css(), out),
         RowValue::BoxShadow(s) => quote(&s.css(), out),
         RowValue::CornerShape(c) => quote(&c.css(), out),
         RowValue::RotateAxis(a) => quote(&a.css(), out),

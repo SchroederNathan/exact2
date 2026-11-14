@@ -110,6 +110,20 @@ final class AlertMacTests: XCTestCase {
     /// (or `showModal`) is a sheet, its title the label, its message the
     /// text, its destructive button marked, its cancel on Escape, and no
     /// default, as AppKit leaves a destructive alert.
+    func testAnOpenAlertRejectsAnActivePropertyAddedLaterWithoutReplacingItsButtons() throws {
+        let p = fixture()
+        p.press(2)
+        let owner = try XCTUnwrap(p.alerts.presented)
+        let button = owner.alert.buttons[0]
+        let source = try XCTUnwrap(p.views[10])
+        XCTAssertNil(source.nativeActiveRefusals["NSAlert button"])
+        p.apply(wireBatch([["op": "style", "id": 10, "style": ["press_opacity_to": 0.4]]]))
+        XCTAssertTrue(p.alerts.presented === owner)
+        XCTAssertTrue(owner.alert.buttons[0] === button)
+        XCTAssertTrue(source.nativeActiveRefusals["NSAlert button"]?.contains("opacity") == true)
+        _ = p.alerts.close(try XCTUnwrap(p.views[3]))
+    }
+
     func testAnAlertShapedDialogIsAnNSAlertSheetAndEachButtonPressesItsOwn() throws {
         let p = fixture()
         var pressed: [UInt32] = []
@@ -574,6 +588,40 @@ final class AlertMacTests: XCTestCase {
         // An action that does not also close it is no alert's button.
         let open = fixture(props: [10: ["command": "request-close"]])
         XCTAssertNil(open.alerts.plan(of: try XCTUnwrap(open.views[3]), popover: false))
+    }
+
+    /// Text and its one closing button (Charlie, 2026-10-18): AppKit's
+    /// one-button alert. Its button is the default, on Return, and Escape
+    /// does nothing, as a lone-button `NSAlert` does; it presses nothing.
+    func testTextAndOneClosingButtonIsTheOneButtonAlert() throws {
+        let p = fixture(label: "Couldn't Save", lines: ["The disk is full."], actions: [], props: [:])
+        var pressed: [UInt32] = [], closed: [UInt32] = []
+        p.onPress = { pressed.append($0) }
+        try XCTUnwrap(p.views[3]).handlers.insert("close")
+        p.onClose = { closed.append($0) }
+        p.dialogCommand("showModal", "ask")
+        let owner = try XCTUnwrap(p.alerts.presented)
+        let alert = owner.alert
+        XCTAssertTrue(window.attachedSheet === alert.window, "a sheet on its window")
+        XCTAssertEqual(alert.messageText, "Couldn't Save")
+        XCTAssertEqual(alert.informativeText, "The disk is full.")
+        XCTAssertEqual(alert.buttons.map(\.title), ["Not Now"])
+        // AppKit's own lone button: the window's default button cell, which
+        // takes Return, its own key equivalent cleared as the sheet begins.
+        XCTAssertTrue(alert.window.defaultButtonCell === alert.buttons[0].cell, "drawn as the default")
+        XCTAssertEqual(p.dialogs.observation?["default"] as? String, "Not Now")
+        XCTAssertFalse(p.alerts.key("Escape"), "Escape has no button")
+        alert.window.sendEvent(key("\u{1b}", 53, in: alert.window))
+        XCTAssertTrue(p.alerts.presented === owner, "Escape leaves it up")
+        // A script's window is not key and its sheet takes no Return event:
+        // the driver's Return, which presses the default as AppKit does.
+        XCTAssertTrue(p.alerts.key("Enter"))
+        XCTAssertNil(window.attachedSheet)
+        XCTAssertNil(p.alerts.presented)
+        turn()
+        turn()
+        XCTAssertEqual(pressed, [])
+        XCTAssertEqual(closed, [3])
     }
 
     /// LLP 1115.000 D13.4: an alert has no outside, and `NSAlert` has none:

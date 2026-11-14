@@ -6,13 +6,18 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { open } from '../../scripts/agent.mjs';
 import { checkOp, judge, ratio } from '../../scripts/agent-check.mjs';
 import { decodePng } from '../../scripts/png.mjs';
 import { serveBuildTree } from './serve.mjs';
 
-// One view per finding class, each named by its testId; `fits` and `ellipsis` are what must not be found.
+const ROOT = resolve(new URL('../..', import.meta.url).pathname);
+const compiler = resolve(process.env.CARGO_TARGET_DIR ?? resolve(ROOT, 'target'), 'debug', process.platform === 'win32' ? 'contract.exe' : 'contract');
+
+// One view per finding class, each named by its testId; `fits`, `ellipsis`, `covered-card` (a card under a view drawn over
+// it), `blob` (a shape holding no text or control that shows) and `grouped` (a list, whose ground is the page's, whatever its role) are what
+// must not be found; nor is `veiled-card`, which a half-opaque panel leaves unjudged (`faded`).
 const BROKEN = `component CheckFixture
   state on = false
   action toggle
@@ -30,6 +35,19 @@ const BROKEN = `component CheckFixture
         button testId="hidden" press=toggle
           text "Under"
         column testId="cover" position="absolute" top=0 left=0 width=300 height=60 background-color="-exact-secondary-background"
+      column position="relative" height=60
+        column testId="covered-card" position="absolute" top=8 left=8 width=160 height=44 border-radius=8 background-color="-exact-background"
+          text testId="covered-line" "Under a cover"
+        column position="absolute" top=0 left=0 width=300 height=60 background-color="-exact-secondary-background"
+      column testId="blob" width=48 height=48 border-radius=24 background-color="-exact-background" aria-hidden=true
+        text visibility="hidden" "Hidden"
+      column opacity=0.5 padding=8 background-color="-exact-secondary-background"
+        column testId="veiled-card" padding=8 border-radius=8 background-color="-exact-secondary-background"
+          text "In a half-opaque panel"
+      list testId="grouped" appearance="auto" listStyle="inset-grouped" role="presentation" height=100 flex-shrink=0
+        section
+          row
+            text "In a grouped list"
       row gap=0
         column testId="a" press=toggle width=100 height=44 background-color="-exact-secondary-background"
         column testId="b" press=toggle width=100 height=44 margin-left=-20 background-color="-exact-tertiary-fill"
@@ -103,6 +121,27 @@ component PaddedFixture
                   text "Scrolls on purpose"
               text testId="readout" white-space="nowrap" font-size="-exact-title2" "00:25:00"
 `;
+// LLP 1116.020 D4 (focus-timer and trivia-quiz, round 18): a vertical scroller holds no sideways overflow, though CSS computes
+// its x `auto` (a native host's vertical scroll view cuts it at the screen's edge). `count` runs past the screen; a strip that
+// scrolls sideways on purpose and a swipe row's snap scroll (LLP 1116.020 D1) hold what lies past their sides.
+const SIDEWAYS = `component SidewaysFixture
+  view
+    column testId="app" height="100vh" display="flex" flex-direction="column"
+      scroll flex=1 min-height=0 testId="scroller"
+        column padding=16 gap=12
+          row testId="count-row" gap=16 align-items="center"
+            text "Completed today" flex=1
+            text testId="count" white-space="nowrap" "0000000000000000000000000000000000000000"
+          scroll testId="strip" overflow-x="auto" overflow-y="hidden"
+            row gap=8
+              text testId="chip-1" white-space="nowrap" padding=8 "A chip that is long"
+              text white-space="nowrap" padding=8 "Another chip that is long"
+              text white-space="nowrap" padding=8 "A third chip, past the edge"
+          scroll testId="swipe" overflow-x="scroll" overflow-y="hidden" scrollbar-width="none" scroll-snap-type="x mandatory"
+            row
+              text testId="swipe-content" width="100%" flex-shrink=0 scroll-snap-align="start" padding=12 "A row's content"
+              text testId="swipe-action" width=88 flex-shrink=0 scroll-snap-align="end" padding=12 "Delete"
+`;
 // A column held to the screen's height, its end past the screen's bottom: a line cut by it, a button out of reach.
 const TALL = `component TallFixture
   state n = 0
@@ -114,6 +153,15 @@ const TALL = `component TallFixture
       text testId="cut" flex-shrink=0 "This line straddles the bottom of the screen"
       button testId="unreachable" press=bump flex-shrink=0
         text "Save"
+`;
+// The same column holding a scroll view: the line straddling the scroll view's end is reached by scrolling, so the column
+// above the scroll view cuts nothing (AgentCheckIOS.swift stops at a scroller the same way).
+const SCROLLED = `component ScrolledFixture
+  view
+    column testId="root" height="100vh" overflow="hidden"
+      scroll testId="list" flex=1 min-height=0
+        column testId="spacer" height=890 flex-shrink=0
+        text testId="past" flex-shrink=0 "This line straddles the end of the scroll view"
 `;
 // LLP 1116.006 D5: a text judged on the fill under it — its own box's (a rounded bubble, whose corners show the page), a
 // bubble column's, the page's — in each scheme; and rows a scroller cuts, overlapping nothing past its edge.
@@ -150,9 +198,9 @@ const built = (() => {
     if (!ready.has(name)) ready.set(name, (async () => {
       const dir = mkdtempSync(join(tmpdir(), `exact-check-${name}-`)), contract = join(dir, 'app.contract'), plan = join(dir, 'app.plan'), dist = join(dir, 'dist');
       writeFileSync(contract, source);
-      const compile = spawnSync('cargo', ['run', '-q', '-p', 'contract', '--', 'build', contract, '-o', plan], { encoding: 'utf8' });
+      const compile = spawnSync(compiler, ['build', contract, '-o', plan], { encoding: 'utf8' });
       if (compile.status !== 0) throw new Error(compile.stderr);
-      const build = spawnSync(process.execPath, ['host/web-js/build.mjs', 'caltrain', '--plan', plan, '--out', dist, '--render', 'none'], { cwd: new URL('../../', import.meta.url).pathname, encoding: 'utf8' });
+      const build = spawnSync(process.execPath, ['host/web-js/build.mjs', 'caltrain', '--plan', plan, '--out', dist, '--render', 'none'], { cwd: ROOT, encoding: 'utf8' });
       if (build.status !== 0) throw new Error(build.stderr);
       const server = createServer((request, response) => serveBuildTree(dist, request, response));
       await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -224,30 +272,24 @@ test('judging: WCAG ratios, the floors, a clamp asked for, a reachable cover, th
   expect(found([{ ...text, fg: [197, 197, 198, 1], inactive: true }])).toEqual([]); // a disabled control's label (WCAG's inactive component)
   expect(found([{ ...text, fg: [60, 60, 67, 0.6] }])).toEqual([]); // the secondary label's value, unnamed (a section footer's), is its
   expect(found([{ ...text, fg: [255, 56, 60, 1] }])).toEqual([]); // the grouped sheet's red (a destructive row's title), UIKit's at 3:1
-  // LLP 1115.000 D4: a role known only by its drawn value is read in the column its host draws. A page in the neutral look
-  // says so (`look`): there the table's neutral red (#c90f1a, 3.5:1 on this grey) is the platform's, at 3:1, and Apple's
-  // red is some author's colour, at 4.5:1. An Apple host that names no look (iOS) draws Apple's.
-  const onGrey = { ...text, fg: [201, 15, 26, 1], bg: [200, 200, 200], on: 'own' };
-  expect(found([onGrey], { look: 'neutral' })).toEqual([]);
-  expect(found([onGrey])).toEqual(['contrast:1']);
-  expect(found([{ ...text, fg: [255, 56, 60, 1] }], { look: 'neutral' })).toEqual(['contrast:1']);
-  // The neutral column's ink on the accent in dark is black: by value alone it is no role, so an author's black text
-  // on a dark grey (3.5:1) is held to 4.5:1 there too.
-  expect(found([{ ...text, fg: [0, 0, 0, 1], bg: [100, 100, 100], on: 'own' }], { look: 'neutral', scheme: 'dark' })).toEqual(['contrast:1']);
   expect(found([{ ...text, fg: [0, 0, 0, 1], over: [30, 0], clips: true }])).toEqual(['clipped:1']);
-  expect(found([{ ...text, fg: [0, 0, 0, 1], over: [30, 0], clips: true, clamp: true }])).toEqual([]);
+  expect(found([{ ...text, fg: [0, 0, 0, 1], over: [30, 0], clips: true, clamp: true, ellipsis: true }])).toEqual([]);
   // A card on white whose fill is white shows nothing; on grey it shows; with an edge it shows.
   const card = { id: 2, x: 4, y: 4, w: 12, h: 12, fill: [255, 255, 255, 1], radius: 8, fillRole: 'secondary-grouped-background' };
   const invisible = judge(obs([card]), png);
   expect(invisible.map((f) => f.kind)).toEqual(['card']);
   expect(invisible[0].hint).toContain('-exact-secondary-background');
-  // The hint knows a plain page by the column's own ground: #121212 is the neutral look's in dark, and nobody's in Apple's.
-  const night = { width: 40, height: 20, data: new Uint8Array(40 * 20 * 4).map((_, i) => i % 4 === 3 ? 255 : 18) };
-  const hint = (look) => judge(obs([{ ...card, fill: [18, 18, 18, 1] }], { scheme: 'dark', ...(look ? { look } : {}) }), night)[0].hint;
-  expect(hint('neutral')).toContain('on a plain page a card is -exact-secondary-background');
-  expect(hint()).not.toContain('on a plain page a card is');
   expect(found([{ ...card, x: 24 }])).toEqual([]);
   expect(found([{ ...card, edge: true }])).toEqual([]);
+  // A side is read only where the capture shows the card's fill over what lies outside it. A red card under a white view
+  // drawn over it (mapapp's park under its panel) shows white on both sides of its edge: no finding. A fill all but
+  // transparent shows the page through it, and is found. A card in a half-opaque ancestor (`faded`) is not judged.
+  expect(found([{ ...card, fill: [255, 59, 48, 1] }])).toEqual([]);
+  expect(found([{ ...card, fill: [0, 0, 0, 0.01] }])).toEqual(['card:2']);
+  expect(found([{ ...card, faded: true }])).toEqual([]);
+  // A white card whose box crosses into the grey (a rotated card over a band): the side in the grey shows its edge, and
+  // the white-on-white sides do not outweigh it.
+  expect(found([{ ...card, x: 10, w: 12 }])).toEqual([]);
   // LLP 1116.010 D2 (trivia, round 12): a card the host says none of is presented (below the viewport, past its scroller's edge) is
   // not judged on the page's pixels there.
   expect(found([{ ...card, vis: { x: 4, y: 20, w: 0, h: 0 } }])).toEqual([]);
@@ -271,6 +313,18 @@ test('judging: WCAG ratios, the floors, a clamp asked for, a reachable cover, th
   const teal = judge(obs([{ ...white, bg: [0, 195, 208], on: 'own', label: true, onAccent: true }]), null);
   expect(teal.map((f) => f.kind)).toEqual(['contrast']);
   expect(teal[0].hint).toContain('leave the accent unsaid');
+  // A tinted button's label in a system hue on its own pale fill is UIKit's drawing (the Clock's green Start): not judged. The
+  // same green as a text on the page is.
+  const green = { ...text, fg: [52, 199, 89, 1], bg: [225, 247, 231], on: 'own', label: true };
+  expect(found([{ ...green, tinted: true }])).toEqual([]);
+  expect(found([green])).toEqual(['contrast:1']);
+  // LLP 1116.020 D7: white on an accent fill that is no button (a sent bubble) is held to a filled button's 3:1: UIKit's blue
+  // (3.4:1) reads, a pale accent (the web's dark one, 2.6:1) is found with the accent's hint; on another fill it stays 4.5:1.
+  expect(found([{ ...white, bg: [0, 136, 255], on: 'own', onAccentFill: true }])).toEqual([]);
+  expect(found([{ ...white, bg: [0, 136, 255], on: 'own' }])).toEqual(['contrast:1']);
+  const paleAccent = judge(obs([{ ...white, bg: [104, 165, 254], on: 'own', onAccentFill: true }]), null);
+  expect(paleAccent.map((f) => [f.kind, f.detail.need])).toEqual([['contrast', 3]]);
+  expect(paleAccent[0].hint).toContain('leave the accent unsaid');
   // Overlap is judged on what is presented of each box: a row its scroller cuts at y = 10 overlaps nothing below.
   const row = { id: 6, x: 0, y: 0, w: 40, h: 20, control: 'press', sized: 'platform' }, tab = { id: 7, x: 0, y: 10, w: 40, h: 20, control: 'press', sized: 'platform' };
   expect(found([row, tab])).toEqual(['overlap:6']);
@@ -293,6 +347,37 @@ test('judging: WCAG ratios, the floors, a clamp asked for, a reachable cover, th
   expect(spill.map((f) => [f.kind, f.id, f.detail.past, f.detail.of])).toEqual([['overflow', 9, 6, 8]]);
 });
 
+// LLP 1115.000 D4: a role known only by its drawn value is read in what its host draws, as the page says it (`palette`).
+test('an ink and a page\'s ground are known by what the page draws each role in', () => {
+  const png = { width: 40, height: 20, data: new Uint8Array(40 * 20 * 4).fill(255) };
+  const obs = (items, extra = {}) => ({ viewport: { w: 40, h: 20 }, scheme: 'light', target: 24, items, ...extra });
+  const text = { id: 1, x: 2, y: 2, w: 16, h: 16, text: 'Hi', size: 16, weight: 400 };
+  const found = (items, extra) => judge(obs(items, extra), png).map((f) => `${f.kind}:${f.id}`);
+  const card = { id: 2, x: 4, y: 4, w: 12, h: 12, fill: [255, 255, 255, 1], radius: 8, fillRole: 'secondary-grouped-background' };
+  // A web page says what it draws each role in (`palette`, check.js): where its red is #c90f1a (3.5:1 on this grey)
+  // that red is the platform's, at 3:1, and Apple's red is some author's colour, at 4.5:1. An Apple host that says none
+  // (iOS) draws Apple's pairs.
+  const onGrey = { ...text, fg: [201, 15, 26, 1], bg: [200, 200, 200], on: 'own' };
+  const page = (scheme, roles) => ({ palette: { light: {}, dark: {}, [scheme]: roles } });
+  expect(found([onGrey], page('light', { 'system-red': [201, 15, 26, 1] }))).toEqual([]);
+  expect(found([onGrey])).toEqual(['contrast:1']);
+  expect(found([{ ...text, fg: [255, 56, 60, 1] }], page('light', { 'system-red': [201, 15, 26, 1] }))).toEqual(['contrast:1']);
+  // Safari on a Mac draws the secondary label as half black, no pair's value (3.9:1 on white): the page says it is the
+  // platform's secondary label, at 3:1.
+  const safariSecondary = { ...text, fg: [0, 0, 0, 0.498] };
+  expect(found([safariSecondary], page('light', { 'secondary-label': [0, 0, 0, 0.498] }))).toEqual([]);
+  expect(found([safariSecondary])).toEqual(['contrast:1']);
+  // An ink on the accent may be black: by value alone it is no role, so an author's black text on a dark grey (3.5:1)
+  // is held to 4.5:1 there too.
+  expect(found([{ ...text, fg: [0, 0, 0, 1], bg: [100, 100, 100], on: 'own' }], { scheme: 'dark', ...page('dark', { AccentColorText: [0, 0, 0, 1] }) })).toEqual(['contrast:1']);
+  // The hint knows a plain page by the ground its page draws: #121212 where the page says so, and nobody's in Apple's pairs,
+  // whose dark ground is black.
+  const night = { width: 40, height: 20, data: new Uint8Array(40 * 20 * 4).map((_, i) => i % 4 === 3 ? 255 : 18) };
+  const hint = (extra) => judge(obs([{ ...card, fill: [18, 18, 18, 1] }], { scheme: 'dark', ...extra }), night)[0].hint;
+  expect(hint(page('dark', { background: [18, 18, 18, 1] }))).toContain('on a plain page a card is -exact-secondary-background');
+  expect(hint({})).not.toContain('on a plain page a card is');
+});
+
 // LLP 1116.009 D5: the judge names the cause: the written width, the padding, and the parent it runs past.
 test('a padded percentage width past its parent is an overflow that names its cause and its repair', () => {
   const png = { width: 40, height: 20, data: new Uint8Array(40 * 20 * 4).fill(255) };
@@ -305,6 +390,22 @@ test('a padded percentage width past its parent is an overflow that names its ca
   expect(ios.map((x) => [x.kind, x.detail.past, x.detail.of, x.detail.pad, x.detail.written, x.detail.unit])).toEqual([['overflow', 14, 3, 14, undefined, 'pt']]);
   // The viewport's own overflow is still there beside it, not instead: the cause is named first, once.
   expect(judge({ viewport: { w: 40, h: 20 }, scheme: 'light', target: 24, items: [{ ...padded, outX: 14 }] }, png)).toHaveLength(1);
+});
+
+test('two texts drawn over each other run together, unless one stands on the opaque fill of the view laid over the other', () => {
+  const vp = { viewport: { w: 200, h: 100 }, scheme: 'light', target: 24 };
+  const row = { id: 3, text: 'Row 5', x: 0, y: 40, w: 60, h: 20 }, tab = { id: 7, text: 'Tab', x: 10, y: 45, w: 30, h: 20, on: 6 };
+  const kindsOf = (items) => judge({ ...vp, items }, null).map((f) => `${f.id} ${f.kind}`);
+  expect(kindsOf([row, tab])).toEqual(['3 overlap']); // no say about what is drawn over what: they run together
+  const bar = { by: 6, x: 0, y: 40, w: 200, h: 30 };
+  expect(kindsOf([{ ...row, beneath: bar }, { ...tab, solid: true }])).toEqual([]); // the row is under the bar (view 6) the tab's fill is
+  expect(kindsOf([{ ...row, beneath: bar }, tab])).toEqual(['3 overlap']); // a see-through bar: the row shows through it
+  expect(kindsOf([{ ...row, beneath: { ...bar, by: 9 } }, { ...tab, solid: true }])).toEqual(['3 overlap']); // under something else
+  // The tab's label running past its bar's edge meets the row outside the fill: they run together there.
+  expect(kindsOf([{ ...row, beneath: { ...bar, x: 20, w: 15 } }, { ...tab, solid: true }])).toEqual(['3 overlap']);
+  // A list's section header pinned over its rows as they pass under it (contacts at the largest text size, bake-off r28).
+  expect(kindsOf([row, { ...tab, pinned: true }])).toEqual([]);
+  expect(judge({ ...vp, items: [{ ...row, control: 'press' }, { ...tab, pinned: true }] }, null)).toEqual([]);
 });
 
 test('a page with every finding class has each found, by testId, in the scheme it shows in; a clean page has none', async () => {
@@ -324,10 +425,21 @@ test('a page with every finding class has each found, by testId, in the scheme i
     // row, so the longer title is cut at its button's edge (LLP 1116 D1's look let the button spill past the row).
     expect(l['opt-b']).toEqual(['clipped']);
     expect(l['opt-a']).toBeUndefined();
-    // The page says the look it draws, which is every build's (LLP 1115.000 D4 part B): its roles are judged in that column.
-    expect((await session.op({ op: 'check' })).look).toBe('neutral');
+    // The page says what it draws each of Exact's roles in, light and dark (Apple's colours, LLP 1115.000 D4): an ink is
+    // judged by that palette.
+    const { palette } = await session.op({ op: 'check' });
+    expect([palette?.light?.['secondary-label'], palette?.dark?.background]).toEqual([[60, 60, 67, 0.6], [0, 0, 0, 1]]);
     expect(l.faint).toEqual(['contrast']);
     expect(l.card).toEqual(['card']);
+    // A card under a view drawn over it does not show because of that view, not its fill; a shape holding no text or
+    // control is no card.
+    expect(l['covered-card']).toBeUndefined();
+    expect(l['covered-line']).toEqual(['covered']);
+    expect(l.blob).toBeUndefined();
+    expect(l['veiled-card']).toBeUndefined(); // its fill is the panel's, but the capture mixes both with the page
+    const seen = await session.op({ op: 'check' }), ids = new Map(((await session.op({ op: 'tree' })).nodes ?? []).map((n) => [n.props?.testId, n.id]));
+    const observed = (testId) => seen.items.find((it) => it.id === ids.get(testId));
+    expect([observed('veiled-card').faded, observed('card').faded]).toEqual([true, undefined]);
     expect(l.tiny).toEqual(['target']);
     expect(l.fits).toBeUndefined();
     expect(l.ellipsis).toBeUndefined(); // an ellipsis the author asked for
@@ -335,6 +447,7 @@ test('a page with every finding class has each found, by testId, in the scheme i
     // In dark the card shows and the faint text reads on it; the author's white label on the pale
     // dark accent does not (unsaid, the web picks black there: LLP 1116.003 D3.1).
     expect(d.card).toBeUndefined();
+    expect(d.grouped).toBeUndefined(); // its ground is the plain page's colour in dark, under its section's card
     expect(d.faint).toBeUndefined();
     expect(d.go).toEqual(['contrast']);
     expect(both.text).toMatch(/^check web · light: \d+ findings\n/);
@@ -355,11 +468,21 @@ test('a page with every finding class has each found, by testId, in the scheme i
       expect(at[0].findings[0].detail.past).toBe(48);
     }
   } finally { await wide.close(); }
+  const sideways = await open({ host: 'web', url: await built('sideways', SIDEWAYS), size: [390, 844] });
+  try {
+    const run = (await checkOp(sideways, ['light'])).check[0];
+    expect(kinds(run)).toEqual({ count: ['overflow'] });
+    expect(run.findings[0].detail.width).toBe(390);
+  } finally { await sideways.close(); }
   const tall = await open({ host: 'web', url: await built('tall', TALL) });
   try {
     const t = kinds((await checkOp(tall, [])).check[0]);
     expect(t).toEqual({ cut: ['clipped'], unreachable: ['covered'] });
   } finally { await tall.close(); }
+  const scrolled = await open({ host: 'web', url: await built('scrolled', SCROLLED) });
+  try {
+    expect(kinds((await checkOp(scrolled, [])).check[0])).toEqual({});
+  } finally { await scrolled.close(); }
   // A row under a bar is covered only when no scroller moves it clear (LLP 1116.012 D3): the fold row of a list above an in-flow bar, or
   // under a bar laid over it with the range to scroll by, is not; the last row of a list that scrolls too little, and the first row
   // under a header at the start of its list, are.

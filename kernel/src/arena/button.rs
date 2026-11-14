@@ -2,24 +2,36 @@
 use super::*;
 use crate::{ButtonFaceStyle, ButtonImagePlacement, ControlKind, PressFace};
 
+#[derive(Clone)]
 pub(crate) struct ButtonInputs {
     env: crate::Env,
     neutral_tab_root: Option<f32>,
+    neutral_role_floor: bool,
+    /// A list row's inset (LLP 1138), which the face's padding takes.
+    row_inset: Option<[f32; 2]>,
     nodes: Vec<ButtonNode>,
 }
 
+#[derive(Clone)]
 struct ButtonNode {
     key: NodeKey,
     kind: NodeType,
     style: Rc<StyleProps>,
     props: PropList,
-    inherited: InheritedStyle,
+    // Shared, so a trial's copy of the engine tree copies a pointer.
+    inherited: std::sync::Arc<InheritedStyle>,
     paragraph: Option<ParagraphStamp>,
+    /// Raster metadata changes the face without a prop or style write.
+    intrinsic: Option<(f32, f32)>,
 }
 
 impl ButtonInputs {
     pub(crate) fn matches(&self, arena: &NodeArena, slot: u32) -> bool {
-        if self.env != *arena.env() || self.neutral_tab_root != arena.neutral_tab_root(slot) {
+        if self.env != *arena.env()
+            || self.neutral_tab_root != arena.neutral_tab_root(slot)
+            || self.neutral_role_floor != arena.neutral_role_floor(slot)
+            || self.row_inset != crate::rows::row_inset(arena, slot)
+        {
             return false;
         }
         let slots = arena.subtree(slot);
@@ -31,6 +43,10 @@ impl ButtonInputs {
                         || *held.style == *arena.style(s))
                     && held.props == *arena.props(s)
                     && held.paragraph == arena.paragraph_stamp(s)
+                    && held.intrinsic
+                        == arena
+                            .intrinsic(s)
+                            .filter(|_| arena.node_type(s) == NodeType::Image)
                     && held
                         .inherited
                         .changed_mask(&arena.computed_inherited(s))
@@ -89,6 +105,23 @@ impl NodeArena {
         )
     }
 
+    fn neutral_role_floor(&self, slot: u32) -> bool {
+        if matches!(
+            self.props(slot).str(PropId::AccessibilityRole),
+            Some("tab" | "radio")
+        ) {
+            return true;
+        }
+        let mut parent = self.parent(slot);
+        while let Some(at) = parent {
+            if self.props(at).str(PropId::AccessibilityRole) == Some("menu") {
+                return true;
+            }
+            parent = self.parent(at);
+        }
+        false
+    }
+
     pub(crate) fn press_face(&self, slot: u32) -> Option<PressFace> {
         if !self.is_native_button(slot) && self.node_type(slot) != NodeType::Pressable {
             return None;
@@ -125,7 +158,16 @@ impl NodeArena {
                         let source = self.props(child).str(PropId::ImageSource);
                         match source.and_then(|s| s.strip_prefix("symbol:")) {
                             Some(symbol) => face.symbol = Some(symbol.to_owned()),
-                            None => face.raster = source.is_some_and(|s| !s.is_empty()),
+                            None => {
+                                face.raster = source.is_some_and(|s| !s.is_empty());
+                                face.image = source.filter(|s| !s.is_empty()).map(|s| {
+                                    crate::control::ButtonRasterImage {
+                                        view: self.local_id(child),
+                                        source: s.to_owned(),
+                                        size: self.intrinsic(child),
+                                    }
+                                });
+                            }
                         }
                         face.leading = face.title.is_none() && face.subtitle.is_none();
                     }
@@ -151,6 +193,8 @@ impl NodeArena {
         ButtonInputs {
             env: self.env.clone(),
             neutral_tab_root: self.neutral_tab_root(slot),
+            neutral_role_floor: self.neutral_role_floor(slot),
+            row_inset: crate::rows::row_inset(self, slot),
             nodes: self
                 .subtree(slot)
                 .into_iter()
@@ -159,8 +203,11 @@ impl NodeArena {
                     kind: self.node_type(s),
                     style: self.styles[s as usize].clone(),
                     props: self.props(s).clone(),
-                    inherited: self.computed_inherited(s),
+                    inherited: std::sync::Arc::new(self.computed_inherited(s)),
                     paragraph: self.paragraph_stamp(s),
+                    intrinsic: self
+                        .intrinsic(s)
+                        .filter(|_| self.node_type(s) == NodeType::Image),
                 })
                 .collect(),
         }
@@ -185,16 +232,38 @@ impl NodeArena {
         let title_mask = mask(TITLE_ROWS);
         let text_style = |child: Option<u32>| {
             let at = child.unwrap_or(slot);
-            let mut style = self.computed_style(at, title_mask);
+            let mut style = self.computed_rows(at, title_mask);
             // Non-inheriting rows (line-clamp) also map from button to title.
             for &row in TITLE_ROWS {
-                if !self.style(at).mask.has(row) && own.mask.has(row) {
+                // A text style the title names gives its own (LLP 1115.000
+                // D12.2).
+                if !self.style(at).mask.has(row)
+                    && own.mask.has(row)
+                    && self.text_style_source(at, row).is_none()
+                {
                     let mut one = StyleMask::EMPTY;
                     one.set(row);
                     style.copy_rows(own, one);
                 }
             }
             style.mask = own.mask.union(self.style(at).mask).intersect(title_mask);
+            // A text style's weight and leading (LLP 1115.000 D12.2) are the
+            // title's as much as its own rows are.
+            for row in [StyleId::FontWeight, StyleId::LineHeight] {
+                if title_mask.has(row) && self.text_style_source(at, row).is_some() {
+                    style.mask.set(row);
+                }
+            }
+            // Bold Text's step (LLP 1115.000 D12.3) on the weight the title
+            // has, the button's included, said so the host paints it.
+            if self.bold_text {
+                let family = self.computed_source(at, StyleId::FontFamily).font_family;
+                let weight = self.emboldened(at, style.font_weight, family);
+                if weight != style.font_weight {
+                    style.font_weight = weight;
+                    style.mask.set(StyleId::FontWeight);
+                }
+            }
             style
         };
         let texts: Vec<_> = self
@@ -243,6 +312,20 @@ impl NodeArena {
             StyleId::ColumnGap,
             StyleId::FlexDirection,
         ]));
+        // A list's row inset (LLP 1138) is the padding the host measures and
+        // places the title by, at an end its author wrote none of.
+        if let Some([left, right]) = crate::rows::row_inset(self, slot) {
+            for (id, length) in [(StyleId::PaddingLeft, left), (StyleId::PaddingRight, right)] {
+                if !own.written.has(id) {
+                    let side = match id {
+                        StyleId::PaddingLeft => &mut button.padding_left,
+                        _ => &mut button.padding_right,
+                    };
+                    *side = crate::style::Dimension::Points(length);
+                    button.mask.set(id);
+                }
+            }
+        }
         // The Neutral tab's floor is below an own minimum, including a clear.
         // Keep this provenance when narrowing the host's configuration rows.
         if neutral_tab_root.is_some() && own.mask.has(StyleId::MinHeight) {
@@ -259,6 +342,7 @@ impl NodeArena {
         };
         Some(ButtonFaceStyle {
             neutral_tab_root,
+            neutral_role_floor: self.neutral_role_floor(slot),
             title,
             subtitle: texts.get(1).map(|&c| text_style(Some(c))),
             symbol,

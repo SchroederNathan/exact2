@@ -1,6 +1,18 @@
 import {test,expect} from 'bun:test';
 import {focusController} from '../navigation.js';
 import {createInputHandlers} from '../input-glue.js';
+import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
+import { readFileSync } from 'node:fs';
+import { glueDeclarations } from './glue-fixture.mjs';
+
+// The wasm host's key wire, and the early queue's copy of it (#140): the chord, its code, repeat and isComposing.
+test('the key wire carries isComposing on its fourth line',()=>{
+  for (const file of ['../glue.js','../document-glue.js']) {
+    const keyChord=Function(`${glueDeclarations(readFileSync(new URL(file,import.meta.url),'utf8'),['keyChord'])}; return keyChord;`)();
+    expect(keyChord({key:'Enter',code:'Enter',repeat:false,isComposing:true})).toBe('Enter\nEnter\nfalse\ntrue');
+    expect(keyChord({key:'b',code:'KeyB',metaKey:true,repeat:true})).toBe('Meta+b\nKeyB\ntrue\nfalse');
+  }
+});
 
 // Production focus transaction, including autofocus during the dispatched commit.
 test('E11 only enclosing canvases receive pointer focus; new autofocus wins',()=>{
@@ -87,14 +99,17 @@ test('a carried restart keeps focus at its place and autofocuses nothing',()=>{
 });
 
 test('declared shortcuts support named keys and leave text input and composition with editors',()=>{
-  const previous={document:globalThis.document,getComputedStyle:globalThis.getComputedStyle};
+  const previous={document:globalThis.document,getComputedStyle:globalThis.getComputedStyle,MutationObserver:globalThis.MutationObserver,Element:globalThis.Element,matchMedia:globalThis.matchMedia};
   const handlers=new Map();
   let chord='',presses=0,editing=false,inert=false,modal=null,shown=[],activates=false;
+  // What the input glue reads as it starts that no chord here touches: its sheets' observers, hover, looks, the
+  // page's last pointer.
+  Object.assign(globalThis,{MutationObserver:class{observe(){}disconnect(){}takeRecords(){return [];}},Element:class{},matchMedia:()=>({matches:false,addEventListener(){}})});
   const button={isConnected:true,disabled:false,getClientRects:()=>[{}],getAttribute:()=>chord,click:()=>presses++};
   const root={addEventListener(){},querySelectorAll:s=>s.includes('aria-modal')?shown:[button],contains:()=>false};
   const target={matches:s=>s.startsWith('button')?activates:editing,closest:()=>modal};
   // Every listener on the document hears the key, in order, as a browser's would.
-  globalThis.document={addEventListener:(name,handler)=>handlers.set(name,[...(handlers.get(name)??[]),handler]),activeElement:target};
+  globalThis.document={addEventListener:(name,handler)=>handlers.set(name,[...(handlers.get(name)??[]),handler]),activeElement:target,getElementById:id=>(id==='exact-snap'?{}:null),styleSheets:[],documentElement:{dataset:{}}};
   globalThis.getComputedStyle=()=>({visibility:'visible'});
   const key=(key,mods={},extra={})=>{
     const event={key,metaKey:false,ctrlKey:false,altKey:false,shiftKey:false,...mods,...extra,
@@ -157,10 +172,8 @@ test('declared shortcuts support named keys and leave text input and composition
 // the page's own colour.
 test('bare fields restore keyboard focus and a disabled native field is the look\'s grey, not the page\'s ink', async () => {
   const {readFileSync} = await import('node:fs');
-  const {chromium: browserPath} = await import('../../../scripts/agent-launch.mjs');
-  const {chromium} = await import('playwright-core');
   const {withLook} = await import('../look.mjs');
-  const browser = await chromium.launch({executablePath: browserPath().executable, headless: true});
+  const browser = await suiteBrowser();
   try {
     const page = await browser.newPage();
     const css = withLook(readFileSync(new URL('../index.html', import.meta.url), 'utf8')).match(/<style>([\s\S]*?)<\/style>/)[1];
@@ -170,6 +183,9 @@ test('bare fields restore keyboard focus and a disabled native field is the look
         <input id="native" data-native disabled value="Disabled"><textarea id="native-area" data-native disabled>Disabled</textarea>
         <input id="authored" data-native disabled style="color:rgb(0,128,0)">
         <input id="quiet" style="outline-style:none"><textarea id="quiet-area" class="c1"></textarea><input id="quiet-native" data-native class="c1">
+        <button id="quiet-button" class="c1">Bare</button><button id="quiet-native-button" data-native class="c1">Native</button>
+        <a id="quiet-link" href="#a" class="c1">Link</a><div id="quiet-box" tabindex="0" style="outline-style:none">Box</div>
+        <input id="quiet-checkbox" type="checkbox" data-native class="c1"><select id="quiet-select" data-native class="c1"><option>A</option></select>
         <span id="gray" style="color:var(--exact-gray-text)"></span>
       </div>`);
       for (const id of ['bare', 'area']) {
@@ -191,8 +207,9 @@ test('bare fields restore keyboard focus and a disabled native field is the look
       expect(await page.$eval('#markdown', el => getComputedStyle(el).outlineStyle)).toBe('none');
       // `outline="none"` as the live host writes it (inline) and the JS
       // target does (its class): the author's row outranks the restore and,
-      // on a native field, the UA's ring; Tab still reaches each.
-      for (const id of ['quiet', 'quiet-area', 'quiet-native']) {
+      // on a native control, the UA's ring, on a field and on any other
+      // element that takes the focus (LLP 1104 D6); Tab still reaches each.
+      for (const id of ['quiet', 'quiet-area', 'quiet-native', 'quiet-button', 'quiet-native-button', 'quiet-link', 'quiet-box', 'quiet-checkbox', 'quiet-select']) {
         await page.keyboard.press('Tab');
         expect(await page.evaluate(() => document.activeElement.id)).toBe(id);
         expect(await page.$eval(`#${id}`, el => el.matches(':focus-visible') && getComputedStyle(el).outlineStyle)).toBe('none');
@@ -203,11 +220,8 @@ test('bare fields restore keyboard focus and a disabled native field is the look
 
 for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: native buttons keep the UA focus ring and bare buttons restore it`, async () => {
   const {readFileSync} = await import('node:fs');
-  const {chromium: browserPath} = await import('../../../scripts/agent-launch.mjs');
-  const playwright = await import('playwright-core');
   const {withLook} = await import('../look.mjs');
-  const browser = await playwright[engine].launch({headless: true,
-    ...(engine === 'chromium' ? {executablePath: browserPath().executable} : {})});
+  const browser = await suiteBrowser(engine);
   try {
     const page = await browser.newPage();
     const reference = await browser.newPage();
@@ -259,14 +273,14 @@ for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: native 
 // #282: the real HTML dialog path, reached through the JS target's commands.
 test('action dialog commands keep modal focus and preserve bare close as window close', async () => {
   const {readFileSync} = await import('node:fs');
-  const {chromium: browserPath} = await import('../../../scripts/agent-launch.mjs');
-  const {chromium} = await import('playwright-core');
-  const browser = await chromium.launch({executablePath: browserPath().executable, headless: true});
+  const browser = await suiteBrowser();
   try {
     const page = await browser.newPage();
     await page.setContent('<div id="exact-root"><button id="opener">Open</button><button id="outside">Outside</button><dialog id="form"><button id="first">First</button><button id="last">Last</button></dialog><div id="box"></div></div><dialog id="other"></dialog>');
     const source = readFileSync(new URL('../../web-js/commands.js', import.meta.url), 'utf8').replace(/^import .*$/gm, '').replace('export const commands', 'const commands');
-    await page.addScriptTag({content: `${source}\nwindow.journal=[];window.quit=0;window.close=()=>quit++;window.hostCommands=commands(line=>journal.push(line));`});
+    // Of commands.js's imports the dialog commands reach only navigation.js's `liveById`; nothing leaves here, so
+    // finding by id is enough.
+    await page.addScriptTag({content: `const liveById = id => document.getElementById(id);\n${source}\nwindow.journal=[];window.quit=0;window.close=()=>quit++;window.hostCommands=commands(line=>journal.push(line));`});
     const glue = readFileSync(new URL('../glue.js', import.meta.url), 'utf8');
     const runtime = readFileSync(new URL('../../web-js/rt.js', import.meta.url), 'utf8');
     await page.addScriptTag({content: `(() => {
@@ -325,8 +339,6 @@ test('action dialog commands keep modal focus and preserve bare close as window 
 }, 60000);
 
 test('a queued dialog close cannot act after its conditional scope ends', async () => {
-  const {chromium: browserPath} = await import('../../../scripts/agent-launch.mjs');
-  const {chromium} = await import('playwright-core');
   const server = Bun.serve({port: 0, hostname: '127.0.0.1', async fetch(req) {
     const path = new URL(req.url).pathname;
     if (path === '/') return new Response('<div id="exact-root"><button id="opener">Open</button><div id="branch"></div></div>', {headers: {'Content-Type': 'text/html'}});
@@ -336,7 +348,7 @@ test('a queued dialog close cannot act after its conditional scope ends', async 
     const file = await local.exists() ? local : Bun.file(new URL(`../../..${path.replace('/web-js/', '/web/')}`, import.meta.url));
     return await file.exists() ? new Response(file) : new Response(null, {status: 404});
   }});
-  const browser = await chromium.launch({executablePath: browserPath().executable, headless: true});
+  const browser = await suiteBrowser();
   try {
     const page = await browser.newPage();
     for (const retain of [false, true]) {

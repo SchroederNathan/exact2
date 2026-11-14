@@ -1,5 +1,6 @@
 //! `scrollIntoView` (LLP 1070.000): the command an action states, and the
 //! agent's `tap … into`, both run here, never by a host.
+use super::text_axes::AxesBefore;
 use super::*;
 use crate::instance::collection::{Align, IntoView, IntoViewStatus};
 
@@ -80,16 +81,19 @@ impl<D: DataSource> Runner<D> {
     /// is its list's to report).
     pub(super) fn record_into_view(&mut self, request: &IntoView, status: Option<IntoViewStatus>) {
         if let Some(IntoViewStatus::Refused(why)) = status {
-            self.log(format!("scrollIntoView {} refused: {why}", request.list));
-            let mut entry = String::from("{\"list\":");
-            crate::agent::quote(&request.list, &mut entry);
-            entry.push_str(",\"status\":");
-            IntoViewStatus::Refused(why).json(&mut entry);
-            entry.push('}');
-            self.into_view_refused.push_back(entry);
-            if self.into_view_refused.len() > 8 {
-                self.into_view_refused.pop_front();
-            }
+            self.record_refusal(&request.list, why);
+        }
+    }
+    pub(super) fn record_refusal(&mut self, list: &str, why: String) {
+        self.log(format!("scrollIntoView {list} refused: {why}"));
+        let mut entry = String::from("{\"list\":");
+        crate::agent::quote(list, &mut entry);
+        entry.push_str(",\"status\":");
+        IntoViewStatus::Refused(why).json(&mut entry);
+        entry.push('}');
+        self.into_view_refused.push_back(entry);
+        if self.into_view_refused.len() > 8 {
+            self.into_view_refused.pop_front();
         }
     }
 
@@ -118,6 +122,18 @@ impl<D: DataSource> Runner<D> {
             offset: None,
         };
         self.scroll_into_view(request)
+    }
+
+    /// What the platform covers of list `view`'s port at its start and end:
+    /// UIKit's bars over a list drawn under them, which its host reports as
+    /// padding (LLP 1130 D3). A row aligned by `scrollIntoView` or a focus
+    /// lands clear of it, as UIKit's `scrollToItem(at:at:animated:)` does.
+    /// Nothing moves now. Whether `view` is a mounted list.
+    pub fn set_list_covered(&mut self, view: ViewId, covered: [f64; 2]) -> bool {
+        match (self.links.lists, self.tree.as_mut()) {
+            (Some(lists), Some(tree)) => (lists.covered)(tree, view, covered),
+            _ => false,
+        }
     }
 
     /// `state.scrollIntoView`: each list's latest request, then refusals.
@@ -178,13 +194,15 @@ impl<D: DataSource> Runner<D> {
             ops = prefix;
         }
         let change = self.router_change()?;
+        // Each phase is prepared as `apply` prepares a commit: its `time` and
+        // `progress` nodes take their text and value in it, and the font rows
+        // it changes are read before it applies. A failure poisons the
+        // runner, so nothing is undone.
+        self.prepare_live_times(&mut ops);
+        let mut axes = self.prepare_text_axes(&ops);
+        let mut created = created_views(&ops);
         self.batch += 1;
-        let language = self.resolved_locale().to_owned();
-        let direction = if self.direction() == "rtl" {
-            exact_kernel::Direction::Rtl
-        } else {
-            exact_kernel::Direction::Ltr
-        };
+        let (language, direction) = self.document_facts();
         self.kernel
             .begin_document_commit(0, self.batch, &ops, Some((&language, direction)))?;
         let mut effects = CommitReceipt::default();
@@ -201,13 +219,16 @@ impl<D: DataSource> Runner<D> {
             // At most the outer and inner scroller of this request, in order.
             // This is a continuation of the command, not a convergence loop.
             while let Some(request) = step.take() {
-                let (phase, writes, work) = self.update_ops(false, |tree, u| {
+                let (mut phase, writes, work) = self.update_ops(false, |tree, u| {
                     status = match into_view {
                         Some(run) => run(tree, u, &request, &mut step)?,
                         None => IntoViewStatus::Refused("this artifact doesn't link lists".into()),
                     };
                     Ok(())
                 })?;
+                self.prepare_live_times(&mut phase);
+                axes = AxesBefore::join(axes, self.prepare_text_axes(&phase), &created);
+                created.extend(created_views(&phase));
                 self.kernel.continue_document_commit(&phase)?;
                 self.settle_into_view_phase(&mut effects);
                 notes.extend(std::mem::take(&mut self.notes));
@@ -226,8 +247,10 @@ impl<D: DataSource> Runner<D> {
             }
             statuses.push(status);
         }
-        let cleanup = self.reconcile_reorder()?;
+        let mut cleanup = self.reconcile_reorder()?;
         if !cleanup.is_empty() {
+            self.prepare_live_times(&mut cleanup);
+            axes = AxesBefore::join(axes, self.prepare_text_axes(&cleanup), &created);
             self.kernel.continue_document_commit(&cleanup)?;
             ops.extend(cleanup);
         }
@@ -244,6 +267,10 @@ impl<D: DataSource> Runner<D> {
         self.tally(&ops, &receipt.touched);
         for note in notes {
             self.log(note);
+        }
+        // The font rows' presented values (LLP 1019 §13 D10).
+        if let Some(tail) = self.settle_text_axes(axes, &receipt)? {
+            super::apply::take_tail(&mut receipt, tail);
         }
         if !self.kernel.is_detached() && self.ids.remembered() > 2 * self.kernel.live_count() + 256
         {
@@ -274,4 +301,14 @@ impl<D: DataSource> Runner<D> {
                 .filter_map(|view| self.kernel.arena().key_of(view)),
         );
     }
+}
+
+/// The views `ops` create.
+fn created_views(ops: &[exact_kernel::Op]) -> std::collections::BTreeSet<ViewId> {
+    (ops.iter())
+        .filter_map(|op| match op {
+            exact_kernel::Op::CreateView { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect()
 }

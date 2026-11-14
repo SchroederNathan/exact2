@@ -348,11 +348,6 @@ fn every_pattern_compiles_with_expected_diagnostics_and_its_tests_parse() {
             failures.extend(all.iter().map(at));
         }
         let warnings = contract::compile_path_all_warned(&path, false).1;
-        let warnings = if name == "one-screen" {
-            super::text_px_width::without_round_button_widths(warnings)
-        } else {
-            warnings
-        };
         failures.extend(warnings.iter().map(at));
         match std::fs::read_to_string(dir.join("app.test.contract")) {
             Ok(tests) => match contract::tests(&tests) {
@@ -380,8 +375,8 @@ fn every_pattern_compiles_with_expected_diagnostics_and_its_tests_parse() {
 }
 
 /// Each pattern, written by `bun exact.mjs pattern <name>` into one app
-/// `exact new` made, passes its own tests on the web: `test web`, or the
-/// command its pattern.json adds (rest's `api-test`, which starts its server).
+/// `exact new` made, passes its own tests on the web: `test web`, which
+/// runs the pattern's server (rest's, site's) for them.
 #[test]
 #[ignore = "async lane: makes an app with Bun and Cargo and drives every pattern's tests in Chrome; bun scripts/async.mjs runs it"]
 fn every_pattern_passes_its_tests_on_the_web() {
@@ -418,14 +413,9 @@ fn every_pattern_passes_its_tests_on_the_web() {
             failures.push(format!("pattern {name}: {said}"));
             continue;
         }
-        let verb = if dir.join("pattern.json").is_file() {
-            "api-test"
-        } else {
-            "test"
-        };
-        let (passed, said) = run(&app, &["exact.mjs", verb, "web"]);
+        let (passed, said) = run(&app, &["exact.mjs", "test", "web"]);
         if !passed {
-            failures.push(format!("{name} ({verb} web):\n{said}"));
+            failures.push(format!("{name} (test web):\n{said}"));
         }
     }
     let _ = std::fs::remove_dir_all(&parent);
@@ -556,4 +546,20 @@ fn wav() -> Vec<u8> {
     b.extend_from_slice(&data.to_le_bytes());
     b.resize(b.len() + data as usize, 0);
     b
+}
+
+#[test]
+fn content_design_readout_has_no_width_ceiling_warning() {
+    let block = blocks()
+        .into_iter()
+        .find(|b| b.doc.ends_with("recipes/content-design.md") && b.info == "contract")
+        .expect("content design readout");
+    let dir = std::env::temp_dir().join(format!("exact-content-design-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("app.contract");
+    std::fs::write(&path, block.body).unwrap();
+    let (result, warnings) = contract::compile_path_all_warned(&path, false);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert!(warnings.is_empty(), "{warnings:?}");
 }

@@ -4,14 +4,14 @@
 // timestamp the test supplies; a voice's playback rate and pan (LLP 1125
 // D10); a sequence's retraction before a voice starts, and its timed haptics
 // (LLP 1125 D3); the held voice of a `{0, 0}` timestamp; the Audio Session
-// API; and the drop before a user activation. Firefox and
-// WebKit come from Playwright (`bunx playwright@1.63.0 install firefox
-// webkit`), Chrome from the machine's; an engine that is missing is skipped.
+// API; and the drop before a user activation. Every engine comes from
+// Playwright (`bunx playwright@1.64.1 install chromium-headless-shell firefox
+// webkit`); an engine that is missing is skipped.
 import { afterAll, test, expect } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
-import { chromium as installed } from '../../../scripts/agent-launch.mjs';
+import { chromium as installed, suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { browserMissing } from '../../../scripts/agent-playwright.mjs';
 import { need } from '../../../scripts/coverage.mjs';
 
@@ -72,12 +72,12 @@ const engineTest = Object.fromEntries(await Promise.all(engines.map(async e => [
 async function launch(name) {
   const playwright = await import('playwright-core');
   if (name === 'chromium') {
-    const { executable, unavailable } = installed();
+    const { unavailable } = installed();
     if (unavailable) return null;
-    return playwright.chromium.launch({ executablePath: executable, headless: true, args: ['--autoplay-policy=user-gesture-required'] });
+    return suiteBrowser('chromium', { args: ['--autoplay-policy=user-gesture-required'] });
   }
   if (!existsSync(playwright[name].executablePath())) return null;
-  return playwright[name].launch({ headless: true });
+  return suiteBrowser(name);
 }
 
 // One browser per engine for this file, and a context of its own for each
@@ -163,9 +163,10 @@ for (const engine of engines) {
         return { last: last(rate), first: rate.findIndex(x => Math.abs(x) > 1e-4), mid: rate[13000],
           hardLeft: [left[frame(100)], right[frame(100)]], half: [left[frame(400)], right[frame(400)]], centre: [left[frame(700)], right[frame(700)]], lines: [...r.lines, ...s.lines] };
       });
-      expect(got.first).toBe(12000);
+      // A resampled voice's edges blur by a few frames: Firefox's resampler (playbackRate 2) spreads each by 4.
+      expect(Math.abs(got.first - 12000)).toBeLessThanOrEqual(4);
       expect(got.mid).toBeCloseTo(0.5, 3);
-      expect(Math.abs(got.last - 14399)).toBeLessThanOrEqual(2);
+      expect(Math.abs(got.last - 14399)).toBeLessThanOrEqual(4);
       expect(got.hardLeft[0]).toBeCloseTo(0.5, 3);
       expect(got.hardLeft[1]).toBeCloseTo(0, 3);
       expect(got.half[0]).toBeCloseTo(0.5 * Math.cos(0.75 * Math.PI / 2), 3);

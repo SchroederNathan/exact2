@@ -7,7 +7,12 @@ pub mod documents;
 pub mod envelope;
 pub mod image;
 mod mixed;
+pub mod modules;
 pub mod placed;
+pub mod presence;
+pub mod process;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod secrets;
 pub mod storage;
 pub use mixed::Mixed;
 pub use placed::Placed;

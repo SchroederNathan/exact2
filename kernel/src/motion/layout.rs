@@ -10,6 +10,8 @@ use exact_motion::{Change, Engine, Property, Value};
 #[derive(Debug, Default)]
 pub struct LayoutMotion {
     tracked: IdSet<NodeKey>,
+    /// The tracked boxes laid out in a block of their own when last seen.
+    blocked: IdSet<NodeKey>,
 }
 
 impl LayoutMotion {
@@ -37,6 +39,7 @@ impl LayoutMotion {
         // A renewed node is a new one (LLP 1078): no old box to move from.
         for key in receipt.destroyed.iter().chain(&receipt.renewed) {
             self.tracked.remove(key);
+            self.blocked.remove(key);
         }
         let mut retired = Vec::new();
         for key in receipt.created.iter().chain(&receipt.touched) {
@@ -48,8 +51,16 @@ impl LayoutMotion {
                     if let Some(value) = kernel.layout_box(*key) {
                         observe_box(engine, *key, value);
                     }
+                    // In the space that old box was in: crossing is from there.
+                    let blocked = kernel
+                        .node_by_key(*key)
+                        .is_some_and(|n| kernel.host_block(n.id).is_some());
+                    if blocked {
+                        self.blocked.insert(*key);
+                    }
                 }
             } else if self.tracked.remove(key) {
+                self.blocked.remove(key);
                 engine.remove_property(motion_node(*key), Property::Layout);
                 retired.push(*key);
             }
@@ -70,11 +81,11 @@ impl LayoutMotion {
         self.observe_as(kernel, key, engine, snap, false)
     }
 
-    /// Observe a box a list moved for no author: its window or a
-    /// measurement placed rows before it (LLP 1010). An idle box takes its
-    /// place with no transition, as UIKit's self-sizing does; the list keeps
-    /// what shows still by its scroll offset. One already moving still
-    /// moves.
+    /// Observe a box moved for no author: a list's window or a measurement
+    /// placed rows before it (LLP 1010), or a host's fact such as the text
+    /// size laid it out again (LLP 1063 D6). An idle box takes its place with
+    /// no transition, as UIKit's self-sizing does; a list keeps what shows
+    /// still by its scroll offset. One already moving still moves.
     pub fn observe_unauthored(
         &mut self,
         kernel: &Kernel,
@@ -121,7 +132,17 @@ impl LayoutMotion {
                 continue;
             };
             self.tracked.insert(key);
-            if snap && engine.remove_property(node, Property::Layout) {
+            // A box moving into its block or out of it (a popover set or
+            // cleared: stage 14 B) changes spaces, not place: it snaps.
+            let blocked = kernel
+                .node_by_key(key)
+                .is_some_and(|n| kernel.host_block(n.id).is_some());
+            let crossed = if blocked {
+                self.blocked.insert(key)
+            } else {
+                self.blocked.remove(&key)
+            };
+            if (snap || crossed) && engine.remove_property(node, Property::Layout) {
                 retired.push(key);
             }
             if unauthored {
@@ -152,6 +173,15 @@ impl LayoutMotion {
             .flat_map(|key| self.observe(kernel, key, engine, snap))
             .collect()
     }
+
+    /// [`LayoutMotion::observe_all`] for a layout a host's fact caused, not an
+    /// app's commit: each box as [`LayoutMotion::observe_unauthored`] takes it.
+    pub fn observe_all_unauthored(&mut self, kernel: &Kernel, engine: &mut Engine) -> Vec<NodeKey> {
+        let keys: Vec<_> = self.tracked.iter().copied().collect();
+        keys.into_iter()
+            .flat_map(|key| self.observe_unauthored(kernel, key, engine))
+            .collect()
+    }
 }
 
 fn declares(kernel: &Kernel, key: NodeKey) -> bool {
@@ -174,21 +204,17 @@ fn observe_box(engine: &mut Engine, key: NodeKey, value: Value) {
     debug_assert!(observed.is_ok(), "layout is finite");
 }
 
-/// A presented box's offset from its laid-out origin and scale of its
-/// surface size. Content retains its laid-out geometry.
+/// A presented box as `[dx, dy, dw, dh]`: its offset from the laid-out
+/// origin, and how far its surface's size, never below zero (a spring can
+/// overshoot it), stands from the laid-out size. Identity is all zeros.
+/// Content retains its laid-out geometry. A difference rather than a ratio,
+/// so a box laid out at zero size still shows the size it closes from.
 pub fn layout_presented(engine: &Engine, node: u64, shown: Value) -> [f64; 4] {
     let at = engine.target(node, Property::Layout).unwrap_or(shown);
-    let scale = |shown: f64, laid: f64| {
-        if laid > 0.0 {
-            shown.max(0.0) / laid
-        } else {
-            1.0
-        }
-    };
     [
         shown.x - at.x,
         shown.y - at.y,
-        scale(shown.z, at.z),
-        scale(shown.w, at.w),
+        shown.z.max(0.0) - at.z,
+        shown.w.max(0.0) - at.w,
     ]
 }

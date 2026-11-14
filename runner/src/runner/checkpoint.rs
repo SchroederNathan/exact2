@@ -1,7 +1,7 @@
 //! A rendered document's checkpoint (LLP 1048.000 D6): the answers the
 //! document was projected from, handed to the runtime as an input of their
 //! own — not the store, not kept answers, not a reload's carried state.
-use super::{DataSource, ResourceState, Runner, RunnerError};
+use super::{DataSource, ResourceState, Runner, RunnerError, Target};
 use crate::delivery::Delivery;
 use crate::Store;
 use exact_kernel::Kernel;
@@ -22,6 +22,10 @@ pub struct Checkpoint {
     pub answers: Vec<(String, String, Vec<Value>, Value)>,
     /// What was still pending then, and rendered its placeholder.
     pub pending: Vec<String>,
+    /// The answered resources whose stream was still open (LLP 1016.000
+    /// D5): the runtime shows each one's answer and asks it again, which
+    /// subscribes the runtime to it.
+    pub open: Vec<String>,
 }
 
 impl<D: DataSource> Runner<D> {
@@ -33,7 +37,8 @@ impl<D: DataSource> Runner<D> {
     /// starts at the render time; the host's clock and store then apply as
     /// ordinary updates. A store-reading resource the render answered is
     /// asked again when the device's store holds the app's own entries,
-    /// showing the rendered answer meanwhile: the render had no store.
+    /// showing the rendered answer meanwhile: the render had no store. So
+    /// is an open stream's: the render's stream ended with the render.
     #[allow(clippy::too_many_arguments)] // the host boot facts
     pub fn boot_checkpoint(
         plan: Plan,
@@ -87,16 +92,36 @@ impl<D: DataSource> Runner<D> {
 
     /// What a document projected from this runner now was projected from
     /// (LLP 1048.000 D6): every answer of the app's sources, the location,
-    /// the clock, and what is still pending. The runner's own facts
-    /// (delivery, the viewport, surface records) are the runtime's to
-    /// answer, never a checkpoint's.
+    /// the clock, what is still pending, and the open streams. The runner's
+    /// own facts (delivery, the viewport, surface records) are the runtime's
+    /// to answer, never a checkpoint's, and so are a module's names: a render
+    /// answers them from the web's declaration, never the reader's device
+    /// (a battery, a permission's status), and a seeded answer is not asked
+    /// again, so the device would never be read.
     pub fn document_checkpoint(&self, location: &str) -> Checkpoint {
-        let mut pending: Vec<String> = self.pending().into_iter().map(|(name, _)| name).collect();
-        let mut answers = Vec::new();
+        let mut pending: Vec<String> = (self.pending().into_iter())
+            .filter(|(_, ticket)| !self.is_open_stream(*ticket))
+            .map(|(name, _)| name)
+            .collect();
+        // Take an element's open stream as its list's: a list's elements
+        // are never listed, and asking the list again asks each of them.
+        let open_rows: Vec<usize> = (self.pending.iter())
+            .filter(|p| !p.in_flight())
+            .filter_map(|p| match p.target {
+                Target::Resource(i) => Some(self.member(i).map_or(i, |m| m.family)),
+                Target::Mutation(_) => None,
+            })
+            .collect();
+        let (mut answers, mut open) = (Vec::new(), Vec::new());
+        let declared = self.declared_resources().len();
         for (i, (row, state)) in self.plan.resources.iter().zip(&self.resources).enumerate() {
+            // An element's answer is asked again by its list's page.
+            if i >= declared {
+                break;
+            }
             let name = self.plan.str(row.name);
             let source = self.plan.str(row.source);
-            if exact_plan::runner_owned_source(source) {
+            if self.device_answers(source) {
                 continue;
             }
             if self.stale[i] {
@@ -115,6 +140,9 @@ impl<D: DataSource> Runner<D> {
                     state.args.clone(),
                     state.value.get(&self.plan).clone(),
                 ));
+                if open_rows.contains(&i) {
+                    open.push(name.to_string());
+                }
             }
         }
         Checkpoint {
@@ -123,22 +151,27 @@ impl<D: DataSource> Runner<D> {
             logic: self.data.revision().map(str::to_owned),
             answers,
             pending,
+            open,
         }
     }
 
     /// Seed each resource `checkpoint` answered (see [`Runner::boot_checkpoint`]).
-    /// Returns which rows it seeded, and the journal's line for it, which
-    /// boot writes after its own.
-    pub(super) fn seed_checkpoint(&mut self, checkpoint: &Checkpoint) -> (Vec<bool>, String) {
+    /// Returns which rows it seeded, those of them whose stream was open,
+    /// and the journal's line for it, which boot writes after its own.
+    pub(super) fn seed_checkpoint(
+        &mut self,
+        checkpoint: &Checkpoint,
+    ) -> (Vec<bool>, Vec<usize>, String) {
         let mut seeded = vec![false; self.plan.resources.len()];
+        let mut open = Vec::new();
         if checkpoint.logic.as_deref() != self.data.revision() {
             let note = "checkpoint: other logic answered it; its answers are asked again";
-            return (seeded, note.into());
+            return (seeded, open, note.into());
         }
         for (i, seed) in seeded.iter_mut().enumerate() {
             let row = &self.plan.resources[i];
             let (name, source) = (self.plan.str(row.name), self.plan.str(row.source));
-            if self.resources[i].is_some() || exact_plan::runner_owned_source(source) {
+            if self.resources[i].is_some() || self.device_answers(source) {
                 continue;
             }
             let Some((_, _, args, value)) = checkpoint
@@ -152,6 +185,7 @@ impl<D: DataSource> Runner<D> {
                 continue;
             }
             self.resources[i] = Some(ResourceState {
+                inspection_generation: 0,
                 args: args.clone(),
                 value: crate::held::Held::new(value.clone()),
                 store_revision: self.store.revision(),
@@ -161,10 +195,19 @@ impl<D: DataSource> Runner<D> {
                 origin: 0,
             });
             *seed = true;
+            if checkpoint.open.iter().any(|n| n == name) {
+                open.push(i);
+            }
         }
         let taken = seeded.iter().filter(|s| **s).count();
         let note = super::lines::seeded(taken, checkpoint.answers.len());
-        (seeded, note)
+        (seeded, open, note)
+    }
+
+    /// Whether the runtime answers `source`, never a checkpoint: the
+    /// runner's own facts and a module's names.
+    fn device_answers(&self, source: &str) -> bool {
+        exact_plan::runner_owned_source(source) || self.plan.module_named(source).is_some()
     }
 
     /// Whether the store holds the app's own entries, not only the

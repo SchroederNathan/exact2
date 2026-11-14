@@ -57,6 +57,7 @@ fn tree_rows<D: DataSource>(
     ids(roots, &mut s);
     s.push_str(",\"nodes\":[");
     let handlers = (rows.len() != 1).then(|| runner.handlers());
+    let activity = crate::head::activity(kernel, &runner.roots());
     let mut first = true;
     for row in rows {
         let Some(node) = kernel.node(row.id) else {
@@ -76,7 +77,7 @@ fn tree_rows<D: DataSource>(
         let _ = write!(s, ",\"depth\":{},\"type\":", row.depth);
         quote(node.node_type.name(), &mut s);
         if plan {
-            if let Some((site, _)) = runner.site_of(node.id) {
+            if let Some(site) = runner.plan_site_of(node.id) {
                 let _ = write!(s, ",\"site\":{}", site.0);
             }
         }
@@ -97,11 +98,24 @@ fn tree_rows<D: DataSource>(
             quote(e.name(), &mut s);
         }
         s.push(']');
-        if runner.inactive(node.id) {
+        let (inactive, hidden) = activity.get(&node.id).copied().unwrap_or_default();
+        if inactive {
             s.push_str(",\"inactive\":true");
+            // LLP 1153 D8: `hidden` where no host shows the route (every
+            // inactive one but a page a sheet covers), so an agent reading
+            // the tree sees which screen shows.
+            if hidden {
+                s.push_str(",\"hidden\":true");
+            }
         }
         if runner.unopened_tabs().contains(&node.id) {
             s.push_str(",\"unopened\":true");
+        }
+        // A status item is placed in the menu bar or tray, not the window,
+        // where the target has one (LLP 1133.025 D4); `tap` reaches it the
+        // same. Elsewhere the button is an ordinary button.
+        if runner.places_status_items() && crate::desktop::presents(node.props, "status") {
+            s.push_str(",\"presented\":\"status\"");
         }
         s.push_str(",\"children\":");
         ids(&node.children(), &mut s);

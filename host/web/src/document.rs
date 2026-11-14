@@ -32,16 +32,22 @@ use super::{layers, Host};
 
 #[path = "document_url.rs"]
 mod document_url;
-pub use document_url::{frame_navigable, navigable};
+pub use document_url::{frame_app_source, frame_navigable, navigable};
 
+#[path = "document_bars.rs"]
+mod bars;
+#[path = "document_markup.rs"]
+mod markup;
 #[path = "page.rs"]
 mod page;
 use crate::css;
+use bars::bar_header;
 use exact_kernel::paint_order::{self, Child, Facts};
-use exact_kernel::SortedMap;
-use exact_kernel::{NodeFacts, PropId, ViewId};
+use exact_kernel::{NodeFacts, PropId, SortedMap, SortedSet, ViewId};
 use exact_plan::EventKind;
 use exact_runner::{DataSource, DocTree, Runner};
+pub use markup::dataset;
+use markup::{markup_pieces, Json};
 pub use page::{
     build_locations, canonical_location, checkpoint, digest, read_checkpoint, route_at,
     route_location, Site,
@@ -101,14 +107,20 @@ impl<D: DataSource> Host<D> {
 
 /// The document of `runner`'s current tree.
 pub fn project<D: DataSource>(runner: &Runner<D>) -> Result<Document, DocumentError> {
-    walk(runner, None).map(|(document, _)| document)
+    walk(runner, None, true).map(|(document, _)| document)
+}
+
+/// [`project`], with the JavaScript template's conditional text-style fills
+/// (LLP 1115.000 D12.2), so its static styles can become classes at adoption.
+pub fn project_for_js<D: DataSource>(runner: &Runner<D>) -> Result<Document, DocumentError> {
+    walk(runner, None, false).map(|(document, _)| document)
 }
 
 /// [`project`], and what it computed for each view, for the first batch.
 pub(crate) fn project_keeping<D: DataSource>(
     runner: &Runner<D>,
 ) -> Result<(Document, Computed), DocumentError> {
-    walk(runner, Some(Computed::new())).map(|(document, computed)| {
+    walk(runner, Some(Computed::new()), true).map(|(document, computed)| {
         let mut computed = computed.unwrap_or_default();
         computed.reverse();
         (document, computed)
@@ -119,25 +131,61 @@ pub(crate) fn project_keeping<D: DataSource>(
 /// holds without one ([`DocTree`], LLP 1048.004). One walk writes both, so
 /// the two documents differ only where the trees do.
 pub trait Source {
+    /// Whether CSS must resolve text-style fills after the document is adopted.
+    fn js_styles(&self) -> bool {
+        true
+    }
     /// The facts of node `id`, when it is live.
     fn facts(&self, id: ViewId) -> Option<NodeFacts<'_>>;
     /// Its children, in order.
     fn children(&self, id: ViewId) -> Cow<'_, [ViewId]>;
     /// The element an SVG reference from `from` names.
     fn resolve(&self, from: ViewId, id: &str) -> Option<ViewId>;
+    /// `style`, node `id`'s, with the weight and leading a text style named
+    /// on it gives the wasm host (LLP 1115.000 D12.2). JavaScript's fills
+    /// are written from the node's facts instead.
+    fn with_style_rows<'s>(
+        &self,
+        _id: ViewId,
+        style: Cow<'s, exact_kernel::StyleProps>,
+    ) -> Cow<'s, exact_kernel::StyleProps> {
+        style
+    }
 }
 
-struct KernelSource<'k>(&'k exact_kernel::Kernel);
+/// A kernel's tree; `bare`: the live wasm host's resolved text-style fills.
+struct KernelSource<'k> {
+    kernel: &'k exact_kernel::Kernel,
+    bare: bool,
+}
 
 impl Source for KernelSource<'_> {
+    fn js_styles(&self) -> bool {
+        !self.bare
+    }
     fn facts(&self, id: ViewId) -> Option<NodeFacts<'_>> {
-        self.0.node(id).map(|n| n.facts())
+        self.kernel.node(id).map(|n| n.facts())
     }
     fn children(&self, id: ViewId) -> Cow<'_, [ViewId]> {
-        Cow::Owned(self.0.node(id).map(|n| n.children()).unwrap_or_default())
+        Cow::Owned(
+            self.kernel
+                .node(id)
+                .map(|n| n.children())
+                .unwrap_or_default(),
+        )
     }
     fn resolve(&self, from: ViewId, id: &str) -> Option<ViewId> {
-        self.0.resolve_id(from, id)
+        self.kernel.resolve_id(from, id)
+    }
+    fn with_style_rows<'s>(
+        &self,
+        id: ViewId,
+        style: Cow<'s, exact_kernel::StyleProps>,
+    ) -> Cow<'s, exact_kernel::StyleProps> {
+        match self.kernel.node(id) {
+            Some(node) if self.bare => super::element::with_style_rows(style, &node),
+            _ => style,
+        }
     }
 }
 
@@ -190,11 +238,17 @@ pub fn project_tree<D: DataSource>(
             exact_runner::press_writes_router(runner.plan(), n.site?).map(|writes| (n.id, writes))
         })
         .collect();
+    let lazy = |id: ViewId| {
+        tree.node(id)
+            .and_then(|n| n.site)
+            .is_some_and(|site| exact_runner::rows::repeated(runner.plan(), site))
+    };
     let (out, keyframes, scroll_document, _, sent) = write(
         tree,
         tree.roots(),
         handlers,
         presses,
+        &lazy,
         font_names_for_runner(runner),
         None,
         writing,
@@ -244,20 +298,30 @@ fn first_prop<S: Source>(src: &S, roots: &[ViewId], id: PropId) -> Option<String
 fn walk<D: DataSource>(
     runner: &Runner<D>,
     computed: Option<Computed>,
+    bare: bool,
 ) -> Result<(Document, Option<Computed>), DocumentError> {
     let _roles = runner.bind_roles(); // Its own (LLP 1121 stage 5).
-    let src = KernelSource(runner.kernel());
+    let src = KernelSource {
+        kernel: runner.kernel(),
+        bare,
+    };
     let roots = runner.roots();
     let handlers = runner.handlers();
     let presses = handlers
         .keys()
         .filter_map(|id| runner.press_writes_router(*id).map(|writes| (*id, writes)))
         .collect();
+    let lazy = |id: ViewId| {
+        runner
+            .site_of(id)
+            .is_some_and(|(site, _)| exact_runner::rows::repeated(runner.plan(), site))
+    };
     let (out, keyframes, scroll_document, computed, _) = write(
         &src,
         &roots,
         handlers,
         presses,
+        &lazy,
         font_names_for_runner(runner),
         computed,
         Writing::default(),
@@ -278,12 +342,13 @@ fn walk<D: DataSource>(
 /// The roots' elements; the `@keyframes`, whether an element is the page's
 /// scroller, what was computed, and what of the HTML the sink has not been
 /// handed yet.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn write<S: Source>(
     src: &S,
     roots: &[ViewId],
     handlers: SortedMap<ViewId, Vec<EventKind>>,
     presses: SortedMap<ViewId, bool>,
+    lazy: &dyn Fn(ViewId) -> bool,
     fonts: Vec<String>,
     computed: Option<Computed>,
     writing: Writing<'_>,
@@ -295,19 +360,31 @@ fn write<S: Source>(
         fonts,
         handlers,
         presses,
+        lazy,
         routes: SortedMap::new(),
+        bars: SortedSet::new(),
+        sites: SortedSet::new(),
         keyframes: SortedMap::new(),
         out: String::new(),
         links: 0,
         buttons: 0,
+        hidden: 0,
         touch: 0,
         select: None,
         scroll_document: false,
+        page: SortedSet::new(),
         css: std::collections::HashMap::new(),
         style: writing.style,
         sink: writing.sink,
         sent: 0,
     };
+    let mut live = Vec::new();
+    for root in roots {
+        walk.page_scrollers(*root, false, &mut Vec::new(), &mut live);
+    }
+    if let [path] = &live[..] {
+        walk.page = path.iter().copied().collect();
+    }
     for root in roots {
         walk.element(*root, None, 16., false)?;
     }
@@ -506,7 +583,14 @@ struct Walk<'r, 'w, S: Source> {
     fonts: Vec<String>,
     handlers: SortedMap<ViewId, Vec<EventKind>>,
     presses: SortedMap<ViewId, bool>,
+    /// Whether an image's view is a row's, which loads as the row comes into
+    /// view (`loading="lazy"`, LLP 1048.007 D5, as the JS build writes it).
+    lazy: &'r dyn Fn(ViewId) -> bool,
     routes: SortedMap<ViewId, Route>,
+    /// The headers marked as their route's bar ([`bar_header`]).
+    bars: SortedSet<ViewId>,
+    /// The routes' headers marked as a site's ([`bars::site_header`]).
+    sites: SortedSet<ViewId>,
     keyframes: SortedMap<String, String>,
     out: String,
     /// Open `a` and `button` elements: the parser closes an open one when a
@@ -516,9 +600,14 @@ struct Walk<'r, 'w, S: Source> {
     /// Open boxes that restrict touch (`element::restricts_touch`): a folded
     /// text under one is an inline box.
     touch: u32,
+    /// Open routes `navigation.project` hides.
+    hidden: u32,
     /// The open `select`'s value: the option that carries it is `selected`.
     select: Option<String>,
     scroll_document: bool,
+    /// The page's scroller's ancestors while one element is it:
+    /// `data-exact-frame` (host/web-js/document.js `markDocument`).
+    page: SortedSet<ViewId>,
     /// A shared style's CSS, by the style's address: the nodes of a
     /// repeated template share one style, and its CSS is computed once.
     css: std::collections::HashMap<usize, String>,
@@ -562,21 +651,43 @@ impl<S: Source> Walk<'_, '_, S> {
         }
         let resolve = |from: ViewId, target: &str| src.resolve(from, target);
         let mut props = props_of(&node);
+        // A decoration's and an atom kind's paint rows as CSS text by name (LLP 1114.007, 1045.000 D3).
+        for name in ["data-decoration-styles", "data-atom-styles"] {
+            if let Some(raw) = props.get(name) {
+                let css = crate::css::decoration_styles(raw, &self.fonts);
+                props.insert(name.into(), css);
+            }
+        }
         super::element::router_press(&mut props, self.presses.get(&id).copied());
         svg_props_of(&resolve, &node, &mut props);
-        self.scroll_document |= props
+        // A page scroller in a route `navigation.project` hides is off the
+        // page (`markDocument`): an inner scroller, not the document's.
+        let route_hidden = self.routes.get(&id).is_some_and(|r| r.hidden);
+        let page_scroller = props
             .get("data-scrolldocument")
             .is_some_and(|v| v == "true");
-        let text = match css_style_of(&resolve, &node) {
+        let offpage = page_scroller && (route_hidden || self.hidden > 0);
+        self.scroll_document |= page_scroller && !offpage;
+        let mut text = match src.with_style_rows(id, css_style_of(&resolve, &node)) {
             Cow::Borrowed(style) => {
                 let fonts = &self.fonts;
                 self.css
                     .entry(style as *const exact_kernel::StyleProps as usize)
-                    .or_insert_with(|| css::css_text(style, fonts).0)
+                    .or_insert_with(|| {
+                        if src.js_styles() {
+                            css::css_text_relative(style, fonts).0
+                        } else {
+                            css::css_text(style, fonts).0
+                        }
+                    })
                     .clone()
             }
+            Cow::Owned(style) if src.js_styles() => css::css_text_relative(&style, &self.fonts).0,
             Cow::Owned(style) => css::css_text(&style, &self.fonts).0,
         };
+        if src.js_styles() {
+            css::text_style::fills(&node, &mut text);
+        }
         animations(node.style, &mut self.keyframes);
         let children = src.children(id);
         let paint = self.isolation.get(&id).copied().unwrap_or_default();
@@ -596,12 +707,14 @@ impl<S: Source> Walk<'_, '_, S> {
                 self.touch > 0,
             ),
             holds,
+            &node,
         );
         let mut style = layers::with_isolation(css, isolated);
         let kept = self.computed.is_some().then(|| style.clone());
         // `glue.js` create: a canvas is a `div` holding the surface element.
         let element = if tag == "canvas" { "div" } else { tag };
         self.route_children(&node, &children);
+        bars::mark_sites(self.src, &node, &children, &mut self.sites);
         let chosen = (element == "select").then(|| props.get("value").cloned());
         // A waiting keyed row is opaque to adoption. Its complete paint
         // summary lets the JS target decide siblings without visiting it.
@@ -650,11 +763,16 @@ impl<S: Source> Walk<'_, '_, S> {
                 // Browser-owned state the glue keeps in JavaScript.
                 "scrollFollowEnd" | "scrollTop" | "scrollLeft" | "autofocus" => {}
                 // A sized, transparent source supplies the natural box before
-                // JavaScript. The live renderer adds the portable role's mask.
+                // JavaScript, as the live renderer sizes it (`symbol-scale`
+                // ems for a symbol drawn for an SF Symbol, neutral.css). The
+                // live renderer adds the portable role's mask.
                 "src" if element == "img" && value.starts_with("symbol:") => {
+                    let drawn = props.get("data-symbol-path").is_some_and(|d| !d.is_empty())
+                        && !value.starts_with("symbol:icon||");
+                    let size = f64::from(font) * if drawn { symbol_scale() } else { 1.0 };
                     attrs.push((
                         name.clone(),
-                        Some(format!("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='{font}' height='{font}'/%3E")),
+                        Some(format!("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}'/%3E")),
                     ));
                 }
                 // `el.textContent = value` while it has no element children:
@@ -702,7 +820,7 @@ impl<S: Source> Walk<'_, '_, S> {
                 // `navigates` + `navigableURL`, `frameURL`: a refused link
                 // loses its href; a refused frame shows about:blank.
                 "href" if !navigable(value) => {}
-                "src" if element == "iframe" && value.starts_with("app:/") => {
+                "src" if element == "iframe" && frame_app_source(value) => {
                     attrs.push(("data-app-src".into(), Some(value.clone())));
                 }
                 "src"
@@ -727,6 +845,21 @@ impl<S: Source> Walk<'_, '_, S> {
             if route.inert && !attrs.iter().any(|(n, _)| n == "inert") {
                 attrs.push(("inert".into(), None));
             }
+        }
+        if offpage {
+            attrs.push(("data-exact-offpage".into(), None));
+        }
+        if self.page.contains(&id) {
+            attrs.push(("data-exact-frame".into(), None));
+        }
+        if self.bars.contains(&id) {
+            attrs.push(("data-exact-bar".into(), None));
+        }
+        if self.sites.contains(&id) {
+            attrs.push(("data-exact-site".into(), None));
+        }
+        if element == "img" && (self.lazy)(id) {
+            attrs.push(("loading".into(), Some("lazy".into())));
         }
         // `attach`: the view id, and a tab stop for an element that hears
         // focus, blur or keys and is not one already.
@@ -762,7 +895,16 @@ impl<S: Source> Walk<'_, '_, S> {
         if !style.is_empty() {
             attrs.push(("style".into(), Some(style)));
         }
-        attrs.push(("data-exact-paint".into(), Some(format!("[{flags},{z}]"))));
+        // `paintWait` takes a summary left out as the template facts with no
+        // z-index, which it is in most elements.
+        let said = attrs
+            .iter()
+            .filter(|(n, _)| n == "data-exact-f" || n.starts_with("data-exact-f-"))
+            .filter_map(|(_, v)| v.as_deref()?.parse::<u16>().ok())
+            .fold(0, |bits, f| bits | f);
+        if flags != said || z != "null" {
+            attrs.push(("data-exact-paint".into(), Some(format!("[{flags},{z}]"))));
+        }
         self.open(id, element, &attrs)?;
         if matches!(element, "img" | "input" | "hr") {
             // Void: no content, no end tag.
@@ -798,15 +940,50 @@ impl<S: Source> Walk<'_, '_, S> {
         self.buttons += u32::from(button);
         let touch = restricts_touch(&node);
         self.touch += u32::from(touch);
+        self.hidden += u32::from(route_hidden);
         let outer = chosen.map(|value| std::mem::replace(&mut self.select, value));
         let only = children.len() == 1;
+        let list = node.node_type == exact_kernel::NodeType::List
+            && node.props.bool(PropId::Virtualized) != Some(true);
         for child in children.iter().copied() {
+            let item = if list {
+                src.facts(child)
+                    .filter(|c| !c.node_type.is_metadata())
+                    .map(|c| {
+                        let role = if node
+                            .props
+                            .str(PropId::AccessibilityRole)
+                            .is_some_and(|r| !role_is(r, "list") && !role_is(r, "directory"))
+                            || c.props
+                                .str(PropId::AccessibilityRole)
+                                .is_some_and(|r| role_is(r, "listitem"))
+                        {
+                            "presentation"
+                        } else {
+                            "listitem"
+                        };
+                        // Top layers do not count as modal-card body rows (navigation.js).
+                        let layer = tag_of(&c, self.buttons > 0) == "dialog"
+                            || c.props.str(PropId::Popover).is_some();
+                        (role, if layer { "layer" } else { "" })
+                    })
+            } else {
+                None
+            };
+            if let Some((role, marker)) = item {
+                self.out.push_str(&format!(
+                    "<div role=\"{role}\" data-exact-list-item=\"{marker}\" style=\"display:contents\">"
+                ));
+            }
             let handled = self.handlers.get(&child).is_some_and(|k| !k.is_empty());
             let fold = only
                 && src
                     .facts(child)
                     .is_some_and(|c| folds(&c, &node, above.as_ref(), true, handled));
             self.element(child, Some(id), font, fold)?;
+            if item.is_some() {
+                self.out.push_str("</div>");
+            }
         }
         if let Some(outer) = outer {
             self.select = outer;
@@ -814,6 +991,7 @@ impl<S: Source> Walk<'_, '_, S> {
         self.links -= u32::from(link);
         self.buttons -= u32::from(button);
         self.touch -= u32::from(touch);
+        self.hidden -= u32::from(route_hidden);
         self.out.push_str("</");
         self.out.push_str(element);
         self.out.push('>');
@@ -871,6 +1049,40 @@ impl<S: Source> Walk<'_, '_, S> {
         Ok(())
     }
 
+    /// Each path from the roots to an element that is a page scroller on the
+    /// page, not in a hidden route, as the walk will find them: found
+    /// before any opening tag streams, marking the routes as it goes.
+    fn page_scrollers(
+        &mut self,
+        id: ViewId,
+        hidden: bool,
+        path: &mut Vec<ViewId>,
+        live: &mut Vec<Vec<ViewId>>,
+    ) {
+        let src = self.src;
+        let Some(node) = src.facts(id) else { return };
+        if node.node_type.is_metadata() {
+            return;
+        }
+        let hidden = hidden || self.routes.get(&id).is_some_and(|r| r.hidden);
+        if !hidden
+            && !matches!(
+                node.node_type,
+                exact_kernel::NodeType::SvgFe | exact_kernel::NodeType::SvgFilter
+            )
+            && node.props.bool(PropId::ScrollDocument) == Some(true)
+        {
+            live.push(path.clone());
+        }
+        let children = src.children(id);
+        self.route_children(&node, &children);
+        path.push(id);
+        for child in children.iter().copied() {
+            self.page_scrollers(child, hidden, path, live);
+        }
+        path.pop();
+    }
+
     /// Mark the routes under a navigation root as `navigation.project` does;
     /// with tabs, as the `tabs` capability does ([`tab_routes`]).
     fn route_children(&mut self, node: &NodeFacts<'_>, children: &[ViewId]) {
@@ -882,6 +1094,9 @@ impl<S: Source> Walk<'_, '_, S> {
         if let Some(tabs) = crate::link::linked().tabs {
             for (id, hidden, inert) in tabs(src, children, key) {
                 self.routes.insert(id, Route { hidden, inert });
+                if let Some(header) = bar_header(src, &self.handlers, id) {
+                    self.bars.insert(header);
+                }
             }
             return;
         }
@@ -899,6 +1114,9 @@ impl<S: Source> Walk<'_, '_, S> {
         };
         let modal = routes[selected].props.str(PropId::NavigationPresentation) == Some("modal");
         for (index, route) in routes.iter().enumerate() {
+            if let Some(header) = bar_header(src, &self.handlers, route.id) {
+                self.bars.insert(header);
+            }
             let active = index == selected;
             let shown = active || (modal && index + 1 == selected);
             self.routes.insert(
@@ -951,6 +1169,9 @@ impl<S: Source> Walk<'_, '_, S> {
             }
             let element = if link { "a" } else { "span" };
             let mut attrs = Vec::new();
+            if let Some(kind) = &piece.atom {
+                attrs.push(("data-exact-atom".to_owned(), Some(kind.clone())));
+            }
             if !style.is_empty() {
                 attrs.push(("style".to_owned(), Some(style)));
             }
@@ -1031,6 +1252,16 @@ const SURFACE: &str = "<canvas data-surface=\"\" style=\"position:absolute;inset
 const SURFACE_STYLE: &str =
     "position:absolute;inset:0;width:100%;height:100%;display:block;z-index:-1";
 
+/// The neutral look's `symbol-scale`: the browser always shows that look.
+fn symbol_scale() -> f64 {
+    use exact_kernel::generated::{metric, METRICS};
+    use exact_kernel::style::metrics::{value, Column};
+    match value(&METRICS[metric::SYMBOL_SCALE], Column::Neutral) {
+        exact_kernel::MetricValue::Number(n) => n,
+        _ => 1.0,
+    }
+}
+
 /// Append `text` escaped for HTML text (`attribute` false) or a
 /// double-quoted attribute value. A carriage return is a reference (the
 /// parser folds a literal one into a newline); a NUL has no spelling the
@@ -1057,179 +1288,62 @@ fn escape(out: &mut String, text: &str, attribute: bool) -> Result<(), &'static 
     Ok(())
 }
 
-/// One piece of `markupPieces`, as the page reads it: numbers keep the
-/// spelling the glue's template literals would give them.
-#[derive(Debug, Clone, PartialEq)]
-struct Piece {
-    text: String,
-    scale: String,
-    weight: String,
-    flags: u8,
-    href: String,
-    /// A list item's indent, CSS px; "0" outside a list.
-    indent: String,
-}
-
-/// Read the host's own `markupPieces` back (`[[text, scale, weight, flags,
-/// href, indent?], …]`), as the linked Markdown capability wrote them; anything else
-/// is a defect.
-fn markup_pieces(json: &str) -> Result<Vec<Piece>, String> {
-    let mut p = Json::new(json);
-    let mut pieces = Vec::new();
-    p.expect(b'[')?;
-    if p.peek() == Some(b']') {
-        return Ok(pieces);
+// Resolve the first concrete ARIA role before supplying item semantics; navigation.js has the same vocabulary.
+// https://www.w3.org/TR/wai-aria-1.3/#host_general_role
+// https://www.w3.org/TR/dpub-aria-1.1/ and https://www.w3.org/TR/graphics-aria-1.0/
+fn role_is(value: &str, wanted: &str) -> bool {
+    let mut words = value
+        .split(['\t', '\n', '\x0c', '\r', ' '])
+        .filter(|r| !r.is_empty());
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if first.eq_ignore_ascii_case(wanted) {
+        return true;
     }
-    loop {
-        p.expect(b'[')?;
-        let text = p.string()?;
-        p.expect(b',')?;
-        let scale = p.number()?;
-        p.expect(b',')?;
-        let weight = p.number()?;
-        p.expect(b',')?;
-        let flags = p.number()?.parse::<u8>().map_err(|e| e.to_string())?;
-        p.expect(b',')?;
-        let href = p.string()?;
-        let indent = if p.peek() == Some(b',') {
-            p.next();
-            p.number()?
-        } else {
-            "0".to_owned()
-        };
-        p.expect(b']')?;
-        pieces.push(Piece {
-            text,
-            scale,
-            weight,
-            flags,
-            href,
-            indent,
-        });
-        match p.next() {
-            Some(b',') => continue,
-            Some(b']') => return Ok(pieces),
-            other => return Err(format!("markup pieces: unexpected {other:?}")),
-        }
-    }
-}
-
-/// A `dataset` row's pairs, the `dataset` capability's reading (LLP 1075.003
-/// §3.3): the runner's object of strings (`NativeProps`,
-/// LLP 1024 §9), written without whitespace and with JSON's escapes for
-/// `"`, `\\` and control characters only. Anything else yields what it
-/// parsed so far.
-pub fn dataset(json: &str) -> Vec<(String, String)> {
-    let mut p = Json::new(json);
-    let mut pairs = Vec::new();
-    if p.expect(b'{').is_err() {
-        return pairs;
-    }
-    while p.peek() == Some(b'"') {
-        let Ok(key) = p.string() else { break };
-        let (Ok(()), Ok(value)) = (p.expect(b':'), p.string()) else {
-            break;
-        };
-        pairs.push((key, value));
-        if p.peek() == Some(b',') {
-            p.next();
-        }
-    }
-    pairs
-}
-
-/// A reader of the JSON the host and the runner write themselves: the
-/// `markupPieces`, and a `dataset` row ([`dataset`]).
-struct Json<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Json<'a> {
-    fn new(text: &'a str) -> Self {
-        Json {
-            bytes: text.as_bytes(),
-            at: 0,
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.at).copied()
-    }
-
-    fn next(&mut self) -> Option<u8> {
-        let b = self.peek();
-        self.at += 1;
-        b
-    }
-
-    fn expect(&mut self, b: u8) -> Result<(), String> {
-        match self.next() {
-            Some(got) if got == b => Ok(()),
-            got => Err(format!(
-                "markup pieces: expected `{}`, found {got:?}",
-                b as char
-            )),
-        }
-    }
-
-    fn number(&mut self) -> Result<String, String> {
-        let start = self.at;
-        while matches!(
-            self.peek(),
-            Some(b'0'..=b'9' | b'.' | b'-' | b'e' | b'E' | b'+')
-        ) {
-            self.at += 1;
-        }
-        let text = std::str::from_utf8(&self.bytes[start..self.at]).map_err(|e| e.to_string())?;
-        // The glue's `${scale}` and `fontWeight = weight` spell the number
-        // as JavaScript does; the host's `css::num` already writes it so.
-        exact_num::parse_f64(text)
-            .map(|_| text.to_owned())
-            .map_err(|e| format!("markup pieces: number {text:?}: {e}"))
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.expect(b'"')?;
-        let mut out = String::new();
-        loop {
-            let start = self.at;
-            while !matches!(self.peek(), Some(b'"' | b'\\') | None) {
-                self.at += 1;
-            }
-            out.push_str(
-                std::str::from_utf8(&self.bytes[start..self.at]).map_err(|e| e.to_string())?,
-            );
-            match self.next() {
-                Some(b'"') => return Ok(out),
-                Some(b'\\') => match self.next() {
-                    Some(b'"') => out.push('"'),
-                    Some(b'\\') => out.push('\\'),
-                    Some(b'n') => out.push('\n'),
-                    Some(b'r') => out.push('\r'),
-                    Some(b't') => out.push('\t'),
-                    Some(b'u') => {
-                        let hex = self
-                            .bytes
-                            .get(self.at..self.at + 4)
-                            .and_then(|h| std::str::from_utf8(h).ok())
-                            .and_then(|h| u32::from_str_radix(h, 16).ok())
-                            .and_then(char::from_u32)
-                            .ok_or("markup pieces: bad \\u escape")?;
-                        self.at += 4;
-                        out.push(hex);
-                    }
-                    other => return Err(format!("markup pieces: bad escape {other:?}")),
-                },
-                _ => return Err("markup pieces: unterminated string".into()),
-            }
-        }
-    }
+    let Some(next) = words.next() else {
+        return false;
+    };
+    const ROLES: &str = "alert alertdialog application article banner blockquote button caption cell checkbox code columnheader combobox comment complementary contentinfo definition deletion dialog directory doc-abstract doc-acknowledgments doc-afterword doc-appendix doc-backlink doc-biblioentry doc-bibliography doc-biblioref doc-chapter doc-colophon doc-conclusion doc-cover doc-credit doc-credits doc-dedication doc-endnote doc-endnotes doc-epigraph doc-epilogue doc-errata doc-example doc-footnote doc-foreword doc-glossary doc-glossref doc-index doc-introduction doc-noteref doc-notice doc-pagebreak doc-pagefooter doc-pageheader doc-pagelist doc-part doc-preface doc-prologue doc-pullquote doc-qna doc-subtitle doc-tip doc-toc document emphasis feed figure form generic graphics-document graphics-object graphics-symbol grid gridcell group heading image img insertion link list listbox listitem log main mark marquee math menu menubar menuitem menuitemcheckbox menuitemradio meter navigation none note option paragraph presentation progressbar radio radiogroup region row rowgroup rowheader scrollbar search searchbox sectionfooter sectionheader separator slider spinbutton status strong subscript suggestion superscript switch tab table tablist tabpanel term textbox time timer toolbar tooltip tree treegrid treeitem";
+    let known = |word: &str| ROLES.split(' ').any(|r| r.eq_ignore_ascii_case(word));
+    !known(first)
+        && std::iter::once(next)
+            .chain(words)
+            .find(|r| known(r))
+            .is_some_and(|r| r.eq_ignore_ascii_case(wanted))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{escape, markup_pieces, navigable};
+    use super::{escape, frame_app_source, markup_pieces, navigable};
+
+    #[test]
+    fn a_frame_source_is_the_glues_when_it_is_an_app_file_or_a_page_naming_one() {
+        for glue in [
+            "app:/data/doc.pdf",
+            "assets/viewer.html?file=app:/cache/a.pdf",
+            "./deck/index.html?n=1&file=app%3A%2Ftmp%2Fa.png#top",
+            "/assets/viewer.html?file=APP:/tmp/a",
+            "other/page.html?file=app:/cache/a",
+        ] {
+            assert!(frame_app_source(glue), "{glue:?}");
+        }
+        for browser in [
+            "assets/viewer.html",
+            "assets/viewer.html?file=https://e.dev/a.pdf",
+            "assets/viewer.html#file=app:/cache/a",
+            "assets/viewer.html?q=x#?file=app:/cache/a",
+            "https://e.dev/viewer.html?file=app:/cache/a",
+            "//e.dev/viewer.html?file=app:/cache/a",
+            "data:text/html,?file=app:/cache/a",
+            // A scheme the URL parser finds after its cleanup.
+            " javascript:alert(1)//?x=app:",
+            "java\tscript:alert(1)//?x=app:",
+            "\u{1}javascript:alert(1)//?x=app:",
+        ] {
+            assert!(!frame_app_source(browser), "{browser:?}");
+        }
+    }
 
     #[test]
     fn schemes_are_read_as_the_url_parser_reads_them() {
@@ -1320,6 +1434,12 @@ mod tests {
         assert_eq!(
             markup_pieces(r#"[["a\\b\tc\u0001",1,0,0,""]]"#).unwrap()[0].text,
             "a\\b\tc\u{1}"
+        );
+        // An atom's piece, as that test pins it, its face's paint, direction and name last.
+        let atom = r##"[["Quote",1,0,72,"",0,["citation","button","i.svg","T","t3-citation:1","[q](t3-citation:1)",2,20,"light-dark(#d52c36, #ff6762)","","ltr","Quoted passage"]]]"##;
+        assert_eq!(
+            markup_pieces(atom).unwrap()[0].atom.as_deref(),
+            Some("citation")
         );
     }
 }

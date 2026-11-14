@@ -13,6 +13,60 @@ import XCTest
 ///   bun host/apple/build.mjs --test --ios
 final class RowCellsIOSTests: XCTestCase {
     private var window: UIWindow!
+    func testTheRowOwnedSeparatorFollowsPresentationWithoutABatchRedraw() throws {
+        let p = try fixture()
+        let (row, line) = try XCTUnwrap(rowLines(p).first)
+        let before = row.layer.convert(line.frame, to: p.root.layer)
+        p.apply(wireBatch([["op": "present", "id": row.id, "property": "translate", "x": 0, "y": 17.25]]))
+        let moved = row.layer.convert(line.frame, to: p.root.layer)
+        XCTAssertEqual(moved.minY - before.minY, 17.25, accuracy: 1e-6)
+        XCTAssertTrue(line.superlayer === row.layer)
+    }
+    func testTheSeparatorFollowsTheRowThroughADragABatchAndTheGhostLanding() throws {
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else {
+            throw missing("scene", "a drag ghost snapshots a row rendered on screen")
+        }
+        let p = try fixture(list: ["props": ["listRows": "true", "id": "cards", "reorderGroup": "cards"]],
+                            rows: [20: ["props": ["text": "Grip", "reorderFor": "cards"]]])
+        window.windowScene = scene
+        window.layoutIfNeeded()
+        _ = UIGraphicsImageRenderer(size: window.bounds.size).image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+        }
+        let calls = ReorderGroupRecorder()
+        p.reorderGroupCalls = calls
+        p.apply(wireBatch([["op": "collections", "items": [["view": 2, "revision": 1, "scrollSequence": 0,
+            "count": 4, "totalExtent": 176, "rows": [["view": 10, "root": 20, "epoch": 1]], "correction": NSNull()]]]]))
+        let grip = try XCTUnwrap(p.views[20]), row = try XCTUnwrap(p.views[10])
+        let before = row.convert(row.bounds, to: window)
+        let hold = try XCTUnwrap(ReorderGroupHold(grip, point: CGPoint(x: before.midX, y: before.midY), ghost: true))
+        let ghost = try XCTUnwrap(hold.ghost)
+        XCTAssertTrue(ghost.view.superview === window)
+        XCTAssertTrue(hold.move(CGPoint(x: before.midX, y: before.midY + 44)))
+        XCTAssertEqual(ghost.frame.minY, before.minY + 44, accuracy: 1e-6)
+        // The runner's displacement and a batch that repaints row lines while lifted.
+        p.apply(wireBatch([["op": "present", "id": 10, "property": "translate", "x": 0, "y": 44],
+                          ["op": "children", "id": 2, "ids": [10, 11, 12, 13]]]))
+        func assertLineAtRowBottom() throws {
+            let line = try XCTUnwrap(rowLines(p).first { $0.row === row }?.layer)
+            let end = row.layer.convert(CGPoint(x: 20, y: row.bounds.maxY), to: window.layer)
+            let path = try XCTUnwrap(line.path?.boundingBoxOfPath)
+            let painted = row.layer.convert(path.offsetBy(dx: line.frame.minX, dy: line.frame.minY), to: window.layer)
+            XCTAssertEqual(end.y, before.maxY + 44, accuracy: 1e-6)
+            XCTAssertEqual(painted.maxY, end.y, accuracy: 1e-6)
+        }
+        try assertLineAtRowBottom()
+        hold.finish(cancel: false)
+        XCTAssertEqual(hold.state.phase, "holding")
+        p.apply(wireBatch([["op": "frame", "id": 10, "x": 0, "y": 44, "w": 400, "h": 44],
+                          ["op": "present", "id": 10, "property": "translate", "x": 0, "y": 0]]))
+        hold.observe(ReorderGroupState(calls.state("settling", target: 2, row: 10, ending: "landed").ops[0].payload))
+        hold.landNow()
+        XCTAssertNil(p.reorderGroup)
+        XCTAssertNil(ghost.view.superview)
+        try assertLineAtRowBottom()
+        XCTAssertTrue(calls.log.contains("drop"))
+    }
     override func tearDown() { window?.isHidden = true; window = nil; super.tearDown() }
 
     /// A page 1 holding a list 2 of four rows 44 points tall, each with a
@@ -58,12 +112,22 @@ final class RowCellsIOSTests: XCTestCase {
     private func ground(_ p: Presenter) -> RowGroundView? {
         p.views[2]?.container.subviews.compactMap { $0 as? RowGroundView }.first
     }
-    /// The separators a list draws, top to bottom.
+    /// Each row's separator layer: the row carries its line.
+    private func rowLines(_ p: Presenter) -> [(row: NodeView, layer: CAShapeLayer)] {
+        (p.views[2]?.container.subviews.compactMap { $0 as? NodeView } ?? []).flatMap { row in
+            (row.layer.sublayers ?? []).compactMap { $0 as? RowLineLayer }.map { (row, $0 as CAShapeLayer) }
+        }
+    }
+    /// The separators a list draws, top to bottom, in the list's space.
     private func separators(_ p: Presenter) -> [CGRect] {
         var rects: [CGRect] = []
-        lines(p)?.shape.path?.applyWithBlock { element in
-            if element.pointee.type == .moveToPoint { rects.append(CGRect(origin: element.pointee.points[0], size: .zero)) }
-            if element.pointee.type == .addLineToPoint, let last = rects.popLast() { rects.append(last.union(CGRect(origin: element.pointee.points[0], size: .zero))) }
+        for (row, layer) in rowLines(p) {
+            var own: [CGRect] = []
+            layer.path?.applyWithBlock { element in
+                if element.pointee.type == .moveToPoint { own.append(CGRect(origin: element.pointee.points[0], size: .zero)) }
+                if element.pointee.type == .addLineToPoint, let last = own.popLast() { own.append(last.union(CGRect(origin: element.pointee.points[0], size: .zero))) }
+            }
+            rects += own.map { $0.offsetBy(dx: row.frame.minX, dy: row.frame.minY) }
         }
         return rects.sorted { $0.minY < $1.minY }
     }
@@ -78,7 +142,9 @@ final class RowCellsIOSTests: XCTestCase {
             XCTAssertEqual(rect.height, RowCells.thickness, accuracy: 0.001, "a point thick")
         }
         let view = try XCTUnwrap(lines(p))
-        XCTAssertEqual(view.shape.fillColor, RowCells.separator.resolvedColor(with: view.traitCollection).cgColor, "in UIKit's separator colour")
+        for (_, layer) in rowLines(p) {
+            XCTAssertEqual(layer.fillColor, RowCells.separator.resolvedColor(with: view.traitCollection).cgColor, "in UIKit's separator colour")
+        }
         XCTAssertNil(view.hitTest(CGPoint(x: 100, y: 44), with: nil), "a touch on a separator is the row's")
         // A row that goes: the lines follow the rows.
         p.apply(wireBatch([["op": "children", "id": 2, "ids": [10, 11, 12]]]))
@@ -93,6 +159,12 @@ final class RowCellsIOSTests: XCTestCase {
         XCTAssertEqual(separators(p).filter { $0.maxY == 44 || $0.maxY == 1 }.map(\.minX), [60, 60])
         // A padding layout resolved anew, its content box alone sent (a percentage in a resized block)
         p.apply(wireBatch([contentOp(20, 200, 20, padding: [0, 0, 0, 8])]))
+        XCTAssertEqual(separators(p).filter { $0.maxY == 44 || $0.maxY == 1 }.map(\.minX), [64, 64])
+        // A text parked past the trailing edge (a `delete=` row's Delete), first among the row's
+        // children as a row mounted again can hold it, is not where the row's text starts.
+        p.apply(wireBatch([["op": "create", "id": 40, "kind": "text", "props": ["text": "Delete"], "style": ["font_size": 17]],
+                           ["op": "children", "id": 10, "ids": [40, 20]],
+                           ["op": "frame", "id": 40, "x": 420.0, "y": 12.0, "w": 60.0, "h": 20.0]]))
         XCTAssertEqual(separators(p).filter { $0.maxY == 44 || $0.maxY == 1 }.map(\.minX), [64, 64])
     }
 
@@ -161,6 +233,97 @@ final class RowCellsIOSTests: XCTestCase {
             XCTAssertNil(ground(q))
             XCTAssertNotNil(row.layer.animation(forKey: "pressDim"))
         }
+    }
+
+    func testAuthoredFeedbackReplacesAnExistingPhysicalOrHeldRowHighlight() throws {
+        let p = try fixture()
+        let row = try XCTUnwrap(p.views[11])
+        for held in [false, true] {
+            if held { XCTAssertEqual(row.hold("active", dropped: nil).held, "active") }
+            else { row.pressed = true }
+            XCTAssertNotNil(ground(p))
+            for style: [String: Any] in [
+                ["press_opacity_to": 0.4], [:], ["press_scale": 0.96], [:],
+                ["background_color": [240, 240, 240, 255], "written": ["background_color"]], [:],
+                ["press_background_color": [255, 0, 0, 255]],
+            ] {
+                p.apply(wireBatch([["op": "style", "id": 11, "style": style]]))
+                XCTAssertEqual(ground(p) == nil, !style.isEmpty, "held=\(held), style=\(style)")
+                XCTAssertEqual(separators(p).count, style.isEmpty ? 3 : 5, "the native highlight owns no separators after authored feedback takes over")
+                if style.isEmpty { XCTAssertNil(row.layer.animation(forKey: "pressDim"), "native row feedback replaces the card's dim") }
+                if style["background_color"] != nil { XCTAssertNotNil(row.layer.animation(forKey: "pressDim")) }
+            }
+            if held { _ = row.hold(nil, dropped: nil) }
+            else { row.pressed = false }
+            XCTAssertNil(ground(p))
+            XCTAssertEqual(separators(p).count, 5)
+            p.apply(wireBatch([["op": "style", "id": 11, "style": [:]]]))
+        }
+        XCTAssertTrue(p.rowCells.select(row) === row)
+        let selected = try XCTUnwrap(ground(p))
+        p.apply(wireBatch([["op": "style", "id": 11, "style": ["press_opacity_to": 0.4]]]))
+        row.pressed = true
+        XCTAssertTrue(ground(p) === selected, "authored feedback leaves native selection in place")
+        row.pressed = false
+        XCTAssertEqual(p.rowCells.observation(row)?["ground"] as? String, "selected")
+        p.rowCells.ran(row, on: nil)
+        waitFor("the native selection ending", late: 1, cap: 2) { self.ground(p) == nil }
+    }
+
+    /// A screen a push covers is out of the window; a batch then keeps its
+    /// rows' lines, which come back with it, and its selected row.
+    /// The selected row's ground follows the row by the record of what
+    /// showed (`Presenter.moveOrPlace`): it moves with a row that showed, and
+    /// takes its place at once with a row shown again since the last frame.
+    func testASelectedRowsGroundMovesOnlyWithARowThatShowed() throws {
+        // In a scene's window, where what a frame showed is read (`Presenter.committed`)
+        guard let scene = hostedWindowScene() else { throw missing("scene", "what the last frame showed is read in a scene's window") }
+        let p = try fixture()
+        let shown = UIWindow(windowScene: scene)
+        shown.frame = window.frame
+        p.viewport.removeFromSuperview(); shown.addSubview(p.viewport); shown.makeKeyAndVisible()
+        window.isHidden = true; window = shown
+        let row = try XCTUnwrap(p.views[11])
+        XCTAssertNotNil(p.rowCells.select(row))
+        waitFor("a frame shows it") { p.showed(row) }
+        let held = try XCTUnwrap(ground(p), "the selected row's ground")
+        UIView.animate(withDuration: 0.5) { p.apply(wireBatch([["op": "frame", "id": 11, "x": 0.0, "y": 50.0, "w": 400.0, "h": 44.0]])) }
+        XCTAssertNotNil(held.layer.animation(forKey: "position"), "with a row that showed, it moves")
+        held.layer.removeAllAnimations()
+        row.isHidden = true
+        waitFor("a frame shows the row hidden") { row.layer.presentation()?.isHidden == true }
+        row.isHidden = false
+        UIView.animate(withDuration: 0.5) { p.apply(wireBatch([["op": "frame", "id": 11, "x": 0.0, "y": 44.0, "w": 400.0, "h": 44.0]])) }
+        XCTAssertEqual(held.frame.minY, 44, "where the row is")
+        XCTAssertEqual(held.layer.animationKeys() ?? [], [], "with a row shown again, at once")
+    }
+
+    func testACoveredScreenKeepsItsLinesAndItsSelectedRowThroughABatch() throws {
+        let p = try fixture()
+        let row = try XCTUnwrap(p.views[11])
+        let screen = UIViewController()
+        p.viewport.removeFromSuperview()
+        screen.view.addSubview(p.viewport)
+        let stack = UINavigationController(rootViewController: screen)
+        window.rootViewController = stack
+        window.layoutIfNeeded()
+        let lines = separators(p)
+        XCTAssertFalse(lines.isEmpty)
+        stack.pushViewController(UIViewController(), animated: false)
+        window.layoutIfNeeded()
+        XCTAssertNil(row.window, "the push took the list's screen out of the window")
+        p.apply(wireBatch([["op": "props", "id": 1, "set": ["testId": "covered"]]]))
+        stack.popViewController(animated: false)
+        window.layoutIfNeeded()
+        XCTAssertEqual(separators(p), lines, "the lines came back with the screen")
+        // Selected, pushed over, and a batch while it is covered.
+        XCTAssertNotNil(p.rowCells.select(row))
+        let before = p.rowCells.screen(of: row)
+        stack.pushViewController(UIViewController(), animated: false)
+        window.layoutIfNeeded()
+        p.rowCells.ran(row, on: before)
+        p.apply(wireBatch([["op": "props", "id": 1, "set": ["testId": "covered again"]]]))
+        XCTAssertEqual(p.rowCells.observation(row)?["ground"] as? String, "selected", "still selected under the pushed screen")
     }
 
     func testATappedRowStaysSelectedUnderTheScreenItPushedAndLetsGoOnTheWayBack() throws {

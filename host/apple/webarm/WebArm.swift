@@ -6,23 +6,77 @@ import WebKit
 
 #if os(macOS)
 import AppKit
-private typealias PlatformImage = NSImage
-/// WKWebView in a `fullSizeContentView` window otherwise inherits the
-/// titlebar as a safe area and insets the guest by it — a black strip the
-/// height of the titlebar over the deck. The kernel already framed this
-/// box; the page fills it. @ref LLP 1020 D1
-private final class ExactWebView: WKWebView {
+typealias PlatformImage = NSImage
+typealias PlatformView = NSView
+/// The kernel already framed this box; the page fills it (@ref LLP 1020 D1).
+/// Under the titlebar of a `fullSizeContentView` window whose titlebar is not
+/// transparent, WKWebView otherwise insets the guest by the part of the
+/// titlebar over it, a strip of `underPageBackgroundColor` over the frame:
+/// WebKit's automatic content insets (`computeAutomaticTopObscuredInset` in
+/// WebKit's `PageClientImplMac.mm`), and its safe area.
+final class ExactWebView: WKWebView {
     override var safeAreaInsets: NSEdgeInsets { NSEdgeInsetsZero }
+    override init(frame: NSRect, configuration: WKWebViewConfiguration) {
+        super.init(frame: frame, configuration: configuration)
+        // Setting `obscuredContentInsets` (macOS 26) turns WebKit's automatic
+        // insets off for good (`-[WKWebView setObscuredContentInsets:]`), but
+        // the setter ignores a value equal to the current one, so it is set
+        // away from zero first. Before macOS 26 nothing public turns them
+        // off, and a frame under such a titlebar keeps the strip.
+        if #available(macOS 26.0, *) {
+            obscuredContentInsets = NSEdgeInsets(top: 1, left: 0, bottom: 0, right: 0)
+            obscuredContentInsets = NSEdgeInsetsZero
+        }
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         pinInsets()
+    }
+    /// The keyboard input source the view's context last had connected.
+    private var inputSource: String?
+    private var inputSourceObserver: NSObjectProtocol?
+    deinit {
+        if let inputSourceObserver { NotificationCenter.default.removeObserver(inputSourceObserver) }
+    }
+    override func becomeFirstResponder() -> Bool {
+        guard super.becomeFirstResponder() else { return false }
+        if inputSourceObserver == nil {
+            inputSourceObserver = NotificationCenter.default.addObserver(
+                forName: NSTextInputContext.keyboardSelectionDidChangeNotification, object: nil, queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.inputSourceChanged() } }
+        }
+        inputSource = inputContext?.selectedKeyboardInputSource
+        return true
+    }
+    /// A source another process selects (an input source switcher, through
+    /// `TISSelectInputSource`) while the view has the keys can leave WebKit's
+    /// input context with no input method: keys then reach the page as the
+    /// layout's characters and nothing composes until the view is focused
+    /// again: after 6 of 8 switches to Korean 2-Set on macOS 27.2 (`gksskf`
+    /// for 한날), none after the system's own input source shortcut (macOS 26).
+    /// Deactivating and activating the context reconnects it: 26 of 26
+    /// switches then composed. Only the current context is touched:
+    /// activating another would take the input method from the view that has
+    /// it; nor one holding marked text, which deactivating may commit or drop.
+    /// A change skipped for either reason is reconnected at the next notice.
+    private func inputSourceChanged() {
+        guard window?.firstResponder === self else { return }
+        // Without an editable element WebKit gives no context: the source is
+        // unknown until the page focuses one again.
+        guard let context = inputContext else { inputSource = nil; return }
+        let source = context.selectedKeyboardInputSource
+        guard source != inputSource, NSTextInputContext.current === context,
+              (self as AnyObject as? NSTextInputClient)?.hasMarkedText() != true else { return }
+        inputSource = source
+        context.deactivate()
+        context.activate()
     }
     override func layout() {
         super.layout()
         pinInsets()
     }
     func pinInsets() {
-        setValue(false, forKey: "automaticallyAdjustsContentInsets")
         func walk(_ v: NSView) {
             if let s = v as? NSScrollView {
                 if s.automaticallyAdjustsContentInsets { s.automaticallyAdjustsContentInsets = false }
@@ -37,7 +91,8 @@ private final class ExactWebView: WKWebView {
 }
 #else
 import UIKit
-private typealias PlatformImage = UIImage
+typealias PlatformImage = UIImage
+typealias PlatformView = UIView
 #endif
 
 public typealias EventFn = @convention(c) (
@@ -46,6 +101,9 @@ public typealias EventFn = @convention(c) (
 public typealias ReplyFn = @convention(c) (
     UnsafeMutableRawPointer?, UInt32, UInt32, UInt32, UnsafePointer<UInt8>?, UInt32
 ) -> Void
+/// The host's moment before a frame's web view is made (@ref LLP 1020.002
+/// §9): the arm's context and the `WKWebViewConfiguration`, for the app's hatch.
+public typealias ConfiguringFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void
 /// Receives an asset's bytes from `ReadFn`; not called for a missing asset.
 public typealias SinkFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, UInt32) -> Void
 /// The host's read of an app asset by name (`deck/app.js`), through the
@@ -61,7 +119,7 @@ private var assetReader: ReadFn?
 /// origin is a scheme of its own; WebKit treats it as a secure context.
 /// One per web view: the configuration retains it, and it holds its arm
 /// weakly.
-private final class AssetScheme: NSObject, WKURLSchemeHandler {
+final class AssetScheme: NSObject, WKURLSchemeHandler {
     static let scheme = "exact-app"
     static let origin = "exact-app://app"
     static let base = URL(string: "exact-app://app/")!
@@ -77,9 +135,10 @@ private final class AssetScheme: NSObject, WKURLSchemeHandler {
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         guard let url = task.request.url else { return }
-        // Only a web view showing a bundled page serves the origin: a remote
-        // guest cannot read the app's assets through it.
-        guard let arm, arm.assetPage != nil else { return refuse(task, url, logging: false) }
+        // Only the arm's own web view showing a bundled page serves the
+        // origin: a remote guest, or a popup WebKit built from a copy of this
+        // configuration, cannot read the app's assets through it.
+        guard let arm, arm.built === webView, arm.assetPage != nil else { return refuse(task, url, logging: false) }
         // The wrapper an iOS page needs is served at the page's own origin,
         // so a framed page keeps first-party storage, as a direct one does
         // (@ref LLP 1020.001 D4).
@@ -97,6 +156,11 @@ private final class AssetScheme: NSObject, WKURLSchemeHandler {
         let range = task.request.value(forHTTPHeaderField: "Range")
         let id = ObjectIdentifier(task)
         let name = String(url.path.drop(while: { $0 == "/" }))
+        // A file the app gave this page (@ref LLP 1020.001 D7).
+        if url.host == "app", name.hasPrefix(FrameFiles.prefix) {
+            guard let file = arm.files.file(name) else { return refuse(task, url, given: "is not a file this frame was given") }
+            return serveGiven(task, url, file)
+        }
         guard url.host == "app", AssetScheme.trees.contains(where: name.hasPrefix) else { return refuse(task, url, logging: true) }
         AssetScheme.reads.async {
             let bytes = AssetScheme.read(name)
@@ -123,12 +187,15 @@ private final class AssetScheme: NSObject, WKURLSchemeHandler {
         stopped.insert(ObjectIdentifier(task))
     }
 
-    func refuse(_ task: WKURLSchemeTask, _ url: URL, logging: Bool) {
+    func refuse(_ task: WKURLSchemeTask, _ url: URL, logging: Bool = false, given: String? = nil) {
         if logging {
             let trees = AssetScheme.trees.joined(separator: " or ")
             FileHandle.standardError.write(Data("exact: iframe \(arm?.src ?? ""): \(url.absoluteString) is not an app asset under \(trees)\n".utf8))
         }
-        task.didReceive(HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: ["Content-Length": "0"])!)
+        if let given { FileHandle.standardError.write(Data("exact: iframe \(arm?.src ?? ""): \(url.absoluteString) \(given)\n".utf8)) }
+        // A given file's refusal carries its responses' sandbox, as they all do.
+        let headers = given == nil ? ["Content-Length": "0"] : ["Content-Length": "0", "Content-Security-Policy": FrameFiles.sandbox]
+        task.didReceive(HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: headers)!)
         task.didFinish()
     }
 
@@ -169,7 +236,7 @@ private final class AssetScheme: NSObject, WKURLSchemeHandler {
         guard parts.count == 2 else { return nil }
         if parts[0].isEmpty {
             guard let suffix = Int(parts[1]), suffix > 0 else { return nil }
-            return (max(0, count - suffix), count - 1)
+            return (suffix >= count ? 0 : count - suffix, count - 1)
         }
         guard let from = Int(parts[0]), from < count else { return nil }
         let to = parts[1].isEmpty ? count - 1 : min(Int(parts[1]) ?? count - 1, count - 1)
@@ -177,14 +244,89 @@ private final class AssetScheme: NSObject, WKURLSchemeHandler {
     }
 }
 
-private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     let id: UInt32
     let context: UnsafeMutableRawPointer?
     let event: EventFn
     let reply: ReplyFn
-    let controller = WKUserContentController()
+    var controller = WKUserContentController()
     let world = WKContentWorld.world(name: "exact.agent")
-    let webView: WKWebView
+    /// The web view, made at the first use, once `partition` is known: a
+    /// partition is fixed when a web view is made, so changing it makes
+    /// another (@ref LLP 1020.002 D1).
+    var built: WKWebView?
+    var webView: WKWebView { built ?? build() }
+    /// A local PDF's view, shown in place of the web view (@ref LLP 1020.002 D10).
+    var pdf: FramePDF?
+    /// What the frame shows: the PDF view, or the web view. A frame said to
+    /// show a local PDF (`pdf` in its configuration) shows the PDF's view
+    /// from the start, before its file comes: it makes no web view that
+    /// `showPDF` would drop at once (@ref LLP 1020.002 D10). A file that is
+    /// not one goes the way any does (`closePDF`, a new view at kind 7).
+    var platformView: PlatformView { pdf?.view ?? (startsAsPDF ? waitingPDF().view : webView) }
+    private var startsAsPDF: Bool { built == nil && options["pdf"] as? Bool == true && partition == nil && sandbox == nil }
+    /// The frame's dialogs, popups and external-scheme confirmations (D5):
+    /// a web view's delegate, and a PDF's links' confirmation without one.
+    @discardableResult func makeUI() -> FrameUI {
+        if let ui { return ui }
+        #if os(iOS)
+        let made = agent ? FrameUIAgent(arm: self) : FrameUI(arm: self)
+        #else
+        let made = FrameUI(arm: self)
+        #endif
+        ui = made
+        return made
+    }
+    private func waitingPDF() -> FramePDF {
+        makeUI() // a PDF's link to another app asks through it (D5), with no web view built
+        let shown = FramePDF(arm: self)
+        shown.view.zoom = CGFloat((options["zoom"] as? NSNumber)?.doubleValue ?? 1)
+        pdf = shown
+        return shown
+    }
+    #if EXACT_DEVELOPMENT
+    /// What the arm owns that the app's hatch changed, each said once (§9).
+    var ownedSaid = Set<String>()
+    #endif
+    /// How many user scripts the arm put in the web view's content controller.
+    var ownScripts = 0
+    /// The host's moment before each web view is made (`exact_web_set_configuring`).
+    var configuringHook: ConfiguringFn?
+    /// The data store the arm gave the web view's configuration.
+    weak var ownStore: WKWebsiteDataStore?
+    /// A partitioned frame's name; its guest is a top-level page in that
+    /// partition's data store, with no message bridge, no `exact-app` scheme
+    /// and no script in the page's world (@ref LLP 1020.002 D1).
+    var partition: String?
+    var agent = false
+    /// The session's app and the session (`exact_web_configure`): a
+    /// persistent partition is the app's, an in-memory one the session's.
+    var app = Bundle.main.bundleIdentifier ?? "exact"
+    var session = ""
+    var options: [String: Any] = [:]
+    /// The words `applyOptions` set on the current web view.
+    var applied = Set<String>()
+    var browser: FrameBrowser?
+    /// The frame's element id and its session's module folder, by which
+    /// `exact_web_automation` finds it, and its automation once driven (@ref LLP 1020.002 D9).
+    var element = ""
+    var owner = ""
+    var automation: FrameAutomation?
+    /// The web view's `WKUIDelegate`: its popups, dialogs, file inputs,
+    /// downloads and permissions (@ref LLP 1020.002 D5).
+    var ui: FrameUI?
+    /// The frame handles `newwindow=`: only then does it ask for popups.
+    var handlesNewWindow = false
+    /// The frame is marked `hatch`: its hatch writes on its configuration.
+    var hatched = false
+    /// Requests held for the agent (`ask`), by token.
+    var asked: [UInt32: (web: ObjectIdentifier?, done: ([String: Any]?) -> Void)] = [:]
+    var nextAsk: UInt32 = 1
+    /// The `about:blank` load shown in place of a refused source: its own
+    /// navigation reports nothing, and one it cancels still ends as itself.
+    var blank: WKNavigation?
+    /// Whether `navigation` is that load: a nil one never is.
+    func isBlank(_ navigation: WKNavigation?) -> Bool { blank != nil && navigation === blank }
     var src: String?
     /// A local `src`'s bytes, as the host read them (`exact_web_set_document`).
     var suppliedDocument: Data?
@@ -203,6 +345,7 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
     var direct = false
     /// A direct guest navigated itself: its later documents' messages are
     /// not the app's (the wrapper's `navigated`).
+    var documentNonce: String?
     var revoked = false
     /// The origin a direct guest's messages must come from.
     var expectedOrigin: String?
@@ -211,6 +354,8 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
     var localGuest = false
     /// A bundled HTML page's URL under `AssetScheme`, while one is served.
     var assetPage: URL?
+    /// The app files that page was given (@ref LLP 1020.001 D7).
+    let files = FrameFiles()
     /// The wrapper `AssetScheme` serves around such a page on iOS.
     var wrapperDocument: String?
     /// A bundled page's origin: loopback HTTP, a secure context (as the web
@@ -220,11 +365,20 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
     static let localOrigin = "http://exact.localhost"
     static let template: WKWebViewConfiguration = {
         let template = WKWebViewConfiguration()
-        _ = template.preferences
+        template.preferences = preferences()
         _ = template.websiteDataStore
         _ = template.defaultWebpagePreferences
         return template
     }()
+    /// Unsaid, as Safari has them (@ref LLP 1020.002 D1, D5): a scripted
+    /// window needs a person's gesture, and a page's `requestFullscreen()`
+    /// takes the screen.
+    static func preferences() -> WKPreferences {
+        let preferences = WKPreferences()
+        preferences.javaScriptCanOpenWindowsAutomatically = false
+        preferences.isElementFullscreenEnabled = true
+        return preferences
+    }
     var wrapperURL: URL
 
     init(id: UInt32, context: UnsafeMutableRawPointer?, event: @escaping EventFn, reply: @escaping ReplyFn) {
@@ -233,6 +387,38 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         self.event = event
         self.reply = reply
         self.wrapperURL = URL(string: "https://exact.invalid/frame/\(id)/index.html")!
+        super.init()
+    }
+
+    func build() -> WKWebView {
+        controller = WKUserContentController()
+        makeUI().takePrints(on: controller)
+        let web = partition == nil ? buildFrame() : buildPartitioned()
+        built = web
+        web.navigationDelegate = self
+        web.uiDelegate = makeUI()
+        #if EXACT_DEVELOPMENT
+        // Safari's platform inspector sees only this guest, not Exact's
+        // native tree. Unasked, only a development arm makes a frame
+        // inspectable (#101); any arm does when the app calls
+        // `openDevTools` (LLP 1020.002 D11, which supersedes #101 there).
+        web.isInspectable = true
+        #endif
+        #if os(macOS)
+        (web as? ExactWebView)?.pinInsets()
+        #else
+        web.scrollView.contentInsetAdjustmentBehavior = .never
+        web.scrollView.contentInset = .zero
+        #endif
+        applied = []
+        applyOptions(to: web)
+        // Preload scripts are a partitioned frame's: an unpartitioned one may be a wrapper's child.
+        if partition != nil { automation?.attached(controller) }
+        ownScripts = controller.userScripts.count
+        return web
+    }
+
+    func buildFrame() -> WKWebView {
         // A copy of one shared configuration, not a fresh one: a fresh
         // configuration builds its preferences, visited-link store and
         // page defaults again for every row (`ensureLazyInitializedRefs`,
@@ -241,21 +427,17 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         // and cookies) and default preferences. The script bridge stays per
         // view (@ref LLP 1020 D2, LLP 1068 §0.1 Q3: views are not pooled).
         let configuration = WebArm.template.copy() as! WKWebViewConfiguration
+        // A copy shares the template's preference objects: a frame whose
+        // hatch may write on them, or that says its own scheduling policy,
+        // has its own, so no other frame's change.
+        if hatched || options["inactiveSchedulingPolicy"] != nil {
+            configuration.preferences = WebArm.preferences()
+            configuration.defaultWebpagePreferences = WKWebpagePreferences()
+        }
         configuration.userContentController = controller
         let assets = AssetScheme()
         configuration.setURLSchemeHandler(assets, forURLScheme: AssetScheme.scheme)
-        #if os(macOS)
-        webView = ExactWebView(frame: .zero, configuration: configuration)
-        #else
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        #endif
-        super.init()
         assets.arm = self
-        #if EXACT_DEVELOPMENT
-        // Safari's platform inspector sees only this guest, not Exact's
-        // native tree. Production arms never compile this opt-in (#101).
-        webView.isInspectable = true
-        #endif
         controller.add(self, contentWorld: world, name: "exactAgent")
         controller.add(self, contentWorld: world, name: "exactFrame")
         // A direct guest's `parent` is its own window: what it posts to
@@ -263,7 +445,7 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         // it before the page's listeners, as an iframe's post never reaches
         // its own window, and hands it to the app (@ref LLP 1020 D2).
         controller.addUserScript(WKUserScript(
-            source: "addEventListener('message', e => { if (e.source !== window) return; e.stopImmediatePropagation(); let p = e.data; if (typeof p !== 'string') { try { p = JSON.stringify(p) } catch { return } } if (typeof p === 'string') window.webkit.messageHandlers.exactFrame.postMessage(p) }, true)",
+            source: "(() => { const replies = new WeakSet(), nonce = Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16)).join('-'); globalThis.__exactHostReply = (text, expected) => { if (expected !== nonce) return; const e = new MessageEvent('message', {data:text, source:window}); replies.add(e); window.dispatchEvent(e); }; addEventListener('message', e => { if (replies.has(e) || e.source !== window) return; e.stopImmediatePropagation(); let p = e.data; if (typeof p !== 'string') { try { p = JSON.stringify(p) } catch { return } } if (typeof p === 'string') window.webkit.messageHandlers.exactFrame.postMessage(p) }, true); window.webkit.messageHandlers.exactAgent.postMessage({document:nonce}); })()",
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true,
             in: world))
@@ -279,24 +461,175 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false,
             in: world))
-        webView.navigationDelegate = self
-        // The guest is a leaf the kernel already framed. WKWebView's default
-        // is to inset itself for the titlebar / safe area, which leaves a
-        // black strip of `underPageBackgroundColor` over the top of the
-        // deck and over siblings (the account mark). Off: the iframe fills
-        // the node's box (@ref LLP 1020 D1).
+        configuring(configuration)
+        #if os(macOS)
+        let webView: WKWebView = ExactWebView(frame: .zero, configuration: configuration)
+        #else
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        #endif
+        // A page that draws no background shows the node under it, as an
+        // iframe's does on the web (@ref LLP 1020 D1). On macOS only the
+        // private `drawsBackground` gives that: `underPageBackgroundColor`,
+        // an `isOpaque` override and the view's layer leave WebKit's white
+        // page background (measured on macOS 27.2). A named exception to
+        // the ruling that no private API ships (LLP 1020 §12).
         #if os(macOS)
         webView.setValue(false, forKey: "drawsBackground")
         if #available(macOS 12.0, *) { webView.underPageBackgroundColor = .clear }
-        (webView as? ExactWebView)?.pinInsets()
         #else
         webView.isOpaque = false
         webView.backgroundColor = .clear
         webView.scrollView.backgroundColor = .clear
-        webView.scrollView.contentInsetAdjustmentBehavior = .never
-        webView.scrollView.contentInset = .zero
         if #available(iOS 15.0, *) { webView.underPageBackgroundColor = .clear }
         #endif
+        return webView
+    }
+
+    /// A partitioned frame's web view: its own preferences (the template's
+    /// are shared by every frame), the partition's store, and only the icon
+    /// reader. Unsaid, as Safari has them: the page draws its own
+    /// background, a scripted `window.open` needs a person's gesture, and
+    /// on iOS a `playsinline` video plays in the tab (@ref LLP 1020.002 D1).
+    func buildPartitioned() -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = Partitions.store(partition!, agent: agent, app: app, session: session)
+        configuration.userContentController = controller
+        let preferences = WebArm.preferences()
+        if #available(macOS 14.0, iOS 17.0, *) { preferences.inactiveSchedulingPolicy = .throttle }
+        configuration.preferences = preferences
+        #if os(iOS)
+        configuration.allowsInlineMediaPlayback = true
+        #endif
+        let browser = FrameBrowser(emit: { [weak self] name, record in self?.emitNavigation(name, record) },
+                                   source: { [weak self] in self?.src })
+        browser.external = { [weak self] url in
+            guard let self, let web = self.built else { return }
+            self.ui?.confirmExternal(url, from: web, byApp: true)
+        }
+        browser.install(on: controller)
+        self.browser = browser
+        configuring(configuration)
+        #if os(macOS)
+        let webView: WKWebView = ExactWebView(frame: .zero, configuration: configuration)
+        #else
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        #endif
+        browser.attach(webView)
+        return webView
+    }
+
+    /// The app's hatch has the configuration before the web view is made
+    /// (@ref LLP 1020.002 §9), its data store, preferences and content
+    /// worlds set: what it adds (an `applicationNameForUserAgent`, content
+    /// rule lists, its own URL schemes) is the new web view's.
+    func configuring(_ configuration: WKWebViewConfiguration) {
+        ownStore = configuration.websiteDataStore
+        configuringHook?(context, Unmanaged.passUnretained(configuration).toOpaque())
+    }
+
+    /// The `apple.*` words and `zoom` (@ref LLP 1020.002 §9, D6). A word
+    /// never said leaves WebKit's default; one said and then dropped goes
+    /// back to it.
+    func applyOptions(to web: WKWebView) {
+        let said = { (key: String) in self.options[key] != nil || self.applied.contains(key) }
+        if said("zoom") { web.pageZoom = CGFloat((options["zoom"] as? NSNumber)?.doubleValue ?? 1) }
+        if said("allowsBackForwardNavigationGestures") { web.allowsBackForwardNavigationGestures = options["allowsBackForwardNavigationGestures"] as? Bool ?? false }
+        #if os(macOS)
+        if said("allowsMagnification") { web.allowsMagnification = options["allowsMagnification"] as? Bool ?? false }
+        #endif
+        // Never on the template's shared preferences: a policy said after the
+        // web view was made with them waits for its next one. No policy lifts
+        // WebKit's clamp of a hidden page's timers to about one a second, and
+        // nothing public does (@ref LLP 1020.002 §9).
+        if #available(macOS 14.0, iOS 17.0, *), said("inactiveSchedulingPolicy"), web.configuration.preferences !== WebArm.template.preferences {
+            switch options["inactiveSchedulingPolicy"] as? String {
+            case "suspend": web.configuration.preferences.inactiveSchedulingPolicy = .suspend
+            case "none": web.configuration.preferences.inactiveSchedulingPolicy = .none
+            // `throttle` is a partitioned frame's unsaid policy (D1); WebKit's default, `suspend`, an unpartitioned one's.
+            default: web.configuration.preferences.inactiveSchedulingPolicy = partition != nil || options["inactiveSchedulingPolicy"] != nil ? .throttle : .suspend
+            }
+        }
+        applied = Set(options.keys).subtracting(["partition", "agent", "app", "session", "newwindow"])
+    }
+
+    /// The app's hatch has the web view or PDF view (@ref LLP 1020.002 §9):
+    /// a development build says by name what it changed of what the arm owns,
+    /// as LLP 1133 D3 detects and does not enforce. A script message handler
+    /// a hatch adds is not detected: WebKit lists no handlers.
+    func checkOwned() {
+        #if EXACT_DEVELOPMENT
+        var changed: [String] = []
+        if let pdf {
+            if pdf.view.delegate !== pdf { changed.append("the PDF view's delegate") }
+        } else if let web = built {
+            if web.navigationDelegate !== self { changed.append("navigationDelegate") }
+            if web.uiDelegate !== ui { changed.append("uiDelegate") }
+            if web.configuration.websiteDataStore !== ownStore { changed.append("websiteDataStore") }
+            if web.configuration.userContentController !== controller { changed.append("userContentController") }
+            if controller.userScripts.count != ownScripts { changed.append("the user scripts of the arm's content controller") }
+            if abs(Double(web.pageZoom) - ((options["zoom"] as? NSNumber)?.doubleValue ?? 1)) > 0.001 { changed.append("pageZoom") }
+            #if os(macOS)
+            if web.appearance != nil { changed.append("appearance") }
+            #else
+            if web.overrideUserInterfaceStyle != .unspecified { changed.append("overrideUserInterfaceStyle") }
+            #endif
+        }
+        for property in changed where ownedSaid.insert(property).inserted {
+            FileHandle.standardError.write(Data("exact: iframe \(id): the app's hatch changed \(property), which the web arm owns (LLP 1020.002 §9)\n".utf8))
+        }
+        #endif
+    }
+
+    /// `partition`, `zoom` and the `apple.*` words, before the web view is
+    /// first made and whenever they change. A new partition replaces the web
+    /// view; the presenter takes the new one from `exact_web_platform_view`.
+    func configure(_ values: [String: Any]) {
+        agent = values["agent"] as? Bool ?? false
+        if let app = values["app"] as? String, !app.isEmpty { self.app = app }
+        session = values["session"] as? String ?? ""
+        handlesNewWindow = values["newwindow"] as? Bool ?? false
+        hatched = values["hatched"] as? Bool ?? false
+        element = values["element"] as? String ?? ""
+        owner = values["owner"] as? String ?? ""
+        Automations.arms.add(self)
+        let name = values["partition"] as? String
+        options = values
+        pdf?.view.zoom = CGFloat((options["zoom"] as? NSNumber)?.doubleValue ?? 1)
+        guard name != partition || (built == nil && pdf == nil) else {
+            if let built { applyOptions(to: built) }
+            return
+        }
+        let replacing = built != nil || pdf != nil
+        if replacing { teardown() }
+        partition = name
+        if replacing {
+            // A local PDF's frame losing its partition shows the PDF's view, and makes no web view for `serve` to drop.
+            if startsAsPDF { _ = waitingPDF() } else { _ = build(); closePDF() }
+            markLoading()
+            scheduleServe()
+        }
+    }
+
+    /// Lets the current web view go: its navigation in flight ends first.
+    func teardown() {
+        guard let old = built else { return }
+        if let browser, let flight = browser.flight {
+            browser.flight = nil
+            browser.emitEnd(flight, "navigateerror", error: "AbortError", message: "the frame's partition changed")
+        }
+        browser?.close(controller: controller)
+        browser = nil
+        automation?.end("iframe \(element)'s partition changed")
+        ui?.close()
+        ui?.forget(old)
+        endAsked()
+        old.stopLoading()
+        old.navigationDelegate = nil
+        old.uiDelegate = nil
+        setPageBridge(false)
+        controller.removeScriptMessageHandler(forName: "exactAgent", contentWorld: world)
+        controller.removeScriptMessageHandler(forName: "exactFrame", contentWorld: world)
+        built = nil
     }
 
     deinit {
@@ -306,17 +639,28 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
     func invalidate() {
         guard !invalidated else { return }
         invalidated = true
-        webView.stopLoading()
+        files.end()
+        automation?.end("iframe \(element) unmounted")
+        Automations.arms.remove(self)
+        pdf?.close()
+        browser?.close(controller: controller)
+        ui?.close()
+        ui?.forget(built)
+        endAsked()
+        built?.uiDelegate = nil
+        built?.stopLoading()
         setPageBridge(false)
         controller.removeScriptMessageHandler(forName: "exactAgent", contentWorld: world)
         controller.removeScriptMessageHandler(forName: "exactFrame", contentWorld: world)
-        webView.navigationDelegate = nil
+        built?.navigationDelegate = nil
     }
 
     func setSrc(_ value: String?) {
         guard !srcInitialized || src != value else { return }
         srcInitialized = true
         src = value
+        // The app moved the frame: what a person decided about the old page no longer holds.
+        ui?.forget(built)
         markLoading()
         scheduleServe()
     }
@@ -332,7 +676,112 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
 
     func markLoading() {
         guestFrame = nil
+        documentNonce = nil
         emit(kind: 3)
+    }
+
+    /// A partitioned frame's source: a web page loaded as itself, or
+    /// `about:blank` and `navigateerror` for one it refuses: a `sandbox`
+    /// (WebKit cannot sandbox a top-level page) or a source that is not a web
+    /// page (a bundled or `app:/` file would need the `exact-app` scheme a
+    /// remote page must not reach) (@ref LLP 1020.002 D1).
+    func servePartitioned() {
+        generation += 1
+        guestFrame = nil
+        documentNonce = nil
+        revoked = false
+        direct = true
+        assetPage = files.give(nil, source: nil)
+        localGuest = false
+        expectedOrigin = nil
+        let refusal: String?
+        if !Partitions.valid(partition!) {
+            refusal = "partition \"\(partition!)\" is not a partition name: persist: and 1 to 64 of A-Z a-z 0-9 . _ -, or the same without persist:"
+        } else if sandbox != nil {
+            refusal = "an iframe with a partition takes no sandbox: WebKit cannot sandbox a top-level page"
+        } else if let src, GuestURL.web(src) == nil {
+            refusal = "a partitioned frame shows web pages; \(src) is not an http, https or about:blank URL"
+        } else {
+            refusal = nil
+        }
+        guard let refusal else {
+            serving = true
+            webView.load(URLRequest(url: src.flatMap(GuestURL.web) ?? URL(string: "about:blank")!))
+            return
+        }
+        FileHandle.standardError.write(Data("exact: iframe \(id): \(refusal)\n".utf8))
+        if let browser, let flight = browser.flight {
+            browser.flight = nil
+            browser.emitEnd(flight, "navigateerror", error: "AbortError", message: "superseded")
+        }
+        blank = webView.load(URLRequest(url: URL(string: "about:blank")!))
+        emit(kind: 2)
+        browser?.send("navigateerror", error: Partitions.valid(partition!) ? "NotSupportedError" : "SyntaxError", message: refusal)
+    }
+
+    /// A guest's `newwindow` or `download` record for the presenter: kind 5,
+    /// `{event, record}` (@ref LLP 1020.002 D5).
+    func emitRecord(_ name: String, _ record: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: ["event": name, "record": record]) else { return }
+        emit(kind: 5, text: String(decoding: data, as: UTF8.self))
+    }
+
+    /// Under the agent, a guest's dialog, file input or download destination
+    /// is a request the drive answers (@ref LLP 1020.002 §10): kind 6,
+    /// `{token, capability, args}`; `exact_web_answer` delivers the answer,
+    /// and nil is Cancel (also when the frame goes first).
+    func ask(_ capability: String, _ args: [String: Any], from web: WKWebView?, done: @escaping ([String: Any]?) -> Void) {
+        guard !invalidated else { return done(nil) }
+        let token = nextAsk
+        nextAsk &+= 1
+        asked[token] = (web.map(ObjectIdentifier.init), done)
+        guard let data = try? JSONSerialization.data(withJSONObject: ["token": token, "capability": capability, "args": args]) else {
+            asked[token] = nil
+            return done(nil)
+        }
+        emit(kind: 6, text: String(decoding: data, as: UTF8.self))
+    }
+
+    /// Held requests end unanswered with their web view (`web`, a closed
+    /// popup's; nil, every one): a dialog as Cancel, a panel as nothing chosen.
+    func endAsked(for web: WKWebView? = nil) {
+        var ending: [([String: Any]?) -> Void] = []
+        for (token, held) in asked where web == nil || held.web == web.map(ObjectIdentifier.init) {
+            asked[token] = nil
+            ending.append(held.done)
+        }
+        for done in ending { done(nil) }
+    }
+
+    func answer(_ value: [String: Any]) {
+        guard let token = (value["token"] as? NSNumber)?.uint32Value, let held = asked.removeValue(forKey: token) else { return }
+        held.done(value["cancel"] as? Bool == true ? nil : value)
+    }
+
+    /// A `FrameNavigation` record for the presenter: kind 4, `{event, record}`.
+    func emitNavigation(_ name: String, _ record: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: ["event": name, "record": record]) else { return }
+        emit(kind: 4, text: String(decoding: data, as: UTF8.self))
+    }
+
+    func command(_ op: [String: Any]) {
+        guard !invalidated else { return }
+        checkOwned()
+        // Any frame's, a PDF one's too (@ref LLP 1020.002 D7); the inspector any web view's (D11).
+        if op["op"] as? String == "captureScreenshot" { return capture(op) }
+        if op["op"] as? String == "openDevTools" { return openDevTools() }
+        guard let browser else {
+            // An unpartitioned frame may be a child of a wrapper document
+            // (a sandboxed page; a remote one on iOS): only a partitioned
+            // frame is always a top-level browsing context to move.
+            let record: [String: Any] = ["url": "", "destination": "", "navigationId": 0, "navigationType": "push", "title": "", "icons": [String](),
+                                         "canGoBack": false, "canGoForward": false, "loading": false, "partitioned": true, "controller": "person",
+                                         "error": "NotSupportedError", "message": "\(op["op"] as? String ?? "command"): iframe \(id) has no partition", "recovering": false]
+            FileHandle.standardError.write(Data("exact: \(record["message"]!)\n".utf8))
+            return emitNavigation("navigateerror", record)
+        }
+        if op["op"] as? String == "navigate" { ui?.forget(built) }
+        browser.command(op)
     }
 
     func scheduleServe() {
@@ -356,8 +805,13 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
     /// class D2 removed (@ref LLP 1020 D2, §10).
     func serve(error: String? = nil) {
         guard !invalidated else { return }
+        checkOwned()
+        if partition == nil, error == nil, sandbox == nil, let file = src.flatMap(localFile), file.1 == "application/pdf", showPDF(file.0) { return }
+        closePDF()
+        if partition != nil { return servePartitioned() }
         generation += 1
         guestFrame = nil
+        documentNonce = nil
         serving = true
         revoked = false
         if error == nil, let file = src.flatMap(localFile) {
@@ -375,7 +829,8 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
             : web?.scheme?.lowercased() == "http" ? "http://exact.invalid" : "https://exact.invalid"
         wrapperURL = URL(string: "\(origin)/frame/\(id)/index.html")!
         localGuest = local != nil && error == nil
-        assetPage = localGuest ? src.flatMap(WebArm.assetURL) : nil
+        // Every serve gives the page's files anew, so the last serve's end.
+        assetPage = files.give(localGuest ? src.flatMap(WebArm.assetURL) : nil, source: src)
         if assetPage != nil { wrapperURL = URL(string: "\(AssetScheme.origin)/.exact/frame/\(id)/index.html")! }
         #if os(iOS)
         // iOS lays a top-level document out by its viewport `<meta>` (980
@@ -422,7 +877,7 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         let url = URL(string: "\(WebArm.localOrigin)/frame/\(id)/index.html")!
         wrapperURL = url
         localGuest = true
-        assetPage = nil
+        assetPage = files.give(nil, source: nil)
         direct = true
         setPageBridge(false)
         expectedOrigin = guestOrigin(remote: nil, local: true)
@@ -465,6 +920,10 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         return "\(o.protocol)://\(host)\(port)"
     }
 
+    /// The inner frame grants fullscreen to whatever the guest becomes, as a
+    /// top-level guest has it (@ref LLP 1020.002 D5). `allow="fullscreen"`
+    /// alone grants only the `src` origin, which in WebKit an opaque sandboxed
+    /// guest never matches.
     func wrapper(error: String?) -> String {
         let local = error.map(errorDocument) ?? src.flatMap(localDocument)
         let remote = local == nil ? src.flatMap(remoteSource) : nil
@@ -477,17 +936,23 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         return """
         <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
         <style>html,body,iframe{margin:0;width:100%;height:100%;border:0;display:block}body{overflow:hidden}</style>
-        <iframe id="exact-frame"\(source)\(restriction)></iframe>
+        <iframe id="exact-frame" allow="fullscreen *"\(source)\(restriction)></iframe>
         <script>
         (() => {
           const inner = document.getElementById('exact-frame');
           const guestOrigin = \(expectedOrigin);
           let committed = false;
+          let connected = false;
           let navigated = false;
           window.__exactRevokeGuest = () => { navigated = true; };
+          window.__exactHostReply = (text, expectedGeneration) => {
+            if (expectedGeneration !== \(generation) || navigated || (!committed && !connected) || guestOrigin === null) return;
+            inner.contentWindow.postMessage(text, guestOrigin === 'null' ? '*' : guestOrigin);
+          };
           addEventListener('message', event => {
             if (event.source !== inner.contentWindow) return;
             if (navigated || guestOrigin === null || event.origin !== guestOrigin) return;
+            connected = true;
             let payload = event.data;
             if (typeof payload !== 'string') {
               try { payload = JSON.stringify(payload); } catch { return; }
@@ -613,7 +1078,9 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard !invalidated else { return }
+        // Every handler serves this arm's own web view, never a popup WebKit
+        // made from a copy of its configuration (@ref LLP 1020.002 D1).
+        guard !invalidated, message.webView === built else { return }
         if message.name == "exactFrame" {
             // A direct guest's post to `parent`, from the document `src`
             // committed and not one it navigated to.
@@ -624,6 +1091,10 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         }
         if message.name == "exactAgent" {
             if let body = message.body as? [String: Any] {
+                if let nonce = body["document"] as? String, direct, !revoked, message.frameInfo.isMainFrame,
+                   let expectedOrigin, WebArm.spelled(message.frameInfo.securityOrigin) == expectedOrigin {
+                    documentNonce = nonce
+                }
                 // `AssetScheme` logs its own misses.
                 if localGuest, let failed = body["failed"] as? String, !failed.hasPrefix("\(AssetScheme.scheme):") {
                     FileHandle.standardError.write(Data("exact: iframe \(src ?? ""): \(failed) did not load (\(WebArm.whyFailed(failed)))\n".utf8))
@@ -649,7 +1120,11 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        guard !invalidated else { return }
+        guard !invalidated, webView === built else { return }
+        if let browser {
+            emit(kind: 2)
+            return browser.crashed()
+        }
         // Process death is a silent wrapper re-serve (@ref LLP 1020 §5).
         suppressLoad = true
         markLoading()
@@ -662,6 +1137,16 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
         guard !invalidated else { decisionHandler(.cancel); return }
+        switch ui?.intercept(navigationAction, in: webView) ?? .proceed {
+        case .cancel: return decisionHandler(.cancel)
+        case .download: return decisionHandler(.download)
+        case .proceed: break
+        }
+        if let browser {
+            if blank == nil || navigationAction.request.url?.absoluteString != "about:blank" { browser.decided(navigationAction) }
+            decisionHandler(.allow)
+            return
+        }
         if direct {
             // The guest navigates itself, as a frame may; its later
             // documents are not the committed `src` (@ref LLP 1020 D2).
@@ -692,9 +1177,53 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         scheduleServe()
     }
 
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        decisionHandler(!invalidated && FrameUI.downloads(navigationResponse) ? .download : .allow)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        ui?.downloads.adopt(download, from: webView)
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        ui?.downloads.adopt(download, from: webView)
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard !invalidated, !isBlank(navigation), let browser else { return }
+        if browser.flight == nil { emit(kind: 3) }
+        browser.started(navigation)
+    }
+
+    func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        guard !invalidated, !isBlank(navigation) else { return }
+        browser?.redirected(navigation)
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        ui?.committed(webView)
+        guard !invalidated, !isBlank(navigation) else { return }
+        automation?.committed()
+        browser?.committed(navigation)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard !invalidated, let browser else { return }
+        serving = false
+        if isBlank(navigation) { blank = nil; return }
+        emit(kind: 2)
+        browser.failed(navigation, error)
+    }
+
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         serving = false
         guard !invalidated else { return }
+        if let browser {
+            if isBlank(navigation) { blank = nil; return }
+            emit(kind: 2)
+            return browser.failed(navigation, error)
+        }
         guard !recovering else {
             recovering = false
             emit(kind: 2)
@@ -710,12 +1239,33 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
         serving = false
         recovering = false
         guard direct, !invalidated else { return }
+        if isBlank(navigation) { blank = nil; return }
         // A direct guest's document loaded: the iframe's `load`.
         emit(kind: 2)
         if suppressLoad { suppressLoad = false } else { emit(kind: 0) }
+        browser?.finished(navigation)
+    }
+
+    func postMessage(_ text: String) {
+        guard pdf == nil else { return }
+        guard partition == nil else {
+            FileHandle.standardError.write(Data("exact: postMessage: iframe \(id) has a partition; a partitioned frame has no message bridge\n".utf8))
+            return
+        }
+        guard !invalidated, !servePending, !revoked else { return }
+        if direct {
+            guard let documentNonce else { return }
+            webView.evaluateJavaScript("globalThis.__exactHostReply?.(\(javascript(text)), \(javascript(documentNonce)))", in: nil, in: world) { _ in }
+        } else {
+            webView.evaluateJavaScript("window.__exactHostReply?.(\(javascript(text)), \(generation))")
+        }
     }
 
     func snapshot(token: UInt32) {
+        if let pdf {
+            guard let image = pdf.picture(pdf.view.bounds), let data = FrameCaptures.png(image) else { return sendReply(token: token, kind: 2, text: "the PDF view drew nothing") }
+            return sendReply(token: token, kind: 0, data: data)
+        }
         guard webView.bounds.width > 0, webView.bounds.height > 0 else {
             sendReply(token: token, kind: 2, text: "iframe has no snapshot box")
             return
@@ -734,6 +1284,7 @@ private final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelega
     }
 
     func evaluate(token: UInt32, script: String) {
+        guard pdf == nil else { return sendReply(token: token, kind: 2, text: "a PDF frame has no document to script") }
         if direct {
             guard !serving else { sendReply(token: token, kind: 2, text: "guest frame is not ready"); return }
             webView.evaluateJavaScript(script, in: nil, in: world) { [weak self] result in self?.evaluated(token: token, result) }
@@ -798,7 +1349,7 @@ public func exactWebCreate(_ id: UInt32, _ context: UnsafeMutableRawPointer?, _ 
 
 @_cdecl("exact_web_platform_view")
 public func exactWebPlatformView(_ handle: UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer? {
-    arm(handle).map { Unmanaged.passUnretained($0.webView).toOpaque() }
+    arm(handle).map { Unmanaged.passUnretained($0.platformView).toOpaque() }
 }
 
 @_cdecl("exact_web_set_src")
@@ -811,14 +1362,33 @@ public func exactWebSetReader(_ read: ReadFn?) {
     assetReader = read
 }
 
+/// Set by the host before the frame's first `exact_web_platform_view`.
+@_cdecl("exact_web_set_configuring")
+public func exactWebSetConfiguring(_ handle: UnsafeMutableRawPointer?, _ hook: ConfiguringFn?) {
+    arm(handle)?.configuringHook = hook
+}
+
 @_cdecl("exact_web_set_document")
 public func exactWebSetDocument(_ handle: UnsafeMutableRawPointer?, _ bytes: UnsafePointer<UInt8>?, _ length: UInt32, _ present: UInt32) {
     arm(handle)?.suppliedDocument = present == 0 ? nil : Data(UnsafeBufferPointer(start: bytes, count: Int(length)))
 }
 
+/// Before `exact_web_set_src`: `{"app:/cache/a.pdf": "/…/cache"}`, each
+/// `app:/cache` or `app:/tmp` path the page's query names, to its root's
+/// directory; absent for none (@ref LLP 1020.001 D7).
+@_cdecl("exact_web_set_files")
+public func exactWebSetFiles(_ handle: UnsafeMutableRawPointer?, _ bytes: UnsafePointer<UInt8>?, _ length: UInt32, _ present: UInt32) {
+    arm(handle)?.files.supplied = present == 0 ? [:] : json(bytes, length).compactMapValues { $0 as? String }
+}
+
 @_cdecl("exact_web_set_sandbox")
 public func exactWebSetSandbox(_ handle: UnsafeMutableRawPointer?, _ bytes: UnsafePointer<UInt8>?, _ length: UInt32, _ present: UInt32) {
     arm(handle)?.setSandbox(present == 0 ? nil : String(decoding: UnsafeBufferPointer(start: bytes, count: Int(length)), as: UTF8.self))
+}
+
+@_cdecl("exact_web_post_message")
+public func exactWebPostMessage(_ handle: UnsafeMutableRawPointer?, _ bytes: UnsafePointer<UInt8>?, _ length: UInt32) {
+    arm(handle)?.postMessage(String(decoding: UnsafeBufferPointer(start: bytes, count: Int(length)), as: UTF8.self))
 }
 
 @_cdecl("exact_web_snapshot")
@@ -838,6 +1408,91 @@ public func exactWebDestroy(_ handle: UnsafeMutableRawPointer?) {
     let retained = Unmanaged<WebArm>.fromOpaque(handle)
     let arm = retained.takeUnretainedValue()
     arm.invalidate()
-    arm.webView.removeFromSuperview()
+    arm.built?.removeFromSuperview()
+    arm.pdf?.view.removeFromSuperview()
     retained.release()
+}
+
+private func json(_ bytes: UnsafePointer<UInt8>?, _ length: UInt32) -> [String: Any] {
+    guard let bytes else { return [:] }
+    let data = Data(UnsafeBufferPointer(start: bytes, count: Int(length)))
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+}
+
+/// `{partition, agent, zoom, allowsBackForwardNavigationGestures,
+/// allowsMagnification, inactiveSchedulingPolicy}`: before the first
+/// `exact_web_platform_view`, and again when any changes (a new partition
+/// makes a new web view, which that call then returns).
+@_cdecl("exact_web_configure")
+public func exactWebConfigure(_ handle: UnsafeMutableRawPointer?, _ bytes: UnsafePointer<UInt8>?, _ length: UInt32) {
+    arm(handle)?.configure(json(bytes, length))
+}
+
+/// A session ended (`{session}`): its in-memory partitions are let go.
+@_cdecl("exact_web_end_session")
+public func exactWebEndSession(_ bytes: UnsafePointer<UInt8>?, _ length: UInt32) {
+    let session = json(bytes, length)["session"] as? String ?? ""
+    if Thread.isMainThread { Partitions.end(session: session) } else { DispatchQueue.main.async { Partitions.end(session: session) } }
+}
+
+/// A frame command (@ref LLP 1020.002 D3): `{op: "navigate", url}`,
+/// `{op: "traverseHistory", delta}`, `{op: "reload", ignoreCache}`,
+/// `{op: "stopLoading"}`; or a picture of the guest (D7), `{op:
+/// "captureScreenshot", path, file, clip}`; or its inspector (D11), `{op:
+/// "openDevTools"}`.
+@_cdecl("exact_web_command")
+public func exactWebCommand(_ handle: UnsafeMutableRawPointer?, _ bytes: UnsafePointer<UInt8>?, _ length: UInt32) {
+    arm(handle)?.command(json(bytes, length))
+}
+
+/// The app's hatch was called with this frame's view (@ref LLP 1020.002 §9):
+/// a development build says by name what it changed of what the arm owns.
+@_cdecl("exact_web_check_owned")
+public func exactWebCheckOwned(_ handle: UnsafeMutableRawPointer?) {
+    arm(handle)?.checkOwned()
+}
+
+/// The agent's answer to a request the arm held (`ask`): `{token, cancel}`,
+/// `{token, text}` (a dialog), `{token, paths}` (a file input) or `{token,
+/// path, shown}` (a download's destination and how its record names it).
+@_cdecl("exact_web_answer")
+public func exactWebAnswer(_ handle: UnsafeMutableRawPointer?, _ bytes: UnsafePointer<UInt8>?, _ length: UInt32) {
+    arm(handle)?.answer(json(bytes, length))
+}
+
+public typealias ClearFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, UInt32) -> Void
+
+/// A call of `@exact/browser-automation` (@ref LLP 1020.002 D9), its options
+/// with `op`, `id` and `owner` (the session's module folder): `done` receives
+/// the answer's JSON, `{error, message}` when it failed.
+@_cdecl("exact_web_automation")
+public func exactWebAutomation(_ bytes: UnsafePointer<UInt8>?, _ length: UInt32, _ context: UnsafeMutableRawPointer?, _ done: ClearFn?) {
+    let request = json(bytes, length)
+    let finish: ([String: Any]) -> Void = { answer in
+        let data = (try? JSONSerialization.data(withJSONObject: answer)) ?? Data("{}".utf8)
+        data.withUnsafeBytes { done?(context, $0.bindMemory(to: UInt8.self).baseAddress, UInt32(data.count)) }
+    }
+    let run = {
+        let id = request["id"] as? String ?? ""
+        let found = Automations.find(owner: request["owner"] as? String ?? "", id: id)
+        guard found.count == 1, let arm = found.first else { return finish(["error": "NotFoundError", "message": "no unique live iframe with id \(id)"]) }
+        let automation = arm.automation ?? FrameAutomation(arm: arm)
+        arm.automation = automation
+        automation.run(request, reply: finish)
+    }
+    if Thread.isMainThread { run() } else { DispatchQueue.main.async(execute: run) }
+}
+
+/// `clearSiteData(partition, types)` (@ref LLP 1020.002 D4), `{partition,
+/// types}`: `done` receives "" when the platform says the clear is done, or
+/// `<DOMException name>: <message>`.
+@_cdecl("exact_web_clear_site_data")
+public func exactWebClearSiteData(_ bytes: UnsafePointer<UInt8>?, _ length: UInt32, _ context: UnsafeMutableRawPointer?, _ done: ClearFn?) {
+    let request = json(bytes, length)
+    let finish: ((String, String)?) -> Void = { failure in
+        let text = failure.map { "\($0.0): \($0.1)" } ?? ""
+        Array(text.utf8).withUnsafeBufferPointer { done?(context, $0.baseAddress, UInt32($0.count)) }
+    }
+    let run = { Partitions.clear(request["partition"] as? String ?? "", types: request["types"] as? [String] ?? [], done: finish) }
+    if Thread.isMainThread { run() } else { DispatchQueue.main.async(execute: run) }
 }

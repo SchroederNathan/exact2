@@ -135,6 +135,10 @@ impl Display {
     fn sequence(&self) -> Option<u32> {
         self.flips.sequence
     }
+    /// The kernel's timestamp of the last completed flip (CLOCK_MONOTONIC).
+    fn last_flip(&self) -> Option<std::time::Duration> {
+        self.flips.at
+    }
     fn fd(&self) -> i32 {
         self.card.0.as_raw_fd()
     }
@@ -187,6 +191,7 @@ struct FlipState {
     first: bool,
     pending: Option<(usize, SubmittedFrame)>,
     sequence: Option<u32>,
+    at: Option<std::time::Duration>,
 }
 impl Default for FlipState {
     fn default() -> Self {
@@ -195,6 +200,7 @@ impl Default for FlipState {
             first: true,
             pending: None,
             sequence: None,
+            at: None,
         }
     }
 }
@@ -226,7 +232,7 @@ impl FlipState {
         crtc: crtc::Handle,
         read: impl FnOnce() -> std::io::Result<Vec<Event>>,
     ) -> std::io::Result<Option<SubmittedFrame>> {
-        let Some(sequence) = receive_flip(crtc, self.sequence, read)? else {
+        let Some((sequence, at)) = receive_flip(crtc, self.sequence, read)? else {
             return Ok(None);
         };
         let Some((back, frame)) = self.pending.take() else {
@@ -234,6 +240,7 @@ impl FlipState {
         };
         self.front = back;
         self.sequence = Some(sequence);
+        self.at = Some(at);
         Ok(Some(frame))
     }
 }
@@ -246,7 +253,7 @@ fn receive_flip(
     crtc: crtc::Handle,
     last_sequence: Option<u32>,
     read: impl FnOnce() -> std::io::Result<Vec<Event>>,
-) -> std::io::Result<Option<u32>> {
+) -> std::io::Result<Option<(u32, std::time::Duration)>> {
     let events = match read() {
         Ok(events) => events,
         Err(e)
@@ -267,7 +274,8 @@ fn receive_flip(
                     distance != 0 && distance < 1 << 31
                 }) =>
         {
-            Some(e.frame)
+            // `duration` is the kernel's flip timestamp (tv_sec/tv_usec).
+            Some((e.frame, e.duration))
         }
         _ => None,
     }))
@@ -300,8 +308,10 @@ pub fn copy_xrgb(frame: &Pixmap, dst: &mut [u8], pitch: usize, width: u32, heigh
     }
 }
 
-fn mtime(path: &Path) -> Option<Vec<(std::path::PathBuf, SystemTime, u64)>> {
-    fn collect(path: &Path, rows: &mut Vec<(std::path::PathBuf, SystemTime, u64)>) {
+type ReloadStamp = Vec<(std::path::PathBuf, SystemTime, u64)>;
+
+fn mtime(path: &Path) -> Option<ReloadStamp> {
+    fn collect(path: &Path, rows: &mut ReloadStamp) {
         let Ok(metadata) = std::fs::metadata(path) else {
             return;
         };
@@ -337,6 +347,11 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
     let (pw, ph) = display.size();
     let viewport = (pw as f32 / config.scale, ph as f32 / config.scale);
     let wall = || started.elapsed().as_secs_f64() * 1000.0;
+    config.clock_started = Some(started);
+    // Startup timestamps for Observe's launch metrics.
+    let mut marks = crate::launch_marks::LaunchMarks::new();
+    let observe_log = std::env::var("EXACT_OBSERVE_LOG").as_deref() == Ok("1");
+    marks.launch_end();
     let (mut p, error) = match crate::app::boot_presenter::<D>(config, viewport) {
         Ok(v) => v,
         Err(e) => {
@@ -350,6 +365,15 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
     // The display's clock owns time (the timers RFC, D1)
     p.set_live_clock(Some(crate::presenter::wall_since(started)));
     let mut input = Input::open();
+    // @ref LLP 1132 D10 — a touch screen alone is `pointer: coarse`, `hover: none`.
+    if input.touch_only() {
+        let mut preferences = p.host().runner().viewport().preferences;
+        preferences.pointer = exact_runner::Pointer::Coarse;
+        preferences.hover = exact_runner::Hover::None;
+        if let Some(e) = p.set_preferences(preferences) {
+            eprintln!("exact: {e}");
+        }
+    }
     let mut vnc = match config.vnc.as_deref() {
         Some(addr) => match Vnc::start(addr, pw, ph) {
             Ok(v) => Some(v),
@@ -362,8 +386,6 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
     };
     let mut pointer = (viewport.0 / 2.0, viewport.1 / 2.0);
     p.set_pointer(Some(pointer));
-    let mut last_tick = 0.0f64;
-    let frame_ms = 1000.0 / f64::from(display.refresh().max(1));
     // A development display samples its flips, and writes a trace on
     // SIGUSR1 (LLP 1079 D3, D5); a production binary does neither.
     let measured = !exact_runner::delivery::production(&p.compat);
@@ -373,7 +395,7 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
     }
     let mut plan_seen = config.dev_plan.as_deref().and_then(mtime);
     // The dev plan's modification time and since when it has waited on requests in flight.
-    let mut held: Option<(Option<Vec<(std::path::PathBuf, SystemTime, u64)>>, Instant)> = None;
+    let mut held: Option<(Option<ReloadStamp>, Instant)> = None;
     // First pixel is the first frame presented (LLP 1026 D11); the update
     // check follows two seconds after it, off the boot path.
     let mut first_pixel: Option<Instant> = None;
@@ -385,7 +407,7 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         config.scale,
         input.len(),
         match (&vnc, config.vnc.as_deref()) {
-            (Some(_), Some("1")) => ", vnc on :5900".to_string(),
+            (Some(_), Some("1")) => ", vnc on 127.0.0.1:5900".to_string(),
             (Some(_), Some(a)) => format!(", vnc on {a}"),
             _ => String::new(),
         },
@@ -407,7 +429,11 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
             if measured {
                 frames.submitted(wall(), p.host().runner().seq(), p.hosts);
             }
-            match display.submit(frame) {
+            let submitted = display.submit(frame);
+            if !marks.done() {
+                marks.submitted(first_pixel.is_none());
+            }
+            match submitted {
                 Ok(Some(frame)) => presented(
                     &mut p,
                     frame,
@@ -427,15 +453,30 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         if p.module_pending() {
             p.first_pixel();
         }
+        if first_pixel.is_some() && !marks.done() {
+            if !p.module_pending() {
+                marks.activated();
+            }
+            marks.turn(&crate::launch_marks::items(
+                &p.host().runner().outstanding(),
+            ));
+        }
+        if marks.take_done() {
+            crate::journal::record("startup", marks.report());
+            if observe_log {
+                eprintln!("observe: startup {}", marks.line());
+            }
+        }
         let now = wall();
         let mut timeout = work_timeout(
             display.pending(),
             p.needs_animation_frame(),
-            p.timer_due_ms(),
-            last_tick,
+            p.wake_due_ms(),
             now,
-            frame_ms,
         );
+        if let Some(wait) = marks.timeout_ms() {
+            timeout = if timeout < 0 { wait } else { timeout.min(wait) };
+        }
         // An activation after this turn's paint left a commit to show: don't sleep.
         if p.dirty() && !display.pending() {
             timeout = 0;
@@ -471,6 +512,14 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         match poll(&fds, display.fd(), timeout) {
             Ok(true) => match display.ready() {
                 Ok(Some(frame)) => {
+                    if !marks.done() {
+                        if let Some(at) = display.last_flip() {
+                            marks.flipped(
+                                at,
+                                &crate::launch_marks::items(&p.host().runner().outstanding()),
+                            );
+                        }
+                    }
                     presented(
                         &mut p,
                         frame,
@@ -519,7 +568,7 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
             check_due = None;
             p.check_update();
         }
-        let mut events = input.read();
+        let mut events = input.read(wall());
         if let Some(v) = vnc.as_mut() {
             events.extend(v.take_events());
         }
@@ -531,12 +580,14 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
             }
         }
 
+        if let Some(e) = p.admit_idle_timer(wall()) {
+            eprintln!("exact: {e}");
+        }
         // The hatches' turn (LLP 1075.003.000.001 §4.1): what they asked of
         // elements runs, and the moments this turn's commits caused.
         p.hatch_turn();
         let now = wall();
-        let due = timer_wake_delay(p.timer_due_ms(), now, last_tick, frame_ms)
-            .is_some_and(|wait| wait <= 0.0);
+        let due = p.wake_due_ms().is_some_and(|due| due <= now);
         if due || p.wants_frames() {
             if let Some(e) = p.follow_local_offset() {
                 eprintln!("exact: {e}");
@@ -545,12 +596,10 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         // A frame task (LLP 1073 D5): each frame the display can take is
         // `frame` (timers, then frame tasks), never caught up.
         if !display.pending() && p.wants_frames() {
-            last_tick = now;
             if let Some(e) = p.animation_frame(now) {
                 eprintln!("exact: {e}");
             }
         } else if due {
-            last_tick = now;
             if let Some(e) = p.advance(now) {
                 eprintln!("exact: {e}");
             }
@@ -649,18 +698,11 @@ fn poll(fds: &[i32], display_fd: i32, timeout: i32) -> Result<bool, String> {
         .any(|fd| fd.fd == display_fd && fd.revents & libc::POLLIN != 0))
 }
 
-fn work_timeout(
-    pending: bool,
-    animation: bool,
-    due: Option<f64>,
-    last_tick: f64,
-    now: f64,
-    frame_ms: f64,
-) -> i32 {
+fn work_timeout(pending: bool, animation: bool, due: Option<f64>, now: f64) -> i32 {
     if animation && !pending {
         0
-    } else if let Some(wait) = timer_wake_delay(due, now, last_tick, frame_ms) {
-        wait.ceil().min(f64::from(i32::MAX)) as i32
+    } else if let Some(due) = due {
+        (due - now).max(0.0).ceil().min(f64::from(i32::MAX)) as i32
     } else {
         -1
     }
@@ -678,44 +720,35 @@ fn presented<D: DataSource>(
         v.publish(frame.pixels.clone());
     }
     p.display_complete(&frame);
+    // Its boxes are the ones the pointer rests on now: their hover, and
+    // their `:hover` looks (LLP 1121 D8), follow (#139).
+    p.follow_pointer();
     if first.is_none() {
         *first = Some(Instant::now());
         *check_due = Some(Instant::now() + Duration::from_secs(2));
     }
 }
 
-/// @ref LLP 1043.000 §3 D8 — KMS page flips pace repaints; even with no
-/// repaint or an input storm, advance at most once per display interval.
-/// Distant timers use poll's single deadline (input/executor fds may wake it).
-fn timer_wake_delay(due: Option<f64>, now: f64, last_frame: f64, frame_ms: f64) -> Option<f64> {
-    due.map(|due| {
-        if due - now <= 8.0 * frame_ms {
-            (last_frame + frame_ms - now).max(0.0)
-        } else {
-            due - now
-        }
-    })
-}
-
 #[cfg(test)]
 mod timer_tests {
-    use super::timer_wake_delay;
+    use super::work_timeout;
 
     #[test]
-    fn timer_deadlines_sleep_or_follow_the_display_without_polling() {
-        let frame = 1000.0 / 60.0;
-        assert_eq!(timer_wake_delay(Some(16.0), 0.0, 0.0, frame), Some(frame));
-        assert_eq!(
-            timer_wake_delay(Some(1000.0), 0.0, 0.0, frame),
-            Some(1000.0)
-        );
-        assert_eq!(timer_wake_delay(None, 0.0, 0.0, frame), None);
-        assert_eq!(timer_wake_delay(Some(16.0), 500.0, 0.0, frame), Some(0.0));
-        // Input wakes during the same frame cannot cause a second advance.
-        assert!(timer_wake_delay(Some(16.0), 501.0, 500.0, frame).unwrap() > 15.0);
-        assert_eq!(
-            timer_wake_delay(Some(1000.0), 1000.0, 0.0, frame),
-            Some(0.0)
-        );
+    fn timer_deadlines_do_not_request_intermediate_frame_wakes() {
+        for (due, now, expected) in [
+            (Some(16.0), 0.0, 16),
+            (Some(2.0), 0.0, 2),
+            (Some(1000.0), 0.0, 1000),
+            (None, 0.0, -1),
+            (Some(16.0), 500.0, 0),
+            (Some(1000.0), 1000.0, 0),
+            (Some(501.1), 501.0, 1),
+            (Some(f64::from(u32::MAX)), 0.0, i32::MAX),
+        ] {
+            assert_eq!(work_timeout(false, false, due, now), expected);
+            assert_eq!(work_timeout(true, false, due, now), expected);
+            assert_eq!(work_timeout(true, true, due, now), expected);
+            assert_eq!(work_timeout(false, true, due, now), 0);
+        }
     }
 }

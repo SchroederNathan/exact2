@@ -3,13 +3,20 @@
 use super::*;
 use std::collections::BTreeSet;
 
-pub(super) fn publish(arena: &mut NodeArena, tree: &mut LayoutTree, root: u32) -> LayoutReceipt {
+pub(super) fn publish(
+    arena: &mut NodeArena,
+    tree: &mut LayoutTree,
+    measurer: &mut dyn TextMeasurer,
+    root: u32,
+) -> LayoutReceipt {
     #[cfg(test)]
     {
         tree.publication_visits = 0;
     }
     for node in tree.taffy.take_layout_changes() {
-        if let Some(&slot) = tree.slots.get(&node) {
+        // An anonymous table's change is its table's (`table.rs`).
+        let slot = tree.slots.get(&node).copied();
+        if let Some(slot) = slot.or_else(|| tree.tables.holding(node)) {
             arena.layout_dirty.insert(slot);
         }
     }
@@ -56,6 +63,7 @@ pub(super) fn publish(arena: &mut NodeArena, tree: &mut LayoutTree, root: u32) -
     let mut changed = Vec::new();
     let mut updated = Vec::new();
     let mut exclusions = Vec::new();
+    let mut images = Vec::new();
     // @ref LLP 1093 D7 — a box in a multi-column flow is published at its
     // place in the flow thread plus its placement: its column's translation,
     // relative to the container's own (`base`), or a straddling box's union.
@@ -82,6 +90,12 @@ pub(super) fn publish(arena: &mut NodeArena, tree: &mut LayoutTree, root: u32) -
         }
         let own_hidden = arena.style(slot).display == crate::Display::None;
         let hidden = hidden || own_hidden;
+        // Its paragraph placed an image in its text, published (below), or,
+        // holding a string, has none to place.
+        if !hidden && arena.is_inline_image(slot) {
+            arena.layout_dirty.remove(slot);
+            continue;
+        }
         if hidden {
             arena.flags_mut(slot).insert(NodeFlags::HIDDEN);
         } else {
@@ -182,12 +196,41 @@ pub(super) fn publish(arena: &mut NodeArena, tree: &mut LayoutTree, root: u32) -
         // A multi-column cut that changed publishes this subtree whole
         // (LLP 1093): placements moved without each child's layout bit.
         let full = full || hidden || republish;
-        let descend_all = full || origin_moved || flags.has(NodeFlags::CHILDREN_DIRTY);
+        // A table that is another box places its parts from its anonymous
+        // table, which can move inside it alone. A row or group places what
+        // it holds by its displacement (`table::displacement`), which can
+        // change with its frame unchanged: it publishes them all again when
+        // that changed or what places it moved, not when it is only on the
+        // way to a dirty cell.
+        let displacement = tree
+            .tables
+            .flat(slot)
+            .then(|| super::table::displacement(arena, tree, slot));
+        let displaced = displacement
+            .is_some_and(|d| tree.displacements.insert(slot, d) != Some(d) || parent_moved);
+        let descend_all = full
+            || origin_moved
+            || displaced
+            || flags.has(NodeFlags::CHILDREN_DIRTY)
+            || tree.tables.anon(slot).is_some();
         arena.set_frame(slot, frame);
         arena.consume_layout_flags(slot);
         if moved {
             arena.mark_geometry_changed(slot, root);
             changed.push(arena.key(slot));
+        }
+        if !hidden && !inline && arena.node_type(slot) == NodeType::Text {
+            if let Some(node) = arena.taffy(slot) {
+                let l = tree.layout(node);
+                super::inline_images::place(
+                    arena,
+                    measurer,
+                    root,
+                    (slot, frame, &l, moved || origin_moved),
+                    &mut images,
+                    (&mut changed, &mut updated),
+                );
+            }
         }
         if !inline
             && (moved
@@ -198,13 +241,33 @@ pub(super) fn publish(arena: &mut NodeArena, tree: &mut LayoutTree, root: u32) -
         {
             updated.push(arena.key(slot));
         }
+        // A table's row group or row holds its children only in the arena:
+        // the engine laid them out in the table's grid (`table.rs`), from
+        // the grid's origin, moved with the row or group as it is moved
+        // relatively. A table that is another box holds its grid.
+        let (fx, fy) = if let Some((dx, dy)) = displacement {
+            (ox + dx, oy + dy)
+        } else if let Some(grid) = tree.tables.anon(slot) {
+            let l = tree.layout(grid);
+            (fx + l.location.x, fy + l.location.y)
+        } else {
+            (fx, fy)
+        };
         if descend_all {
             for &child in arena.children(slot).iter().rev() {
                 if arena.blocks.holds(child) {
                     continue; // its own layout's, in its own space
                 }
                 let full = full || arena.flags(child).has(NodeFlags::ATTACHED);
-                stack.push((child, fx, fy, hidden, full, origin_moved, shift));
+                stack.push((
+                    child,
+                    fx,
+                    fy,
+                    hidden,
+                    full,
+                    origin_moved || displaced,
+                    shift,
+                ));
             }
         } else if let Some(children) = paths.get(&slot) {
             for &(_, child) in children.iter().rev() {
@@ -270,7 +333,7 @@ pub fn compute(
         }
     }
     let refitted = fit::settle(arena, tree);
-    let mut receipt = publish(arena, tree, root_slot);
+    let mut receipt = publish(arena, tree, measurer, root_slot);
     for key in refitted {
         if !receipt.updated.contains(&key) {
             receipt.updated.push(key);
@@ -329,6 +392,160 @@ mod tests {
             );
         }
     }
+    /// A table of `rows` rows of two cells, each holding a 20 by 10 box; the
+    /// first box holds 9, 4 by 4 and relatively positioned. Laid out once.
+    /// 1 root, 2 table, 3 tbody, 9; rows 10 000 + r, cells 20 000 + 2r + c,
+    /// boxes 40 000 + 2r + c (disjoint up to 5 000 rows).
+    fn big_table(rows: u32) -> (Kernel, Offer) {
+        let mut k = Kernel::new(Box::new(MonospaceMeasurer::default()));
+        let offer = Offer::definite(400.0, 20.0 * rows as f32 + 100.0);
+        let mut ops = Vec::new();
+        let view = |id| Op::CreateView {
+            id,
+            node_type: NodeType::View,
+        };
+        let ids: Vec<u32> = (0..rows).map(|r| 10_000 + r).collect();
+        for id in [1, 2, 3, 9] {
+            ops.push(view(id));
+        }
+        ops.extend([
+            prop(2, PropId::SemanticTag, "table"),
+            prop(3, PropId::SemanticTag, "tbody"),
+            style(9, StyleId::Width, "4px"),
+            style(9, StyleId::Height, "4px"),
+            style(9, StyleId::PositionType, "relative"),
+        ]);
+        for &row in &ids {
+            ops.push(view(row));
+            ops.push(prop(row, PropId::SemanticTag, "tr"));
+            let mut cells = Vec::new();
+            for c in 0..2 {
+                let (cell, inner) = (
+                    20_000 + (row - 10_000) * 2 + c,
+                    40_000 + (row - 10_000) * 2 + c,
+                );
+                ops.extend([
+                    view(cell),
+                    prop(cell, PropId::SemanticTag, "td"),
+                    view(inner),
+                    style(inner, StyleId::Width, "20px"),
+                    style(inner, StyleId::Height, "10px"),
+                ]);
+                ops.push(Op::SetChildren {
+                    id: inner,
+                    children: if inner == 40_000 { vec![9] } else { Vec::new() },
+                });
+                ops.push(Op::SetChildren {
+                    id: cell,
+                    children: vec![inner],
+                });
+                cells.push(cell);
+            }
+            ops.push(Op::SetChildren {
+                id: row,
+                children: cells,
+            });
+        }
+        ops.extend([
+            Op::SetChildren {
+                id: 3,
+                children: ids,
+            },
+            Op::SetChildren {
+                id: 2,
+                children: vec![3],
+            },
+            Op::SetChildren {
+                id: 1,
+                children: vec![2],
+            },
+            Op::AttachRoot { id: 1 },
+        ]);
+        k.apply(0, 1, &ops).unwrap();
+        k.compute_layout(1, offer).unwrap();
+        // Every node is its own, and the rows and group are the table's flat parts.
+        assert_eq!(
+            k.node(1).unwrap().arena.iter_live().count(),
+            4 + 5 * rows as usize
+        );
+        for id in [3, 10_000, 9_999 + rows] {
+            let slot = k.node(id).unwrap().slot;
+            assert!(k.tree().tables.flat(slot), "{id} is a flat part");
+        }
+        (k, offer)
+    }
+
+    /// A move inside one cell of a table visits the path to it, not every
+    /// row's cells: a row or group descends whole only when displaced.
+    #[test]
+    fn a_move_inside_one_table_cell_visits_only_its_path() {
+        let (mut k, offer) = big_table(20);
+        k.apply(0, 2, &[style(9, StyleId::Left, "3px")]).unwrap();
+        k.compute_layout(1, offer).unwrap();
+        assert!(
+            k.tree().publication_visits <= 8,
+            "visits {}, the path being 1, 2, 3, 10 000, 20 000, 40 000, 9",
+            k.tree().publication_visits
+        );
+        equal_fresh(&k, offer);
+    }
+
+    /// A layout with nothing changed publishes nothing, however large the
+    /// table; and one that places every part of its grid again, with no
+    /// origin changed (a cell's box restyled to where it already was),
+    /// publishes the path to that box alone: Taffy patch 69 reports an
+    /// unchanged grid origin as no change.
+    #[test]
+    fn a_large_table_laid_out_again_unchanged_publishes_nothing() {
+        let (mut k, offer) = big_table(500);
+        for _ in 0..3 {
+            let receipt = k.compute_layout(1, offer).unwrap();
+            assert_eq!(k.tree().publication_visits, 0);
+            assert!(receipt.changed.is_empty() && receipt.updated.is_empty());
+        }
+        let row = k.node(10_499).unwrap().slot;
+        let before = k.tree().displacements.get(&row).copied();
+        k.apply(0, 2, &[style(9, StyleId::Left, "0px")]).unwrap();
+        let receipt = k.compute_layout(1, offer).unwrap();
+        assert!(receipt.changed.is_empty(), "{:?}", receipt.changed);
+        assert!(
+            k.tree().publication_visits <= 8,
+            "visits {}",
+            k.tree().publication_visits
+        );
+        assert_eq!(k.tree().displacements.get(&row).copied(), before);
+        equal_fresh(&k, offer);
+    }
+
+    /// Publication's cost on a 500-row table: an unchanged relayout (what a
+    /// host's scroll frame asks of the kernel) and a restyle inside one cell.
+    /// Run with `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn table_publication_cost() {
+        let (mut k, offer) = big_table(500);
+        let runs = 200;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            k.compute_layout(1, offer).unwrap();
+        }
+        let unchanged = start.elapsed() / runs;
+        let start = std::time::Instant::now();
+        let mut visits = 0;
+        for i in 0..runs {
+            let left = format!("{}px", i % 7);
+            k.apply(0, 2 + i as u64, &[style(9, StyleId::Left, &left)])
+                .unwrap();
+            k.compute_layout(1, offer).unwrap();
+            visits += k.tree().publication_visits;
+        }
+        let restyle = start.elapsed() / runs;
+        eprintln!(
+            "TABLE500 unchanged relayout {unchanged:?}; one-cell restyle + layout {restyle:?}, {} visits each",
+            visits / runs as usize
+        );
+    }
+
     #[test]
     fn paint_and_prop_edits_skip_publication_but_geometry_edits_still_publish() {
         let calls = Rc::new(Cell::new(0));
@@ -418,5 +635,57 @@ mod tests {
             equal_fresh(&k, offer);
         }
         assert!(calls.get() > 0);
+    }
+
+    /// LLP 1011.002: an image in a paragraph's text is placed with its
+    /// paragraph, left clean (a layout with nothing changed visits nothing),
+    /// and placed alike by a rehydrated kernel.
+    #[test]
+    fn an_image_in_text_is_placed_once_and_as_a_fresh_kernel_places_it() {
+        let offer = Offer::definite(200.0, 400.0);
+        let mut k = Kernel::with_monospace();
+        let mut ops = vec![
+            Op::CreateView {
+                id: 1,
+                node_type: NodeType::View,
+            },
+            Op::CreateView {
+                id: 2,
+                node_type: NodeType::Text,
+            },
+            Op::CreateView {
+                id: 3,
+                node_type: NodeType::Text,
+            },
+            Op::CreateView {
+                id: 4,
+                node_type: NodeType::Image,
+            },
+            prop(3, PropId::Text, "words before"),
+            style(4, StyleId::Width, "30px"),
+            style(4, StyleId::Height, "30px"),
+        ];
+        ops.extend([
+            Op::SetChildren {
+                id: 2,
+                children: vec![3, 4],
+            },
+            Op::SetChildren {
+                id: 1,
+                children: vec![2],
+            },
+            Op::AttachRoot { id: 1 },
+        ]);
+        k.apply(0, 1, &ops).unwrap();
+        k.compute_layout(1, offer).unwrap();
+        let image = k.node(4).unwrap().frame;
+        assert!(image.x > 0.0 && image.width == 30.0, "{image:?}");
+        k.compute_layout(1, offer).unwrap();
+        assert_eq!(k.tree().publication_visits, 0);
+        equal_fresh(&k, offer);
+        k.apply(0, 1, &[style(4, StyleId::Width, "50px")]).unwrap();
+        k.compute_layout(1, offer).unwrap();
+        assert_eq!(k.node(4).unwrap().frame.width, 50.0);
+        equal_fresh(&k, offer);
     }
 }

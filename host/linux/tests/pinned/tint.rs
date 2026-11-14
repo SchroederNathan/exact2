@@ -1,6 +1,5 @@
 //! Raster template alpha, fitting and box paint held to Chrome at 1×.
 use crate::borders::{boot, held_to_chrome, view};
-use exact_linux::presenter::PainterChoice;
 use std::time::Duration;
 
 #[test]
@@ -8,10 +7,7 @@ fn raster_tint_matches_chrome_in_both_painters() {
     let cases = [
         "fill", "contain", "cover", "none", "down", "small", "natural", "auto", "rounded",
     ];
-    let mut choices = vec![PainterChoice::Cpu];
-    if exact_linux::gpu::Gpu::new().is_ok() {
-        choices.push(PainterChoice::Gpu);
-    }
+    let choices = crate::paint::painters();
     let mut failures = Vec::new();
     for choice in choices {
         let mut p = boot(choice, "tint.contract");
@@ -33,18 +29,17 @@ fn raster_tint_matches_chrome_in_both_painters() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// LLP 1095 D8: an untinted symbol is `AccentColor`, here its fallback pair
-/// (`#0088ff`, iOS 27's measured tint: LLP 1115.000 D3.2; no report on
-/// Linux), not the text colour; a tint row wins.
+/// LLP 1081 stage 2: a symbol is drawn in its computed `color`, inherited
+/// (the column's black) or its own (red), on every host; a tint is for rasters.
 #[test]
-fn an_untinted_symbol_paints_the_accent_fallback() {
+fn a_symbol_paints_its_color() {
     crate::pin_font();
     let plan = contract::compile(
         r##"component App
   view
     column width=100 height=100 background-color="#ffffff" color="#000000"
       image "symbol:play-fill" testId="plain" width=48 height=48 font-size=48
-      image "symbol:play-fill" testId="red" width=48 height=48 font-size=48 -exact-tint-color="#ff0000"
+      image "symbol:play-fill" testId="red" width=48 height=48 font-size=48 color="#ff0000"
 "##,
     )
     .unwrap();
@@ -68,6 +63,6 @@ fn an_untinted_symbol_paints_the_accent_fallback() {
             .min_by_key(|c| u16::from(c[0]) + u16::from(c[1]) + u16::from(c[2]))
             .unwrap()
     };
-    assert_eq!(ink(0), [0x00, 0x88, 0xff]);
+    assert_eq!(ink(0), [0x00, 0x00, 0x00]);
     assert_eq!(ink(48), [0xff, 0x00, 0x00]);
 }

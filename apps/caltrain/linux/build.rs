@@ -10,6 +10,9 @@ fn main() {
         Ok(p) => p,
         Err(e) => panic!("app.contract:{e}"),
     };
+    let entries = contract::snapshot::entries(std::path::Path::new("..")).unwrap();
+    contract::snapshot::check_refreshes(&entries, &mut caltrain_data::Caltrain)
+        .unwrap_or_else(|e| panic!("widget refresh: {e}"));
     let baked =
         contract::bake(plan, caltrain_data::Caltrain).unwrap_or_else(|e| panic!("bake: {e:?}"));
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -25,8 +28,16 @@ fn main() {
     let platform = "linux";
     let manifest = contract::Manifest::read(&app_dir).unwrap_or_else(|e| panic!("app.json: {e}"));
     let grants = caltrain_data::Caltrain.grants();
-    let compat = exact_bake::compatibility_id(&app_dir, platform, &target, &manifest, Some(grants))
-        .unwrap_or_else(|e| panic!("compatibility id: {e}"));
+    let compat = exact_bake::compatibility_id_sources_with_entries(
+        &app_dir,
+        platform,
+        &target,
+        &manifest,
+        Some(grants),
+        None,
+        Some(&entries),
+    )
+    .unwrap_or_else(|e| panic!("compatibility id: {e}"));
     std::fs::write(out_dir.join("compat.json"), compat.to_json()).unwrap();
     let host = if compat.inputs["store"]["L"] == "0" {
         "exact_linux"
@@ -38,15 +49,15 @@ fn main() {
         .unwrap_or_else(|e| panic!("hatches: {e}"));
     std::fs::write(
         out_dir.join("entry.rs"),
-        format!(
-            "{}\n{hatches}fn main() {{ std::process::exit({host}::{run}); }}\n",
-            contract::rust_entry(
-                "caltrain_data::Caltrain",
-                "caltrain_data::Caltrain",
-                compat.inputs["rustMode"].as_str().unwrap()
-            )
-            .unwrap()
-        ),
+        contract::linux_entry(
+            "caltrain_data::Caltrain",
+            "caltrain_data::Caltrain",
+            compat.inputs["rustMode"].as_str().unwrap(),
+            host,
+            &hatches,
+            run,
+        )
+        .unwrap_or_else(|e| panic!("entry: {e}")),
     )
     .unwrap();
 }

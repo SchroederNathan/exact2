@@ -26,6 +26,14 @@ export function storageKey(appId, href = launchHref()) {
   return `${own}/agent/${name}`;
 }
 export const agentStorageRefusal = 'storage is unavailable in agent mode unless the drive names a scratch store (--storage <name>)';
+// A read in a drive with no scratch store answers as an empty store would (LLP 1102 §3.17): the roots, empty, and
+// nothing else, so a source that falls back on ENOENT (its first launch) does so; a write is refused (`agent`).
+// js/src/prelude.js answers the same on native.
+export const agentReads = ['readFile', 'readdir', 'stat', 'realpath'];
+export function emptyRead(op, path) {
+  if (op === 'readdir' && Object.values(directories).includes(path)) return [];
+  throw Object.assign(new Error(`filesystem: no such file or directory: ${path} (a drive that names no scratch store reads an empty one; --storage <name> names one)`), { kind: 'Unavailable', code: 'ENOENT' });
+}
 
 // @ref LLP 1069.005 D2b — the launch seed a drive names (`&seed=`, default
 // 1, as `exactTime().seed` reads it), or null outside the agent. Only a
@@ -100,4 +108,43 @@ export function keyStore(name, indexedDB) {
     put: (handle, pair) => run('readwrite', keys => keys.put({ privateKey: pair.privateKey, publicKey: pair.publicKey }, handle)).then(() => {}),
     get: handle => run('readonly', keys => keys.get(handle)).then(pair => pair ?? null),
   };
+}
+
+/** A kept session's read/modify/write spans every tab sharing its localStorage key. */
+export function exclusiveSecret(store, prefix, name, work) {
+  if (!globalThis.navigator?.locks) return Promise.reject(Object.assign(new Error('This browser cannot coordinate shared secret updates'), { name: 'NotSupportedError' }));
+  return navigator.locks.request(`${prefix}${name}`, async () => {
+    const discard = () => {
+      store.pending.delete(name);
+      if (store.writes) store.writes = store.writes.filter(([key]) => key !== name);
+    };
+    const key = prefix + name, marker = `exact.exclusive.${key}`;
+    // A prior failed write belongs to an older snapshot, never this lease.
+    discard();
+    if (localStorage.getItem(marker) != null) {
+      localStorage.removeItem(key); localStorage.removeItem(marker);
+    }
+    const fresh = localStorage.getItem(key);
+    if (fresh == null) store.map.delete(name); else store.map.set(name, fresh);
+    localStorage.setItem(marker, '1');
+    (store.leased ??= new Set()).add(name);
+    let completed = false;
+    try { const value = await work(); completed = true; return value; } finally {
+      try { store.persist(); } finally { store.leased.delete(name); }
+      if (store.pending.has(name)) {
+        discard(); store.map.delete(name);
+        localStorage.removeItem(key);
+        throw new Error('The shared secret could not be persisted');
+      }
+      if (!completed) { discard(); store.map.delete(name); localStorage.removeItem(key); }
+      localStorage.removeItem(marker);
+    }
+  });
+}
+
+
+/** Automatic retries must share the lease; a value check alone races another tab. */
+export async function retrySecretWrite(key, current, write, locks = globalThis.navigator?.locks) {
+  if (!locks) throw new Error('This browser cannot coordinate a secret write retry');
+  await locks.request(key, () => { if (current()) write(); });
 }

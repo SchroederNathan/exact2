@@ -7,24 +7,12 @@ enum ButtonConfigurationMac {
     // Weak keys retain each pristine control's value only while our authored
     // override is active. An absent row on an untouched control writes nothing.
     private static let pristineSizes = NSMapTable<NSButton, NSNumber>.weakToStrongObjects()
-    static func weight(_ value: Int) -> NSFont.Weight {
-        switch value {
-        case ..<200: return .ultraLight
-        case 200..<300: return .thin
-        case 300..<400: return .light
-        case 400..<500: return .regular
-        case 500..<600: return .medium
-        case 600..<700: return .semibold
-        case 700..<800: return .bold
-        case 800..<900: return .heavy
-        default: return .black
-        }
-    }
+    static func weight(_ value: Int) -> NSFont.Weight { TextEngine.namedWeight(value) }
     static func font(_ incoming: NSFont, rows: NodeStyle) -> NSFont {
         guard rows["font_size"] != nil || rows["font_weight"] != nil else { return incoming }
         let size = rows["font_size"]?.number.map { CGFloat($0) } ?? incoming.pointSize
         let value = rows["font_weight"]?.number.map(Int.init) ?? TextEngine.controlWeight(incoming)
-        return TextEngine.cssWeight(NSFont.systemFont(ofSize: size, weight: weight(value)), weight: value, size: size)
+        return TextEngine.cssWeight(value, size: size) { NSFont.systemFont(ofSize: size, weight: weight($0)) }
     }
     static func color(_ value: BatchValue?, appearance: NSAppearance, accent: NSColor?) -> NSColor? {
         let dark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -80,7 +68,8 @@ enum ButtonConfigurationMac {
         // the system's, and the platform's red where the author painted no accent: the accent look's bezel (AppKit's
         // white title on it), else the ink.
         button.hasDestructiveAction = destructive
-        button.bezelColor = look.hasSuffix("-accent") ? (red ? .systemRed : accent ?? .controlAccentColor) : nil
+        button.bezelColor = color(rows.button["background_color"], appearance: appearance, accent: accent)
+            ?? (look.hasSuffix("-accent") ? (red ? .systemRed : accent ?? .controlAccentColor) : nil)
         let authored = color(rows.title["text_color"], appearance: appearance, accent: accent)
         let foreground = authored ?? (red && !look.hasSuffix("-accent") ? NSColor.systemRed : nil)
         // SwiftUI's `.plain` draws in the label colour, `.borderless` in the
@@ -100,12 +89,17 @@ enum ButtonConfigurationMac {
         let symbolFont = font(titleFont, rows: rows.symbol)
         let symbolWeight = rows.symbol["font_weight"]?.number.map(Int.init) ?? TextEngine.controlWeight(titleFont)
         button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: symbolFont.pointSize, weight: weight(symbolWeight))
-        var image = face.symbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }
+        // An svg-only icon's path (stage 9 A2): a template image at the symbol's point size.
+        var image = face.symbol.flatMap { FaceSymbol.image($0, points: symbolFont.pointSize) }
         if let tint = color(rows.symbol["tint_color"], appearance: appearance, accent: accent), let source = image {
-            // Palette colours belong to the symbol, independently of the label.
-            let config = button.symbolConfiguration!.applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
-            image = source.withSymbolConfiguration(config)
-            image?.isTemplate = false
+            if face.symbol.map(FaceSymbol.isPath) == true {
+                image = FaceSymbol.tinted(source, tint) // (a path has no palette)
+            } else {
+                // Palette colours belong to the symbol, independently of the label.
+                let config = button.symbolConfiguration!.applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
+                image = source.withSymbolConfiguration(config)
+                image?.isTemplate = false
+            }
         }
         button.image = image
         if image == nil { button.imagePosition = .noImage }

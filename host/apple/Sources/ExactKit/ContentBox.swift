@@ -15,12 +15,20 @@ extension NodeView {
     /// Native fields keep their published editor box for field layout (LLP
     /// 1104 D5) and read their padding rows. Other content uses the published
     /// box, or the bounds of a box sent none.
-    func contentBox() -> CGRect {
+    /// The bounds at the size layout gave: a box drawn on the pixel grid
+    /// can be up to a device pixel smaller or larger (`PixelGridIOS.swift`,
+    /// `PixelGridMac.swift`), and its text wraps at layout's width, not the
+    /// drawn one.
+    package var layoutBounds: CGRect { CGRect(origin: bounds.origin, size: grid?.layout.size ?? bounds.size) }
+    /// The frame layout sent, where the drawn one is on the pixel grid.
+    package var laidOutFrame: CGRect { grid?.layout ?? frame }
+
+    package func contentBox() -> CGRect {
         if !isNativeTextControl {
-            return kernelContentBox?.offsetBy(dx: bounds.minX, dy: bounds.minY) ?? bounds
+            return kernelContentBox?.offsetBy(dx: bounds.minX, dy: bounds.minY) ?? layoutBounds
         }
         let uniform = number("border_width")
-        return bounds.insetBy(
+        return layoutBounds.insetBy(
             left: number("border_width_left", uniform) + number("padding_left"),
             top: number("border_width_top", uniform) + number("padding_top"),
             right: number("border_width_right", uniform) + number("padding_right"),
@@ -44,6 +52,16 @@ extension NodeView {
         layerPaintCache = nil
         needsLayout = true; needsDisplay = true
         #endif
+    }
+
+    /// Clips `ctx` to the content edge's curve, where CSS trims a replaced
+    /// element's content (CSS Backgrounds 3 §5.3, "Corner Clipping"): each
+    /// radius less the border and padding beside it, so a bordered rounded
+    /// image sits inside its border's inner curve.
+    func clipToContentEdge(_ ctx: CGContext, _ content: CGRect) {
+        let radii = BorderPaint.contentRadii(cornerSizes(in: layoutBounds), outer: layoutBounds, inner: content)
+        ctx.addPath(BorderPaint.roundedRect(content, radii, shape: CornerShape(style["corner_shape"])))
+        ctx.clip()
     }
 
     /// Places what draws in the content box at it, as a video is

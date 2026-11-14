@@ -212,8 +212,8 @@ reply is M3's design (LLP 1020.000): the plausible shape is the data
 seam — a guest `message` lands as an action, the command runs as a
 mutation (LLP 1016) with the client's auth, and the settled result is
 posted back — keeping the token out of the guest and the bridge out of
-the Contract's way. General app→guest messaging beyond replies stays
-cut (§5).
+the Contract's way. Host-initiated string updates to a mounted frame were
+earned back on 2026-10-19 (§5, §11); structured messages stay cut.
 
 **D3 — loading is the GPU-module shape.** The Apple webview arm is a
 separate artifact beside `libexact_gpu.dylib`, `dlopen`ed at the first
@@ -310,9 +310,11 @@ so each return is a measurement or a named consumer, not drift:
 - **App→guest messaging** — the earn-back trigger ("the first deck the
   URL cannot configure") was met the day the survey read the shipped SDK:
   every `castleSdk` deck expects replies in its window. The narrow form
-  — replies to guest messages — is scoped in as D2r; **general**
-  app→guest messaging (host-initiated pushes) stays cut until a deck
-  needs one the reply channel cannot carry.
+  — replies to guest messages — is scoped in as D2r. **Host-initiated
+  string updates — earned back 2026-10-19** by T3 Code's MCP App and HTML
+  documents, which need theme, shortcut and context changes the reply
+  channel cannot carry (§11). Structured clone and broadcast to every frame
+  stay cut until a guest needs one a string to one frame cannot carry.
 - **Navigation policy, verdicts, popups, the 13-op controller** — the
   first product need to intercept guest navigation. Until then: the guest
   navigates itself as any iframe may; popups are denied by `sandbox`
@@ -544,7 +546,9 @@ LLP 1020.001 D4 amends this table for a bundled HTML page under `assets/` or `de
   precede data activation are delivered once the executor is ready.
   This is the scoped local-file failure rule, not a change to network
   iframe failures. A fitted PDF element and Chrome's PDF viewer fragments
-  remain outside this scope.
+  remain outside this scope. A bundled page is given an `app:/cache` or
+  `app:/tmp` file by naming it in its own query (LLP 1020.001 D7); a value it
+  cannot be given is emptied, and the frame loads as any page does.
 - **Direct** is the web view's own document. A local one is served at the
   synthetic origin above, with `sandbox` sent as a `Content-Security-Policy: sandbox …`
   header, which WebKit enforces on a top-level document, opaque origin
@@ -595,3 +599,70 @@ LLP 1020.001 D4 amends this table for a bundled HTML page under `assets/` or `de
 - **The document read.** A local `src` is read once per `src`, off the main
   thread (`WebViews.update`). It used to be read on the main thread at every
   update of the row.
+
+
+## 11. Addressed string replies and host updates (2026-10-19)
+
+Admitted by a doing-list trade (`rules/DEFERRED.md`, section "Features carried over as 'no'").
+
+`postMessage(text, iframeId)` runs on Apple and both web executors
+for string replies and host-initiated theme, shortcut and MCP-context updates. The
+consumer needs these for interactive HTML and MCP documents. It keeps
+the existing canvas form and its ordered pending queue. Its compiler distinguishes
+iframe delivery internally; the public command still has two string arguments, and
+repeated iframe instances may compute their ids.
+
+A post addresses one mounted frame. Missing or ambiguous ids and names shared
+with a live canvas are refused. Iframe posts never wait by id for a future frame:
+a replacement document cannot inherit a prior frame's messages. Web delivery uses
+that document's Window and known origin, or `*` only for an opaque sandbox; an
+observed subsequent load revokes its channel until the app commits a new source.
+Authored source or sandbox changes immediately replace the channel token. On the web,
+a cross-origin or opaque guest can start self-navigation before its parent observes
+load; its WindowProxy remains stable during that interval. This channel does not
+claim navigation-start revocation there. Apple checks the wrapper generation or a
+direct document's private isolated-world nonce, and revokes at navigation start. A
+direct native guest receives a synthesized string MessageEvent; its own posts continue
+through the existing guest-to-app bridge.
+
+It excludes structured-clone expansion, a permission broker, a navigation controller
+and an app-owned native bridge. Linux refuses iframe-tagged posts explicitly and keeps
+its existing canvas protocol. The focused compiler/browser tests and native fixture are
+`post_message.rs`, `frame-messages.test.mjs` and `IframePostMessageTests.swift`.
+
+## 12. The guest's box on macOS with public API (2026-11-03)
+
+Under Daehyeon Mun's ruling of 2026-11-03 that no private API ships in app
+code. A frame fills its node's box (D1). Under the titlebar of a
+`fullSizeContentView` window whose titlebar is not transparent (a window
+with a toolbar or a sidebar), WebKit insets the page by the part of the
+titlebar over it and draws a strip of `underPageBackgroundColor` there
+(`computeAutomaticTopObscuredInset`, WebKit's `PageClientImplMac.mm`).
+Setting `WKWebView.obscuredContentInsets` (macOS 26) ends those automatic
+insets, so the arm sets it to zero as it makes the view
+(`IframeCaptureTests.testAFrameUnderTheTitlebarFillsItsBox`). Before
+macOS 26 nothing public ends them: there, a frame that reaches under such a
+titlebar keeps the strip, the height of the overlap, and its page's
+viewport is shorter by as much. Frames below the titlebar, and every frame
+in a window whose titlebar is transparent, are not affected.
+
+A page that draws no background shows the node under it, as an iframe's
+does on the web. On macOS only WKWebView's private `drawsBackground` gives
+that; `underPageBackgroundColor`, an `isOpaque` override and the view's
+layer leave WebKit's white page background (macOS 27.2). Without it every
+such frame turns opaque. **Ruled (Daehyeon Mun, 2026-11-03):** the arm
+keeps `drawsBackground`, a named exception to that day's no-private-API
+ruling, as Web Inspector's private calls are (LLP 1020.002 D11).
+
+A scaled frame hears pointer events where it is drawn, as Chromium's
+does. AppKit's geometry ignores a layer's transform, and WKWebView converts
+each event's window point by that geometry, so a page under a layer that
+scales it would hear every press, hover and wheel where the unscaled box
+is. On macOS an iframe's 2D `scale` therefore goes into view geometry: the
+web view lies in a holder whose bounds are the box and whose frame is the
+box scaled about `transform-origin`, and AppKit scales the page's drawing
+and its events alike (`FrameScaleMac.swift`,
+`IframeScaleTests`). The node's layer draws the rest of its transform. A
+frame that is also rotated or in space keeps the layer's scale. The
+iframe's own box, a background or border on the element, is drawn
+unscaled.
